@@ -1,0 +1,536 @@
+# Codex Usage Monitor
+
+Track your OpenAI Codex CLI usage limits in real time — locally, with optional external access. No cloud accounts required to get started.
+
+**Problem:** `codex /status` shows your limits right now, but there's no persistent dashboard, no history, and no alerts when you're running low.
+
+**Solution:** A local bash script that scrapes `codex /status` every 15 minutes, writes a `data.json` snapshot, serves a dashboard in your browser, and fires Discord or Telegram alerts directly — all from your own machine, with zero cloud dependency.
+
+---
+
+## Table of Contents
+
+1. [Architecture Overview](#architecture-overview)
+2. [Prerequisites](#prerequisites)
+3. [Quick Start (Local)](#quick-start-local)
+4. [Running Continuously](#running-continuously)
+   - [Option A: tmux](#option-a-tmux-recommended)
+   - [Option B: Docker](#option-b-docker)
+   - [Option C: WSL (Windows)](#option-c-wsl-windows)
+   - [Option D: LXC Container](#option-d-lxc-container)
+   - [Option E: systemd service](#option-e-systemd-service-linux)
+   - [Option F: cron](#option-f-cron)
+5. [Notifications (Discord & Telegram)](#notifications-discord--telegram)
+6. [External Dashboard (Optional)](#external-dashboard-optional-github-gist--pages)
+7. [Configuration Reference](#configuration-reference)
+8. [Troubleshooting](#troubleshooting)
+9. [Project Structure](#project-structure)
+10. [Contributing](#contributing)
+11. [License](#license)
+
+---
+
+## Architecture Overview
+
+```
+┌──────────────────────────────────────┐
+│  Your machine (any OS with bash)      │
+│                                        │
+│  codex /status                         │
+│       ↓                                │
+│  local/monitor.sh                      │
+│       ↓              ↓                 │
+│  local/data.json   Discord/Telegram    │
+│  local/history.json  (direct curl)     │
+│       ↓                                │
+│  local/dashboard.html                  │
+│  (browser via serve.sh / Docker)       │
+└──────────────────────────────────────┘
+          │ optional (Tier 2)
+          ▼
+   GitHub Gist ──→ yourname.github.io/codex-monitor
+   (JSON blob)       (static dashboard)
+```
+
+**Tier 1 — Local only:** Everything runs on your machine. No accounts, no cloud.  
+**Tier 2 — External dashboard (optional):** `monitor.sh` also PATCHes a GitHub Gist. A static GitHub Pages site reads from it. Requires a GitHub account and a Personal Access Token.
+
+---
+
+## Prerequisites
+
+### Required (Tier 1)
+| Requirement | Check | Install |
+|---|---|---|
+| OpenAI Codex CLI | `codex /status` | [OpenAI docs](https://openai.com/blog/openai-codex) |
+| bash | `bash --version` | Pre-installed on Linux/macOS/WSL |
+| curl | `curl --version` | Pre-installed on most systems |
+| python3 | `python3 --version` | [python.org](https://python.org) — needed for dashboard server & JSON handling |
+| GNU grep (Linux/macOS) | `grep -P '' /dev/null` | Linux: built-in. macOS: `brew install grep` |
+
+> **Windows users:** Run everything inside WSL, Docker, or a Linux VM/LXC. Native Windows bash is not supported. See [Running Continuously](#running-continuously) for options.
+
+> **macOS users:** The default `grep` does not support `-P`. Fix: `brew install grep` then add `/opt/homebrew/bin` to your `PATH`.
+
+### Optional (Tier 2 — External Dashboard)
+| Requirement | Notes |
+|---|---|
+| GitHub account | Free — for Gist storage and Pages hosting |
+| GitHub Personal Access Token | `gist` scope only. Create at [github.com/settings/tokens](https://github.com/settings/tokens) |
+
+---
+
+## Quick Start (Local)
+
+```bash
+# 1. Clone
+git clone https://github.com/YOUR_USERNAME/codex-usage-monitor.git
+cd codex-usage-monitor/local
+
+# 2. Configure
+cp .env.example .env
+# Edit .env — Discord/Telegram are optional, leave blank to skip
+
+# 3. Make executable
+chmod +x monitor.sh serve.sh
+
+# 4. Run once to verify
+./monitor.sh
+# Output: parsed JSON printed to terminal, data.json written
+
+# 5. Open the dashboard
+./serve.sh
+# Then open: http://localhost:8080/dashboard.html
+```
+
+---
+
+## Running Continuously
+
+Pick whichever option fits your environment best.
+
+### Option A: tmux (recommended)
+
+Best for: any Linux/macOS machine where you want a simple persistent session.
+
+```bash
+# Install if needed
+sudo apt install tmux        # Debian/Ubuntu
+brew install tmux            # macOS
+
+# Start monitor in a named session
+tmux new -s codex-monitor 'cd /path/to/codex-usage-monitor/local && ./monitor.sh --loop 900'
+
+# Detach (leave running): Ctrl+B, then D
+# Reattach later:
+tmux attach -t codex-monitor
+
+# Start dashboard in a second session (optional)
+tmux new -s codex-dash 'cd /path/to/codex-usage-monitor/local && ./serve.sh'
+```
+
+---
+
+### Option B: Docker
+
+Best for: always-on local running, Windows users, anyone who prefers containers.
+
+**Requirements:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) or Docker Engine + Compose.
+
+```bash
+# From the repo root:
+
+# 1. Configure
+cp local/.env.example local/.env
+# Edit local/.env
+
+# 2. Build and start
+docker compose up -d
+
+# Dashboard available at:
+# http://localhost:8080/dashboard.html
+
+# View logs
+docker compose logs -f
+
+# Stop
+docker compose down
+```
+
+**Manual Docker (without Compose):**
+```bash
+docker build -t codex-monitor .
+docker run -d \
+  --name codex-monitor \
+  --restart unless-stopped \
+  --env-file local/.env \
+  -p 8080:8080 \
+  -v "$(pwd)/local":/app \
+  codex-monitor
+```
+
+> **Port conflict?** Change the port: `-p 9090:8080` then visit `http://localhost:9090/dashboard.html`
+
+---
+
+### Option C: WSL (Windows)
+
+Best for: Windows users who want native Linux tooling without a full VM.
+
+```powershell
+# Install WSL2 (run in PowerShell as Administrator)
+wsl --install
+
+# Then in the WSL terminal:
+cd /mnt/c/path/to/codex-usage-monitor/local
+chmod +x monitor.sh serve.sh
+./monitor.sh            # test once
+
+# Run continuously with tmux inside WSL
+tmux new -s codex-monitor './monitor.sh --loop 900'
+```
+
+> The dashboard served from WSL is accessible on Windows via `http://localhost:8080/dashboard.html` — WSL2 bridges the network automatically.
+
+---
+
+### Option D: LXC Container
+
+Best for: Proxmox homelab users or anyone running LXC on Linux.
+
+```bash
+# Create a lightweight Alpine or Ubuntu container
+# (example using Proxmox pct or plain lxc-create)
+
+# Proxmox:
+pct create 200 local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst \
+  --hostname codex-monitor --memory 256 --rootfs local-lvm:4
+
+pct start 200
+pct exec 200 -- bash
+
+# Inside the container:
+apt update && apt install -y bash curl python3 git grep
+git clone https://github.com/YOUR_USERNAME/codex-usage-monitor.git
+cd codex-usage-monitor/local
+cp .env.example .env && nano .env
+chmod +x monitor.sh serve.sh
+
+# Run monitor as systemd service (see Option E below)
+# Bind port 8080 in your LXC config if you want external access:
+# pct set 200 -net0 name=eth0,bridge=vmbr0,ip=dhcp
+```
+
+---
+
+### Option E: systemd service (Linux)
+
+Best for: servers, headless Linux boxes, Raspberry Pi — auto-starts on boot and restarts on failure.
+
+```bash
+# Create service file (adjust paths)
+sudo tee /etc/systemd/system/codex-monitor.service << 'EOF'
+[Unit]
+Description=Codex Usage Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/home/youruser/codex-usage-monitor/local
+EnvironmentFile=/home/youruser/codex-usage-monitor/local/.env
+ExecStart=/bin/bash /home/youruser/codex-usage-monitor/local/monitor.sh --loop 900
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable --now codex-monitor
+
+# Check status and logs
+sudo systemctl status codex-monitor
+journalctl -u codex-monitor -f
+```
+
+**Add a second service for the dashboard:**
+```bash
+sudo tee /etc/systemd/system/codex-dashboard.service << 'EOF'
+[Unit]
+Description=Codex Usage Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=youruser
+ExecStart=/bin/bash /home/youruser/codex-usage-monitor/local/serve.sh
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl enable --now codex-dashboard
+```
+
+---
+
+### Option F: cron
+
+Best for: lightweight — no persistent process, just runs on schedule.
+
+```bash
+crontab -e
+
+# Add this line (adjust path):
+*/15 * * * * /bin/bash /home/youruser/codex-usage-monitor/local/monitor.sh >> /tmp/codex-monitor.log 2>&1
+```
+
+---
+
+## Notifications (Discord & Telegram)
+
+Both work via a **direct `curl` call from `monitor.sh`** — no server, no middleman, no third-party backend. As long as your machine has internet access, alerts fire.
+
+### Discord
+
+1. Open your Discord server → **Server Settings** → **Integrations** → **Webhooks**
+2. Click **New Webhook**, pick a channel, click **Copy Webhook URL**
+3. Add to `local/.env`:
+   ```bash
+   DISCORD_WEBHOOK=https://discord.com/api/webhooks/123456789/abcdefgh...
+   ```
+
+**Test it directly (no monitor needed):**
+```bash
+source local/.env
+curl -X POST "$DISCORD_WEBHOOK" \
+  -H "Content-Type: application/json" \
+  -d '{"content": "✅ Codex monitor test alert"}'
+```
+
+---
+
+### Telegram
+
+1. Open Telegram → message **@BotFather** → send `/newbot` → follow prompts → copy the **bot token**
+2. Start a chat with your new bot (send it any message)
+3. Find your chat ID:
+   ```bash
+   curl "https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates"
+   # Look for "chat":{"id": <number>} in the response
+   ```
+4. Add to `local/.env`:
+   ```bash
+   TELEGRAM_BOT_TOKEN=123456789:ABCdefGHI-jklMNO
+   TELEGRAM_CHAT_ID=987654321
+   ```
+
+**Test it directly:**
+```bash
+source local/.env
+curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+  -d "chat_id=${TELEGRAM_CHAT_ID}" \
+  --data-urlencode "text=✅ Codex monitor test alert"
+```
+
+---
+
+### Alert Thresholds
+
+Alerts fire **once** as usage drops below each threshold — no spam.
+
+```bash
+# Default: alert at 75%, 50%, 25%, 10%, 5% remaining
+ALERT_THRESHOLDS=75,50,25,10,5
+
+# Minimal alerting
+ALERT_THRESHOLDS=25,5
+
+# Verbose
+ALERT_THRESHOLDS=90,75,50,25,10,5,1
+```
+
+---
+
+## External Dashboard (Optional — GitHub Gist + Pages)
+
+Skip this section entirely if you only need the local dashboard.
+
+This tier lets you view the dashboard from any browser anywhere, using:
+- **GitHub Gist** as a free JSON data store (updated by `monitor.sh` via `curl`)
+- **GitHub Pages** to host `local/dashboard.html` — the same file used locally, just deployed statically
+
+### Setup (one-time, ~10 minutes)
+
+**Step 1 — Create a Gist**
+
+1. Go to [gist.github.com](https://gist.github.com)
+2. Create a **secret** Gist with a file named `data.json` (contents can be `{}` for now)
+3. Copy the Gist ID from the URL: `gist.github.com/<username>/<GIST_ID>`
+
+**Step 2 — Create a Personal Access Token**
+
+1. Go to [github.com/settings/tokens](https://github.com/settings/tokens) → **Generate new token (classic)**
+2. Check only the **`gist`** scope
+3. Copy the token
+
+**Step 3 — Configure `local/.env`**
+
+```bash
+GITHUB_PAT=ghp_yourTokenHere
+GITHUB_GIST_ID=abc123def456...
+```
+
+Run `./monitor.sh` once — you should see `[OK] Gist updated` in the output.
+
+**Step 4 — Set your Gist ID in `local/dashboard.html`**
+
+Open `local/dashboard.html` and set `GIST_ID` near the top of the `<script>` block:
+
+```javascript
+const GIST_ID = 'abc123def456...';  // your actual Gist ID
+```
+
+With this set, the same `dashboard.html` file switches into **external mode** and fetches data from your Gist instead of local files.
+
+**Step 5 — Deploy `dashboard.html` to GitHub Pages**
+
+Option A — Add to an existing GitHub Pages repo:
+```bash
+cp local/dashboard.html ~/my-pages-repo/codex/index.html
+cd ~/my-pages-repo && git add . && git commit -m "Add Codex monitor" && git push
+# Access at: https://yourname.github.io/codex/
+```
+
+Option B — Enable Pages on this repo:
+1. Push this repo to GitHub
+2. Go to **Settings → Pages → Source → Deploy from branch**
+3. Select `main` branch, `/local` folder
+4. Rename `dashboard.html` → `index.html` for a cleaner URL
+5. Access at: `https://yourname.github.io/codex-usage-monitor/`
+
+---
+
+## Configuration Reference
+
+All variables go in `local/.env` (copy from `local/.env.example`).
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DISCORD_WEBHOOK` | No | — | Discord webhook URL |
+| `TELEGRAM_BOT_TOKEN` | No | — | Telegram bot token from BotFather |
+| `TELEGRAM_CHAT_ID` | No | — | Numeric Telegram chat ID |
+| `ALERT_THRESHOLDS` | No | `75,50,25,10,5` | Comma-separated % thresholds for alerts |
+| `GITHUB_PAT` | No (Tier 2 only) | — | GitHub Personal Access Token (`gist` scope) |
+| `GITHUB_GIST_ID` | No (Tier 2 only) | — | ID of the Gist to update |
+| `LOOP_INTERVAL` | No (Docker only) | `900` | Seconds between scrapes in container |
+
+---
+
+## Troubleshooting
+
+### `codex: command not found`
+
+The Codex CLI is not in PATH. Run `which codex` or check your shell profile. Try running `codex /status` manually first.
+
+### `Could not parse usage percentages from codex output`
+
+OpenAI may have changed the `codex /status` output format. Run `codex /status 2>&1 | cat` to see raw output and check whether `5h limit:` / `Weekly limit:` lines still appear with `% left`.
+
+If you are running inside WSL and `codex /status` gets treated like a normal prompt, update to the current `local/monitor.sh`. It now opens Codex in a PTY and sends `/status` as terminal input instead of passing it as a CLI argument. If Codex starts slowly in your environment, raise `CODEX_STATUS_TIMEOUT_SECONDS` in `local/.env`.
+
+### `grep -P` errors on macOS
+
+Install GNU grep:
+```bash
+brew install grep
+export PATH="/opt/homebrew/bin:$PATH"  # add to ~/.zshrc
+```
+
+### Dashboard shows blank / "Could not load data.json"
+
+`monitor.sh` hasn't run yet, or you opened `dashboard.html` directly from the filesystem (not via `serve.sh`). Run:
+```bash
+./monitor.sh          # creates data.json
+./serve.sh            # starts http server
+# then open http://localhost:8080/dashboard.html
+```
+
+### Docker: port already in use
+
+```bash
+# Change the host port in docker-compose.yml
+ports:
+  - "9090:8080"   # use 9090 instead
+```
+
+### Gist sync returns HTTP 401
+
+Your `GITHUB_PAT` is expired or missing `gist` scope. Generate a new token at [github.com/settings/tokens](https://github.com/settings/tokens).
+
+### Gist sync returns HTTP 404
+
+`GITHUB_GIST_ID` is wrong. Double-check the ID from the Gist URL.
+
+---
+
+## Project Structure
+
+```
+codex-usage-monitor/
+├── local/
+│   ├── monitor.sh        # Scraper, parser, alerter, optional Gist sync
+│   ├── dashboard.html    # Unified dashboard — local mode by default, Gist mode if GIST_ID is set
+│   ├── serve.sh          # One-liner: starts python HTTP server for dashboard
+│   ├── .env.example      # Config template — copy to .env (git-ignored)
+│   ├── .env              # Your config (git-ignored, never committed)
+│   ├── data.json         # Latest usage snapshot (git-ignored, written by monitor.sh)
+│   └── history.json      # Rolling 24h history (git-ignored, written by monitor.sh)
+├── Dockerfile            # Container image (alpine + bash + curl + python3 + Node)
+├── docker-compose.yml    # Compose file: one command to run everything
+├── docker-entrypoint.sh  # Container startup: monitor loop + HTTP server
+├── .gitignore
+├── LICENSE               # MIT
+├── README.md
+└── agent.md              # AI agent context document
+```
+
+---
+
+## Contributing
+
+PRs welcome. Some ideas:
+
+- [ ] Detect `codex /status --json` if/when OpenAI adds it
+- [ ] Slack webhook support
+- [ ] ntfy.sh support (self-hosted push notifications)
+- [ ] Multi-account support
+- [ ] Longer history retention (configurable window)
+- [ ] Email alerts via a simple SMTP relay
+- [ ] macOS-compatible parsing (pure sed, no GNU grep)
+- [ ] Auto-open browser on `serve.sh` start
+- [ ] GitHub Actions workflow for automated Gist update (no local machine needed)
+
+---
+
+## Local Testing Notes
+
+- History retention is time-based now. `HISTORY_RETENTION_HOURS=24` keeps a 24-hour window even if you change the scrape interval.
+- Docker should only be used when the container can access an authenticated Codex CLI config. A common setup is mounting `~/.codex` into `/root/.codex`.
+- The container now performs a startup scrape and exits if monitoring cannot start, so it will not keep serving stale data after the scraper dies.
+- The dashboard clears metrics and marks itself stale on refresh failure instead of leaving old percentages visible.
+
+### Parser Test
+
+```bash
+bash tests/monitor_parser_test.sh
+```
+
+## License
+
+MIT

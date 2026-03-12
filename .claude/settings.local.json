@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(which bash:*)",
+      "Bash(python3 -c \"print\\('hello'\\)\" 2>&1)",
+      "Bash(python -c \"print\\('hello'\\)\" 2>&1)",
+      "Bash(wsl.exe --install --no-distribution 2>&1 || echo \"May need admin privileges\")",
+      "Bash(wsl.exe --install -d Ubuntu 2>&1)",
+      "Bash(wsl.exe --list --verbose 2>&1)",
+      "Bash(wsl.exe -d Ubuntu -- echo \"WSL is working\" 2>&1)",
+      "Bash(wsl.exe -d Ubuntu -- bash -c \"python3 --version && grep --version | head -1\" 2>&1)",
+      "Bash(wsl.exe -d Ubuntu -- bash -c \"cd '/mnt/c/Users/bdworzanczyk/OneDrive - EPLUS TECHNOLOGY INC/Cloud - Dan Bos'\\\\''s files/Bart/AI/Projects/codex-usage-monitor' && bash tests/monitor_parser_test.sh\" 2>&1)",
+      "Bash(wsl.exe -d Ubuntu -- bash -c 'cd \"/mnt/c/Users/bdworzanczyk/OneDrive - EPLUS TECHNOLOGY INC/Cloud - Dan Bos'\"'\"'s files/Bart/AI/Projects/codex-usage-monitor\" && source local/monitor.sh && raw=$\\(cat tests/parser_fixtures/quoted_status.txt\\) && parse_status_from_raw \"$raw\" 300' 2>&1)",
+      "Bash(wsl.exe -d Ubuntu -- bash \"/mnt/c/Users/bdworzanczyk/OneDrive - EPLUS TECHNOLOGY INC/Cloud - Dan Bos's files/Bart/AI/Projects/codex-usage-monitor/tests/debug_quoted.sh\" 2>&1)",
+      "Bash(wsl.exe -d Ubuntu -- file \"/mnt/c/Users/bdworzanczyk/OneDrive - EPLUS TECHNOLOGY INC/Cloud - Dan Bos's files/Bart/AI/Projects/codex-usage-monitor/tests/monitor_parser_test.sh\" 2>&1)",
+      "Bash(wsl.exe -d Ubuntu -- file \"/mnt/c/Users/bdworzanczyk/OneDrive - EPLUS TECHNOLOGY INC/Cloud - Dan Bos's files/Bart/AI/Projects/codex-usage-monitor/tests/parser_fixtures/quoted_status.txt\" 2>&1)"
+    ]
+  }
+}

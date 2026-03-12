@@ -1,0 +1,3 @@
+Account: "Dan Ops" <dan@example.com> | Model: codex "5.4"
+5h limit: 14% left (resets 2026-03-12 18:00 UTC)
+Weekly limit: 9% left (resets 2026-03-17 00:00 UTC)
