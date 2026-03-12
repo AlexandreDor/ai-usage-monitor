@@ -49,7 +49,7 @@ Track your OpenAI Codex CLI usage limits in real time — locally, with optional
 │  local/history.json  (direct curl)     │
 │       ↓                                │
 │  local/dashboard.html                  │
-│  (browser via serve.sh / Docker)       │
+│  (browser via serve.sh)                │
 └──────────────────────────────────────┘
           │ optional (Tier 2)
           ▼
@@ -443,7 +443,6 @@ All variables go in `local/.env` (copy from `local/.env.example`).
 | `ALERT_THRESHOLDS` | No | `75,50,25,10,5` | Comma-separated % thresholds for alerts |
 | `GITHUB_PAT` | No (Tier 2 only) | — | GitHub Personal Access Token (`gist` scope) |
 | `GITHUB_GIST_ID` | No (Tier 2 only) | — | ID of the Gist to update |
-| `LOOP_INTERVAL` | No (Docker only) | `900` | Seconds between scrapes in container |
 
 ---
 
@@ -476,14 +475,6 @@ export PATH="/opt/homebrew/bin:$PATH"  # add to ~/.zshrc
 # then open http://localhost:8080/dashboard.html
 ```
 
-### Docker: port already in use
-
-```bash
-# Change the host port in docker-compose.yml
-ports:
-  - "9090:8080"   # use 9090 instead
-```
-
 ### Gist sync returns HTTP 401
 
 Your `GITHUB_PAT` is expired or missing `gist` scope. Generate a new token at [github.com/settings/tokens](https://github.com/settings/tokens).
@@ -506,13 +497,10 @@ codex-usage-monitor/
 │   ├── .env              # Your config (git-ignored, never committed)
 │   ├── data.json         # Latest usage snapshot (git-ignored, written by monitor.sh)
 │   └── history.json      # Rolling 24h history (git-ignored, written by monitor.sh)
-├── Dockerfile            # Container image (alpine + bash + curl + python3 + Node)
-├── docker-compose.yml    # Compose file: one command to run everything
-├── docker-entrypoint.sh  # Container startup: monitor loop + HTTP server
 ├── .gitignore
 ├── LICENSE               # MIT
 ├── README.md
-└── agent.md              # AI agent context document
+└── tests/                # Parser tests + fixtures
 ```
 
 ---

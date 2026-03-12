@@ -14,3 +14,12 @@ npm-debug.log*
 # Windows
 Thumbs.db
 desktop.ini
+
+# Local/internal-only repo content
+.claude/
+WHY.MD
+agent.md
+Dockerfile
+docker-compose.yml
+docker-entrypoint.sh
+openclaw-webinfo/
