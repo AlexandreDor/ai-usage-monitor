@@ -6,6 +6,8 @@ Track your OpenAI Codex CLI usage limits in real time — locally, with optional
 
 **Solution:** A local bash script that scrapes `codex /status` every 15 minutes, writes a `data.json` snapshot, serves a dashboard in your browser, and fires Discord or Telegram alerts directly — all from your own machine, with zero cloud dependency.
 
+![Codex Limits dashboard hero](local/images/hero.png)
+
 ---
 
 ## Table of Contents
@@ -13,13 +15,14 @@ Track your OpenAI Codex CLI usage limits in real time — locally, with optional
 1. [Architecture Overview](#architecture-overview)
 2. [Prerequisites](#prerequisites)
 3. [Quick Start (Local)](#quick-start-local)
-4. [Running Continuously](#running-continuously)
-   - [Option A: tmux](#option-a-tmux-recommended)
-   - [Option B: Docker](#option-b-docker)
-   - [Option C: WSL (Windows)](#option-c-wsl-windows)
-   - [Option D: LXC Container](#option-d-lxc-container)
-   - [Option E: systemd service](#option-e-systemd-service-linux)
-   - [Option F: cron](#option-f-cron)
+4. [Ways To Run It](#ways-to-run-it)
+   - [Option A: Two Local Terminals](#option-a-two-local-terminals-easiest)
+   - [Option B: Bash Background Process](#option-b-bash-background-process)
+   - [Option C: tmux](#option-c-tmux-recommended)
+   - [Option D: WSL (Windows)](#option-d-wsl-windows)
+   - [Option E: LXC Container](#option-e-lxc-container)
+   - [Option F: systemd service](#option-f-systemd-service-linux)
+   - [Option G: cron](#option-g-cron)
 5. [Notifications (Discord & Telegram)](#notifications-discord--telegram)
 6. [External Dashboard (Optional)](#external-dashboard-optional-github-gist--pages)
 7. [Configuration Reference](#configuration-reference)
@@ -31,6 +34,8 @@ Track your OpenAI Codex CLI usage limits in real time — locally, with optional
 ---
 
 ## Architecture Overview
+
+![Codex Limits framework](local/images/framework.png)
 
 ```
 ┌──────────────────────────────────────┐
@@ -63,14 +68,14 @@ Track your OpenAI Codex CLI usage limits in real time — locally, with optional
 | Requirement | Check | Install |
 |---|---|---|
 | OpenAI Codex CLI | `codex /status` | [OpenAI docs](https://openai.com/blog/openai-codex) |
-| bash | `bash --version` | Pre-installed on Linux/macOS/WSL |
+| bash | `bash --version` | Pre-installed on Linux/WSL |
 | curl | `curl --version` | Pre-installed on most systems |
 | python3 | `python3 --version` | [python.org](https://python.org) — needed for dashboard server & JSON handling |
-| GNU grep (Linux/macOS) | `grep -P '' /dev/null` | Linux: built-in. macOS: `brew install grep` |
+| GNU grep | `grep -P '' /dev/null` | Built-in on most Linux distributions |
 
-> **Windows users:** Run everything inside WSL, Docker, or a Linux VM/LXC. Native Windows bash is not supported. See [Running Continuously](#running-continuously) for options.
-
-> **macOS users:** The default `grep` does not support `-P`. Fix: `brew install grep` then add `/opt/homebrew/bin` to your `PATH`.
+> **Windows users:** Run everything inside WSL. Native Windows bash is not supported.
+>
+> **Supported / tested:** Linux-based shells only. We have tested this on WSL and on a Proxmox LXC container.
 
 ### Optional (Tier 2 — External Dashboard)
 | Requirement | Notes |
@@ -103,20 +108,72 @@ chmod +x monitor.sh serve.sh
 # Then open: http://localhost:8080/dashboard.html
 ```
 
+Important: `serve.sh` only hosts the dashboard files. It does not refresh usage by itself. For live updates, `monitor.sh` must also be running on a loop or schedule.
+
 ---
 
-## Running Continuously
+## Ways To Run It
 
-Pick whichever option fits your environment best.
+Pick the simplest option that fits your environment. In every setup:
 
-### Option A: tmux (recommended)
+- `monitor.sh` scrapes Codex and writes `data.json` / `history.json`
+- `serve.sh` serves `dashboard.html`
 
-Best for: any Linux/macOS machine where you want a simple persistent session.
+This project is designed for local Linux-style execution. Docker is intentionally not documented as a supported runtime because the current status capture depends on an authenticated local Codex CLI environment.
+
+### Option A: Two Local Terminals (easiest)
+
+Best for: first-time setup, testing, and most local users on Linux/WSL.
+
+Terminal 1:
+```bash
+cd /path/to/codex-usage-monitor/local
+./monitor.sh --loop 900
+```
+
+Terminal 2:
+```bash
+cd /path/to/codex-usage-monitor/local
+./serve.sh
+```
+
+Then open:
+```text
+http://localhost:8080/dashboard.html
+```
+
+For faster testing:
+```bash
+./monitor.sh --loop 60
+```
+
+---
+
+### Option B: Bash Background Process
+
+Best for: one shell, lightweight local use, quick demos.
+
+```bash
+cd /path/to/codex-usage-monitor/local
+./monitor.sh --loop 900 > /tmp/codex-monitor.log 2>&1 &
+MONITOR_PID=$!
+./serve.sh
+```
+
+Stop the background monitor later with:
+```bash
+kill "$MONITOR_PID"
+```
+
+---
+
+### Option C: tmux (recommended)
+
+Best for: any Linux/WSL machine where you want a simple persistent session.
 
 ```bash
 # Install if needed
 sudo apt install tmux        # Debian/Ubuntu
-brew install tmux            # macOS
 
 # Start monitor in a named session
 tmux new -s codex-monitor 'cd /path/to/codex-usage-monitor/local && ./monitor.sh --loop 900'
@@ -131,49 +188,7 @@ tmux new -s codex-dash 'cd /path/to/codex-usage-monitor/local && ./serve.sh'
 
 ---
 
-### Option B: Docker
-
-Best for: always-on local running, Windows users, anyone who prefers containers.
-
-**Requirements:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) or Docker Engine + Compose.
-
-```bash
-# From the repo root:
-
-# 1. Configure
-cp local/.env.example local/.env
-# Edit local/.env
-
-# 2. Build and start
-docker compose up -d
-
-# Dashboard available at:
-# http://localhost:8080/dashboard.html
-
-# View logs
-docker compose logs -f
-
-# Stop
-docker compose down
-```
-
-**Manual Docker (without Compose):**
-```bash
-docker build -t codex-monitor .
-docker run -d \
-  --name codex-monitor \
-  --restart unless-stopped \
-  --env-file local/.env \
-  -p 8080:8080 \
-  -v "$(pwd)/local":/app \
-  codex-monitor
-```
-
-> **Port conflict?** Change the port: `-p 9090:8080` then visit `http://localhost:9090/dashboard.html`
-
----
-
-### Option C: WSL (Windows)
+### Option D: WSL (Windows)
 
 Best for: Windows users who want native Linux tooling without a full VM.
 
@@ -194,7 +209,7 @@ tmux new -s codex-monitor './monitor.sh --loop 900'
 
 ---
 
-### Option D: LXC Container
+### Option E: LXC Container
 
 Best for: Proxmox homelab users or anyone running LXC on Linux.
 
@@ -216,14 +231,14 @@ cd codex-usage-monitor/local
 cp .env.example .env && nano .env
 chmod +x monitor.sh serve.sh
 
-# Run monitor as systemd service (see Option E below)
+# Run monitor as systemd service (see Option F below)
 # Bind port 8080 in your LXC config if you want external access:
 # pct set 200 -net0 name=eth0,bridge=vmbr0,ip=dhcp
 ```
 
 ---
 
-### Option E: systemd service (Linux)
+### Option F: systemd service (Linux)
 
 Best for: servers, headless Linux boxes, Raspberry Pi — auto-starts on boot and restarts on failure.
 
@@ -279,7 +294,7 @@ sudo systemctl enable --now codex-dashboard
 
 ---
 
-### Option F: cron
+### Option G: cron
 
 Best for: lightweight — no persistent process, just runs on schedule.
 
