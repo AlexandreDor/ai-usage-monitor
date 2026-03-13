@@ -1,0 +1,23 @@
+# Secrets and local state — never commit these
+local/.env
+local/.alert_state
+
+# Node / npm (if ever used locally)
+node_modules/
+npm-debug.log*
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Local/internal-only repo content
+.claude/
+WHY.MD
+agent.md
+Dockerfile
+docker-compose.yml
+docker-entrypoint.sh
+openclaw-webinfo/
