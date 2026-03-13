@@ -13,9 +13,10 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
 ## Table of Contents
 
 1. [Architecture Overview](#architecture-overview)
-2. [Prerequisites](#prerequisites)
-3. [Quick Start (Local)](#quick-start-local)
-4. [Ways To Run It](#ways-to-run-it)
+2. [Project Structure](#project-structure)
+3. [Prerequisites](#prerequisites)
+4. [Quick Start (Local)](#quick-start-local)
+5. [Ways To Run It](#ways-to-run-it)
    - [Option A: Two Local Terminals](#option-a-two-local-terminals-easiest)
    - [Option B: Bash Background Process](#option-b-bash-background-process)
    - [Option C: tmux](#option-c-tmux-recommended)
@@ -23,11 +24,10 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
    - [Option E: LXC Container](#option-e-lxc-container)
    - [Option F: systemd service](#option-f-systemd-service-linux)
    - [Option G: cron](#option-g-cron)
-5. [Notifications (Discord & Telegram)](#notifications-discord--telegram)
-6. [External Dashboard (Optional)](#external-dashboard-optional-github-gist--pages)
-7. [Configuration Reference](#configuration-reference)
-8. [Troubleshooting](#troubleshooting)
-9. [Project Structure](#project-structure)
+6. [Notifications (Discord & Telegram)](#notifications-discord--telegram)
+7. [External Dashboard (Optional)](#external-dashboard-optional-github-gist--pages)
+8. [Configuration Reference](#configuration-reference)
+9. [Troubleshooting](#troubleshooting)
 10. [Contributing](#contributing)
 11. [License](#license)
 
@@ -59,6 +59,31 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
 
 **Tier 1 — Local only:** Everything runs on your machine. No external accounts beyond your existing OpenAI / ChatGPT subscription.  
 **Tier 2 — External dashboard (optional):** `monitor.sh` also PATCHes a GitHub Gist. A static GitHub Pages site reads from it. Requires a GitHub account and a Personal Access Token.
+
+---
+
+## Project Structure
+
+```text
+codex-usage-monitor/
+|-- local/
+|   |-- monitor.sh        # Scraper, parser, alerts, optional Gist sync
+|   |-- dashboard.html    # Local dashboard UI
+|   |-- serve.sh          # Simple HTTP server for the dashboard
+|   |-- .env.example      # Config template; copy to .env
+|   |-- .env              # Your local config (git-ignored, created by you)
+|   |-- data.json         # Latest usage snapshot written by monitor.sh
+|   |-- history.json      # Rolling history used by the chart
+|   `-- images/
+|       |-- hero.png
+|       |-- framework.png
+|       |-- discord.png
+|       |-- logo.png
+|       `-- codex_monitor_architecture.svg
+|-- .gitignore
+|-- LICENSE
+`-- README.md
+```
 
 ---
 
@@ -514,25 +539,6 @@ Your `GITHUB_PAT` is expired or missing `gist` scope. Generate a new token at [g
 
 ---
 
-## Project Structure
-
-```
-codex-usage-monitor/
-├── local/
-│   ├── monitor.sh        # Scraper, parser, alerter, optional Gist sync
-│   ├── dashboard.html    # Unified dashboard — local mode by default, Gist mode if GIST_ID is set
-│   ├── serve.sh          # One-liner: starts python HTTP server for dashboard
-│   ├── .env.example      # Config template — copy to .env (git-ignored)
-│   ├── .env              # Your config (git-ignored, never committed)
-│   ├── data.json         # Latest usage snapshot (git-ignored, written by monitor.sh)
-│   └── history.json      # Rolling 24h history (git-ignored, written by monitor.sh)
-├── .gitignore
-├── LICENSE               # MIT
-├── README.md
-└── tests/                # Parser tests + fixtures
-```
-
----
 
 ## Contributing
 
