@@ -353,6 +353,10 @@ curl -X POST "$DISCORD_WEBHOOK" \
   -d '{"content": "✅ Codex monitor test alert"}'
 ```
 
+**Example Discord alert:**
+
+![Discord alert proof](local/images/discord.png)
+
 ---
 
 ### Telegram
