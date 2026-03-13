@@ -1,7 +1,5 @@
 # Secrets and local state — never commit these
 local/.env
-local/data.json
-local/history.json
 local/.alert_state
 
 # Node / npm (if ever used locally)
