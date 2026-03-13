@@ -1,6 +1,6 @@
 # Codex Usage Monitor
 
-Track your OpenAI Codex CLI usage limits in real time — locally, with optional external access. No cloud accounts required to get started.
+Track your OpenAI Codex CLI usage limits in real time locally, with optional external access. No cloud accounts required to get started.
 
 **Problem:** `codex /status` shows your limits right now, but there's no persistent dashboard, no history, and no alerts when you're running low.
 
