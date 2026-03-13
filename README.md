@@ -4,7 +4,7 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
 
 **Problem:** OpenAI already lets you check Codex usage in `codex /status` and in the ChatGPT Codex usage page, but those views do not give you rolling history or proactive notifications when you're running low.
 
-**Solution:** A local bash script that scrapes `codex /status` every 15 minutes, writes a `data.json` snapshot, serves a dashboard in your browser, and fires Discord or Telegram alerts directly — all from your own machine, with zero cloud dependency.
+**Solution:** A local bash script that scrapes `codex /status` every 15 minutes, writes a `data.json` snapshot, serves a dashboard in your browser, and fires Discord or Telegram alerts directly all from your own machine, with zero cloud dependency.
 
 ![Codex Limits dashboard hero](local/images/hero.png)
 
