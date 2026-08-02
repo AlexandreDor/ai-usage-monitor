@@ -9,7 +9,7 @@
 #
 # Usage:
 #   ./monitor.sh              # run once
-#   ./monitor.sh --loop 900   # run every 900 seconds (15 min)
+#   ./monitor.sh --loop 900   # run now, then at :00, :15, :30, and :45
 #
 # Environment variables (set in .env or export):
 #   DISCORD_WEBHOOK     — Discord webhook URL (optional)
@@ -539,6 +539,39 @@ send_alert() {
   send_telegram "$message"
 }
 
+weekly_pace_vs_ideal() {
+  local weekly_pct="$1"
+  local weekly_reset_at="$2"
+  local scraped_at_epoch="$3"
+
+  python3 - "$weekly_pct" "$weekly_reset_at" "$scraped_at_epoch" <<'PYEOF'
+import sys
+
+try:
+    actual = float(sys.argv[1])
+    reset_at = int(sys.argv[2])
+    sampled_at = int(sys.argv[3])
+except (TypeError, ValueError):
+    raise SystemExit(0)
+
+weekly_window = 7 * 24 * 60 * 60
+remaining = reset_at - sampled_at
+if not 0 <= actual <= 100 or not 0 <= remaining <= weekly_window:
+    raise SystemExit(0)
+
+ideal = round(100 * remaining / weekly_window, 1)
+difference = round(actual - ideal, 1)
+direction = "on pace" if difference == 0 else "above" if difference > 0 else "below"
+sign = "+" if difference > 0 else ""
+
+if ideal > 0:
+    relative = round(abs(actual - ideal) / ideal * 100, 1)
+    print(f"{sign}{difference:.1f} pts · {relative:.1f}% {direction}")
+else:
+    print(f"{sign}{difference:.1f} pts")
+PYEOF
+}
+
 check_thresholds() {
   local five_h_pct="$1"
   local weekly_pct="$2"
@@ -555,7 +588,7 @@ check_thresholds() {
   local weekly_armed_reset_at=0
   local last_notified_5h_reset_at=0
   local last_notified_weekly_reset_at=0
-  local thresholds state_key state_value saved_5h_pct saved_weekly_pct
+  local thresholds state_key state_value saved_5h_pct saved_weekly_pct pace pace_suffix
   if [[ -f "$STATE_FILE" ]]; then
     while IFS='=' read -r state_key state_value; do
       case "$state_key" in
@@ -574,6 +607,9 @@ check_thresholds() {
   fi
 
   mapfile -t thresholds < <(load_thresholds)
+  pace="$(weekly_pace_vs_ideal "$weekly_pct" "$weekly_reset_at" "$scraped_at_epoch")"
+  pace_suffix=""
+  [[ -n "$pace" ]] && pace_suffix=$'\n'"*Pace vs ideal:* ${pace}"
 
   # A consumed cycle is armed until its known deadline passes. This also
   # detects resets that happened while the monitor was stopped.
@@ -614,7 +650,7 @@ check_thresholds() {
   if [[ "$five_h_pct" =~ ^[0-9]+$ ]]; then
     for t in "${thresholds[@]}"; do
       if (( five_h_pct <= t && prev_5h_pct > t )); then
-        send_alert "⚠️ *Codex 5h limit at ${five_h_pct}% remaining* (crossed ${t}% threshold). Resets at ${five_h_reset}"
+        send_alert "⚠️ *Codex 5h limit at ${five_h_pct}% remaining* (crossed ${t}% threshold). Resets at ${five_h_reset}${pace_suffix}"
         break
       fi
     done
@@ -624,7 +660,7 @@ check_thresholds() {
   if [[ "$weekly_pct" =~ ^[0-9]+$ ]]; then
     for t in "${thresholds[@]}"; do
       if (( weekly_pct <= t && prev_weekly_pct > t )); then
-        send_alert "⚠️ *Codex weekly limit at ${weekly_pct}% remaining* (crossed ${t}% threshold). Resets ${weekly_reset}"
+        send_alert "⚠️ *Codex weekly limit at ${weekly_pct}% remaining* (crossed ${t}% threshold). Resets ${weekly_reset}${pace_suffix}"
         break
       fi
     done
@@ -688,19 +724,40 @@ run_once() {
     "$five_h_reset_at" "$weekly_reset_at" "$scraped_at_epoch"
 }
 
+validate_interval() {
+  local interval="$1"
+  if [[ ! "$interval" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] Loop interval must be a positive integer number of seconds." >&2
+    return 1
+  fi
+}
+
+seconds_until_next_interval() {
+  local now_epoch="$1"
+  local interval="$2"
+  printf '%s\n' "$((interval - now_epoch % interval))"
+}
+
 main() {
   local interval="${LOOP_INTERVAL:-$DEFAULT_INTERVAL_SECONDS}"
+  local now_epoch delay next_epoch next_check
   check_requirements
 
   if [[ "${1:-}" == "--loop" ]]; then
     interval="${2:-$interval}"
-    echo "Starting monitor loop (interval: ${interval}s). Press Ctrl+C to stop."
+    validate_interval "$interval" || exit 1
+    echo "Starting monitor loop (aligned interval: ${interval}s). Press Ctrl+C to stop."
     while true; do
-      run_once "$interval" || echo "[WARN] Scrape cycle failed, will retry next interval"
-      echo "[$(date -u +%H:%M:%SZ)] Next check in ${interval}s..."
-      sleep "$interval"
+      run_once "$interval" || echo "[WARN] Scrape cycle failed, will retry at the next scheduled check"
+      now_epoch="$(date -u +%s)"
+      delay="$(seconds_until_next_interval "$now_epoch" "$interval")"
+      next_epoch="$((now_epoch + delay))"
+      next_check="$(date -u -d "@${next_epoch}" +%H:%M:%SZ)"
+      echo "[$(date -u +%H:%M:%SZ)] Next check at ${next_check} (in ${delay}s)..."
+      sleep "$delay"
     done
   else
+    validate_interval "$interval" || exit 1
     run_once "$interval"
   fi
 }

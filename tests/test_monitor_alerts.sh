@@ -11,10 +11,12 @@ trap 'rm -rf "$TEST_DIR"' EXIT
 
 STATE_FILE="${TEST_DIR}/.alert_state"
 ALERT_LOG="${TEST_DIR}/alerts.log"
+ALERT_COUNT_LOG="${TEST_DIR}/alert-count.log"
 ALERT_THRESHOLDS=0
 
 send_alert() {
   printf '%s\n' "$1" >> "$ALERT_LOG"
+  printf '1\n' >> "$ALERT_COUNT_LOG"
 }
 
 fail() {
@@ -25,7 +27,7 @@ fail() {
 assert_alert_count() {
   local expected="$1"
   local actual=0
-  [[ -f "$ALERT_LOG" ]] && actual="$(wc -l < "$ALERT_LOG")"
+  [[ -f "$ALERT_COUNT_LOG" ]] && actual="$(wc -l < "$ALERT_COUNT_LOG")"
   [[ "$actual" -eq "$expected" ]] || fail "expected ${expected} alerts, got ${actual}"
 }
 
@@ -41,7 +43,7 @@ state_value() {
 }
 
 reset_case() {
-  rm -f "$STATE_FILE" "$ALERT_LOG"
+  rm -f "$STATE_FILE" "$ALERT_LOG" "$ALERT_COUNT_LOG"
 }
 
 now=2000000000
@@ -79,5 +81,14 @@ check_thresholds 80 100 "later" "unknown" "$((now + 300))" "" "$now"
 check_thresholds 100 100 "later" "unknown" "" "" "$((now + 300 + 5 * 60 * 60 + 1))"
 assert_alert_count 0
 [[ "$(state_value five_h_armed_reset_at)" == "0" ]] || fail "stale 5h cycle was not cleared"
+
+# Threshold alerts include the same weekly pace delta shown by the dashboard.
+reset_case
+ALERT_THRESHOLDS=50
+check_thresholds 100 40 "unknown" "later" "" "$((now + 7 * 24 * 60 * 60 / 2))" "$now"
+assert_alert_count 1
+alert_message="$(<"$ALERT_LOG")"
+[[ "$alert_message" == *$'*Pace vs ideal:* -10.0 pts · 20.0% below'* ]] \
+  || fail "weekly pace delta was missing from threshold alert"
 
 printf 'PASS: monitor reset alert tests\n'

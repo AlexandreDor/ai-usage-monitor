@@ -391,11 +391,9 @@
       const intervalMs = Number.isFinite(intervalSeconds) && intervalSeconds > 0
         ? intervalSeconds * 1000
         : REFRESH_INTERVAL_MS;
-      const scrapedAt = Date.parse(displayText(data?.scraped_at, ''));
-      const nextUpdate = scrapedAt + intervalMs + 5_000;
-      const delay = Number.isFinite(nextUpdate) && nextUpdate > Date.now()
-        ? nextUpdate - Date.now()
-        : intervalMs;
+      const now = Date.now();
+      const nextUpdate = (Math.floor((now - 5_000) / intervalMs) + 1) * intervalMs + 5_000;
+      const delay = nextUpdate - now;
       clearTimeout(refreshTimer);
       refreshTimer = setTimeout(refresh, delay);
     }
