@@ -3,7 +3,7 @@
 # Codex Usage Monitor — Local Scraper & Alert Script
 # ============================================================================
 # Runs on the machine where OpenAI Codex CLI is installed and authenticated.
-# Scrapes `codex /status`, parses usage percentages, writes data.json locally,
+# Reads limits through the local Codex app-server, writes data.json locally,
 # fires Discord/Telegram alerts via direct curl (no server needed), and
 # optionally syncs data to a GitHub Gist for external dashboard access.
 #
@@ -21,33 +21,73 @@
 # ============================================================================
 
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/.env"
-STATE_FILE="${SCRIPT_DIR}/.alert_state"
-DATA_FILE="${SCRIPT_DIR}/data.json"
-HISTORY_FILE="${SCRIPT_DIR}/history.json"
+RUNTIME_DIR="${SCRIPT_DIR}/runtime"
+STATE_FILE="${RUNTIME_DIR}/.alert_state"
+DATA_FILE="${RUNTIME_DIR}/data.json"
+HISTORY_FILE="${RUNTIME_DIR}/history.json"
 DEFAULT_INTERVAL_SECONDS=900
 
-# Load .env if present
+mkdir -p "$RUNTIME_DIR"
+chmod 700 "$RUNTIME_DIR"
+
+load_config() {
+  local line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
+
+    if [[ "$line" != *=* ]]; then
+      echo "[WARN] Ignoring malformed configuration line." >&2
+      continue
+    fi
+
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [[ ! "$key" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+      echo "[WARN] Ignoring invalid configuration key." >&2
+      continue
+    fi
+
+    case "$key" in
+      ALERT_THRESHOLDS|CODEX_BIN|CODEX_STATUS_TIMEOUT_SECONDS|DISCORD_WEBHOOK|GITHUB_GIST_ID|GITHUB_PAT|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID)
+        if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
+          value="${value:1:${#value}-2}"
+        fi
+        printf -v "$key" '%s' "$value"
+        ;;
+      *)
+        echo "[WARN] Ignoring unsupported configuration key: $key" >&2
+        ;;
+    esac
+  done < "$ENV_FILE"
+}
+
+# Parse configuration as data; never execute .env as shell code.
 if [[ -f "$ENV_FILE" ]]; then
-  set -a
-  # shellcheck source=/dev/null
-  source "$ENV_FILE"
-  set +a
+  if [[ -L "$ENV_FILE" || ! -O "$ENV_FILE" ]]; then
+    echo "[ERROR] .env must be a regular file owned by the current user." >&2
+    exit 1
+  fi
+  chmod 600 "$ENV_FILE"
+  load_config
 fi
 
 # Defaults
 ALERT_THRESHOLDS="${ALERT_THRESHOLDS:-75,50,25,10,5}"
-HISTORY_RETENTION_HOURS="${HISTORY_RETENTION_HOURS:-24}"
+HISTORY_RETENTION_HOURS="${HISTORY_RETENTION_HOURS:-192}"
 
 # ============================================================================
 # Validation
 # ============================================================================
 check_requirements() {
   local missing=0
+  local codex_command="${CODEX_BIN:-codex}"
 
-  if ! command -v codex &>/dev/null; then
+  if ! command -v "$codex_command" &>/dev/null; then
     echo "[ERROR] 'codex' command not found. Is OpenAI Codex CLI installed and in PATH?"
     echo "        Try: which codex   or   codex /status"
     missing=1
@@ -63,14 +103,23 @@ check_requirements() {
     missing=1
   fi
 
-  if ! grep -oP '1' <<<"1" &>/dev/null; then
-    echo "[ERROR] This script requires grep with PCRE support (-P)."
-    echo "        On macOS, install GNU grep and add it to PATH."
+  if [[ -n "${GITHUB_PAT:-}" && -z "${GITHUB_GIST_ID:-}" ]]; then
+    echo "[WARN] GITHUB_PAT is set but GITHUB_GIST_ID is missing. Gist sync disabled."
+  fi
+
+  if [[ -n "${GITHUB_GIST_ID:-}" && ! "$GITHUB_GIST_ID" =~ ^[A-Fa-f0-9]+$ ]]; then
+    echo "[ERROR] GITHUB_GIST_ID has an invalid format."
     missing=1
   fi
 
-  if [[ -n "${GITHUB_PAT:-}" && -z "${GITHUB_GIST_ID:-}" ]]; then
-    echo "[WARN] GITHUB_PAT is set but GITHUB_GIST_ID is missing. Gist sync disabled."
+  if [[ -n "${DISCORD_WEBHOOK:-}" && ! "$DISCORD_WEBHOOK" =~ ^https://(discord\.com|discordapp\.com)/api/webhooks/[0-9]+/[A-Za-z0-9._-]+$ ]]; then
+    echo "[ERROR] DISCORD_WEBHOOK must be an official Discord HTTPS webhook URL."
+    missing=1
+  fi
+
+  if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && ! "$TELEGRAM_BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+    echo "[ERROR] TELEGRAM_BOT_TOKEN has an invalid format."
+    missing=1
   fi
 
   if [[ $missing -eq 1 ]]; then
@@ -78,130 +127,174 @@ check_requirements() {
   fi
 }
 
-run_status_command() {
-  local codex_cmd
-  codex_cmd="${CODEX_BIN:-codex}"
+fetch_status_json() {
+  local interval_seconds="$1"
+  local codex_cmd="${CODEX_BIN:-codex}"
 
-  python3 - "$codex_cmd" "${CODEX_STATUS_TIMEOUT_SECONDS:-20}" <<'PYEOF'
+  python3 - "$codex_cmd" "${CODEX_STATUS_TIMEOUT_SECONDS:-20}" "$interval_seconds" "$HISTORY_RETENTION_HOURS" <<'PYEOF'
+import datetime
+import json
 import os
-import re
 import select
-import signal
 import subprocess
 import sys
 import time
+from zoneinfo import ZoneInfo
 
 codex_cmd = sys.argv[1]
 timeout_seconds = max(5, int(sys.argv[2]))
-trust_ack_sent = False
+interval_seconds = max(1, int(sys.argv[3]))
+history_window_hours = float(sys.argv[4])
+paris_timezone = ZoneInfo("Europe/Paris")
+
+# Do not pass notification or storage credentials to the Codex subprocess.
+codex_environment = os.environ.copy()
+for secret_name in ("DISCORD_WEBHOOK", "GITHUB_PAT", "TELEGRAM_BOT_TOKEN"):
+    codex_environment.pop(secret_name, None)
+
+process = subprocess.Popen(
+    [codex_cmd, "app-server", "--stdio"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+    bufsize=1,
+    close_fds=True,
+    env=codex_environment,
+)
+
+
+def send(message):
+    process.stdin.write(json.dumps(message) + "\n")
+    process.stdin.flush()
+
+
+def stop_process():
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+
+
+send({
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "clientInfo": {"name": "codex-usage-monitor", "version": "1.0.0"},
+        "capabilities": {"experimentalApi": True},
+    },
+})
+
 deadline = time.monotonic() + timeout_seconds
-next_status_attempt = time.monotonic() + 4
-status_attempts = 0
-max_status_attempts = 4
-buffer = []
-
-master_fd, slave_fd = os.openpty()
-
-try:
-    proc = subprocess.Popen(
-        [codex_cmd, "--no-alt-screen"],
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        close_fds=True,
-    )
-finally:
-    os.close(slave_fd)
+result = None
+rate_limit_requested = False
 
 try:
     while time.monotonic() < deadline:
-        ready, _, _ = select.select([master_fd], [], [], 0.2)
-        if ready:
-            chunk = os.read(master_fd, 65536)
-            if not chunk:
+        ready, _, _ = select.select([process.stdout], [], [], 0.5)
+        if not ready:
+            if process.poll() is not None:
                 break
-            text = chunk.decode("utf-8", errors="ignore")
-            buffer.append(text)
-            joined = "".join(buffer)
-            normalized = joined.replace("\r", "\n")
+            continue
 
-            if (
-                not trust_ack_sent
-                and (
-                    "Do you trust the contents of this directory" in normalized
-                    or "Press enter to continue" in normalized
-                    or "prompt injection" in normalized
-                )
-            ):
-                os.write(master_fd, b"1\r")
-                trust_ack_sent = True
-                next_status_attempt = time.monotonic() + 3
-                continue
-
-            if (
-                status_attempts < max_status_attempts
-                and time.monotonic() >= next_status_attempt
-            ):
-                os.write(master_fd, b"/status\r")
-                status_attempts += 1
-                next_status_attempt = time.monotonic() + 2
-
-            if re.search(r"5h limit", normalized, re.IGNORECASE) and re.search(r"weekly limit", normalized, re.IGNORECASE):
-                time.sleep(0.5)
-                break
-        elif (
-            status_attempts < max_status_attempts
-            and time.monotonic() >= next_status_attempt
-        ):
-            os.write(master_fd, b"/status\r")
-            status_attempts += 1
-            next_status_attempt = time.monotonic() + 2
-
-    try:
-        proc.send_signal(signal.SIGINT)
-        proc.wait(timeout=2)
-    except Exception:
-        proc.terminate()
+        line = process.stdout.readline()
+        if not line:
+            break
         try:
-            proc.wait(timeout=2)
-        except Exception:
-            proc.kill()
-            proc.wait(timeout=2)
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if message.get("id") == 1 and not rate_limit_requested:
+            if message.get("error"):
+                break
+            send({"method": "initialized"})
+            send({"id": 2, "method": "account/rateLimits/read", "params": None})
+            rate_limit_requested = True
+        elif message.get("id") == 2:
+            result = message.get("result")
+            break
 finally:
-    os.close(master_fd)
+    stop_process()
 
-output = "".join(buffer)
-if not output.strip():
-    sys.stderr.write("[ERROR] codex status capture returned empty output\n")
-    sys.exit(1)
+if not isinstance(result, dict):
+    sys.stderr.write("[ERROR] Codex app-server did not return usage limits.\n")
+    raise SystemExit(1)
 
-debug_path = os.environ.get("CODEX_STATUS_DEBUG_FILE")
-if debug_path:
-    with open(debug_path, "w", encoding="utf-8") as fh:
-        fh.write(output)
+snapshots_by_id = result.get("rateLimitsByLimitId")
+if isinstance(snapshots_by_id, dict) and snapshots_by_id:
+    snapshots = list(snapshots_by_id.values())
+else:
+    snapshots = [result.get("rateLimits")]
 
-sys.stdout.write(output)
-PYEOF
-}
+windows = []
+for snapshot in snapshots:
+    if not isinstance(snapshot, dict):
+        continue
+    for window_name in ("primary", "secondary"):
+        window = snapshot.get(window_name)
+        if isinstance(window, dict):
+            windows.append(window)
 
-normalize_status_output() {
-  python3 -c "import re, sys; data = sys.stdin.read(); data = data.replace('\r\n', '\n').replace('\r', '\n').replace('\u2502', '|'); data = re.sub(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\\\)|[@-_])', '', data); data = ''.join(ch for ch in data if ch in '\n\t' or ord(ch) >= 32); print(data, end='')"
-}
 
-build_status_json() {
-  python3 - "$@" <<'PYEOF'
-import json
-import sys
+def window_with_duration(minimum, maximum):
+    for window in windows:
+        duration = window.get("windowDurationMins")
+        if isinstance(duration, int) and minimum <= duration <= maximum:
+            return window
+    return None
+
+
+def remaining_percent(window):
+    if not window:
+        return None
+    used = window.get("usedPercent")
+    if not isinstance(used, int) or not 0 <= used <= 100:
+        return None
+    return 100 - used
+
+
+def reset_time(window):
+    if not window:
+        return "unknown"
+    timestamp = window.get("resetsAt")
+    if not isinstance(timestamp, int):
+        return "unknown"
+    try:
+        reset = datetime.datetime.fromtimestamp(timestamp, paris_timezone)
+    except (OverflowError, OSError, ValueError):
+        return "unknown"
+    return reset.strftime("%d/%m/%Y %H:%M (Paris)")
+
+
+def reset_timestamp(window):
+    if not window:
+        return None
+    timestamp = window.get("resetsAt")
+    return timestamp if isinstance(timestamp, int) and timestamp > 0 else None
+
+
+five_hour_window = window_with_duration(1, 360)
+weekly_window = window_with_duration(7 * 24 * 60, 8 * 24 * 60)
+
+if five_hour_window is None and weekly_window is None:
+    sys.stderr.write("[ERROR] Codex returned no recognized usage windows.\n")
+    raise SystemExit(1)
 
 payload = {
-    "five_h_pct": int(sys.argv[1]),
-    "five_h_reset": sys.argv[2],
-    "weekly_pct": int(sys.argv[3]),
-    "weekly_reset": sys.argv[4],
-    "account": sys.argv[5],
-    "scraped_at": sys.argv[6],
-    "sample_interval_seconds": int(sys.argv[7]),
-    "history_window_hours": float(sys.argv[8]),
+    "five_h_pct": remaining_percent(five_hour_window),
+    "five_h_reset": reset_time(five_hour_window),
+    "five_h_reset_at": reset_timestamp(five_hour_window),
+    "weekly_pct": remaining_percent(weekly_window),
+    "weekly_reset": reset_time(weekly_window),
+    "weekly_reset_at": reset_timestamp(weekly_window),
+    "scraped_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "sample_interval_seconds": interval_seconds,
+    "history_window_hours": history_window_hours,
 }
 print(json.dumps(payload, indent=2))
 PYEOF
@@ -217,53 +310,27 @@ import sys
 
 data = json.loads(sys.argv[1])
 value = data.get(sys.argv[2], "")
+if value is None:
+    value = ""
 if isinstance(value, float) and value.is_integer():
     value = int(value)
 print(value)
 PYEOF
 }
 
-parse_status_from_raw() {
-  local raw="$1"
-  local interval_seconds="$2"
-  local cleaned five_h_pct five_h_reset weekly_pct weekly_reset account scraped_at
+timestamp_to_epoch() {
+  local timestamp="$1"
 
-  cleaned="$(printf '%s' "$raw" | sed 's/\x1b\[[0-9;]*m//g; s/\x1b\[[0-9;]*[a-zA-Z]//g' | normalize_status_output)"
+  python3 - "$timestamp" <<'PYEOF'
+import datetime
+import sys
 
-  if [[ -z "$cleaned" ]]; then
-    echo "[ERROR] codex /status returned empty output" >&2
-    return 1
-  fi
-
-  five_h_pct=$(printf '%s\n' "$cleaned" | grep -i "5h limit" | grep -oP '\d+(?=% left)' || true)
-  five_h_reset=$(printf '%s\n' "$cleaned" | grep -i "5h limit" | grep -oP '(?<=resets ).*?(?=\)|\s*\||$)' | head -n 1 | sed 's/[[:space:]]*$//' || true)
-  weekly_pct=$(printf '%s\n' "$cleaned" | grep -i "weekly limit" | grep -oP '\d+(?=% left)' || true)
-  weekly_reset=$(printf '%s\n' "$cleaned" | grep -i "weekly limit" | grep -oP '(?<=resets ).*?(?=\)|\s*\||$)' | head -n 1 | sed 's/[[:space:]]*$//' || true)
-  account=$(printf '%s\n' "$cleaned" | grep -iE '^[[:space:]]*Account:' | tail -n 1 | sed 's/.*Account:[[:space:]]*//' | sed 's/[[:space:]]*|.*$//' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)
-
-  if [[ -z "$five_h_pct" && -z "$weekly_pct" ]]; then
-    echo "[ERROR] Could not parse usage percentages from codex output." >&2
-    echo "[DEBUG] Raw output:" >&2
-    printf '%s\n' "$cleaned" >&2
-    return 1
-  fi
-
-  five_h_pct="${five_h_pct:-0}"
-  weekly_pct="${weekly_pct:-0}"
-  five_h_reset="${five_h_reset:-unknown}"
-  weekly_reset="${weekly_reset:-unknown}"
-  account="${account:-}"
-  scraped_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-  build_status_json \
-    "$five_h_pct" \
-    "$five_h_reset" \
-    "$weekly_pct" \
-    "$weekly_reset" \
-    "$account" \
-    "$scraped_at" \
-    "$interval_seconds" \
-    "$HISTORY_RETENTION_HOURS"
+try:
+    value = datetime.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+    print(int(value.timestamp()))
+except (ValueError, OverflowError):
+    raise SystemExit(1)
+PYEOF
 }
 
 history_max_entries() {
@@ -289,28 +356,86 @@ write_local_snapshot() {
 
   python3 - "$HISTORY_FILE" "$DATA_FILE" "$json" "$max_entries" <<'PYEOF'
 import json
+import fcntl
+import os
 import pathlib
 import sys
+import tempfile
 
 history_path = pathlib.Path(sys.argv[1])
 data_path = pathlib.Path(sys.argv[2])
 new_entry = json.loads(sys.argv[3])
 max_entries = int(sys.argv[4])
+public_fields = {
+    "five_h_pct",
+    "five_h_reset",
+    "five_h_reset_at",
+    "weekly_pct",
+    "weekly_reset",
+    "weekly_reset_at",
+    "scraped_at",
+    "sample_interval_seconds",
+    "history_window_hours",
+}
 
-history = []
-if history_path.exists():
+
+def sanitize_entry(entry):
+    if not isinstance(entry, dict):
+        return None
+    sanitized = {key: entry[key] for key in public_fields if key in entry}
+    for key in ("five_h_reset", "weekly_reset"):
+        value = sanitized.get(key)
+        if not isinstance(value, str) or len(value) > 100 or "@" in value:
+            sanitized[key] = "unknown"
+    for key in ("five_h_reset_at", "weekly_reset_at"):
+        value = sanitized.get(key)
+        if value is not None and (not isinstance(value, int) or value <= 0):
+            sanitized[key] = None
+    return sanitized
+
+
+new_entry = sanitize_entry(new_entry)
+if new_entry is None:
+    raise SystemExit("invalid usage snapshot")
+
+def atomic_write(path, content):
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", text=True
+    )
     try:
-        history = json.loads(history_path.read_text(encoding="utf-8"))
-        if not isinstance(history, list):
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as temporary_file:
+            temporary_file.write(content)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+
+lock_path = history_path.parent / ".monitor.lock"
+with lock_path.open("a+", encoding="utf-8") as lock_file:
+    os.chmod(lock_path, 0o600)
+    fcntl.flock(lock_file, fcntl.LOCK_EX)
+
+    history = []
+    if history_path.exists():
+        try:
+            history = json.loads(history_path.read_text(encoding="utf-8"))
+            if not isinstance(history, list):
+                history = []
+        except Exception:
             history = []
-    except Exception:
-        history = []
 
-history.insert(0, new_entry)
-history = history[:max_entries]
+    history = [entry for item in history if (entry := sanitize_entry(item)) is not None]
+    history.insert(0, new_entry)
+    history = history[:max_entries]
 
-history_path.write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
-data_path.write_text(json.dumps(new_entry, indent=2) + "\n", encoding="utf-8")
+    atomic_write(history_path, json.dumps(history, indent=2) + "\n")
+    atomic_write(data_path, json.dumps(new_entry, indent=2) + "\n")
 PYEOF
 
   echo "[OK] Data written to ${DATA_FILE}"
@@ -335,97 +460,6 @@ for part in sys.argv[1].split(","):
 for value in sorted(set(values), reverse=True):
     print(value)
 PYEOF
-}
-
-# ============================================================================
-# Scrape and parse codex /status
-# ============================================================================
-scrape_status() {
-  # Capture raw output, strip ANSI escape codes
-  local raw
-  raw=$(codex /status 2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/\x1b\[[0-9;]*[a-zA-Z]//g')
-
-  if [[ -z "$raw" ]]; then
-    echo "[ERROR] codex /status returned empty output" >&2
-    return 1
-  fi
-
-  # Parse 5h limit
-  local five_h_pct five_h_reset weekly_pct weekly_reset model account
-
-  five_h_pct=$(echo "$raw" | grep -i "5h limit" | grep -oP '\d+(?=% left)' || echo "")
-  five_h_reset=$(echo "$raw" | grep -i "5h limit" | grep -oP '(?<=resets )\S+' || echo "")
-
-  weekly_pct=$(echo "$raw" | grep -i "weekly limit" | grep -oP '\d+(?=% left)' || echo "")
-  weekly_reset=$(echo "$raw" | grep -i "weekly limit" | grep -oP '(?<=resets ).*?(?=\s*[│\|]|$)' | sed 's/[[:space:]]*$//' || echo "")
-
-  model=$(echo "$raw" | grep -i "Model:" | sed 's/.*Model:\s*//' | sed 's/\s*│.*$//' | xargs || echo "unknown")
-  account=$(echo "$raw" | grep -i "Account:" | sed 's/.*Account:\s*//' | sed 's/\s*│.*$//' | xargs || echo "unknown")
-
-  # Validate we got something
-  if [[ -z "$five_h_pct" && -z "$weekly_pct" ]]; then
-    echo "[ERROR] Could not parse usage percentages from codex output." >&2
-    echo "[DEBUG] Raw output:" >&2
-    echo "$raw" >&2
-    return 1
-  fi
-
-  # Default to 0 if one is missing
-  five_h_pct="${five_h_pct:-0}"
-  weekly_pct="${weekly_pct:-0}"
-
-  # Build JSON
-  cat <<EOF
-{
-  "five_h_pct": ${five_h_pct},
-  "five_h_reset": "${five_h_reset}",
-  "weekly_pct": ${weekly_pct},
-  "weekly_reset": "${weekly_reset}",
-  "model": "${model}",
-  "account": "${account}",
-  "scraped_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-EOF
-}
-
-# ============================================================================
-# Write data to local disk
-# ============================================================================
-write_local() {
-  local json="$1"
-
-  # Append to history array (keep last 96 entries = 24h at 15-min intervals)
-  local history_file="${SCRIPT_DIR}/history.json"
-  local now_entry
-  now_entry="$json"
-
-  if [[ -f "$history_file" ]]; then
-    # Read existing history, prepend new entry, trim to 96
-    local existing
-    existing=$(cat "$history_file")
-    # Use python3 for reliable JSON array manipulation
-    python3 - <<PYEOF
-import json, sys
-
-new_entry = json.loads('''${json}''')
-try:
-    history = json.loads('''${existing}''')
-    if not isinstance(history, list):
-        history = []
-except Exception:
-    history = []
-
-history.insert(0, new_entry)
-history = history[:96]  # keep 24h of 15-min samples
-print(json.dumps(history, indent=2))
-PYEOF
-  else
-    echo "[${json}]"
-  fi > "$history_file"
-
-  # Write latest snapshot
-  echo "$json" > "$DATA_FILE"
-  echo "[OK] Data written to ${DATA_FILE}"
 }
 
 # ============================================================================
@@ -456,9 +490,8 @@ EOF
 )
 
   local http_code
-  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+  http_code=$(printf 'header = "Authorization: token %s"\n' "$GITHUB_PAT" | curl --config - -s -o /dev/null -w "%{http_code}" \
     -X PATCH "https://api.github.com/gists/${GITHUB_GIST_ID}" \
-    -H "Authorization: token ${GITHUB_PAT}" \
     -H "Content-Type: application/json" \
     -d "$payload")
 
@@ -485,7 +518,7 @@ print(json.dumps({"content": sys.argv[1]}))
 PYEOF
 )"
 
-  curl -s -o /dev/null -X POST "$DISCORD_WEBHOOK" \
+  printf 'url = "%s"\n' "$DISCORD_WEBHOOK" | curl --config - -s -o /dev/null -X POST \
     -H "Content-Type: application/json" \
     -d "$payload"
 }
@@ -494,8 +527,7 @@ send_telegram() {
   local message="$1"
   if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then return; fi
 
-  curl -s -o /dev/null -X POST \
-    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TELEGRAM_BOT_TOKEN" | curl --config - -s -o /dev/null -X POST \
     -d "chat_id=${TELEGRAM_CHAT_ID}" \
     --data-urlencode "text=${message}"
 }
@@ -512,39 +544,108 @@ check_thresholds() {
   local weekly_pct="$2"
   local five_h_reset="$3"
   local weekly_reset="$4"
+  local five_h_reset_at="$5"
+  local weekly_reset_at="$6"
+  local scraped_at_epoch="$7"
 
   # Load previous alert state
   local prev_5h_pct=100
   local prev_weekly_pct=100
-  local thresholds
+  local five_h_armed_reset_at=0
+  local weekly_armed_reset_at=0
+  local last_notified_5h_reset_at=0
+  local last_notified_weekly_reset_at=0
+  local thresholds state_key state_value saved_5h_pct saved_weekly_pct
   if [[ -f "$STATE_FILE" ]]; then
-    # shellcheck source=/dev/null
-    source "$STATE_FILE"
+    while IFS='=' read -r state_key state_value; do
+      case "$state_key" in
+        prev_5h_pct|prev_weekly_pct)
+          if [[ "$state_value" =~ ^[0-9]+$ ]] && (( state_value <= 100 )); then
+            printf -v "$state_key" '%s' "$state_value"
+          fi
+          ;;
+        five_h_armed_reset_at|weekly_armed_reset_at|last_notified_5h_reset_at|last_notified_weekly_reset_at)
+          if [[ "$state_value" =~ ^[0-9]+$ ]]; then
+            printf -v "$state_key" '%s' "$state_value"
+          fi
+          ;;
+      esac
+    done < "$STATE_FILE"
   fi
 
   mapfile -t thresholds < <(load_thresholds)
 
-  # Check 5h limit (sort descending so we catch the highest crossed threshold first)
-  for t in "${thresholds[@]}"; do
-    if (( five_h_pct <= t && prev_5h_pct > t )); then
-      send_alert "⚠️ *Codex 5h limit at ${five_h_pct}% remaining* (crossed ${t}% threshold). Resets at ${five_h_reset}"
-      break
+  # A consumed cycle is armed until its known deadline passes. This also
+  # detects resets that happened while the monitor was stopped.
+  local reset_age
+  if (( five_h_armed_reset_at > 0 && scraped_at_epoch >= five_h_armed_reset_at )); then
+    reset_age=$(( scraped_at_epoch - five_h_armed_reset_at ))
+    if (( reset_age <= 5 * 60 * 60 && last_notified_5h_reset_at != five_h_armed_reset_at )); then
+      send_alert "*Codex 5h limit reset.* A new usage cycle is available."
+      last_notified_5h_reset_at="$five_h_armed_reset_at"
     fi
-  done
+    five_h_armed_reset_at=0
+  fi
+
+  if (( weekly_armed_reset_at > 0 && scraped_at_epoch >= weekly_armed_reset_at )); then
+    reset_age=$(( scraped_at_epoch - weekly_armed_reset_at ))
+    if (( reset_age <= 7 * 24 * 60 * 60 && last_notified_weekly_reset_at != weekly_armed_reset_at )); then
+      send_alert "*Codex weekly limit reset.* A new usage cycle is available."
+      last_notified_weekly_reset_at="$weekly_armed_reset_at"
+    fi
+    weekly_armed_reset_at=0
+  fi
+
+  # Ignore shifting reset estimates while a cycle is armed. Once it has reset,
+  # arm the next plausible deadline only after some quota has been consumed.
+  if (( five_h_armed_reset_at == 0 )) \
+    && [[ "$five_h_pct" =~ ^[0-9]+$ && "$five_h_reset_at" =~ ^[0-9]+$ ]] \
+    && (( five_h_pct < 100 && five_h_reset_at > scraped_at_epoch && five_h_reset_at <= scraped_at_epoch + 6 * 60 * 60 )); then
+    five_h_armed_reset_at="$five_h_reset_at"
+  fi
+
+  if (( weekly_armed_reset_at == 0 )) \
+    && [[ "$weekly_pct" =~ ^[0-9]+$ && "$weekly_reset_at" =~ ^[0-9]+$ ]] \
+    && (( weekly_pct < 100 && weekly_reset_at > scraped_at_epoch && weekly_reset_at <= scraped_at_epoch + 8 * 24 * 60 * 60 )); then
+    weekly_armed_reset_at="$weekly_reset_at"
+  fi
+
+  # Check 5h limit (sort descending so we catch the highest crossed threshold first)
+  if [[ "$five_h_pct" =~ ^[0-9]+$ ]]; then
+    for t in "${thresholds[@]}"; do
+      if (( five_h_pct <= t && prev_5h_pct > t )); then
+        send_alert "⚠️ *Codex 5h limit at ${five_h_pct}% remaining* (crossed ${t}% threshold). Resets at ${five_h_reset}"
+        break
+      fi
+    done
+  fi
 
   # Check weekly limit
-  for t in "${thresholds[@]}"; do
-    if (( weekly_pct <= t && prev_weekly_pct > t )); then
-      send_alert "⚠️ *Codex weekly limit at ${weekly_pct}% remaining* (crossed ${t}% threshold). Resets ${weekly_reset}"
-      break
-    fi
-  done
+  if [[ "$weekly_pct" =~ ^[0-9]+$ ]]; then
+    for t in "${thresholds[@]}"; do
+      if (( weekly_pct <= t && prev_weekly_pct > t )); then
+        send_alert "⚠️ *Codex weekly limit at ${weekly_pct}% remaining* (crossed ${t}% threshold). Resets ${weekly_reset}"
+        break
+      fi
+    done
+  fi
 
   # Save state
-  cat > "$STATE_FILE" <<EOF
-prev_5h_pct=${five_h_pct}
-prev_weekly_pct=${weekly_pct}
-EOF
+  saved_5h_pct="$prev_5h_pct"
+  saved_weekly_pct="$prev_weekly_pct"
+  [[ "$five_h_pct" =~ ^[0-9]+$ ]] && saved_5h_pct="$five_h_pct"
+  [[ "$weekly_pct" =~ ^[0-9]+$ ]] && saved_weekly_pct="$weekly_pct"
+  local state_tmp
+  state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")"
+  printf '%s\n' \
+    'state_version=2' \
+    "prev_5h_pct=${saved_5h_pct}" \
+    "prev_weekly_pct=${saved_weekly_pct}" \
+    "five_h_armed_reset_at=${five_h_armed_reset_at}" \
+    "weekly_armed_reset_at=${weekly_armed_reset_at}" \
+    "last_notified_5h_reset_at=${last_notified_5h_reset_at}" \
+    "last_notified_weekly_reset_at=${last_notified_weekly_reset_at}" > "$state_tmp"
+  mv -f "$state_tmp" "$STATE_FILE"
 }
 
 # ============================================================================
@@ -555,7 +656,7 @@ run_once() {
   echo "[$(date -u +%H:%M:%SZ)] Scraping codex status..."
 
   local json
-  json=$(parse_status_from_raw "$(run_status_command)" "$interval_seconds") || return 1
+  json=$(fetch_status_json "$interval_seconds") || return 1
 
   # Pretty-print to terminal
   echo "$json" | python3 -m json.tool 2>/dev/null || echo "$json"
@@ -573,13 +674,18 @@ run_once() {
   sync_gist "$json" "$history_json"
 
   # Extract values for threshold check
-  local five_h weekly five_h_reset weekly_reset
+  local five_h weekly five_h_reset weekly_reset five_h_reset_at weekly_reset_at scraped_at scraped_at_epoch
   five_h=$(json_get_field "$json" "five_h_pct")
   weekly=$(json_get_field "$json" "weekly_pct")
   five_h_reset=$(json_get_field "$json" "five_h_reset")
   weekly_reset=$(json_get_field "$json" "weekly_reset")
+  five_h_reset_at=$(json_get_field "$json" "five_h_reset_at")
+  weekly_reset_at=$(json_get_field "$json" "weekly_reset_at")
+  scraped_at=$(json_get_field "$json" "scraped_at")
+  scraped_at_epoch=$(timestamp_to_epoch "$scraped_at") || scraped_at_epoch=$(date -u +%s)
 
-  check_thresholds "$five_h" "$weekly" "$five_h_reset" "$weekly_reset"
+  check_thresholds "$five_h" "$weekly" "$five_h_reset" "$weekly_reset" \
+    "$five_h_reset_at" "$weekly_reset_at" "$scraped_at_epoch"
 }
 
 main() {

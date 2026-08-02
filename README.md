@@ -67,13 +67,14 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
 ```text
 codex-usage-monitor/
 |-- local/
-|   |-- monitor.sh        # Scraper, parser, alerts, optional Gist sync
+|   |-- monitor.sh        # Codex usage collector, alerts, optional Gist sync
 |   |-- dashboard.html    # Local dashboard UI
-|   |-- serve.sh          # Simple HTTP server for the dashboard
+|   |-- serve.sh          # Allowlisted HTTP server for LAN access
 |   |-- .env.example      # Config template; copy to .env
 |   |-- .env              # Your local config (git-ignored, created by you)
-|   |-- data.json         # Latest usage snapshot written by monitor.sh
-|   |-- history.json      # Rolling history used by the chart
+|   |-- runtime/          # Private generated state (git-ignored, mode 0700)
+|   |   |-- data.json     # Usage snapshot without account identity
+|   |   `-- history.json  # Rolling usage history
 |   `-- images/
 |       |-- hero.png
 |       |-- framework.png
@@ -96,7 +97,6 @@ codex-usage-monitor/
 | bash | `bash --version` | Pre-installed on Linux/WSL |
 | curl | `curl --version` | Pre-installed on most systems |
 | python3 | `python3 --version` | [python.org](https://python.org) — needed for dashboard server & JSON handling |
-| GNU grep | `grep -P '' /dev/null` | Built-in on most Linux distributions |
 
 > [!NOTE]
 > **First-time Codex users — you must authenticate before using this tool.**
@@ -144,6 +144,7 @@ cd codex-usage-monitor/local
 # 2. Configure
 cp .env.example .env
 # Edit .env — Discord/Telegram are optional, leave blank to skip
+chmod 600 .env
 
 # 3. Make executable
 chmod +x monitor.sh serve.sh
@@ -154,10 +155,22 @@ chmod +x monitor.sh serve.sh
 
 # 5. Open the dashboard
 ./serve.sh
-# Then open: http://localhost:8080/dashboard.html
+# On this machine: http://localhost:8080/dashboard.html
+# On your LAN:     http://<machine-lan-ip>:8080/dashboard.html
 ```
 
-Important: `serve.sh` only hosts the dashboard files. It does not refresh usage by itself. For live updates, `monitor.sh` must also be running on a loop or schedule.
+Important: `serve.sh` only hosts an explicit allowlist containing the dashboard, its images, `data.json`, and `history.json`. Files such as `.env`, `.alert_state`, locks, logs, and directory listings are never served. It does not refresh usage by itself; `monitor.sh` must also run on a loop or schedule.
+
+### LAN security
+
+`serve.sh` listens on `0.0.0.0` so other devices on the local network can open the dashboard. It does not provide authentication, so anyone on that LAN can see usage percentages and reset times.
+
+- The generated JSON never contains the Codex account identity or tokens.
+- `.env` is parsed as configuration data rather than executed as shell code.
+- Runtime data and secrets are created with owner-only permissions.
+- Use a host firewall to restrict port `8080` to your trusted local subnet.
+- Do not forward port `8080` on the router or expose this server directly to the internet.
+- To restrict access to the same machine, run `./serve.sh 8080 127.0.0.1`.
 
 ---
 
@@ -423,6 +436,12 @@ ALERT_THRESHOLDS=25,5
 ALERT_THRESHOLDS=90,75,50,25,10,5,1
 ```
 
+The monitor also alerts once when an active 5-hour or weekly limit resets. Reset
+deadlines are persisted locally, so a reset that happens while the monitor is
+stopped is reported on the next run when it is no more than one full limit
+window old. The first run only initializes this state and never reports an old
+reset.
+
 ---
 
 ## External Dashboard (Optional — GitHub Gist + Pages)
@@ -505,19 +524,9 @@ All variables go in `local/.env` (copy from `local/.env.example`).
 
 The Codex CLI is not in PATH. Run `which codex` or check your shell profile. Try running `codex /status` manually first.
 
-### `Could not parse usage percentages from codex output`
+### `Codex app-server did not return usage limits`
 
-OpenAI may have changed the `codex /status` output format. Run `codex /status 2>&1 | cat` to see raw output and check whether `5h limit:` / `Weekly limit:` lines still appear with `% left`.
-
-If you are running inside WSL and `codex /status` gets treated like a normal prompt, update to the current `local/monitor.sh`. It now opens Codex in a PTY and sends `/status` as terminal input instead of passing it as a CLI argument. If Codex starts slowly in your environment, raise `CODEX_STATUS_TIMEOUT_SECONDS` in `local/.env`.
-
-### `grep -P` errors on macOS
-
-Install GNU grep:
-```bash
-brew install grep
-export PATH="/opt/homebrew/bin:$PATH"  # add to ~/.zshrc
-```
+Verify authentication with `codex login status` and update the Codex CLI. If the local app-server starts slowly, raise `CODEX_STATUS_TIMEOUT_SECONDS` in `local/.env`.
 
 ### Dashboard shows blank / "Could not load data.json"
 
@@ -549,7 +558,6 @@ PRs welcome. Some ideas:
 - [ ] Multi-account support
 - [ ] Longer history retention (configurable window)
 - [ ] Email alerts via a simple SMTP relay
-- [ ] macOS-compatible parsing (pure sed, no GNU grep)
 - [ ] Auto-open browser on `serve.sh` start
 - [ ] GitHub Actions workflow for automated Gist update (no local machine needed)
 
@@ -557,7 +565,7 @@ PRs welcome. Some ideas:
 
 ## Local Testing Notes
 
-- History retention is time-based now. `HISTORY_RETENTION_HOURS=24` keeps a 24-hour window even if you change the scrape interval.
+- History retention is time-based. `HISTORY_RETENTION_HOURS=192` keeps a rolling 8-day window even if you change the scrape interval.
 - Docker should only be used when the container can access an authenticated Codex CLI config. A common setup is mounting `~/.codex` into `/root/.codex`. If `codex /status` does not work on the host, it will not work inside Docker either — authenticate first.
 - The container now performs a startup scrape and exits if monitoring cannot start, so it will not keep serving stale data after the scraper dies.
 - The dashboard clears metrics and marks itself stale on refresh failure instead of leaving old percentages visible.
