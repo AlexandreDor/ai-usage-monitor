@@ -13,6 +13,7 @@ local/scripts/*
 # Node / npm (if ever used locally)
 node_modules/
 npm-debug.log*
+__pycache__/
 
 # macOS
 .DS_Store
