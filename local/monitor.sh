@@ -899,11 +899,15 @@ send_alert() {
   echo "[ALERT] Detected: $message"
   if [[ -n "${DISCORD_WEBHOOK:-}" ]]; then
     ((configured += 1))
-    send_discord "$message" && ((delivered += 1)) || true
+    if send_discord "$message"; then
+      ((delivered += 1))
+    fi
   fi
   if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
     ((configured += 1))
-    send_telegram "$message" && ((delivered += 1)) || true
+    if send_telegram "$message"; then
+      ((delivered += 1))
+    fi
   fi
   if (( configured == 0 )); then
     echo "[INFO] No alert channel configured; alert acknowledged locally."
