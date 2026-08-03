@@ -1,0 +1,8 @@
+{
+  "rateLimitsByLimitId": {
+    "unknown": {
+      "primary": {"windowDurationMins": 900, "usedPercent": 30},
+      "secondary": {"windowDurationMins": 10080, "usedPercent": "30"}
+    }
+  }
+}

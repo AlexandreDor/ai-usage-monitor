@@ -15,6 +15,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 
 ### 1. Fiabiliser les appels réseau
 
+**Statut : terminé.**
+
 **Problème :** les appels vers GitHub Gist, Discord et Telegram n'ont pas de timeout, de stratégie de retry bornée ni de vérification complète des réponses HTTP. Une panne réseau peut bloquer la collecte ou être considérée comme un succès.
 
 **Actions :**
@@ -37,6 +39,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 
 ### 2. Corriger les alertes lors du franchissement de plusieurs seuils
 
+**Statut : terminé.**
+
 **Problème :** si le quota passe rapidement de 80 % à 4 %, seul le premier seuil rencontré est envoyé. Les seuils plus critiques sont ensuite définitivement perdus.
 
 **Actions :**
@@ -55,6 +59,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 
 ### 3. Ajouter un verrou global sur chaque cycle
 
+**Statut : terminé.**
+
 **Problème :** le verrou actuel couvre uniquement la mise à jour de l'historique. Plusieurs instances peuvent collecter simultanément, envoyer des alertes en double ou écraser leur état.
 
 **Actions :**
@@ -72,6 +78,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 **Effort : XS à S**
 
 ### 4. Détecter les données périmées
+
+**Statut : différé.** La conservation et l'exploitation des données sur le long terme seront traitées séparément.
 
 **Problème :** le dashboard considère les données comme valides tant que les fichiers JSON restent accessibles, même si le collecteur est arrêté depuis plusieurs heures.
 
@@ -95,6 +103,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 
 ### 5. Rendre la rétention réellement temporelle
 
+**Statut : différé.** La politique actuelle est conservée en attendant la conception des calculs d'utilisation à long terme.
+
 **Problème :** l'historique est tronqué selon un nombre d'entrées calculé à partir de l'intervalle courant, pas selon l'âge réel des relevés. Un changement d'intervalle peut raccourcir ou allonger fortement la période conservée.
 
 **Actions :**
@@ -114,6 +124,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 
 ### 6. Renforcer le parsing des limites Codex
 
+**Statut : terminé.**
+
 **Problème :** les fenêtres de tous les snapshots sont aplaties, puis la première durée entre 1 et 360 minutes est considérée comme la fenêtre de cinq heures. Une évolution de l'API peut donc associer les mauvaises limites.
 
 **Actions :**
@@ -127,12 +139,14 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 **Critères de validation :**
 
 - Les fenêtres courte et hebdomadaire ne peuvent pas provenir de limites incompatibles.
-- Une réponse partielle ou inconnue produit une erreur explicite.
+- Une réponse inconnue produit une erreur explicite. Une réponse partielle observée sur l'API réelle reste exploitable sans fusion de `limitId`, avec un avertissement et des champs indisponibles à `null`.
 - Les variantes de réponse connues sont couvertes par des tests.
 
 **Effort : M**
 
 ### 7. Valider toute la configuration au démarrage
+
+**Statut : terminé.**
 
 **Actions :**
 
@@ -152,6 +166,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 **Effort : S**
 
 ### 8. Rendre le dashboard totalement autonome
+
+**Statut : terminé.**
 
 **Problème :** Chart.js et les polices sont chargés depuis des CDN. Une panne Internet peut rendre le dashboard local inutilisable malgré la disponibilité des données.
 
@@ -173,6 +189,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 
 ### 9. Corriger et optimiser le graphique historique
 
+**Statut : terminé.**
+
 **Actions :**
 
 - Calculer l'allure idéale avec le `weekly_reset_at` de chaque relevé.
@@ -191,6 +209,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 
 ### 10. Sécuriser l'exposition réseau
 
+**Statut : terminé.**
+
 **Actions :**
 
 - Écouter sur `127.0.0.1` par défaut.
@@ -207,6 +227,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 **Effort : XS à S**
 
 ### 11. Mettre en place les tests et la CI
+
+**Statut : terminé.**
 
 **Actions :**
 
@@ -226,6 +248,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 **Effort : M**
 
 ### 12. Améliorer l'observabilité
+
+**Statut : terminé.**
 
 **Actions :**
 
