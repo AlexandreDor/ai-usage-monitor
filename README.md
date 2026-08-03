@@ -150,27 +150,28 @@ chmod 600 .env
 chmod +x monitor.sh serve.sh
 
 # 4. Run once to verify
+./monitor.sh --check
 ./monitor.sh
-# Output: parsed JSON printed to terminal, data.json written
+# Output: parsed JSON printed to terminal, runtime/data.json written
 
 # 5. Open the dashboard
 ./serve.sh
 # On this machine: http://localhost:8080/dashboard.html
-# On your LAN:     http://<machine-lan-ip>:8080/dashboard.html
+# For trusted LAN access: ./serve.sh --bind 0.0.0.0 --port 8080
 ```
 
-Important: `serve.sh` only hosts an explicit allowlist containing the dashboard, its images, `data.json`, and `history.json`. Files such as `.env`, `.alert_state`, locks, logs, and directory listings are never served. It does not refresh usage by itself; `monitor.sh` must also run on a loop or schedule.
+Important: `serve.sh` only hosts an explicit allowlist containing the dashboard, its local CSS/JavaScript, its favicon, `data.json`, and `history.json`. Files such as `.env`, `.alert_state`, `health.json`, locks, logs, and directory listings are never served. It does not refresh usage by itself; `monitor.sh` must also run on a loop or schedule.
 
 ### LAN security
 
-`serve.sh` listens on `0.0.0.0` so other devices on the local network can open the dashboard. It does not provide authentication, so anyone on that LAN can see usage percentages and reset times.
+`serve.sh` listens on `127.0.0.1` by default. LAN access must be enabled explicitly with `./serve.sh --bind 0.0.0.0 --port 8080`. The server provides neither authentication nor TLS, so anyone able to reach that port can see usage percentages and reset times.
 
 - The generated JSON never contains the Codex account identity or tokens.
 - `.env` is parsed as configuration data rather than executed as shell code.
 - Runtime data and secrets are created with owner-only permissions.
 - Use a host firewall to restrict port `8080` to your trusted local subnet.
 - Do not forward port `8080` on the router or expose this server directly to the internet.
-- To restrict access to the same machine, run `./serve.sh 8080 127.0.0.1`.
+- Keep the default bind for same-machine access; use a trusted reverse proxy if authentication or TLS is required.
 
 ---
 
@@ -443,8 +444,69 @@ ALERT_THRESHOLDS=90,75,50,25,10,5,1
 The monitor also alerts once when an active 5-hour or weekly limit resets. Reset
 deadlines are persisted locally, so a reset that happens while the monitor is
 stopped is reported on the next run when it is no more than one full limit
-window old. The first run only initializes this state and never reports an old
-reset.
+window old. The first quota observation uses 100% as its baseline. A drop across
+several thresholds emits one alert for the most critical crossed threshold, and
+failed deliveries remain pending for a later cycle.
+
+### Local alert scripts
+
+The monitor can also run trusted local executables for selected thresholds or
+resets. Script thresholds are independent from `ALERT_THRESHOLDS`: adding a
+script at 60% does not add a Discord or Telegram notification at 60%.
+
+```bash
+ALERT_SCRIPT_TIMEOUT_SECONDS=30
+
+ALERT_SCRIPT_1=/home/youruser/codex-usage-monitor/local/scripts/reset-worker.sh
+ALERT_SCRIPT_1_EVENTS=5h:reset,weekly:reset
+
+ALERT_SCRIPT_2=/home/youruser/codex-usage-monitor/local/scripts/reduce-load.sh
+ALERT_SCRIPT_2_EVENTS=5h:50,5h:25,weekly:20
+
+# Multiple scripts may react to the same event.
+ALERT_SCRIPT_3=/home/youruser/codex-usage-monitor/local/scripts/audit.sh
+ALERT_SCRIPT_3_EVENTS=5h:25
+```
+
+Indices range from 1 to 99 and may be sparse. Each path must be absolute and
+executable. Commands and arguments are deliberately not parsed; create a small
+wrapper script when arguments are needed. Supported selectors are `5h:reset`,
+`weekly:reset`, `5h:<0..100>`, and `weekly:<0..100>`.
+
+Store personal hooks in `local/scripts/`. Everything in that directory is
+ignored by Git except its `.gitkeep` placeholder, so scripts and embedded local
+configuration cannot be included in commits or pushes accidentally. Use
+`realpath local/scripts/your-hook.sh` to obtain the absolute path required in
+`local/.env`.
+
+On first activation, the monitor records a baseline without replaying thresholds
+that are already below the configured levels. Afterwards, every crossed script
+threshold runs separately, from highest to lowest; rules sharing a threshold run
+by ascending index. A reset clears that window's script threshold journal.
+
+Each action is journaled before execution and attempted at most once. A non-zero
+exit or timeout is logged but does not fail the monitor cycle, retry the action,
+or prevent later scripts from running. Notification delivery remains independent
+and keeps its existing retry behavior. Scripts run synchronously under the cycle
+lock, from their own directory, with no stdin. Their stdout and stderr go to the
+monitor log.
+
+Scripts receive these environment variables:
+
+| Variable | Value |
+|---|---|
+| `CODEX_ALERT_EVENT` | `threshold` or `reset` |
+| `CODEX_ALERT_WINDOW` | `5h` or `weekly` |
+| `CODEX_ALERT_THRESHOLD` | Crossed level, or empty for a reset |
+| `CODEX_ALERT_REMAINING_PCT` | Remaining percentage observed by the monitor |
+| `CODEX_ALERT_RESET_AT` | Relevant reset Unix timestamp, when known |
+| `CODEX_ALERT_RESET_LABEL` | Human-readable reset label, when known |
+| `CODEX_ALERT_SCRAPED_AT` | Unix timestamp of the observation |
+| `CODEX_ALERT_MESSAGE` | Human-readable event description |
+| `CODEX_ALERT_RULE_INDEX` | Configured rule index |
+
+Discord, Telegram, and Gist credentials are removed from the child environment.
+Alert scripts are otherwise trusted local code and are not sandboxed.
 
 ---
 
@@ -479,21 +541,24 @@ GITHUB_GIST_ID=abc123def456...
 
 Run `./monitor.sh` once — you should see `[OK] Gist updated` in the output.
 
-**Step 4 — Set your Gist ID in `local/dashboard.html`**
+**Step 4 — Set your Gist ID in `local/assets/dashboard.js`**
 
-Open `local/dashboard.html` and set `GIST_ID` near the top of the `<script>` block:
+Open `local/assets/dashboard.js` and set `GIST_ID` near the top of the file:
 
 ```javascript
 const GIST_ID = 'abc123def456...';  // your actual Gist ID
 ```
 
-With this set, the same `dashboard.html` file switches into **external mode** and fetches data from your Gist instead of local files.
+With this set, the dashboard switches into **external mode** and fetches data from your Gist instead of local files.
 
 **Step 5 — Deploy `dashboard.html` to GitHub Pages**
 
 Option A — Add to an existing GitHub Pages repo:
 ```bash
+mkdir -p ~/my-pages-repo/codex/assets ~/my-pages-repo/codex/images
 cp local/dashboard.html ~/my-pages-repo/codex/index.html
+cp local/assets/* ~/my-pages-repo/codex/assets/
+cp local/images/favicon.png ~/my-pages-repo/codex/images/
 cd ~/my-pages-repo && git add . && git commit -m "Add Codex monitor" && git push
 # Access at: https://yourname.github.io/codex/
 ```
@@ -517,8 +582,24 @@ All variables go in `local/.env` (copy from `local/.env.example`).
 | `TELEGRAM_BOT_TOKEN` | No | — | Telegram bot token from BotFather |
 | `TELEGRAM_CHAT_ID` | No | — | Numeric Telegram chat ID |
 | `ALERT_THRESHOLDS` | No | `75,50,25,10,5` | Comma-separated % thresholds for alerts |
+| `ALERT_SCRIPT_<N>` | No | — | Absolute executable path for script rule 1..99 |
+| `ALERT_SCRIPT_<N>_EVENTS` | With matching script | — | Comma-separated threshold/reset selectors |
+| `ALERT_SCRIPT_TIMEOUT_SECONDS` | No | `30` | Per-script timeout, from `1` to `300` seconds |
+| `HISTORY_RETENTION_HOURS` | No | `192` | Entry-count retention target, from `0.25` to `8760` hours |
+| `LOOP_INTERVAL` | No | `900` | Collection interval, from `1` to `86400` seconds |
+| `CODEX_BIN` | No | `codex` | Codex CLI executable |
+| `CODEX_STATUS_TIMEOUT_SECONDS` | No | `20` | Codex app-server timeout, from `5` to `300` seconds |
+| `CURL_CONNECT_TIMEOUT_SECONDS` | No | `5` | HTTP connection timeout, from `1` to `60` seconds |
+| `CURL_MAX_TIME_SECONDS` | No | `20` | Total HTTP timeout, from `1` to `600` seconds |
+| `CURL_RETRIES` | No | `2` | HTTP retry count, from `0` to `5` |
+| `CURL_RETRY_DELAY_SECONDS` | No | `1` | Initial retry delay, from `0` to `60` seconds |
+| `MONITOR_DEBUG` | No | `0` | Set to `1` for bounded diagnostics without credentials |
 | `GITHUB_PAT` | No (Tier 2 only) | — | GitHub Personal Access Token (`gist` scope) |
 | `GITHUB_GIST_ID` | No (Tier 2 only) | — | ID of the Gist to update |
+| `GITHUB_API_URL` | No | `https://api.github.com` | GitHub API base URL; primarily injectable for tests |
+| `TELEGRAM_API_URL` | No | `https://api.telegram.org` | Telegram API base URL; primarily injectable for tests |
+
+`GITHUB_PAT`/`GITHUB_GIST_ID` and `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` must be configured as complete pairs. Python 3.9 or newer, `tzdata` with `Europe/Paris`, `curl`, and `flock` are required.
 
 ---
 
@@ -569,10 +650,12 @@ PRs welcome. Some ideas:
 
 ## Local Testing Notes
 
-- History retention is time-based. `HISTORY_RETENTION_HOURS=192` keeps a rolling 8-day window even if you change the scrape interval.
+- Run `tests/run.sh` for the dependency-free suite and `npm ci && npm run test:browser` for Playwright/axe-core checks.
+- CI runs Bash syntax checks, ShellCheck, the complete shell/Node suite, and Chromium browser tests.
+- History retention remains entry-count based so existing long-term data behavior is preserved. Changing the scrape interval changes the effective time span represented by `HISTORY_RETENTION_HOURS`.
 - Docker should only be used when the container can access an authenticated Codex CLI config. A common setup is mounting `~/.codex` into `/root/.codex`. If `codex /status` does not work on the host, it will not work inside Docker either — authenticate first.
 - The container now performs a startup scrape and exits if monitoring cannot start, so it will not keep serving stale data after the scraper dies.
-- The dashboard clears metrics and marks itself stale on refresh failure instead of leaving old percentages visible.
+- A graph failure is isolated from the primary quota metrics. Age-based stale-data detection remains a separate roadmap item.
 
 
 ## License

@@ -2,26 +2,20 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=../local/monitor.sh
-source "${ROOT_DIR}/local/monitor.sh"
+# shellcheck source=tests/lib/test_helper.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test_helper.sh"
+# shellcheck source=local/monitor.sh
+source "$MONITOR_PATH"
+use_test_runtime
+monitor_defaults
 
-TEST_DIR="$(mktemp -d)"
-trap 'rm -rf "$TEST_DIR"' EXIT
-
-STATE_FILE="${TEST_DIR}/.alert_state"
-ALERT_LOG="${TEST_DIR}/alerts.log"
-ALERT_COUNT_LOG="${TEST_DIR}/alert-count.log"
+ALERT_LOG="${TEST_ROOT}/alerts.log"
+ALERT_COUNT_LOG="${TEST_ROOT}/alert-count.log"
 ALERT_THRESHOLDS=0
 
 send_alert() {
   printf '%s\n' "$1" >> "$ALERT_LOG"
   printf '1\n' >> "$ALERT_COUNT_LOG"
-}
-
-fail() {
-  printf 'FAIL: %s\n' "$1" >&2
-  exit 1
 }
 
 assert_alert_count() {
@@ -73,7 +67,7 @@ reset_case
 printf 'prev_5h_pct=80\nprev_weekly_pct=70\n' > "$STATE_FILE"
 check_thresholds 80 70 "later" "later" "$((now + 300))" "$((now + 3600))" "$now"
 assert_alert_count 0
-[[ "$(state_value state_version)" == "2" ]] || fail "state was not migrated"
+[[ "$(state_value state_version)" == "3" ]] || fail "state was not migrated"
 
 # A reset older than its whole window is discarded rather than reported late.
 reset_case

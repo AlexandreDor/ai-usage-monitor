@@ -1,0 +1,7 @@
+{
+  "rateLimitsByLimitId": {
+    "partial": {
+      "primary": {"windowDurationMins": 300, "usedPercent": 12.5}
+    }
+  }
+}

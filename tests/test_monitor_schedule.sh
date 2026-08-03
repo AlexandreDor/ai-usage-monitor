@@ -2,17 +2,13 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=../local/monitor.sh
-source "${ROOT_DIR}/local/monitor.sh"
-
-TEST_DIR="$(mktemp -d)"
-trap 'rm -rf "$TEST_DIR"' EXIT
-
-fail() {
-  printf 'FAIL: %s\n' "$1" >&2
-  exit 1
-}
+# shellcheck source=tests/lib/test_helper.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test_helper.sh"
+# Sourcing defines functions only: configuration and developer runtime stay untouched.
+# shellcheck source=local/monitor.sh
+source "$MONITOR_PATH"
+use_test_runtime
+monitor_defaults
 
 assert_delay() {
   local now_epoch="$1"
@@ -38,8 +34,10 @@ if validate_interval 0 2>/dev/null || validate_interval invalid 2>/dev/null; the
 fi
 
 # Loop mode must scrape immediately before sleeping until the first boundary.
-LOOP_LOG="${TEST_DIR}/loop.log"
+LOOP_LOG="${TEST_ROOT}/loop.log"
 (
+  # These overrides are called indirectly by main from the sourced monitor.
+  # shellcheck disable=SC2329
   check_requirements() { :; }
   run_once() { printf 'scrape:%s\n' "$1" >> "$LOOP_LOG"; }
   date() {

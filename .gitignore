@@ -6,6 +6,10 @@ local/data.json
 local/history.json
 local/runtime/
 
+# User alert scripts stay local. Keep only the directory placeholder tracked.
+local/scripts/*
+!local/scripts/.gitkeep
+
 # Node / npm (if ever used locally)
 node_modules/
 npm-debug.log*

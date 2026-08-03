@@ -1,0 +1,14 @@
+{
+  "rateLimitsByLimitId": {
+    "partial-first": {
+      "primary": {"windowDurationMins": 300, "usedPercent": 1}
+    },
+    "coherent": {
+      "primary": {"windowDurationMins": 300, "usedPercent": 20.25, "resetsAt": 2000000000},
+      "secondary": {"windowDurationMins": 10080, "usedPercent": 95.5, "resetsAt": 2000600000}
+    },
+    "weekly-only": {
+      "secondary": {"windowDurationMins": 10080, "usedPercent": 2}
+    }
+  }
+}

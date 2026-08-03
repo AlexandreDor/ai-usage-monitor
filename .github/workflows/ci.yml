@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+      - name: Check Bash syntax
+        run: bash -n local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
+      - name: Run tests
+        run: tests/run.sh
+      - name: Install browser test dependencies
+        run: npm ci
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run browser tests
+        run: npm run test:browser
+      - name: Run ShellCheck
+        run: shellcheck -x local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
