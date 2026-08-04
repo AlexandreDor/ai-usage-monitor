@@ -6,10 +6,9 @@ const AxeBuilder = require('@axe-core/playwright').default;
 const snapshot = {
   five_h_pct: 72,
   weekly_pct: 36,
-  five_h_reset: 'later',
-  weekly_reset: 'later',
   scraped_at: '2026-08-03T17:30:01Z',
-  weekly_reset_at: 1786196419,
+  five_h_reset_at: 1785778500,
+  weekly_reset_at: 1767443640,
   sample_interval_seconds: 900,
 };
 
@@ -28,6 +27,9 @@ test('works offline and exposes no critical accessibility violations', async ({ 
 
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   await expect(page.locator('#weekly-pct')).toHaveText('36%');
+  await expect(page.locator('#last-updated')).toHaveText('Last scraped 03/08/2026 19:30');
+  await expect(page.locator('#five-h-reset')).toHaveText('03/08/2026 19:35');
+  await expect(page.locator('#weekly-reset')).toHaveText('03/01/2026 13:34');
   expect(externalRequests).toEqual([]);
 
   const results = await new AxeBuilder({ page }).analyze();

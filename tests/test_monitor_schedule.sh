@@ -35,6 +35,7 @@ fi
 
 # Loop mode must scrape immediately before sleeping until the first boundary.
 LOOP_LOG="${TEST_ROOT}/loop.log"
+LOOP_OUTPUT="${TEST_ROOT}/loop.out"
 (
   # These overrides are called indirectly by main from the sourced monitor.
   # shellcheck disable=SC2329
@@ -43,8 +44,8 @@ LOOP_LOG="${TEST_ROOT}/loop.log"
   date() {
     case "$*" in
       '-u +%s') printf '43620\n' ;;
-      '-u -d @44100 +%H:%M:%SZ') printf '12:15:00Z\n' ;;
-      '-u +%H:%M:%SZ') printf '12:07:00Z\n' ;;
+      '-d @44100 +%d/%m/%Y %H:%M') printf '01/01/1970 13:15\n' ;;
+      '+%d/%m/%Y %H:%M') printf '01/01/1970 13:07\n' ;;
       *) return 1 ;;
     esac
   }
@@ -52,11 +53,12 @@ LOOP_LOG="${TEST_ROOT}/loop.log"
     printf 'sleep:%s\n' "$1" >> "$LOOP_LOG"
     exit 0
   }
-  main --loop 900 >/dev/null
+  main --loop 900 > "$LOOP_OUTPUT"
 )
 
 expected_log=$'scrape:900\nsleep:480'
 actual_log="$(<"$LOOP_LOG")"
 [[ "$actual_log" == "$expected_log" ]] || fail "loop did not scrape before aligned sleep"
+assert_contains "$(<"$LOOP_OUTPUT")" '[01/01/1970 13:07] Next check at 01/01/1970 13:15 (in 480s)...' "loop timestamps are not formatted in Paris time"
 
 printf 'PASS: monitor schedule tests\n'

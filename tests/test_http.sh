@@ -45,7 +45,7 @@ assert_contains "$headers" 'X-Content-Type-Options: nosniff' "nosniff header mis
 assert_contains "$headers" 'X-Frame-Options: DENY' "frame protection missing"
 assert_contains "$headers" 'Cache-Control: no-store' "cache header missing"
 
-for path in /monitor.sh /runtime/.alert_state '/%2e%2e%2fmonitor.sh' '/%252e%252e%252fmonitor.sh'; do
+for path in /monitor.sh /runtime/.alert_state /runtime/usage-history.sqlite3 '/%2e%2e%2fmonitor.sh' '/%252e%252e%252fmonitor.sh'; do
   code="$(curl --path-as-is --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:${port}${path}")"
   assert_eq 404 "$code" "non-allowlisted path exposed: $path"
 done

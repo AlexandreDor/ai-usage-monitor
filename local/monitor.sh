@@ -33,6 +33,7 @@ RUNTIME_DIR="${SCRIPT_DIR}/runtime"
 STATE_FILE="${RUNTIME_DIR}/.alert_state"
 DATA_FILE="${RUNTIME_DIR}/data.json"
 HISTORY_FILE="${RUNTIME_DIR}/history.json"
+ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"
 HEALTH_FILE="${RUNTIME_DIR}/health.json"
 LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
 DEFAULT_INTERVAL_SECONDS=900
@@ -57,7 +58,7 @@ load_config() {
     fi
 
     case "$key" in
-      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|CODEX_BIN|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID)
+      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID)
         if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
           value="${value:1:${#value}-2}"
         fi
@@ -250,6 +251,7 @@ validate_config() {
   local invalid=0 secret
   validate_integer LOOP_INTERVAL "$LOOP_INTERVAL" 1 86400 || invalid=1
   validate_integer CODEX_STATUS_TIMEOUT_SECONDS "$CODEX_STATUS_TIMEOUT_SECONDS" 5 300 || invalid=1
+  validate_integer ARCHIVE_RETENTION_DAYS "$ARCHIVE_RETENTION_DAYS" 0 36500 || invalid=1
   validate_number HISTORY_RETENTION_HOURS "$HISTORY_RETENTION_HOURS" 0.25 8760 || invalid=1
   validate_integer CURL_CONNECT_TIMEOUT_SECONDS "$CURL_CONNECT_TIMEOUT_SECONDS" 1 60 || invalid=1
   validate_integer CURL_MAX_TIME_SECONDS "$CURL_MAX_TIME_SECONDS" 1 600 || invalid=1
@@ -347,6 +349,7 @@ initialize() {
 
   ALERT_THRESHOLDS="${ALERT_THRESHOLDS:-75,50,25,10,5}"
   ALERT_SCRIPT_TIMEOUT_SECONDS="${ALERT_SCRIPT_TIMEOUT_SECONDS:-30}"
+  ARCHIVE_RETENTION_DAYS="${ARCHIVE_RETENTION_DAYS:-365}"
   HISTORY_RETENTION_HOURS="${HISTORY_RETENTION_HOURS:-192}"
   LOOP_INTERVAL="${LOOP_INTERVAL:-$DEFAULT_INTERVAL_SECONDS}"
   CODEX_STATUS_TIMEOUT_SECONDS="${CODEX_STATUS_TIMEOUT_SECONDS:-20}"
@@ -560,7 +563,7 @@ def reset_time(window):
         reset = datetime.datetime.fromtimestamp(timestamp, paris_timezone)
     except (OverflowError, OSError, ValueError):
         return "unknown"
-    return reset.strftime("%d/%m/%Y %H:%M (Paris)")
+    return reset.strftime("%d/%m/%Y %H:%M")
 
 
 def reset_timestamp(window):
@@ -618,6 +621,15 @@ try:
 except (ValueError, OverflowError):
     raise SystemExit(1)
 PYEOF
+}
+
+format_paris_now() {
+  TZ=Europe/Paris date '+%d/%m/%Y %H:%M'
+}
+
+format_paris_timestamp() {
+  local epoch="$1"
+  TZ=Europe/Paris date -d "@${epoch}" '+%d/%m/%Y %H:%M'
 }
 
 history_max_entries() {
@@ -1414,9 +1426,26 @@ finally:
 PYEOF
 }
 
+append_cycle_error() {
+  local message="$1"
+  if [[ -n "${CYCLE_ERROR:-}" ]]; then
+    CYCLE_ERROR="${CYCLE_ERROR}; ${message}"
+  else
+    CYCLE_ERROR="$message"
+  fi
+}
+
+archive_snapshot() {
+  local json="$1"
+  printf '%s\n' "$json" | python3 "$SCRIPT_DIR/archive.py" \
+    --database "$ARCHIVE_FILE" \
+    --history "$HISTORY_FILE" \
+    --retention-days "$ARCHIVE_RETENTION_DAYS"
+}
+
 run_cycle() {
   local interval_seconds="$1"
-  echo "[$(date -u +%H:%M:%SZ)] Scraping codex status..."
+  echo "[$(format_paris_now)] Scraping codex status..."
 
   local json status=0
   CYCLE_ERROR=""
@@ -1425,8 +1454,15 @@ run_cycle() {
   # Pretty-print to terminal
   echo "$json" | python3 -m json.tool 2>/dev/null || echo "$json"
 
+  # Write the long-term archive. Archive failures are reported but must not
+  # prevent the current snapshot, Gist sync, or alert processing.
+  if ! archive_snapshot "$json"; then
+    status=1
+    append_cycle_error "Long-term archive update failed"
+  fi
+
   # Write locally
-  write_local_snapshot "$json" "$interval_seconds" || { CYCLE_ERROR="Local snapshot write failed"; return 1; }
+  write_local_snapshot "$json" "$interval_seconds" || { append_cycle_error "Local snapshot write failed"; return 1; }
 
   # Read history for gist sync
   local history_json="[]"
@@ -1434,7 +1470,7 @@ run_cycle() {
     history_json="$(<"$HISTORY_FILE")"
   fi
 
-  sync_gist "$json" "$history_json" || { status=1; CYCLE_ERROR="GitHub Gist sync failed"; }
+  sync_gist "$json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
 
   # Extract values for threshold check
   local five_h weekly five_h_reset weekly_reset five_h_reset_at weekly_reset_at scraped_at scraped_at_epoch
@@ -1449,7 +1485,7 @@ run_cycle() {
 
   check_thresholds "$five_h" "$weekly" "$five_h_reset" "$weekly_reset" \
     "$five_h_reset_at" "$weekly_reset_at" "$scraped_at_epoch" \
-    || { status=1; CYCLE_ERROR="${CYCLE_ERROR:+${CYCLE_ERROR}; }${ALERT_PROCESSING_ERROR:-alert processing failed}"; }
+    || { status=1; append_cycle_error "${ALERT_PROCESSING_ERROR:-alert processing failed}"; }
   return "$status"
 }
 
@@ -1536,8 +1572,8 @@ main() {
       now_epoch="$(date -u +%s)"
       delay="$(seconds_until_next_interval "$now_epoch" "$interval")"
       next_epoch="$((now_epoch + delay))"
-      next_check="$(date -u -d "@${next_epoch}" +%H:%M:%SZ)"
-      echo "[$(date -u +%H:%M:%SZ)] Next check at ${next_check} (in ${delay}s)..."
+      next_check="$(format_paris_timestamp "$next_epoch")"
+      echo "[$(format_paris_now)] Next check at ${next_check} (in ${delay}s)..."
       sleep "$delay"
     done
   else

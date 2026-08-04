@@ -32,6 +32,7 @@ use_test_runtime() {
   STATE_FILE="${RUNTIME_DIR}/.alert_state"
   DATA_FILE="${RUNTIME_DIR}/data.json"
   HISTORY_FILE="${RUNTIME_DIR}/history.json"
+  ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"
   HEALTH_FILE="${RUNTIME_DIR}/health.json"
   LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
   ENV_FILE="${TEST_ROOT}/.env"
@@ -45,6 +46,7 @@ monitor_defaults() {
   done
   ALERT_THRESHOLDS=75,50,25,10,5
   ALERT_SCRIPT_TIMEOUT_SECONDS=30
+  ARCHIVE_RETENTION_DAYS=365
   HISTORY_RETENTION_HOURS=192
   LOOP_INTERVAL=900
   CODEX_STATUS_TIMEOUT_SECONDS=5

@@ -74,7 +74,8 @@ codex-usage-monitor/
 |   |-- .env              # Your local config (git-ignored, created by you)
 |   |-- runtime/          # Private generated state (git-ignored, mode 0700)
 |   |   |-- data.json     # Usage snapshot without account identity
-|   |   `-- history.json  # Rolling usage history
+|   |   |-- history.json  # Rolling usage history
+|   |   `-- usage-history.sqlite3  # Progressive long-term archive
 |   `-- images/
 |       |-- hero.png
 |       |-- framework.png
@@ -179,7 +180,8 @@ Important: `serve.sh` only hosts an explicit allowlist containing the dashboard,
 
 Pick the simplest option that fits your environment. In every setup:
 
-- `monitor.sh` scrapes Codex and writes `data.json` / `history.json`
+- `monitor.sh` scrapes Codex and writes `data.json` / `history.json`, while
+  also maintaining the local SQLite archive
 - `serve.sh` serves `dashboard.html`
 
 This project is designed for local Linux-style execution. Docker is intentionally not documented as a supported runtime because the current status capture depends on an authenticated local Codex CLI environment.
@@ -586,6 +588,7 @@ All variables go in `local/.env` (copy from `local/.env.example`).
 | `ALERT_SCRIPT_<N>_EVENTS` | With matching script | — | Comma-separated threshold/reset selectors |
 | `ALERT_SCRIPT_TIMEOUT_SECONDS` | No | `30` | Per-script timeout, from `1` to `300` seconds |
 | `HISTORY_RETENTION_HOURS` | No | `192` | Entry-count retention target, from `0.25` to `8760` hours |
+| `ARCHIVE_RETENTION_DAYS` | No | `365` | Long-term SQLite archive retention; `0` means unlimited, maximum `36500` days |
 | `LOOP_INTERVAL` | No | `900` | Collection interval, from `1` to `86400` seconds |
 | `CODEX_BIN` | No | `codex` | Codex CLI executable |
 | `CODEX_STATUS_TIMEOUT_SECONDS` | No | `20` | Codex app-server timeout, from `5` to `300` seconds |
@@ -641,7 +644,6 @@ PRs welcome. Some ideas:
 - [ ] Slack webhook support
 - [ ] ntfy.sh support (self-hosted push notifications)
 - [ ] Multi-account support
-- [ ] Longer history retention (configurable window)
 - [ ] Email alerts via a simple SMTP relay
 - [ ] Auto-open browser on `serve.sh` start
 - [ ] GitHub Actions workflow for automated Gist update (no local machine needed)
@@ -653,6 +655,8 @@ PRs welcome. Some ideas:
 - Run `tests/run.sh` for the dependency-free suite and `npm ci && npm run test:browser` for Playwright/axe-core checks.
 - CI runs Bash syntax checks, ShellCheck, the complete shell/Node suite, and Chromium browser tests.
 - History retention remains entry-count based so existing long-term data behavior is preserved. Changing the scrape interval changes the effective time span represented by `HISTORY_RETENTION_HOURS`.
+- Long-term history is stored separately in `runtime/usage-history.sqlite3`: all points are kept for 24 hours, then the newest point in each 30-minute UTC bucket is kept through 7 days, and the newest point in each hourly UTC bucket is kept thereafter. The default retention is one year; `ARCHIVE_RETENTION_DAYS=0` keeps it indefinitely. SQLite is provided by Python's standard library and the archive is not served by `serve.sh` or synchronized to the Gist.
+- The SQLite archive is local state, not an off-machine backup. Back it up separately if the long-term history must survive disk loss.
 - Docker should only be used when the container can access an authenticated Codex CLI config. A common setup is mounting `~/.codex` into `/root/.codex`. If `codex /status` does not work on the host, it will not work inside Docker either — authenticate first.
 - The container now performs a startup scrape and exits if monitoring cannot start, so it will not keep serving stale data after the scraper dies.
 - A graph failure is isolated from the primary quota metrics. Age-based stale-data detection remains a separate roadmap item.

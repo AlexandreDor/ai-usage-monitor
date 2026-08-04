@@ -5,6 +5,16 @@ const GIST_ID = '';
 const REFRESH_INTERVAL_MS = 900_000;
 const DECIMATION_THRESHOLD = 1000;
 const DECIMATION_SAMPLES = 600;
+const PARIS_TIME_ZONE = 'Europe/Paris';
+const parisDateTimeFormatter = new Intl.DateTimeFormat('en-GB', {
+  timeZone: PARIS_TIME_ZONE,
+  day: '2-digit',
+  month: '2-digit',
+  year: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23',
+});
 
 let chart = null;
 let refreshTimer = null;
@@ -30,9 +40,25 @@ function scheduleRefresh(data = null) {
   refreshTimer = setTimeout(refresh, nextUpdate - now);
 }
 
-function fmtTime(value) {
-  const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString() : '-';
+function formatParisDateTime(value, includeYear = true) {
+  const timestamp = typeof value === 'number' ? value : Date.parse(value);
+  if (!Number.isFinite(timestamp)) return '-';
+
+  const parts = Object.fromEntries(
+    parisDateTimeFormatter
+      .formatToParts(new Date(timestamp))
+      .filter(part => part.type !== 'literal')
+      .map(part => [part.type, part.value]),
+  );
+  const date = includeYear ? `${parts.day}/${parts.month}/${parts.year}` : `${parts.day}/${parts.month}`;
+  return `${date} ${parts.hour}:${parts.minute}`;
+}
+
+function formatParisUnixTimestamp(value) {
+  const timestamp = Number(value);
+  return Number.isFinite(timestamp) && timestamp > 0
+    ? formatParisDateTime(timestamp * 1000)
+    : '-';
 }
 
 function idealWeeklyRemaining(sampledAt, resetTimestamp) {
@@ -126,9 +152,8 @@ function normalizeHistory(history) {
 }
 
 function historyTitle(points) {
-  const options = { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' };
-  const start = new Date(points[0].timestamp).toLocaleString(undefined, options);
-  const end = new Date(points[points.length - 1].timestamp).toLocaleString(undefined, options);
+  const start = formatParisDateTime(points[0].timestamp, false);
+  const end = formatParisDateTime(points[points.length - 1].timestamp, false);
   return points.length === 1 ? `History / ${start}` : `History / ${start} - ${end}`;
 }
 
@@ -175,20 +200,30 @@ function chartDatasets(points) {
 }
 
 function formatChartTimestamp(value) {
-  return new Date(value).toLocaleString(undefined, {
-    day: '2-digit',
-    month: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
+  return formatParisDateTime(value, false);
+}
+
+function chartTimeBounds(points) {
+  const min = points[0].timestamp;
+  const max = points[points.length - 1].timestamp;
+  return min < max ? { min, max } : null;
 }
 
 function renderHistory(history) {
   const points = normalizeHistory(history);
   const datasets = chartDatasets(points);
+  const timeBounds = chartTimeBounds(points);
   document.getElementById('history-label').textContent = historyTitle(points);
 
   if (chart) {
+    const xScale = chart.options.scales.x;
+    if (timeBounds) {
+      xScale.min = timeBounds.min;
+      xScale.max = timeBounds.max;
+    } else {
+      delete xScale.min;
+      delete xScale.max;
+    }
     chart.data.datasets = datasets;
     chart.update('none');
     setHistoryError();
@@ -215,6 +250,7 @@ function renderHistory(history) {
         },
         x: {
           type: 'linear',
+          ...(timeBounds || {}),
           grid: { color: 'rgba(255,255,255,0.05)' },
           ticks: { color: '#8b949e', maxTicksLimit: 12, callback: formatChartTimestamp },
         },
@@ -227,7 +263,7 @@ function renderHistory(history) {
           threshold: DECIMATION_THRESHOLD,
         },
         legend: { labels: { color: '#e6edf3', boxWidth: 12 } },
-        tooltip: { callbacks: { title: items => items.length ? formatChartTimestamp(items[0].parsed.x) : '' } },
+        tooltip: { callbacks: { title: items => items.length ? formatParisDateTime(items[0].parsed.x) : '' } },
       },
     },
   });
@@ -245,10 +281,10 @@ function renderData(data) {
   }
   setBar('five-h-bar', 'five-h-pct', data.five_h_pct);
   setBar('weekly-bar', 'weekly-pct', data.weekly_pct);
-  document.getElementById('five-h-reset').textContent = displayText(data.five_h_reset);
-  document.getElementById('weekly-reset').textContent = displayText(data.weekly_reset);
+  document.getElementById('five-h-reset').textContent = formatParisUnixTimestamp(data.five_h_reset_at);
+  document.getElementById('weekly-reset').textContent = formatParisUnixTimestamp(data.weekly_reset_at);
   renderWeeklyPaceDelta(data);
-  document.getElementById('last-updated').textContent = `Last scraped ${fmtTime(displayText(data.scraped_at, ''))}`;
+  document.getElementById('last-updated').textContent = `Last scraped ${formatParisDateTime(displayText(data.scraped_at, ''))}`;
   setMainError();
   scheduleRefresh(data);
 }

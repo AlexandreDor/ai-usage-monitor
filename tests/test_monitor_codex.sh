@@ -15,6 +15,8 @@ result="$(fetch_status_json 900)"
 assert_eq coherent "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["limit_id"])' <<< "$result")"
 assert_eq 79.75 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["five_h_pct"])' <<< "$result")" "real-valued percentage lost"
 assert_eq 4.5 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["weekly_pct"])' <<< "$result")"
+assert_eq '18/05/2033 05:33' "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["five_h_reset"])' <<< "$result")" "5h reset is not formatted in Paris time"
+assert_eq '25/05/2033 04:13' "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["weekly_reset"])' <<< "$result")" "weekly reset is not formatted in Paris time"
 
 export FAKE_CODEX_FIXTURE="${ROOT_DIR}/tests/fixtures/codex/partial.json"
 diagnostic="${TEST_ROOT}/partial.err"
