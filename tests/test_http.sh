@@ -13,6 +13,17 @@ with socket.socket() as sock:
 PY
 )"
 server_pid=""
+analytics_database="${TEST_ROOT}/usage-history.sqlite3"
+python3 - "$ROOT_DIR" "$analytics_database" <<'PY'
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "local"))
+from storage import connect_database
+
+connection = connect_database(Path(sys.argv[2]))
+connection.close()
+PY
 cleanup() {
   [[ -z "$server_pid" ]] || kill "$server_pid" 2>/dev/null || true
   rm -rf "$TEST_ROOT"
@@ -24,7 +35,7 @@ bash "$SERVE" --bind localhost --port 8080 >/dev/null 2>&1 && fail "hostname bin
 bash "$SERVE" --unknown >/dev/null 2>&1 && fail "unknown CLI option accepted"
 assert_contains "$(bash "$SERVE" --help)" 'default: 127.0.0.1' "help omits localhost default"
 
-bash "$SERVE" --port "$port" >"${TEST_ROOT}/server.log" 2>&1 &
+DASHBOARD_ANALYTICS_DATABASE="$analytics_database" bash "$SERVE" --port "$port" >"${TEST_ROOT}/server.log" 2>&1 &
 server_pid=$!
 for _ in {1..50}; do
   curl --silent --fail "http://127.0.0.1:${port}/dashboard.html" -o "${TEST_ROOT}/dashboard" && break

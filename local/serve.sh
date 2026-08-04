@@ -4,6 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ANALYTICS_DATABASE_PATH="${DASHBOARD_ANALYTICS_DATABASE:-${SCRIPT_DIR}/runtime/usage-history.sqlite3}"
 PORT=8080
 BIND_ADDRESS="127.0.0.1"
 POSITIONAL_PORT=""
@@ -70,6 +71,11 @@ if ! command -v python3 &>/dev/null; then
   exit 1
 fi
 
+if [[ "$ANALYTICS_DATABASE_PATH" != /* ]] || [[ -e "$ANALYTICS_DATABASE_PATH" && -L "$ANALYTICS_DATABASE_PATH" ]]; then
+  echo "[ERROR] DASHBOARD_ANALYTICS_DATABASE must be an absolute path and not a symbolic link." >&2
+  exit 2
+fi
+
 if [[ ! "$PORT" =~ ^[0-9]+$ ]] || ((${#PORT} > 5)) || ((10#$PORT < 1 || 10#$PORT > 65535)); then
   echo "[ERROR] Port must be an integer between 1 and 65535." >&2
   exit 2
@@ -97,7 +103,7 @@ fi
 echo "Serving dashboard at http://${DISPLAY_ADDRESS}:${PORT}/dashboard.html"
 echo "Only allowlisted dashboard assets and usage JSON are exposed. Press Ctrl+C to stop."
 
-python3 - "$SCRIPT_DIR" "$PORT" "$BIND_ADDRESS" <<'PYEOF'
+python3 - "$SCRIPT_DIR" "$PORT" "$BIND_ADDRESS" "$ANALYTICS_DATABASE_PATH" <<'PYEOF'
 import functools
 import http.server
 import pathlib
@@ -113,6 +119,7 @@ from analytics import AnalyticsError, build_payload
 root = pathlib.Path(sys.argv[1]).resolve()
 port = int(sys.argv[2])
 bind_address = sys.argv[3]
+analytics_database = pathlib.Path(sys.argv[4])
 public_files = {
     "/dashboard.html": "/dashboard.html",
     "/analytics.html": "/analytics.html",
@@ -152,7 +159,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             if set(raw) - allowed:
                 raise AnalyticsError("unknown query parameter")
             params = {key: values[0] for key, values in raw.items()}
-            payload = build_payload(root / "runtime" / "usage-history.sqlite3", root / "pricing.json", params)
+            payload = build_payload(analytics_database, root / "pricing.json", params)
         except (AnalyticsError, ValueError) as error:
             status = 503 if "not available" in str(error) or "cannot be read" in str(error) else 400
             self.send_json(status, {"error": str(error)}, include_body=include_body)
