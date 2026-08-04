@@ -563,7 +563,7 @@ def reset_time(window):
         reset = datetime.datetime.fromtimestamp(timestamp, paris_timezone)
     except (OverflowError, OSError, ValueError):
         return "unknown"
-    return reset.strftime("%d/%m/%Y %H:%M (Paris)")
+    return reset.strftime("%d/%m/%Y %H:%M")
 
 
 def reset_timestamp(window):
@@ -621,6 +621,15 @@ try:
 except (ValueError, OverflowError):
     raise SystemExit(1)
 PYEOF
+}
+
+format_paris_now() {
+  TZ=Europe/Paris date '+%d/%m/%Y %H:%M'
+}
+
+format_paris_timestamp() {
+  local epoch="$1"
+  TZ=Europe/Paris date -d "@${epoch}" '+%d/%m/%Y %H:%M'
 }
 
 history_max_entries() {
@@ -1436,7 +1445,7 @@ archive_snapshot() {
 
 run_cycle() {
   local interval_seconds="$1"
-  echo "[$(date -u +%H:%M:%SZ)] Scraping codex status..."
+  echo "[$(format_paris_now)] Scraping codex status..."
 
   local json status=0
   CYCLE_ERROR=""
@@ -1563,8 +1572,8 @@ main() {
       now_epoch="$(date -u +%s)"
       delay="$(seconds_until_next_interval "$now_epoch" "$interval")"
       next_epoch="$((now_epoch + delay))"
-      next_check="$(date -u -d "@${next_epoch}" +%H:%M:%SZ)"
-      echo "[$(date -u +%H:%M:%SZ)] Next check at ${next_check} (in ${delay}s)..."
+      next_check="$(format_paris_timestamp "$next_epoch")"
+      echo "[$(format_paris_now)] Next check at ${next_check} (in ${delay}s)..."
       sleep "$delay"
     done
   else

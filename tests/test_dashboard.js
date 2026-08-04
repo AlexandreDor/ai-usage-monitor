@@ -33,6 +33,7 @@ function element(id) {
 let fetchQueue = [];
 let destroyed = 0;
 function FakeChart(_context, config) {
+  this.config = config;
   this.data = config.data;
   this.update = () => {};
   this.destroy = () => { destroyed += 1; };
@@ -63,6 +64,15 @@ function evaluate(expression) {
 }
 
 (async () => {
+  if (evaluate(`formatParisDateTime('2026-01-03T12:34:00Z')`) !== '03/01/2026 13:34') {
+    fail('winter timestamp is not formatted in Paris time');
+  }
+  if (evaluate(`formatParisDateTime('2026-08-03T17:30:00Z')`) !== '03/08/2026 19:30') {
+    fail('summer timestamp is not formatted in Paris time');
+  }
+  if (evaluate(`formatParisDateTime('invalid')`) !== '-') fail('invalid timestamp did not use fallback');
+  if (evaluate('formatParisUnixTimestamp(0)') !== '-') fail('invalid reset timestamp did not use fallback');
+
   const points = evaluate(`normalizeHistory([
     {scraped_at:'2026-08-01T00:00:00Z', weekly_pct:90, weekly_reset_at:1786147200},
     {scraped_at:'2026-08-02T00:00:00Z', weekly_pct:70, weekly_reset_at:1786147200}
@@ -71,7 +81,38 @@ function evaluate(expression) {
   const ideals = evaluate('chartDatasets(testPoints)[2].data.map(point => point.y)');
   if (ideals.length !== 2 || ideals[0] === ideals[1]) fail('ideal pace is not calculated per point');
 
-  evaluate(`renderHistory([{scraped_at:'2026-08-01T00:00:00Z', five_h_pct:80}])`);
+  if (evaluate('historyTitle(testPoints)') !== 'History / 01/08 02:00 - 02/08 02:00') {
+    fail('history title is not formatted in Paris time');
+  }
+
+  evaluate(`renderHistory([
+    {scraped_at:'2026-08-01T00:00:00Z', five_h_pct:80},
+    {scraped_at:'2026-08-02T00:00:00Z', five_h_pct:70},
+  ])`);
+  if (evaluate('chart.config.options.scales.x.min') !== Date.parse('2026-08-01T00:00:00Z')) {
+    fail('chart start bound does not match the first point');
+  }
+  if (evaluate('chart.config.options.scales.x.max') !== Date.parse('2026-08-02T00:00:00Z')) {
+    fail('chart end bound does not match the last point');
+  }
+  if (evaluate(`chart.config.options.scales.x.ticks.callback(Date.parse('2026-08-03T17:30:00Z'))`) !== '03/08 19:30') {
+    fail('chart axis is not formatted in Paris time');
+  }
+  if (evaluate(`chart.config.options.plugins.tooltip.callbacks.title([{parsed:{x:Date.parse('2026-08-03T17:30:00Z')}}])`) !== '03/08/2026 19:30') {
+    fail('chart tooltip is not formatted in Paris time');
+  }
+
+  evaluate(`renderData({
+    five_h_pct: 80,
+    weekly_pct: 70,
+    scraped_at: '2026-08-03T17:30:01Z',
+    five_h_reset_at: 1785778500,
+    weekly_reset_at: 1767443640,
+  })`);
+  if (element('last-updated').textContent !== 'Last scraped 03/08/2026 19:30') fail('last update is not formatted in Paris time');
+  if (element('five-h-reset').textContent !== '03/08/2026 19:35') fail('five-hour reset is not formatted in Paris time');
+  if (element('weekly-reset').textContent !== '03/01/2026 13:34') fail('weekly reset is not formatted in Paris time');
+
   fetchQueue = [
     { five_h_pct: 80, weekly_pct: 70, scraped_at: '2026-08-03T00:00:00Z' },
     [],
