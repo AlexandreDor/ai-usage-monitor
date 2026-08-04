@@ -75,8 +75,8 @@ function renderLimits(data) {
   byId('limits-empty').hidden = points.length > 0;
   byId('limits-chart-wrap').hidden = points.length === 0;
   const datasets = [
-    { label: '5-hour remaining', data: points.map(point => ({ x: Date.parse(point.at), y: point.five_h_pct })), borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,.10)', fill: true, borderWidth: 2, pointRadius: 0, tension: .25, spanGaps: false },
-    { label: 'Weekly remaining', data: points.map(point => ({ x: Date.parse(point.at), y: point.weekly_pct })), borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.07)', fill: true, borderWidth: 2, pointRadius: 0, tension: .25, spanGaps: false },
+    { label: '5-hour remaining', data: points.map(point => ({ x: Date.parse(point.at), y: point.five_h_pct })), borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,.10)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false },
+    { label: 'Weekly remaining', data: points.map(point => ({ x: Date.parse(point.at), y: point.weekly_pct })), borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.07)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false },
   ];
   if (limitsChart) { limitsChart.data.datasets = datasets; limitsChart.update('none'); return; }
   if (typeof Chart !== 'function') throw new Error('Chart.js failed to load');
