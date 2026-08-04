@@ -48,6 +48,18 @@ with connection:
            VALUES (?, ?, ?, ?, ?, ?)""",
         (1785859500, "hermes", "auto", "gpt-5.6-sol", 1000000, "auto-sol"),
     )
+    for index, (provider, model) in enumerate((
+        ("ollama", "gemma4:26b-a4b-it-q8_0"),
+        ("ollama", "ornith:35b-q8_0"),
+        ("openai", "unknown"),
+        ("opencode", "nemotron-3-ultra-free"),
+    )):
+        connection.execute(
+            """INSERT INTO token_usage_events
+               (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (1785859600 + index, "opencode", provider, model, 100, f"configured-zero-{index}"),
+        )
     connection.execute(
         "INSERT INTO collector_runs VALUES (?, ?, ?, ?, ?, ?, ?)",
         ("codex", 1, "ok", 1785859500, 1785859500, None, "fixture-v1"),
@@ -68,6 +80,7 @@ assert_eq 21.75 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["toke
 assert_eq 100 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["summary"]["assumed_zero_tokens"])' <<<"$payload")" "unknown model token count"
 assert_eq priced "$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(item["pricing_status"] for item in data["tokens"]["breakdown"] if item["provider"] == "openai-codex"))' <<<"$payload")" "openai-codex GPT-5.6 Sol pricing"
 assert_eq priced "$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(item["pricing_status"] for item in data["tokens"]["breakdown"] if item["provider"] == "auto"))' <<<"$payload")" "auto GPT-5.6 Sol pricing"
+assert_eq 4 "$(python3 -c 'import json,sys; data=json.load(sys.stdin); configured={("ollama","gemma4:26b-a4b-it-q8_0"),("ollama","ornith:35b-q8_0"),("openai","unknown"),("opencode","nemotron-3-ultra-free")}; print(sum((item["provider"],item["model"]) in configured and item["pricing_status"] == "priced" for item in data["tokens"]["breakdown"]))' <<<"$payload")" "configured zero-price models"
 assert_eq 1 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["total"])' <<<"$payload")" "reset count"
 assert_eq 42 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["baselines"]["hermes"][0]["tokens"])' <<<"$payload")" "Hermes baseline"
 
