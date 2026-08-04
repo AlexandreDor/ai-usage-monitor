@@ -68,7 +68,10 @@ def period(connection: sqlite3.Connection, params: dict[str, str], now: int) -> 
     if start >= end:
         raise AnalyticsError("the requested period is empty")
     duration = end - start
-    granularity = 3600 if duration <= 2 * 86400 else 21600 if duration <= 8 * 86400 else 86400 if duration <= 120 * 86400 else 604800 if duration <= 730 * 86400 else 2592000
+    # Match the archive's compaction schedule instead of reducing a 30-day
+    # view to one point per day. This preserves the useful 15/30-minute and
+    # hourly detail while keeping an unbounded "all" request manageable.
+    granularity = 900 if duration <= 86400 else 1800 if duration <= 7 * 86400 else 3600 if duration <= 366 * 86400 else 86400
     return start, end, label, granularity
 
 
