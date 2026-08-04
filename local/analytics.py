@@ -78,6 +78,9 @@ def price_index(catalog: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]
         provider = entry["provider"].strip().lower()
         for model in [entry["model"], *entry.get("aliases", [])]:
             result[(provider, model.strip().lower())] = entry
+        for identifier in entry.get("identifiers", []):
+            alias_provider, alias_model = identifier.split("/", 1)
+            result[(alias_provider.strip().lower(), alias_model.strip().lower())] = entry
     return result
 
 

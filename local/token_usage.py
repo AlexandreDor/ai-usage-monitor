@@ -91,6 +91,14 @@ def load_pricing(path: Path) -> dict[str, Any]:
         aliases = entry.get("aliases", [])
         if not isinstance(aliases, list) or not all(isinstance(item, str) for item in aliases):
             raise CollectorError("pricing aliases must be an array of strings")
+        identifiers = entry.get("identifiers", [])
+        if not isinstance(identifiers, list) or not all(
+            isinstance(item, str)
+            and item.count("/") == 1
+            and all(part.strip() for part in item.split("/", 1))
+            for item in identifiers
+        ):
+            raise CollectorError("pricing identifiers must be provider/model strings")
     return value
 
 
