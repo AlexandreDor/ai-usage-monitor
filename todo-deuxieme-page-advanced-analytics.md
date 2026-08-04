@@ -1,6 +1,24 @@
 # Deuxième page « Advanced Analytics »
 
-> **Statut : implémenté sur la branche `dev` le 4 août 2026.** Le stockage v2, les collecteurs, l'API locale, la page responsive et les tests décrits ci-dessous sont en place.
+> **Statut : partiellement implémenté sur la branche `dev` le 4 août 2026.** Le socle est livré : stockage v2, collecteurs, API locale, page responsive, documentation et tests de régression principaux. Ce fichier est conservé pour suivre les écarts ci-dessous.
+
+## État de vérification
+
+### Livré
+
+- archive SQLite v2, rétention, récupération après corruption et reconstruction des resets ;
+- collecteurs Codex, OpenCode et Hermes, avec baseline Hermes et catalogue tarifaire local ;
+- API locale `/api/analytics`, filtres, dates Europe/Paris, pagination bornée et allowlist HTTP ;
+- page locale avec périodes, filtres, graphiques limites/tokens, ventilation des coûts, reset history et statut des collecteurs ;
+- documentation de l'usage local et tests shell, HTTP, Node et Playwright.
+
+### Reste à faire avant de supprimer ce todo
+
+- Corriger le mode `TOKEN_USAGE_SOURCES=auto` : un répertoire Codex présent mais sans rollout doit rester `disabled`, sans faire échouer le cycle.
+- Faire utiliser à l'API le catalogue configuré par `TOKEN_PRICING_FILE`, et non systématiquement `local/pricing.json`.
+- Aligner l'interface sur le périmètre prévu : marqueurs de reset, graphe coût, ventilation par application, colonnes reasoning/total/statut tarifaire et pagination de 50 lignes.
+- Ajouter les résumés textuels des graphiques, les annonces de fraîcheur et les tests manquants (concurrence API/écriture, rotation Codex, mises à jour OpenCode, réinitialisation Hermes, changement d'heure et maintien de données après erreur).
+- Harmoniser la granularité et le rafraîchissement avec les règles définies dans ce document, ou documenter explicitement la règle finalement retenue.
 
 ## Résumé
 

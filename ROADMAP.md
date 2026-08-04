@@ -103,7 +103,7 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 
 ### 5. Rendre la rétention réellement temporelle
 
-**Statut : différé.** La politique actuelle est conservée en attendant la conception des calculs d'utilisation à long terme.
+**Statut : partiellement terminé.** L'archive SQLite longue durée applique désormais une rétention temporelle et un compactage par granularité. L'historique JSON utilisé par le dashboard principal reste toutefois limité par nombre d'entrées ; les critères ci-dessous restent donc ouverts pour ce flux.
 
 **Problème :** l'historique est tronqué selon un nombre d'entrées calculé à partir de l'intervalle courant, pas selon l'âge réel des relevés. Un changement d'intervalle peut raccourcir ou allonger fortement la période conservée.
 
@@ -272,6 +272,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 
 ### 13. Améliorer l'accessibilité du dashboard
 
+**Statut : partiellement terminé.** La structure sémantique, les barres natives `<progress>`, les messages d'erreur et `prefers-reduced-motion` sont en place. Il reste un résumé accessible des graphiques, l'annonce de fraîcheur et les détails d'allure hors attribut `title`.
+
 **Actions :**
 
 - Ajouter une structure sémantique avec `<main>`, `<section>` et des titres.
@@ -285,6 +287,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 **Effort : M**
 
 ### 14. Mettre la documentation en cohérence
+
+**Statut : partiellement terminé.** L'architecture, la configuration et l'analytics locale sont documentés. Les URL de clonage contiennent encore `YOUR_USERNAME` et les exemples de test d'alertes exécutent encore `.env` avec `source`.
 
 **Actions :**
 
@@ -301,6 +305,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 
 ### 15. Préparer le packaging et les releases
 
+**Statut : non commencé.**
+
 **Actions :**
 
 - Versionner les scripts avec le bit exécutable.
@@ -312,6 +318,8 @@ Cette feuille de route regroupe les améliorations identifiées lors de l'audit 
 **Effort : M**
 
 ### 16. Réduire progressivement le script monolithique
+
+**Statut : partiellement terminé.** Le stockage, l'archivage et la collecte analytics sont désormais séparés en modules Python. Le protocole Codex, la validation principale et l'orchestration restent concentrés dans `monitor.sh`.
 
 **Objectif :** améliorer la testabilité sans lancer une réécriture prématurée.
 
