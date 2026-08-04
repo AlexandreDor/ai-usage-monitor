@@ -71,7 +71,7 @@ const analyticsPayload = {
     series: [{ at: '2026-08-04T00:00:00Z', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 0, output_tokens: 200000, reasoning_tokens: 50000 }],
     breakdown: [{ source: 'codex', provider: 'openai', model: 'gpt-5.6-sol', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 0, output_tokens: 200000, estimated_cost_usd: 11.25, pricing_status: 'priced' }],
   },
-  resets: { total: 2, weekly_total: 2, weekly_summary: { random: { count: 1, gained_vs_ideal_pct: 72.4, lost_vs_ideal_pct: 0 }, end_of_week: { count: 1, unused_pct_points: 5 } }, offset: 0, limit: 10, items: [{ window: 'weekly', category: 'random', reset_at: '2026-08-04T08:00:00Z', observed_at: '2026-08-04T08:15:00Z', observation_delay_seconds: 900, before_pct: 28, after_pct: 100, ideal_weekly_pace_pct: 58, pace_delta_pct_points: 42, pace_delta_vs_ideal_pct: 72.4, unused_pct_points: 0 }] },
+  resets: { total: 2, weekly_total: 2, weekly_summary: { random: { count: 1, gained_vs_ideal_pct_points: 30.004, lost_vs_ideal_pct_points: 0 }, end_of_week: { count: 1, unused_pct_points: 5 } }, offset: 0, limit: 10, items: [{ window: 'weekly', category: 'random', reset_at: '2026-08-04T08:00:00Z', observed_at: '2026-08-04T08:15:00Z', observation_delay_seconds: 900, before_pct: 28, after_pct: 100, ideal_weekly_pace_pct: 58.004, pace_delta_pct_points: 30.004, unused_pct_points: 0 }] },
   baselines: { hermes: [{ tokens: 42 }] },
   pricing: { currency: 'USD', as_of: '2026-08-04', valuation_mode: 'current_catalog' },
   warnings: ['No catalog price; assumed zero: other/unknown-model'],
@@ -93,7 +93,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#estimated-cost')).toHaveText('$11.25');
   await expect(page.locator('#allocation-total-cost')).toHaveText('$11.25');
   await expect(page.locator('#random-reset-count')).toHaveText('1');
-  await expect(page.locator('#random-reset-impact')).toContainText('Gain 72.4%');
+  await expect(page.locator('#random-reset-impact')).toContainText('Gain +30.004 pts');
   await expect(page.locator('#end-week-reset-count')).toHaveText('1');
   await expect(page.locator('#resets-body')).toContainText('Random');
   await expect(page.locator('#breakdown-body')).toContainText('gpt-5.6-sol');

@@ -66,13 +66,11 @@ def ideal_weekly_pace(connection: sqlite3.Connection, reset_at: int) -> float | 
     return round(100 * remaining / WEEKLY_WINDOW_SECONDS, 3)
 
 
-def random_reset_impact(connection: sqlite3.Connection, reset_at: int, after: Any) -> tuple[float | None, float | None, float | None]:
+def random_reset_impact(connection: sqlite3.Connection, reset_at: int, before: Any) -> tuple[float | None, float | None]:
     ideal = ideal_weekly_pace(connection, reset_at)
-    if not isinstance(after, (int, float)) or ideal is None:
-        return ideal, None, None
-    delta = round(float(after) - ideal, 3)
-    relative = round(100 * delta / ideal, 3) if ideal > 0 else None
-    return ideal, delta, relative
+    if not isinstance(before, (int, float)) or ideal is None:
+        return ideal, None
+    return ideal, round(ideal - float(before), 3)
 
 
 def period(connection: sqlite3.Connection, params: dict[str, str], now: int) -> tuple[int, int, str, int]:
@@ -248,33 +246,27 @@ def reset_history(connection: sqlite3.Connection, start: int, end: int, kind: st
         (start, end),
     ).fetchall()
     random_impacts = {
-        row["reset_at_epoch"]: random_reset_impact(connection, row["reset_at_epoch"], row["after_pct"])
+        row["reset_at_epoch"]: random_reset_impact(connection, row["reset_at_epoch"], row["before_pct"])
         for row in weekly_rows
         if row["detection_method"] == "random_observed"
     }
     random_summary = {
         "count": 0,
-        "gained_vs_ideal_pct": 0.0,
-        "lost_vs_ideal_pct": 0.0,
-        "net_vs_ideal_pct": 0.0,
         "gained_vs_ideal_pct_points": 0.0,
         "lost_vs_ideal_pct_points": 0.0,
         "net_vs_ideal_pct_points": 0.0,
     }
     end_of_week_summary = {"count": 0, "unused_pct_points": 0.0}
     for weekly_row in weekly_rows:
-        before, after = weekly_row["before_pct"], weekly_row["after_pct"]
+        before = weekly_row["before_pct"]
         if weekly_row["detection_method"] == "random_observed":
             random_summary["count"] += 1
-            _ideal, change, relative = random_impacts[weekly_row["reset_at_epoch"]]
+            _ideal, change = random_impacts[weekly_row["reset_at_epoch"]]
             if change is not None:
-                random_summary["net_vs_ideal_pct"] += relative or 0
                 random_summary["net_vs_ideal_pct_points"] += change
                 if change >= 0:
-                    random_summary["gained_vs_ideal_pct"] += relative or 0
                     random_summary["gained_vs_ideal_pct_points"] += change
                 else:
-                    random_summary["lost_vs_ideal_pct"] -= relative or 0
                     random_summary["lost_vs_ideal_pct_points"] -= change
         else:
             end_of_week_summary["count"] += 1
@@ -304,9 +296,8 @@ def reset_history(connection: sqlite3.Connection, start: int, end: int, kind: st
                 "before_pct": row["before_pct"],
                 "after_pct": row["after_pct"],
                 "detection_method": row["detection_method"],
-                "ideal_weekly_pace_pct": random_impacts.get(row["reset_at_epoch"], (None, None, None))[0],
-                "pace_delta_pct_points": random_impacts.get(row["reset_at_epoch"], (None, None, None))[1],
-                "pace_delta_vs_ideal_pct": random_impacts.get(row["reset_at_epoch"], (None, None, None))[2],
+                "ideal_weekly_pace_pct": random_impacts.get(row["reset_at_epoch"], (None, None))[0],
+                "pace_delta_pct_points": random_impacts.get(row["reset_at_epoch"], (None, None))[1],
                 "unused_pct_points": round(float(row["before_pct"]), 3)
                 if row["window"] == "weekly" and row["detection_method"] != "random_observed" and isinstance(row["before_pct"], (int, float)) and row["before_pct"] > 0
                 else 0,

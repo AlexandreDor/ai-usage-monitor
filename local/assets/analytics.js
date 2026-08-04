@@ -30,7 +30,11 @@ function formatTokens(value) { return compactNumber.format(safeNumber(value)); }
 function formatFullTokens(value) { return preciseNumber.format(safeNumber(value)); }
 function formatDate(value) { const date = new Date(value); return Number.isFinite(date.getTime()) ? dateTime.format(date) : '—'; }
 function formatCost(value) { return `$${safeNumber(value).toFixed(safeNumber(value) < 1 ? 4 : 2)}`; }
-function formatPoints(value) { return `${Math.round(safeNumber(value) * 10) / 10} pts`; }
+function formatSignedPoints(value) {
+  const number = Math.round(safeNumber(value) * 1000) / 1000;
+  return `${number >= 0 ? '+' : ''}${number} pts`;
+}
+function formatPoints(value) { return `${Math.round(safeNumber(value) * 1000) / 1000} pts`; }
 function formatPercent(value) { return `${Math.round(safeNumber(value) * 10) / 10}%`; }
 function totalBillable(summary) { return safeNumber(summary.input_tokens) + safeNumber(summary.cache_read_tokens) + safeNumber(summary.cache_write_tokens) + safeNumber(summary.output_tokens); }
 function formatDuration(seconds) {
@@ -138,7 +142,7 @@ function renderResets(data) {
     cell(row, formatDate(item.observed_at));
     cell(row, `${item.before_pct ?? '—'}% → ${item.after_pct ?? '—'}%`);
     const impact = item.category === 'random'
-      ? `${item.pace_delta_vs_ideal_pct >= 0 ? '+' : ''}${item.pace_delta_vs_ideal_pct ?? 0}% vs ideal pace`
+      ? `${formatSignedPoints(item.pace_delta_pct_points)} vs ideal pace`
       : item.category === 'end_of_week' && item.unused_pct_points > 0
         ? `${item.unused_pct_points}% unused expired`
         : '—';
@@ -222,7 +226,7 @@ function render(payload) {
   const random = weeklySummary.random || {};
   const endOfWeek = weeklySummary.end_of_week || {};
   byId('random-reset-count').textContent = formatFullTokens(random.count);
-  byId('random-reset-impact').textContent = `Gain ${formatPercent(random.gained_vs_ideal_pct)} · loss ${formatPercent(random.lost_vs_ideal_pct)} vs ideal pace`;
+  byId('random-reset-impact').textContent = `Gain ${formatSignedPoints(random.gained_vs_ideal_pct_points)} · loss ${formatPoints(random.lost_vs_ideal_pct_points)} vs ideal pace`;
   byId('end-week-reset-count').textContent = formatFullTokens(endOfWeek.count);
   byId('end-week-reset-impact').textContent = `${formatPercent(endOfWeek.unused_pct_points)} of unused quota expired`;
   byId('period-label').textContent = `${shortDate.format(new Date(payload.period.from))} – ${shortDate.format(new Date(payload.period.to))}`;
