@@ -50,4 +50,10 @@ for path in /monitor.sh /runtime/.alert_state /runtime/usage-history.sqlite3 '/%
   assert_eq 404 "$code" "non-allowlisted path exposed: $path"
 done
 
+analytics_code="$(curl --silent --output "${TEST_ROOT}/analytics-error" --write-out '%{http_code}' "http://127.0.0.1:${port}/api/analytics?range=24h")"
+assert_eq 200 "$analytics_code" "analytics API response"
+assert_eq 1 "$(json_field "${TEST_ROOT}/analytics-error" schema_version)" "analytics schema version"
+bad_query_code="$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:${port}/api/analytics?range=bad")"
+assert_eq 400 "$bad_query_code" "invalid analytics query response"
+
 printf 'PASS: local HTTP server tests\n'

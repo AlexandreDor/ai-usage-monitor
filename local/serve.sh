@@ -105,7 +105,10 @@ import socket
 import socketserver
 import sys
 import threading
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
+
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]).resolve()))
+from analytics import AnalyticsError, build_payload
 
 root = pathlib.Path(sys.argv[1]).resolve()
 port = int(sys.argv[2])
@@ -124,6 +127,46 @@ public_files = {
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     server_version = "CodexDashboard"
     sys_version = ""
+
+    def send_json(self, status, value, *, include_body=True):
+        import json
+
+        body = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if include_body:
+            self.wfile.write(body)
+
+    def serve_analytics(self, *, include_body=True):
+        split = urlsplit(self.path)
+        try:
+            raw = parse_qs(split.query, keep_blank_values=True, max_num_fields=20)
+            if any(len(values) != 1 for values in raw.values()):
+                raise AnalyticsError("query parameters must not be repeated")
+            allowed = {"range", "from_date", "to_date", "source", "model", "reset_type", "reset_offset", "reset_limit"}
+            if set(raw) - allowed:
+                raise AnalyticsError("unknown query parameter")
+            params = {key: values[0] for key, values in raw.items()}
+            payload = build_payload(root / "runtime" / "usage-history.sqlite3", root / "pricing.json", params)
+        except (AnalyticsError, ValueError) as error:
+            status = 503 if "not available" in str(error) or "cannot be read" in str(error) else 400
+            self.send_json(status, {"error": str(error)}, include_body=include_body)
+            return
+        self.send_json(200, payload, include_body=include_body)
+
+    def do_GET(self):
+        if unquote(urlsplit(self.path).path) == "/api/analytics":
+            self.serve_analytics()
+            return
+        super().do_GET()
+
+    def do_HEAD(self):
+        if unquote(urlsplit(self.path).path) == "/api/analytics":
+            self.serve_analytics(include_body=False)
+            return
+        super().do_HEAD()
 
     def send_head(self):
         request_path = unquote(urlsplit(self.path).path)
