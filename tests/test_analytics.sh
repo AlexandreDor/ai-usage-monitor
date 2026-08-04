@@ -24,6 +24,10 @@ with connection:
         ("5h", 1785862800, 1785863700, 5, 100, "scheduled_crossing"),
     )
     connection.execute(
+        "INSERT INTO reset_events VALUES (?, ?, ?, ?, ?, ?)",
+        ("weekly", 1785864600, 1785865500, 35, 100, "scheduled_crossing"),
+    )
+    connection.execute(
         """INSERT INTO token_usage_events
            (occurred_at_epoch, source, provider, model, input_tokens, cache_read_tokens,
             cache_write_tokens, output_tokens, reasoning_tokens, external_id)
@@ -81,7 +85,8 @@ assert_eq 100 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens
 assert_eq priced "$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(item["pricing_status"] for item in data["tokens"]["breakdown"] if item["provider"] == "openai-codex"))' <<<"$payload")" "openai-codex GPT-5.6 Sol pricing"
 assert_eq priced "$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(item["pricing_status"] for item in data["tokens"]["breakdown"] if item["provider"] == "auto"))' <<<"$payload")" "auto GPT-5.6 Sol pricing"
 assert_eq 4 "$(python3 -c 'import json,sys; data=json.load(sys.stdin); configured={("ollama","gemma4:26b-a4b-it-q8_0"),("ollama","ornith:35b-q8_0"),("openai","unknown"),("opencode","nemotron-3-ultra-free")}; print(sum((item["provider"],item["model"]) in configured and item["pricing_status"] == "priced" for item in data["tokens"]["breakdown"]))' <<<"$payload")" "configured zero-price models"
-assert_eq 1 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["total"])' <<<"$payload")" "reset count"
+assert_eq 2 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["total"])' <<<"$payload")" "reset count"
+assert_eq 1 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["weekly_total"])' <<<"$payload")" "weekly reset count"
 assert_eq 42 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["baselines"]["hermes"][0]["tokens"])' <<<"$payload")" "Hermes baseline"
 
 filtered="$(python3 "$ROOT_DIR/local/analytics.py" \
@@ -90,7 +95,8 @@ filtered="$(python3 "$ROOT_DIR/local/analytics.py" \
   --params '{"range":"24h","source":"codex","model":"gpt-5.6-sol","reset_type":"weekly"}' \
   --now 1785866400)"
 assert_eq 1 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["summary"]["events"])' <<<"$filtered")" "source/model filter"
-assert_eq 0 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["total"])' <<<"$filtered")" "reset type filter"
+assert_eq 1 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["total"])' <<<"$filtered")" "reset type filter"
+assert_eq 1 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["weekly_total"])' <<<"$filtered")" "weekly reset metric ignores history filter"
 
 python3 "$ROOT_DIR/local/analytics.py" --database "$database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"range":"invalid"}' >/dev/null 2>&1 && fail "invalid range accepted"
 python3 "$ROOT_DIR/local/analytics.py" --database "$database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"from_date":"2026-08-04"}' >/dev/null 2>&1 && fail "unpaired custom date accepted"

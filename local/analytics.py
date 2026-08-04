@@ -197,12 +197,21 @@ def reset_history(connection: sqlite3.Connection, start: int, end: int, kind: st
         values.append(kind)
     where = " AND ".join(clauses)
     total = int(scalar(connection, f"SELECT COUNT(*) FROM reset_events WHERE {where}", values) or 0)
+    weekly_total = int(
+        scalar(
+            connection,
+            "SELECT COUNT(*) FROM reset_events WHERE reset_at_epoch >= ? AND reset_at_epoch < ? AND window = 'weekly'",
+            (start, end),
+        )
+        or 0
+    )
     rows = connection.execute(
         f"SELECT * FROM reset_events WHERE {where} ORDER BY reset_at_epoch DESC LIMIT ? OFFSET ?",
         [*values, limit, offset],
     ).fetchall()
     return {
         "total": total,
+        "weekly_total": weekly_total,
         "offset": offset,
         "limit": limit,
         "items": [

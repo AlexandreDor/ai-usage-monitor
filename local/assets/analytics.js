@@ -173,7 +173,7 @@ function render(payload) {
   byId('estimated-cost').textContent = formatCost(summary.estimated_cost_usd);
   byId('allocation-total-cost').textContent = formatCost(summary.estimated_cost_usd);
   byId('pricing-note').textContent = `Catalog ${payload.pricing.as_of} · ${payload.pricing.currency}`;
-  byId('reset-count').textContent = formatFullTokens(payload.resets.total);
+  byId('reset-count').textContent = formatFullTokens(payload.resets.weekly_total);
   byId('period-label').textContent = `${shortDate.format(new Date(payload.period.from))} – ${shortDate.format(new Date(payload.period.to))}`;
   byId('granularity-label').textContent = `Buckets of ${formatDuration(payload.period.granularity_seconds)}`;
   renderLimits(payload.limits);

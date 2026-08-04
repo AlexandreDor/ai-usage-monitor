@@ -71,7 +71,7 @@ const analyticsPayload = {
     series: [{ at: '2026-08-04T00:00:00Z', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 0, output_tokens: 200000, reasoning_tokens: 50000 }],
     breakdown: [{ source: 'codex', provider: 'openai', model: 'gpt-5.6-sol', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 0, output_tokens: 200000, estimated_cost_usd: 11.25, pricing_status: 'priced' }],
   },
-  resets: { total: 1, offset: 0, limit: 10, items: [{ window: '5h', reset_at: '2026-08-04T08:00:00Z', observed_at: '2026-08-04T08:15:00Z', observation_delay_seconds: 900, before_pct: 4, after_pct: 100 }] },
+  resets: { total: 1, weekly_total: 0, offset: 0, limit: 10, items: [{ window: '5h', reset_at: '2026-08-04T08:00:00Z', observed_at: '2026-08-04T08:15:00Z', observation_delay_seconds: 900, before_pct: 4, after_pct: 100 }] },
   baselines: { hermes: [{ tokens: 42 }] },
   pricing: { currency: 'USD', as_of: '2026-08-04', valuation_mode: 'current_catalog' },
   warnings: ['No catalog price; assumed zero: other/unknown-model'],
@@ -88,7 +88,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#total-tokens')).toHaveText('1.7M');
   await expect(page.locator('#estimated-cost')).toHaveText('$11.25');
   await expect(page.locator('#allocation-total-cost')).toHaveText('$11.25');
-  await expect(page.locator('#reset-count')).toHaveText('1');
+  await expect(page.locator('#reset-count')).toHaveText('0');
   await expect(page.locator('#breakdown-body')).toContainText('gpt-5.6-sol');
   await expect(page.locator('#analytics-warnings')).toContainText('assumed zero');
   expect(externalRequests).toEqual([]);
