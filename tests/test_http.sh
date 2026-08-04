@@ -34,7 +34,7 @@ kill -0 "$server_pid" 2>/dev/null || fail "HTTP server did not start"
 assert_contains "$(<"${TEST_ROOT}/server.log")" "127.0.0.1:${port}" "default bind was not localhost"
 assert_contains "$(<"${TEST_ROOT}/dashboard")" 'Codex Limits' "dashboard asset content"
 
-for path in / /assets/dashboard.js /assets/dashboard.css /assets/chart.umd.min.js /images/favicon.png; do
+for path in / /analytics.html /assets/dashboard.js /assets/dashboard.css /assets/analytics.js /assets/analytics.css /assets/chart.umd.min.js /images/favicon.png; do
   code="$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:${port}${path}")"
   assert_eq 200 "$code" "allowlisted asset $path"
 done

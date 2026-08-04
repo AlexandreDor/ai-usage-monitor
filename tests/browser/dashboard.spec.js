@@ -58,3 +58,40 @@ test('clears a previous chart when history becomes empty', async ({ page }) => {
   await expect(page.locator('#history-error')).toContainText('History is empty');
   await expect(page.locator('#history-label')).toHaveText('History unavailable');
 });
+
+const analyticsPayload = {
+  schema_version: 1,
+  period: { range: '30d', from: '2026-07-05T10:00:00Z', to: '2026-08-04T10:00:00Z', timezone: 'Europe/Paris', granularity_seconds: 86400 },
+  filters: { source: 'all', model: null, reset_type: 'all' },
+  available: { sources: ['codex', 'opencode'], models: ['gpt-5.6-sol', 'unknown-model'] },
+  freshness: { limits_last_sample_at: '2026-08-04T09:45:00Z', collectors: { codex: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, opencode: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, hermes: { status: 'disabled', last_success_at: null } } },
+  limits: { samples: 2, series: [{ at: '2026-08-03T00:00:00Z', five_h_pct: 80, weekly_pct: 60 }, { at: '2026-08-04T00:00:00Z', five_h_pct: 55, weekly_pct: 52 }] },
+  tokens: {
+    summary: { input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 0, output_tokens: 200000, reasoning_tokens: 50000, events: 2, estimated_cost_usd: 11.25, assumed_zero_tokens: 100 },
+    series: [{ at: '2026-08-04T00:00:00Z', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 0, output_tokens: 200000, reasoning_tokens: 50000 }],
+    breakdown: [{ source: 'codex', provider: 'openai', model: 'gpt-5.6-sol', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 0, output_tokens: 200000, estimated_cost_usd: 11.25, pricing_status: 'priced' }],
+  },
+  resets: { total: 1, offset: 0, limit: 10, items: [{ window: '5h', reset_at: '2026-08-04T08:00:00Z', observed_at: '2026-08-04T08:15:00Z', observation_delay_seconds: 900, before_pct: 4, after_pct: 100 }] },
+  baselines: { hermes: [{ tokens: 42 }] },
+  pricing: { currency: 'USD', as_of: '2026-08-04', valuation_mode: 'current_catalog' },
+  warnings: ['No catalog price; assumed zero: other/unknown-model'],
+};
+
+test('renders advanced analytics and remains local', async ({ page }) => {
+  const externalRequests = [];
+  page.on('request', request => {
+    if (new URL(request.url()).hostname !== '127.0.0.1') externalRequests.push(request.url());
+  });
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: analyticsPayload }));
+  await page.goto('/analytics.html');
+
+  await expect(page.locator('#total-tokens')).toHaveText('1.7M');
+  await expect(page.locator('#estimated-cost')).toHaveText('$11.25');
+  await expect(page.locator('#reset-count')).toHaveText('1');
+  await expect(page.locator('#breakdown-body')).toContainText('gpt-5.6-sol');
+  await expect(page.locator('#analytics-warnings')).toContainText('assumed zero');
+  expect(externalRequests).toEqual([]);
+
+  const results = await new AxeBuilder({ page }).analyze();
+  expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+});

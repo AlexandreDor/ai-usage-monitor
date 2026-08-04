@@ -115,8 +115,11 @@ port = int(sys.argv[2])
 bind_address = sys.argv[3]
 public_files = {
     "/dashboard.html": "/dashboard.html",
+    "/analytics.html": "/analytics.html",
     "/assets/dashboard.css": "/assets/dashboard.css",
     "/assets/dashboard.js": "/assets/dashboard.js",
+    "/assets/analytics.css": "/assets/analytics.css",
+    "/assets/analytics.js": "/assets/analytics.js",
     "/assets/chart.umd.min.js": "/assets/chart.umd.min.js",
     "/images/favicon.png": "/images/favicon.png",
     "/data.json": "/runtime/data.json",

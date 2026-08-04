@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Advanced Analytics · Codex Usage Monitor</title>
+  <meta name="description" content="Long-term limits, reset history, local token usage and API-equivalent cost estimates">
+  <link rel="icon" type="image/png" sizes="128x128" href="images/favicon.png">
+  <link rel="stylesheet" href="assets/dashboard.css">
+  <link rel="stylesheet" href="assets/analytics.css">
+  <script src="assets/chart.umd.min.js" defer></script>
+  <script src="assets/analytics.js" defer></script>
+</head>
+<body class="analytics-page">
+  <header class="analytics-header">
+    <a class="back-link" href="dashboard.html"><span aria-hidden="true">←</span> Live limits</a>
+    <div class="eyebrow">Local intelligence</div>
+    <h1>Advanced Analytics</h1>
+    <p>Long-range limits, token consumption and API-equivalent cost—kept on this machine.</p>
+  </header>
+
+  <main class="analytics-shell">
+    <section class="filter-panel" aria-label="Analytics filters">
+      <div class="range-group" id="range-group" aria-label="Date range">
+        <button type="button" data-range="24h">24h</button>
+        <button type="button" data-range="7d">7d</button>
+        <button type="button" data-range="30d" class="active">30d</button>
+        <button type="button" data-range="90d">90d</button>
+        <button type="button" data-range="1y">1y</button>
+        <button type="button" data-range="all">All</button>
+        <button type="button" data-range="custom">Custom</button>
+      </div>
+      <div class="filter-fields">
+        <label>Application
+          <select id="source-filter">
+            <option value="all">All applications</option>
+            <option value="codex">Codex</option>
+            <option value="opencode">OpenCode</option>
+            <option value="hermes">Hermes</option>
+          </select>
+        </label>
+        <label>Model
+          <select id="model-filter"><option value="">All models</option></select>
+        </label>
+        <div class="custom-dates" id="custom-dates" hidden>
+          <label>From <input id="from-date" type="date"></label>
+          <label>To <input id="to-date" type="date"></label>
+          <button type="button" id="apply-dates">Apply</button>
+        </div>
+      </div>
+    </section>
+
+    <div id="analytics-error" class="analytics-message error-message" role="alert" hidden></div>
+    <div id="analytics-warnings" class="analytics-message warning-message" role="status" hidden></div>
+
+    <section class="metric-grid" aria-label="Period summary">
+      <article class="metric-card">
+        <span class="metric-label">Billable tokens</span>
+        <strong id="total-tokens">—</strong>
+        <small id="token-detail">Input, cache and output</small>
+      </article>
+      <article class="metric-card cost-card">
+        <span class="metric-label">API-equivalent cost</span>
+        <strong id="estimated-cost">—</strong>
+        <small id="pricing-note">Current catalog · USD</small>
+      </article>
+      <article class="metric-card">
+        <span class="metric-label">Resets observed</span>
+        <strong id="reset-count">—</strong>
+        <small>5-hour and weekly windows</small>
+      </article>
+      <article class="metric-card">
+        <span class="metric-label">Selected period</span>
+        <strong class="period-value" id="period-label">—</strong>
+        <small id="granularity-label">—</small>
+      </article>
+    </section>
+
+    <section class="analytics-grid">
+      <article class="card analytics-card wide">
+        <div class="section-heading">
+          <div><span class="section-kicker">Codex limits</span><h2>Long-term availability</h2></div>
+          <span class="sample-count" id="limit-samples">—</span>
+        </div>
+        <div class="chart-wrap" id="limits-chart-wrap"><canvas id="limits-chart"></canvas></div>
+        <p class="empty-state" id="limits-empty" hidden>No limit samples in this period.</p>
+      </article>
+
+      <article class="card analytics-card wide">
+        <div class="section-heading">
+          <div><span class="section-kicker">Local consumption</span><h2>Tokens over time</h2></div>
+          <span class="sample-count" id="event-count">—</span>
+        </div>
+        <div class="chart-wrap" id="tokens-chart-wrap"><canvas id="tokens-chart"></canvas></div>
+        <p class="empty-state" id="tokens-empty" hidden>No token events in this period.</p>
+      </article>
+
+      <article class="card analytics-card wide table-card">
+        <div class="section-heading">
+          <div><span class="section-kicker">Cost allocation</span><h2>By application and model</h2></div>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Application</th><th>Provider / model</th><th>Input</th><th>Cache</th><th>Output</th><th>Est. cost</th></tr></thead>
+            <tbody id="breakdown-body"></tbody>
+          </table>
+        </div>
+        <p class="empty-state" id="breakdown-empty" hidden>No model consumption to display.</p>
+      </article>
+
+      <article class="card analytics-card wide table-card">
+        <div class="section-heading reset-heading">
+          <div><span class="section-kicker">Reset history</span><h2>Previous limit resets</h2></div>
+          <label class="compact-filter">Window
+            <select id="reset-filter"><option value="all">All</option><option value="5h">5-hour</option><option value="weekly">Weekly</option></select>
+          </label>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Window</th><th>Scheduled reset</th><th>First observation</th><th>Before → after</th><th>Delay</th></tr></thead>
+            <tbody id="resets-body"></tbody>
+          </table>
+        </div>
+        <p class="empty-state" id="resets-empty" hidden>No reset observed in this period.</p>
+        <div class="pagination" id="reset-pagination" hidden>
+          <button type="button" id="resets-previous">Previous</button>
+          <span id="reset-page-label"></span>
+          <button type="button" id="resets-next">Next</button>
+        </div>
+      </article>
+
+      <article class="card analytics-card wide">
+        <div class="section-heading"><div><span class="section-kicker">Data health</span><h2>Collectors</h2></div></div>
+        <div class="collector-grid" id="collector-grid"></div>
+        <p class="baseline-note" id="baseline-note" hidden></p>
+      </article>
+    </section>
+  </main>
+
+  <footer class="analytics-footer">Costs are estimates based on the current local pricing catalog. Request, tool and contract charges are excluded.</footer>
+</body>
+</html>
