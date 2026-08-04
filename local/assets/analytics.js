@@ -30,6 +30,8 @@ function formatTokens(value) { return compactNumber.format(safeNumber(value)); }
 function formatFullTokens(value) { return preciseNumber.format(safeNumber(value)); }
 function formatDate(value) { const date = new Date(value); return Number.isFinite(date.getTime()) ? dateTime.format(date) : '—'; }
 function formatCost(value) { return `$${safeNumber(value).toFixed(safeNumber(value) < 1 ? 4 : 2)}`; }
+function formatPoints(value) { return `${Math.round(safeNumber(value) * 10) / 10} pts`; }
+function formatPercent(value) { return `${Math.round(safeNumber(value) * 10) / 10}%`; }
 function totalBillable(summary) { return safeNumber(summary.input_tokens) + safeNumber(summary.cache_read_tokens) + safeNumber(summary.cache_write_tokens) + safeNumber(summary.output_tokens); }
 function formatDuration(seconds) {
   const value = safeNumber(seconds);
@@ -131,9 +133,16 @@ function renderResets(data) {
   for (const item of data.items) {
     const row = document.createElement('tr');
     cell(row, item.window, 'source-pill');
+    cell(row, item.category === 'random' ? 'Random' : item.category === 'end_of_week' ? 'End of week' : 'Scheduled', 'source-pill');
     cell(row, formatDate(item.reset_at));
     cell(row, formatDate(item.observed_at));
     cell(row, `${item.before_pct ?? '—'}% → ${item.after_pct ?? '—'}%`);
+    const impact = item.category === 'random'
+      ? `${item.adjustment_pct_points >= 0 ? '+' : ''}${item.adjustment_pct_points ?? 0} pts vs baseline`
+      : item.category === 'end_of_week' && item.unused_pct_points > 0
+        ? `${item.unused_pct_points}% unused expired`
+        : '—';
+    cell(row, impact);
     cell(row, formatDuration(item.observation_delay_seconds));
     body.appendChild(row);
   }
@@ -209,7 +218,13 @@ function render(payload) {
   byId('estimated-cost').textContent = formatCost(summary.estimated_cost_usd);
   byId('allocation-total-cost').textContent = formatCost(summary.estimated_cost_usd);
   byId('pricing-note').textContent = `Catalog ${payload.pricing.as_of} · ${payload.pricing.currency}`;
-  byId('reset-count').textContent = formatFullTokens(payload.resets.weekly_total);
+  const weeklySummary = payload.resets.weekly_summary || { random: {}, end_of_week: {} };
+  const random = weeklySummary.random || {};
+  const endOfWeek = weeklySummary.end_of_week || {};
+  byId('random-reset-count').textContent = formatFullTokens(random.count);
+  byId('random-reset-impact').textContent = `Gain ${formatPoints(random.gained_pct_points)} · loss ${formatPoints(random.lost_pct_points)} vs baseline`;
+  byId('end-week-reset-count').textContent = formatFullTokens(endOfWeek.count);
+  byId('end-week-reset-impact').textContent = `${formatPercent(endOfWeek.unused_pct_points)} of unused quota expired`;
   byId('period-label').textContent = `${shortDate.format(new Date(payload.period.from))} – ${shortDate.format(new Date(payload.period.to))}`;
   byId('granularity-label').textContent = `Buckets of ${formatDuration(payload.period.granularity_seconds)}`;
   renderLimits(payload.limits);

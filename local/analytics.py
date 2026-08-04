@@ -211,32 +211,59 @@ def reset_history(connection: sqlite3.Connection, start: int, end: int, kind: st
         values.append(kind)
     where = " AND ".join(clauses)
     total = int(scalar(connection, f"SELECT COUNT(*) FROM reset_events WHERE {where}", values) or 0)
-    weekly_total = int(
-        scalar(
-            connection,
-            "SELECT COUNT(*) FROM reset_events WHERE reset_at_epoch >= ? AND reset_at_epoch < ? AND window = 'weekly'",
-            (start, end),
-        )
-        or 0
-    )
+    weekly_rows = connection.execute(
+        """SELECT before_pct, after_pct, detection_method
+             FROM reset_events
+            WHERE reset_at_epoch >= ? AND reset_at_epoch < ? AND window = 'weekly'""",
+        (start, end),
+    ).fetchall()
+    random_summary = {"count": 0, "gained_pct_points": 0.0, "lost_pct_points": 0.0, "net_pct_points": 0.0}
+    end_of_week_summary = {"count": 0, "unused_pct_points": 0.0}
+    for weekly_row in weekly_rows:
+        before, after = weekly_row["before_pct"], weekly_row["after_pct"]
+        if weekly_row["detection_method"] == "random_observed":
+            random_summary["count"] += 1
+            if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+                change = float(after) - float(before)
+                random_summary["net_pct_points"] += change
+                if change >= 0:
+                    random_summary["gained_pct_points"] += change
+                else:
+                    random_summary["lost_pct_points"] -= change
+        else:
+            end_of_week_summary["count"] += 1
+            if isinstance(before, (int, float)) and before > 0:
+                end_of_week_summary["unused_pct_points"] += float(before)
+    for summary in (random_summary, end_of_week_summary):
+        for key, value in tuple(summary.items()):
+            if isinstance(value, float):
+                summary[key] = round(value, 3)
     rows = connection.execute(
         f"SELECT * FROM reset_events WHERE {where} ORDER BY reset_at_epoch DESC LIMIT ? OFFSET ?",
         [*values, limit, offset],
     ).fetchall()
     return {
         "total": total,
-        "weekly_total": weekly_total,
+        "weekly_total": len(weekly_rows),
+        "weekly_summary": {"random": random_summary, "end_of_week": end_of_week_summary},
         "offset": offset,
         "limit": limit,
         "items": [
             {
                 "window": row["window"],
+                "category": "random" if row["detection_method"] == "random_observed" else "end_of_week" if row["window"] == "weekly" else "scheduled",
                 "reset_at": iso_utc(row["reset_at_epoch"]),
                 "observed_at": iso_utc(row["observed_at_epoch"]),
                 "observation_delay_seconds": max(0, row["observed_at_epoch"] - row["reset_at_epoch"]),
                 "before_pct": row["before_pct"],
                 "after_pct": row["after_pct"],
                 "detection_method": row["detection_method"],
+                "adjustment_pct_points": round(float(row["after_pct"]) - float(row["before_pct"]), 3)
+                if row["detection_method"] == "random_observed" and isinstance(row["before_pct"], (int, float)) and isinstance(row["after_pct"], (int, float))
+                else None,
+                "unused_pct_points": round(float(row["before_pct"]), 3)
+                if row["window"] == "weekly" and row["detection_method"] != "random_observed" and isinstance(row["before_pct"], (int, float)) and row["before_pct"] > 0
+                else 0,
             }
             for row in rows
         ],

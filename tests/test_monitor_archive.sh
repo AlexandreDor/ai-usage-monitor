@@ -162,6 +162,31 @@ with sqlite3.connect(sys.argv[1]) as connection:
 PYEOF
 )" "reset event reconstruction created duplicates"
 
+# An early weekly refill with a materially advanced deadline is classified as
+# a random reset rather than a scheduled end-of-week reset.
+rm -f "$ARCHIVE_FILE"
+random_before=$((BASE - 900))
+random_previous_deadline=$((BASE + 4 * 86400))
+random_current_deadline=$((random_previous_deadline + 3 * 86400))
+printf '{"weekly_pct":28,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+  "$random_previous_deadline" "$(iso_at "$random_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+  "$random_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '1' "$(python3 - "$ARCHIVE_FILE" "$BASE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    row = connection.execute(
+        "SELECT detection_method, before_pct, after_pct FROM reset_events WHERE reset_at_epoch = ?",
+        (int(sys.argv[2]),),
+    ).fetchone()
+assert row == ("random_observed", 28.0, 100.0), row
+print(1)
+PYEOF
+)" "random weekly reset was not derived"
+
 mode="$(stat -c '%a' "$ARCHIVE_FILE")"
 assert_eq 600 "$mode" "archive permissions are not private"
 

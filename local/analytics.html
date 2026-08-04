@@ -70,9 +70,14 @@
         <small id="pricing-note">Current catalog · USD</small>
       </article>
       <article class="metric-card">
-        <span class="metric-label">Weekly resets observed</span>
-        <strong id="reset-count">—</strong>
-        <small>Weekly window only</small>
+        <span class="metric-label">Random weekly resets</span>
+        <strong id="random-reset-count">—</strong>
+        <small id="random-reset-impact">Gain/loss versus pre-reset baseline</small>
+      </article>
+      <article class="metric-card">
+        <span class="metric-label">End-of-week resets</span>
+        <strong id="end-week-reset-count">—</strong>
+        <small id="end-week-reset-impact">Unused quota lost at reset</small>
       </article>
       <article class="metric-card">
         <span class="metric-label">Selected period</span>
@@ -123,7 +128,7 @@
         </div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Window</th><th>Scheduled reset</th><th>First observation</th><th>Before → after</th><th>Delay</th></tr></thead>
+            <thead><tr><th>Window</th><th>Category</th><th>Scheduled reset</th><th>First observation</th><th>Before → after</th><th>Impact</th><th>Delay</th></tr></thead>
             <tbody id="resets-body"></tbody>
           </table>
         </div>

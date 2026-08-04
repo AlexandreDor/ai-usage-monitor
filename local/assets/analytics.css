@@ -175,7 +175,7 @@ input { display: block; min-height: 36px; margin-top: 4px; padding: 7px 10px; }
 
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 12px;
   margin-bottom: 18px;
 }
