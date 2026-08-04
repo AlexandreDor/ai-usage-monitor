@@ -14,17 +14,18 @@ import sys
 import time
 from typing import Any
 
+from storage import (
+    ArchiveCorruptionError,
+    SCHEMA_VERSION,
+    connect_database,
+    is_corruption_error,
+)
 
-SCHEMA_VERSION = "1"
 RECENT_SECONDS = 24 * 60 * 60
 MEDIUM_SECONDS = 7 * 24 * 60 * 60
 MEDIUM_BUCKET_SECONDS = 30 * 60
 OLD_BUCKET_SECONDS = 60 * 60
 MAX_RETENTION_DAYS = 36500
-
-
-class ArchiveCorruptionError(RuntimeError):
-    """The SQLite file cannot be safely read."""
 
 
 class ArchiveInputError(ValueError):
@@ -37,20 +38,6 @@ def warn(message: str) -> None:
 
 def error(message: str) -> None:
     print(f"[ERROR] {message}", file=sys.stderr)
-
-
-def is_corruption_error(exc: sqlite3.DatabaseError) -> bool:
-    message = str(exc).lower()
-    return any(
-        marker in message
-        for marker in (
-            "not a database",
-            "malformed",
-            "unsupported file format",
-            "file is encrypted",
-            "database disk image is malformed",
-        )
-    )
 
 
 def finite_number(value: Any) -> bool:
@@ -154,68 +141,6 @@ def row_values(snapshot: dict[str, Any]) -> tuple[Any, ...]:
     ))
 
 
-def create_schema(connection: sqlite3.Connection) -> None:
-    connection.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS snapshots (
-            scraped_at_epoch INTEGER PRIMARY KEY,
-            scraped_at TEXT NOT NULL,
-            five_h_pct REAL,
-            five_h_reset TEXT,
-            five_h_reset_at INTEGER,
-            weekly_pct REAL,
-            weekly_reset TEXT,
-            weekly_reset_at INTEGER,
-            sample_interval_seconds INTEGER,
-            history_window_hours REAL,
-            limit_id TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_snapshots_scraped_at
-            ON snapshots(scraped_at_epoch);
-        """
-    )
-    connection.execute("PRAGMA user_version = 1")
-
-
-def check_integrity(connection: sqlite3.Connection) -> None:
-    try:
-        result = connection.execute("PRAGMA quick_check").fetchone()
-    except sqlite3.DatabaseError as exc:
-        if is_corruption_error(exc):
-            raise ArchiveCorruptionError(str(exc)) from exc
-        raise
-    if not result or result[0] != "ok":
-        detail = result[0] if result else "no integrity result"
-        raise ArchiveCorruptionError(str(detail))
-
-
-def connect_database(database_path: Path) -> sqlite3.Connection:
-    if database_path.is_symlink():
-        raise OSError(f"archive database must not be a symbolic link: {database_path}")
-    existed = database_path.exists()
-    connection: sqlite3.Connection | None = None
-    try:
-        connection = sqlite3.connect(str(database_path), timeout=10)
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.execute("PRAGMA foreign_keys = ON")
-        if existed:
-            check_integrity(connection)
-        create_schema(connection)
-        return connection
-    except sqlite3.DatabaseError as exc:
-        if connection is not None:
-            connection.close()
-        if existed and is_corruption_error(exc):
-            raise ArchiveCorruptionError(str(exc)) from exc
-        raise
-
-
 def read_history(history_path: Path) -> list[dict[str, Any]]:
     if not history_path.exists():
         return []
@@ -301,6 +226,41 @@ def compact(connection: sqlite3.Connection, retention_days: int) -> None:
         connection.execute("DELETE FROM snapshots WHERE scraped_at_epoch < ?", (cutoff,))
 
 
+def rebuild_reset_events(connection: sqlite3.Connection) -> None:
+    """Derive observed reset crossings from the retained limit snapshots."""
+    rows = connection.execute(
+        """
+        SELECT scraped_at_epoch, five_h_pct, five_h_reset_at,
+               weekly_pct, weekly_reset_at
+        FROM snapshots
+        ORDER BY scraped_at_epoch
+        """
+    ).fetchall()
+    connection.execute("DELETE FROM reset_events")
+    windows = (("5h", 1, 2), ("weekly", 3, 4))
+    for previous, current in zip(rows, rows[1:]):
+        for window, pct_index, reset_index in windows:
+            reset_at = previous[reset_index]
+            if not isinstance(reset_at, int) or reset_at <= 0:
+                continue
+            if previous[0] < reset_at <= current[0]:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO reset_events (
+                        window, reset_at_epoch, observed_at_epoch,
+                        before_pct, after_pct, detection_method
+                    ) VALUES (?, ?, ?, ?, ?, 'scheduled_crossing')
+                    """,
+                    (
+                        window,
+                        reset_at,
+                        current[0],
+                        previous[pct_index],
+                        current[pct_index],
+                    ),
+                )
+
+
 def ingest(
     database_path: Path,
     history_path: Path,
@@ -333,6 +293,7 @@ def ingest(
             )
             insert_snapshot(connection, snapshot)
             compact(connection, retention_days)
+            rebuild_reset_events(connection)
     finally:
         connection.close()
     os.chmod(database_path, 0o600)

@@ -68,6 +68,13 @@ with sqlite3.connect(sys.argv[1]) as connection:
     print(int(connection.execute("SELECT value FROM metadata WHERE key = 'history_json_migrated'").fetchone()[0] == "1"))
 PYEOF
 )" "migration marker missing"
+assert_eq 2 "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("PRAGMA user_version").fetchone()[0])
+PYEOF
+)" "archive schema was not migrated to v2"
 
 # Rebuild a clean archive for compaction checks.
 rm -f "$ARCHIVE_FILE"
@@ -123,6 +130,37 @@ printf 'not a sqlite database\n' > "$ARCHIVE_FILE"
 archive_at "$BASE"
 compgen -G "${ARCHIVE_FILE}.corrupt.*" >/dev/null || fail "corrupt archive backup missing"
 assert_eq yes "$(has_epoch "$BASE")" "archive was not rebuilt after corruption"
+
+# Reset events are deterministically derived from retained adjacent snapshots.
+rm -f "$ARCHIVE_FILE"
+printf '[]\n' > "$HISTORY_FILE"
+before=$((BASE - 100))
+reset_at=$((BASE - 50))
+printf '{"five_h_pct":5,"weekly_pct":7,"five_h_reset_at":%s,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+  "$reset_at" "$reset_at" "$(iso_at "$before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+snapshot_at "$BASE" 100 100 | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '2' "$(python3 - "$ARCHIVE_FILE" "$reset_at" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    rows = connection.execute(
+        "SELECT window, before_pct, after_pct FROM reset_events "
+        "WHERE reset_at_epoch = ? ORDER BY window", (int(sys.argv[2]),)
+    ).fetchall()
+assert rows == [("5h", 5.0, 100.0), ("weekly", 7.0, 100.0)], rows
+print(len(rows))
+PYEOF
+)" "reset events were not derived from the crossing"
+archive_at "$BASE"
+assert_eq '2' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("SELECT COUNT(*) FROM reset_events").fetchone()[0])
+PYEOF
+)" "reset event reconstruction created duplicates"
 
 mode="$(stat -c '%a' "$ARCHIVE_FILE")"
 assert_eq 600 "$mode" "archive permissions are not private"
