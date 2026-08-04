@@ -24,12 +24,13 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
    - [Option E: LXC Container](#option-e-lxc-container)
    - [Option F: systemd service](#option-f-systemd-service-linux)
    - [Option G: cron](#option-g-cron)
-6. [Notifications (Discord & Telegram)](#notifications-discord--telegram)
-7. [External Dashboard (Optional)](#external-dashboard-optional-github-gist--pages)
-8. [Configuration Reference](#configuration-reference)
-9. [Troubleshooting](#troubleshooting)
-10. [Contributing](#contributing)
-11. [License](#license)
+6. [Advanced Analytics](#advanced-analytics)
+7. [Notifications (Discord & Telegram)](#notifications-discord--telegram)
+8. [External Dashboard (Optional)](#external-dashboard-optional-github-gist--pages)
+9. [Configuration Reference](#configuration-reference)
+10. [Troubleshooting](#troubleshooting)
+11. [Contributing](#contributing)
+12. [License](#license)
 
 ---
 
@@ -41,14 +42,13 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
 ┌──────────────────────────────────────┐
 │  Your machine (any OS with bash)      │
 │                                        │
-│  codex /status                         │
+│  Codex limits + local agent sessions   │
 │       ↓                                │
 │  local/monitor.sh                      │
 │       ↓              ↓                 │
-│  local/data.json   Discord/Telegram    │
-│  local/history.json  (direct curl)     │
-│       ↓                                │
-│  local/dashboard.html                  │
+│  JSON + SQLite     Discord/Telegram    │
+│       ↓              (direct curl)     │
+│  dashboard.html + analytics.html       │
 │  (browser via serve.sh)                │
 └──────────────────────────────────────┘
           │ optional (Tier 2)
@@ -69,6 +69,11 @@ codex-usage-monitor/
 |-- local/
 |   |-- monitor.sh        # Codex usage collector, alerts, optional Gist sync
 |   |-- dashboard.html    # Local dashboard UI
+|   |-- analytics.html    # Local long-term limits/token analytics UI
+|   |-- analytics.py      # Read-only aggregation used by /api/analytics
+|   |-- token_usage.py    # Codex/OpenCode/Hermes token collectors
+|   |-- storage.py        # Shared SQLite schema and integrity checks
+|   |-- pricing.json      # Versioned API-equivalent pricing catalog
 |   |-- serve.sh          # Allowlisted HTTP server for LAN access
 |   |-- .env.example      # Config template; copy to .env
 |   |-- .env              # Your local config (git-ignored, created by you)
@@ -158,14 +163,15 @@ chmod +x monitor.sh serve.sh
 # 5. Open the dashboard
 ./serve.sh
 # On this machine: http://localhost:8080/dashboard.html
+# Advanced analytics: http://localhost:8080/analytics.html
 # For trusted LAN access: ./serve.sh --bind 0.0.0.0 --port 8080
 ```
 
-Important: `serve.sh` only hosts an explicit allowlist containing the dashboard, its local CSS/JavaScript, its favicon, `data.json`, and `history.json`. Files such as `.env`, `.alert_state`, `health.json`, locks, logs, and directory listings are never served. It does not refresh usage by itself; `monitor.sh` must also run on a loop or schedule.
+Important: `serve.sh` only hosts an explicit allowlist containing the two dashboards, their local assets, the favicon, `data.json`, `history.json`, and the read-only `/api/analytics` response. The raw SQLite archive and files such as `.env`, `.alert_state`, `health.json`, locks, logs, and directory listings are never served. It does not refresh usage by itself; `monitor.sh` must also run on a loop or schedule.
 
 ### LAN security
 
-`serve.sh` listens on `127.0.0.1` by default. LAN access must be enabled explicitly with `./serve.sh --bind 0.0.0.0 --port 8080`. The server provides neither authentication nor TLS, so anyone able to reach that port can see usage percentages and reset times.
+`serve.sh` listens on `127.0.0.1` by default. LAN access must be enabled explicitly with `./serve.sh --bind 0.0.0.0 --port 8080`. The server provides neither authentication nor TLS, so anyone able to reach that port can see usage percentages, reset times, local token counts, model names, and cost estimates.
 
 - The generated JSON never contains the Codex account identity or tokens.
 - `.env` is parsed as configuration data rather than executed as shell code.
@@ -182,7 +188,7 @@ Pick the simplest option that fits your environment. In every setup:
 
 - `monitor.sh` scrapes Codex and writes `data.json` / `history.json`, while
   also maintaining the local SQLite archive
-- `serve.sh` serves `dashboard.html`
+- `serve.sh` serves `dashboard.html`, `analytics.html`, and the local read-only analytics API
 
 This project is designed for local Linux-style execution. Docker is intentionally not documented as a supported runtime because the current status capture depends on an authenticated local Codex CLI environment.
 
@@ -375,6 +381,25 @@ crontab -e
 ```
 
 ---
+
+## Advanced Analytics
+
+Open `http://localhost:8080/analytics.html` or follow **Advanced analytics** from the live limits page. This second, local-only page provides:
+
+- limit history over 24 hours, 7/30/90 days, one year, all retained data, or custom Paris calendar dates;
+- a paginated history of detected 5-hour and weekly resets;
+- token input, cache read/write, output, and reasoning counters collected from local Codex, OpenCode, and Hermes data stores;
+- breakdowns by application, provider, and model;
+- API-equivalent USD cost estimates using the current versioned `local/pricing.json` catalog;
+- collector freshness, failures, and Hermes pre-monitor baselines.
+
+Collection runs with every monitor cycle—every 15 minutes by default—and is independent of limit retrieval. In `TOKEN_USAGE_SOURCES=auto` mode, missing applications are disabled without failing the cycle. An explicitly requested missing source marks the cycle as failed/degraded.
+
+Codex and OpenCode histories are initially imported when their events have reliable dates. Existing cumulative Hermes counters become a separately displayed baseline and are excluded from dated totals. Collection only reads local usage metadata and counters; it does not read Codex authentication data or transmit analytics to the Gist.
+
+Cost values are estimates, not billing statements. They use the catalog active when the page is viewed, count reasoning as part of billable output rather than twice, and assume zero cost for unknown models while clearly flagging their tokens. Request, tool, search, cache-storage, batch, private-contract, and currency-conversion charges are excluded.
+
+The long-term page requires the local Python server because its API aggregates the private SQLite archive. It is intentionally unavailable on the optional static/Gist dashboard.
 
 ## Notifications (Discord & Telegram)
 
@@ -589,6 +614,11 @@ All variables go in `local/.env` (copy from `local/.env.example`).
 | `ALERT_SCRIPT_TIMEOUT_SECONDS` | No | `30` | Per-script timeout, from `1` to `1800` seconds |
 | `HISTORY_RETENTION_HOURS` | No | `192` | Entry-count retention target, from `0.25` to `8760` hours |
 | `ARCHIVE_RETENTION_DAYS` | No | `365` | Long-term SQLite archive retention; `0` means unlimited, maximum `36500` days |
+| `TOKEN_USAGE_SOURCES` | No | `auto` | `auto`, `none`, or a comma-separated list of `codex`, `opencode`, `hermes` |
+| `TOKEN_PRICING_FILE` | No | `local/pricing.json` | Absolute path to the validated versioned pricing catalog |
+| `CODEX_DATA_DIR` | No | `~/.codex` | Absolute Codex data directory containing local rollout sessions |
+| `OPENCODE_DB_PATH` | No | XDG OpenCode path | Absolute path to `opencode.db` |
+| `HERMES_DB_PATH` | No | `~/.hermes/state.db` | Absolute path to the Hermes state database |
 | `LOOP_INTERVAL` | No | `900` | Collection interval, from `1` to `86400` seconds |
 | `CODEX_BIN` | No | `codex` | Codex CLI executable |
 | `CODEX_STATUS_TIMEOUT_SECONDS` | No | `20` | Codex app-server timeout, from `5` to `300` seconds |
@@ -625,6 +655,10 @@ Verify authentication with `codex login status` and update the Codex CLI. If the
 # then open http://localhost:8080/dashboard.html
 ```
 
+### Advanced analytics returns “archive is not available yet”
+
+Run `./monitor.sh` once to initialize `runtime/usage-history.sqlite3`, then reload `analytics.html`. Use `./monitor.sh --check` to validate the pricing catalog and configured Codex/OpenCode/Hermes paths without changing analytics data.
+
 ### Gist sync returns HTTP 401
 
 Your `GITHUB_PAT` is expired or missing `gist` scope. Generate a new token at [github.com/settings/tokens](https://github.com/settings/tokens).
@@ -655,7 +689,7 @@ PRs welcome. Some ideas:
 - Run `tests/run.sh` for the dependency-free suite and `npm ci && npm run test:browser` for Playwright/axe-core checks.
 - CI runs Bash syntax checks, ShellCheck, the complete shell/Node suite, and Chromium browser tests.
 - History retention remains entry-count based so existing long-term data behavior is preserved. Changing the scrape interval changes the effective time span represented by `HISTORY_RETENTION_HOURS`.
-- Long-term history is stored separately in `runtime/usage-history.sqlite3`: all points are kept for 24 hours, then the newest point in each 30-minute UTC bucket is kept through 7 days, and the newest point in each hourly UTC bucket is kept thereafter. The default retention is one year; `ARCHIVE_RETENTION_DAYS=0` keeps it indefinitely. SQLite is provided by Python's standard library and the archive is not served by `serve.sh` or synchronized to the Gist.
+- Long-term history is stored separately in `runtime/usage-history.sqlite3`: all limit points are kept for 24 hours, then the newest point in each 30-minute UTC bucket is kept through 7 days, and the newest point in each hourly UTC bucket is kept thereafter. Token events and reconstructed resets use the same retention period without limit-series downsampling. The default retention is one year; `ARCHIVE_RETENTION_DAYS=0` keeps it indefinitely. SQLite is provided by Python's standard library; the raw archive is not served by `serve.sh` or synchronized to the Gist.
 - The SQLite archive is local state, not an off-machine backup. Back it up separately if the long-term history must survive disk loss.
 - Docker should only be used when the container can access an authenticated Codex CLI config. A common setup is mounting `~/.codex` into `/root/.codex`. If `codex /status` does not work on the host, it will not work inside Docker either — authenticate first.
 - The container now performs a startup scrape and exits if monitoring cannot start, so it will not keep serving stale data after the scraper dies.

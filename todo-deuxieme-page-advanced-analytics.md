@@ -1,5 +1,7 @@
 # Deuxième page « Advanced Analytics »
 
+> **Statut : implémenté sur la branche `dev` le 4 août 2026.** Le stockage v2, les collecteurs, l'API locale, la page responsive et les tests décrits ci-dessous sont en place.
+
 ## Résumé
 
 Ajouter une page locale `analytics.html`, accessible depuis la page principale, consacrée :
