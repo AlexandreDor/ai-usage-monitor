@@ -20,7 +20,7 @@
 #   ALERT_THRESHOLDS    — comma-separated thresholds, default: 75,50,25,10,5
 #   ALERT_SCRIPT_N      — absolute path to executable alert hook N (optional)
 #   ALERT_SCRIPT_N_EVENTS — events for hook N, e.g. 5h:50,weekly:reset
-#   ALERT_SCRIPT_TIMEOUT_SECONDS — per-hook timeout, default: 30
+#   ALERT_SCRIPT_TIMEOUT_SECONDS — per-hook timeout, default: 30, maximum: 1800
 #   GITHUB_PAT          — GitHub Personal Access Token with gist scope (optional)
 #   GITHUB_GIST_ID      — ID of the GitHub Gist to update (optional)
 # ============================================================================
@@ -176,7 +176,7 @@ validate_alert_scripts() {
     esac
   done < <(compgen -A variable ALERT_SCRIPT_)
 
-  validate_integer ALERT_SCRIPT_TIMEOUT_SECONDS "$ALERT_SCRIPT_TIMEOUT_SECONDS" 1 300 || invalid=1
+  validate_integer ALERT_SCRIPT_TIMEOUT_SECONDS "$ALERT_SCRIPT_TIMEOUT_SECONDS" 1 1800 || invalid=1
   for (( index = 1; index <= 99; index++ )); do
     path_name="ALERT_SCRIPT_${index}"
     events_name="ALERT_SCRIPT_${index}_EVENTS"
@@ -337,6 +337,7 @@ PYEOF
 }
 
 initialize() {
+  local codex_bin_override="${CODEX_BIN_OVERRIDE:-}"
   umask 077
   if [[ -f "$ENV_FILE" ]]; then
     if [[ -L "$ENV_FILE" || ! -O "$ENV_FILE" ]]; then
@@ -345,6 +346,10 @@ initialize() {
     fi
     chmod 600 "$ENV_FILE"
     load_config
+  fi
+
+  if [[ -n "$codex_bin_override" ]]; then
+    CODEX_BIN="$codex_bin_override"
   fi
 
   ALERT_THRESHOLDS="${ALERT_THRESHOLDS:-75,50,25,10,5}"
@@ -1033,6 +1038,7 @@ run_alert_script() {
           "CODEX_ALERT_RESET_LABEL=${reset_label}" \
           "CODEX_ALERT_SCRAPED_AT=${scraped_at}" \
           "CODEX_ALERT_MESSAGE=${message}" \
+          "CODEX_ALERT_CODEX_BIN=${CODEX_BIN:-codex}" \
           "CODEX_ALERT_RULE_INDEX=${rule_index}" \
           "$path" </dev/null
   ) || exit_code=$?
@@ -1546,6 +1552,7 @@ main() {
           shift
         fi
         ;;
+      --status-json) mode=status_json ;;
       --check) mode=check ;;
       --fail-fast) fail_fast=1 ;;
       --once) mode=once ;;
@@ -1555,6 +1562,10 @@ main() {
   done
 
   validate_interval "$interval" || return 1
+  if [[ "$mode" == status_json ]]; then
+    fetch_status_json "$interval"
+    return $?
+  fi
   if [[ "$mode" == check ]]; then
     echo "[INFO] Checking Codex authentication and app-server response..."
     fetch_status_json "$interval" >/dev/null || return 1

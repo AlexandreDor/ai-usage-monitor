@@ -138,7 +138,7 @@ ALERT_SCRIPT_2="$SCRIPT_FIXTURE"
 ALERT_SCRIPT_2_EVENTS=5h:050
 validate_config >/dev/null 2>&1 && fail "duplicate path/event action accepted"
 
-for timeout_value in 0 301 abc; do
+for timeout_value in 0 1801 abc; do
   monitor_defaults
   ALERT_SCRIPT_TIMEOUT_SECONDS="$timeout_value"
   validate_config >/dev/null 2>&1 && fail "invalid script timeout accepted: $timeout_value"

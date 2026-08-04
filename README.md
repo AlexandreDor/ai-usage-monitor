@@ -586,7 +586,7 @@ All variables go in `local/.env` (copy from `local/.env.example`).
 | `ALERT_THRESHOLDS` | No | `75,50,25,10,5` | Comma-separated % thresholds for alerts |
 | `ALERT_SCRIPT_<N>` | No | — | Absolute executable path for script rule 1..99 |
 | `ALERT_SCRIPT_<N>_EVENTS` | With matching script | — | Comma-separated threshold/reset selectors |
-| `ALERT_SCRIPT_TIMEOUT_SECONDS` | No | `30` | Per-script timeout, from `1` to `300` seconds |
+| `ALERT_SCRIPT_TIMEOUT_SECONDS` | No | `30` | Per-script timeout, from `1` to `1800` seconds |
 | `HISTORY_RETENTION_HOURS` | No | `192` | Entry-count retention target, from `0.25` to `8760` hours |
 | `ARCHIVE_RETENTION_DAYS` | No | `365` | Long-term SQLite archive retention; `0` means unlimited, maximum `36500` days |
 | `LOOP_INTERVAL` | No | `900` | Collection interval, from `1` to `86400` seconds |
