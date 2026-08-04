@@ -613,6 +613,41 @@ def collect(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def check(args: argparse.Namespace) -> int:
+    load_pricing(Path(args.pricing).expanduser())
+    requested = parse_sources(args.sources)
+    explicit = args.sources.strip().lower() not in ("auto", "none")
+    paths = {
+        "codex": Path(args.codex_data_dir).expanduser(),
+        "opencode": Path(args.opencode_db).expanduser(),
+        "hermes": Path(args.hermes_db).expanduser(),
+    }
+    failed = False
+    for source in SOURCES:
+        if source not in requested:
+            print(f"[INFO] {source}: disabled.")
+            continue
+        path = paths[source]
+        available = path.is_dir() if source == "codex" else path.is_file()
+        if not available:
+            label = "ERROR" if explicit else "INFO"
+            print(f"[{label}] {source}: source path not found: {path}", file=sys.stderr if explicit else sys.stdout)
+            failed = failed or explicit
+            continue
+        if source != "codex":
+            try:
+                connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+                connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+                connection.close()
+            except sqlite3.DatabaseError as exc:
+                print(f"[ERROR] {source}: database read failed: {exc}", file=sys.stderr)
+                failed = True
+                continue
+        print(f"[OK] {source}: source is readable.")
+    print(f"[OK] pricing: {Path(args.pricing).expanduser()}")
+    return 1 if failed else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
@@ -626,12 +661,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--hermes-db", default=str(Path.home() / ".hermes" / "state.db"))
     parser.add_argument("--now", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--check", action="store_true")
     return parser
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(collect(build_parser().parse_args()))
+        arguments = build_parser().parse_args()
+        raise SystemExit(check(arguments) if arguments.check else collect(arguments))
     except (CollectorError, ValueError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         raise SystemExit(1)

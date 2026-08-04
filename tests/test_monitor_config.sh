@@ -16,6 +16,22 @@ use_test_runtime
 monitor_defaults
 
 validate_config
+
+for invalid_sources in '' 'codex,' 'auto,codex' 'codex,other'; do
+  monitor_defaults
+  TOKEN_USAGE_SOURCES="$invalid_sources"
+  validate_config >/dev/null 2>&1 && fail "invalid token sources accepted: '$invalid_sources'"
+done
+monitor_defaults
+TOKEN_USAGE_SOURCES=codex,opencode,hermes
+validate_config
+monitor_defaults
+CODEX_DATA_DIR=relative/path
+validate_config >/dev/null 2>&1 && fail "relative token source path accepted"
+monitor_defaults
+TOKEN_PRICING_FILE="${TEST_ROOT}/missing-pricing.json"
+validate_config >/dev/null 2>&1 && fail "missing pricing catalog accepted"
+monitor_defaults
 LOOP_INTERVAL=1
 CODEX_STATUS_TIMEOUT_SECONDS=5
 ARCHIVE_RETENTION_DAYS=0

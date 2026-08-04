@@ -58,7 +58,7 @@ load_config() {
     fi
 
     case "$key" in
-      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID)
+      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
         if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
           value="${value:1:${#value}-2}"
         fi
@@ -248,7 +248,7 @@ PYEOF
 }
 
 validate_config() {
-  local invalid=0 secret
+  local invalid=0 secret path_value
   validate_integer LOOP_INTERVAL "$LOOP_INTERVAL" 1 86400 || invalid=1
   validate_integer CODEX_STATUS_TIMEOUT_SECONDS "$CODEX_STATUS_TIMEOUT_SECONDS" 5 300 || invalid=1
   validate_integer ARCHIVE_RETENTION_DAYS "$ARCHIVE_RETENTION_DAYS" 0 36500 || invalid=1
@@ -279,6 +279,19 @@ validate_config() {
   [[ "$MONITOR_DEBUG" == 0 || "$MONITOR_DEBUG" == 1 ]] || { config_error "MONITOR_DEBUG must be 0 or 1." || true; invalid=1; }
   [[ "$GITHUB_API_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || { config_error "GITHUB_API_URL is not a valid HTTP(S) base URL." || true; invalid=1; }
   [[ "$TELEGRAM_API_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || { config_error "TELEGRAM_API_URL is not a valid HTTP(S) base URL." || true; invalid=1; }
+  [[ "$TOKEN_USAGE_SOURCES" == auto || "$TOKEN_USAGE_SOURCES" == none || "$TOKEN_USAGE_SOURCES" =~ ^(codex|opencode|hermes)(,(codex|opencode|hermes))*$ ]] || { config_error "TOKEN_USAGE_SOURCES must be auto, none, or a comma-separated list of codex,opencode,hermes." || true; invalid=1; }
+
+  for path_value in "$TOKEN_PRICING_FILE" "$CODEX_DATA_DIR" "$OPENCODE_DB_PATH" "$HERMES_DB_PATH"; do
+    if [[ "$path_value" != /* ]] || has_control_characters "$path_value"; then
+      config_error "Token analytics paths must be absolute and contain no control characters." || true
+      invalid=1
+      break
+    fi
+  done
+  if [[ ! -f "$TOKEN_PRICING_FILE" || ! -r "$TOKEN_PRICING_FILE" || -L "$TOKEN_PRICING_FILE" ]]; then
+    config_error "TOKEN_PRICING_FILE must be a readable regular file, not a symbolic link." || true
+    invalid=1
+  fi
 
   for secret in "$GITHUB_PAT" "$DISCORD_WEBHOOK" "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID"; do
     if has_control_characters "$secret"; then
@@ -370,6 +383,11 @@ initialize() {
   GITHUB_GIST_ID="${GITHUB_GIST_ID:-}"
   GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
   TELEGRAM_API_URL="${TELEGRAM_API_URL:-https://api.telegram.org}"
+  TOKEN_USAGE_SOURCES="${TOKEN_USAGE_SOURCES:-auto}"
+  TOKEN_PRICING_FILE="${TOKEN_PRICING_FILE:-${SCRIPT_DIR}/pricing.json}"
+  CODEX_DATA_DIR="${CODEX_DATA_DIR:-${HOME}/.codex}"
+  OPENCODE_DB_PATH="${OPENCODE_DB_PATH:-${XDG_DATA_HOME:-${HOME}/.local/share}/opencode/opencode.db}"
+  HERMES_DB_PATH="${HERMES_DB_PATH:-${HOME}/.hermes/state.db}"
 
   check_requirements || return 1
   validate_config || return 1
@@ -1449,49 +1467,66 @@ archive_snapshot() {
     --retention-days "$ARCHIVE_RETENTION_DAYS"
 }
 
+collect_token_usage() {
+  python3 "$SCRIPT_DIR/token_usage.py" \
+    --database "$ARCHIVE_FILE" \
+    --pricing "$TOKEN_PRICING_FILE" \
+    --sources "$TOKEN_USAGE_SOURCES" \
+    --retention-days "$ARCHIVE_RETENTION_DAYS" \
+    --codex-data-dir "$CODEX_DATA_DIR" \
+    --opencode-db "$OPENCODE_DB_PATH" \
+    --hermes-db "$HERMES_DB_PATH"
+}
+
+check_token_usage() {
+  python3 "$SCRIPT_DIR/token_usage.py" \
+    --check \
+    --database "$ARCHIVE_FILE" \
+    --pricing "$TOKEN_PRICING_FILE" \
+    --sources "$TOKEN_USAGE_SOURCES" \
+    --codex-data-dir "$CODEX_DATA_DIR" \
+    --opencode-db "$OPENCODE_DB_PATH" \
+    --hermes-db "$HERMES_DB_PATH"
+}
+
 run_cycle() {
   local interval_seconds="$1"
   echo "[$(format_paris_now)] Scraping codex status..."
 
-  local json status=0
+  local json status=0 history_json="[]"
   CYCLE_ERROR=""
-  json=$(fetch_status_json "$interval_seconds") || { CYCLE_ERROR="Codex collection failed"; return 1; }
+  if json=$(fetch_status_json "$interval_seconds"); then
+    echo "$json" | python3 -m json.tool 2>/dev/null || echo "$json"
+    if ! archive_snapshot "$json"; then
+      status=1
+      append_cycle_error "Long-term archive update failed"
+    fi
+    if write_local_snapshot "$json" "$interval_seconds"; then
+      [[ -f "$HISTORY_FILE" ]] && history_json="$(<"$HISTORY_FILE")"
+    else
+      status=1
+      append_cycle_error "Local snapshot write failed"
+    fi
+    sync_gist "$json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
 
-  # Pretty-print to terminal
-  echo "$json" | python3 -m json.tool 2>/dev/null || echo "$json"
-
-  # Write the long-term archive. Archive failures are reported but must not
-  # prevent the current snapshot, Gist sync, or alert processing.
-  if ! archive_snapshot "$json"; then
+    local five_h weekly five_h_reset weekly_reset five_h_reset_at weekly_reset_at scraped_at scraped_at_epoch
+    five_h=$(json_get_field "$json" "five_h_pct")
+    weekly=$(json_get_field "$json" "weekly_pct")
+    five_h_reset=$(json_get_field "$json" "five_h_reset")
+    weekly_reset=$(json_get_field "$json" "weekly_reset")
+    five_h_reset_at=$(json_get_field "$json" "five_h_reset_at")
+    weekly_reset_at=$(json_get_field "$json" "weekly_reset_at")
+    scraped_at=$(json_get_field "$json" "scraped_at")
+    scraped_at_epoch=$(timestamp_to_epoch "$scraped_at") || scraped_at_epoch=$(date -u +%s)
+    check_thresholds "$five_h" "$weekly" "$five_h_reset" "$weekly_reset" \
+      "$five_h_reset_at" "$weekly_reset_at" "$scraped_at_epoch" \
+      || { status=1; append_cycle_error "${ALERT_PROCESSING_ERROR:-alert processing failed}"; }
+  else
     status=1
-    append_cycle_error "Long-term archive update failed"
+    append_cycle_error "Codex limit collection failed"
   fi
 
-  # Write locally
-  write_local_snapshot "$json" "$interval_seconds" || { append_cycle_error "Local snapshot write failed"; return 1; }
-
-  # Read history for gist sync
-  local history_json="[]"
-  if [[ -f "$HISTORY_FILE" ]]; then
-    history_json="$(<"$HISTORY_FILE")"
-  fi
-
-  sync_gist "$json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
-
-  # Extract values for threshold check
-  local five_h weekly five_h_reset weekly_reset five_h_reset_at weekly_reset_at scraped_at scraped_at_epoch
-  five_h=$(json_get_field "$json" "five_h_pct")
-  weekly=$(json_get_field "$json" "weekly_pct")
-  five_h_reset=$(json_get_field "$json" "five_h_reset")
-  weekly_reset=$(json_get_field "$json" "weekly_reset")
-  five_h_reset_at=$(json_get_field "$json" "five_h_reset_at")
-  weekly_reset_at=$(json_get_field "$json" "weekly_reset_at")
-  scraped_at=$(json_get_field "$json" "scraped_at")
-  scraped_at_epoch=$(timestamp_to_epoch "$scraped_at") || scraped_at_epoch=$(date -u +%s)
-
-  check_thresholds "$five_h" "$weekly" "$five_h_reset" "$weekly_reset" \
-    "$five_h_reset_at" "$weekly_reset_at" "$scraped_at_epoch" \
-    || { status=1; append_cycle_error "${ALERT_PROCESSING_ERROR:-alert processing failed}"; }
+  collect_token_usage || { status=1; append_cycle_error "Local token usage collection failed"; }
   return "$status"
 }
 
@@ -1569,7 +1604,9 @@ main() {
   if [[ "$mode" == check ]]; then
     echo "[INFO] Checking Codex authentication and app-server response..."
     fetch_status_json "$interval" >/dev/null || return 1
-    echo "[OK] Configuration, dependencies, permissions, tzdata and Codex authentication are valid."
+    echo "[INFO] Checking local token analytics sources and pricing..."
+    check_token_usage || return 1
+    echo "[OK] Configuration, dependencies, permissions, tzdata, Codex authentication and token analytics are valid."
     return 0
   fi
 

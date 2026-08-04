@@ -30,8 +30,12 @@ check_thresholds() {
   CALLS+=(alerts)
 }
 
+collect_token_usage() {
+  CALLS+=(tokens)
+}
+
 run_once 900 >/dev/null 2>&1 && fail "archive failure was not propagated to run_once"
-assert_eq 'archive local gist alerts' "${CALLS[*]}" "archive failure stopped later delivery steps"
+assert_eq 'archive local gist alerts tokens' "${CALLS[*]}" "archive failure stopped later delivery steps"
 assert_eq failure "$(json_field "$HEALTH_FILE" last_cycle_result)" "archive failure was not recorded in health"
 assert_contains "$(json_field "$HEALTH_FILE" last_error.message)" 'Long-term archive update failed' "archive failure detail missing"
 

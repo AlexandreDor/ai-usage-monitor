@@ -62,6 +62,11 @@ monitor_defaults() {
   GITHUB_GIST_ID=""
   GITHUB_API_URL=https://api.github.com
   TELEGRAM_API_URL=https://api.telegram.org
+  TOKEN_USAGE_SOURCES=none
+  TOKEN_PRICING_FILE="${ROOT_DIR}/local/pricing.json"
+  CODEX_DATA_DIR="${TEST_ROOT}/missing-codex"
+  OPENCODE_DB_PATH="${TEST_ROOT}/missing-opencode.db"
+  HERMES_DB_PATH="${TEST_ROOT}/missing-hermes.db"
 }
 
 json_field() {
