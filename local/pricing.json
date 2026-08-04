@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "currency": "USD",
+  "as_of": "2026-08-04",
+  "valuation_mode": "current_catalog",
+  "unknown_model_policy": "assumed_zero",
+  "entries": [
+    {
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "aliases": ["gpt-5.6-sol-pro"],
+      "input_per_million": 5.0,
+      "cache_read_per_million": 0.5,
+      "cache_write_per_million": 5.0,
+      "output_per_million": 30.0,
+      "source_url": "https://developers.openai.com/api/docs/models/compare"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6-terra",
+      "aliases": ["gpt-5.6-terra-pro"],
+      "input_per_million": 2.0,
+      "cache_read_per_million": 0.2,
+      "cache_write_per_million": 2.0,
+      "output_per_million": 12.0,
+      "source_url": "https://developers.openai.com/api/docs/models/compare"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6-luna",
+      "aliases": ["gpt-5.6-luna-pro"],
+      "input_per_million": 0.2,
+      "cache_read_per_million": 0.02,
+      "cache_write_per_million": 0.2,
+      "output_per_million": 1.2,
+      "source_url": "https://developers.openai.com/api/docs/models/compare"
+    }
+  ],
+  "notes": [
+    "OpenAI cache writes are valued at the uncached input rate because no separate write price is published.",
+    "Request, tool, cache-storage, batch, contract, and currency-conversion charges are excluded."
+  ]
+}
