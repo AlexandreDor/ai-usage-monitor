@@ -87,6 +87,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
 
   await expect(page.locator('#total-tokens')).toHaveText('1.7M');
   await expect(page.locator('#estimated-cost')).toHaveText('$11.25');
+  await expect(page.locator('#allocation-total-cost')).toHaveText('$11.25');
   await expect(page.locator('#reset-count')).toHaveText('1');
   await expect(page.locator('#breakdown-body')).toContainText('gpt-5.6-sol');
   await expect(page.locator('#analytics-warnings')).toContainText('assumed zero');

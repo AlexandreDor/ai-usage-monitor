@@ -163,6 +163,9 @@ input { display: block; min-height: 36px; margin-top: 4px; padding: 7px 10px; }
 
 .section-heading h2 { margin-top: 4px; font-size: 1.15rem; letter-spacing: -0.01em; }
 .sample-count { color: var(--muted); font-size: 0.75rem; white-space: nowrap; }
+.allocation-total { text-align: right; white-space: nowrap; }
+.allocation-total span { display: block; color: var(--muted); font-size: .63rem; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
+.allocation-total strong { display: block; margin-top: 4px; color: #86efac; font-size: 1.25rem; }
 .chart-wrap { height: 260px; }
 .chart-wrap canvas { max-height: none; }
 .empty-state { color: var(--muted); padding: 28px 0; text-align: center; font-size: .88rem; }
@@ -205,4 +208,6 @@ td { color: #dbeafe; }
   .chart-wrap { height: 230px; }
   .analytics-card { padding: 18px; }
   .reset-heading { align-items: end; }
+  .allocation-total span { font-size: .58rem; }
+  .allocation-total strong { font-size: 1.05rem; }
 }

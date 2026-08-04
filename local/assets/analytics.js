@@ -171,6 +171,7 @@ function render(payload) {
   byId('total-tokens').title = `${formatFullTokens(totalBillable(summary))} billable tokens`;
   byId('token-detail').textContent = `${formatTokens(summary.input_tokens)} input · ${formatTokens(summary.cache_read_tokens + summary.cache_write_tokens)} cache · ${formatTokens(summary.output_tokens)} output`;
   byId('estimated-cost').textContent = formatCost(summary.estimated_cost_usd);
+  byId('allocation-total-cost').textContent = formatCost(summary.estimated_cost_usd);
   byId('pricing-note').textContent = `Catalog ${payload.pricing.as_of} · ${payload.pricing.currency}`;
   byId('reset-count').textContent = formatFullTokens(payload.resets.total);
   byId('period-label').textContent = `${shortDate.format(new Date(payload.period.from))} – ${shortDate.format(new Date(payload.period.to))}`;
