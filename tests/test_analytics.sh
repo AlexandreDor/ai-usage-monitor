@@ -98,7 +98,15 @@ assert_eq 1 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]
 assert_eq 1 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["total"])' <<<"$filtered")" "reset type filter"
 assert_eq 1 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["weekly_total"])' <<<"$filtered")" "weekly reset metric ignores history filter"
 
+multi_filtered="$(python3 "$ROOT_DIR/local/analytics.py" \
+  --database "$database" \
+  --pricing "$ROOT_DIR/local/pricing.json" \
+  --params '{"range":"24h","sources":"codex,hermes","models":"gpt-5.6-sol,unknown-model"}' \
+  --now 1785866400)"
+assert_eq 3 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["summary"]["events"])' <<<"$multi_filtered")" "multiple source/model filters"
+
 python3 "$ROOT_DIR/local/analytics.py" --database "$database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"range":"invalid"}' >/dev/null 2>&1 && fail "invalid range accepted"
 python3 "$ROOT_DIR/local/analytics.py" --database "$database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"from_date":"2026-08-04"}' >/dev/null 2>&1 && fail "unpaired custom date accepted"
+python3 "$ROOT_DIR/local/analytics.py" --database "$database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"range":"24h","sources":"codex,invalid"}' >/dev/null 2>&1 && fail "invalid source list accepted"
 
 printf 'PASS: advanced analytics query tests\n'

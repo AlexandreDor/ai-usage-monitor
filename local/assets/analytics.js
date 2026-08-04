@@ -3,7 +3,16 @@
 const ANALYTICS_REFRESH_MS = 900_000;
 const RESET_PAGE_SIZE = 10;
 const PARIS_ZONE = 'Europe/Paris';
-const state = { range: '30d', source: 'all', model: '', resetType: 'all', resetOffset: 0, fromDate: '', toDate: '' };
+const state = {
+  range: '30d',
+  sources: ['codex', 'opencode', 'hermes'],
+  models: [],
+  availableModels: [],
+  resetType: 'all',
+  resetOffset: 0,
+  fromDate: '',
+  toDate: '',
+};
 let limitsChart = null;
 let tokensChart = null;
 let refreshTimer = null;
@@ -37,8 +46,9 @@ function setMessage(id, messages) {
 }
 
 function queryString() {
-  const query = new URLSearchParams({ source: state.source, reset_type: state.resetType, reset_offset: String(state.resetOffset), reset_limit: String(RESET_PAGE_SIZE) });
-  if (state.model) query.set('model', state.model);
+  const query = new URLSearchParams({ reset_type: state.resetType, reset_offset: String(state.resetOffset), reset_limit: String(RESET_PAGE_SIZE) });
+  if (state.sources.length) query.set('sources', state.sources.join(','));
+  if (state.models.length) query.set('models', state.models.join(','));
   if (state.range === 'custom') {
     query.set('from_date', state.fromDate);
     query.set('to_date', state.toDate);
@@ -156,13 +166,39 @@ function renderCollectors(freshness, baselines) {
   note.textContent = baselineTokens ? `Hermes pre-monitor baseline excluded from dated totals: ${formatFullTokens(baselineTokens)} tokens.` : '';
 }
 
+function checkedValues(container) {
+  return [...container.querySelectorAll('input[type="checkbox"]:checked')].map(input => input.value);
+}
+
+function setCheckedValues(container, values) {
+  const selected = new Set(values);
+  for (const input of container.querySelectorAll('input[type="checkbox"]')) input.checked = selected.has(input.value);
+}
+
+function addFilterOption(container, value) {
+  const label = document.createElement('label');
+  label.className = 'filter-option';
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.value = value;
+  input.checked = state.models.includes(value);
+  label.append(input, ` ${value}`);
+  container.appendChild(label);
+}
+
 function updateModelOptions(models) {
-  const select = byId('model-filter');
-  const current = state.model;
-  while (select.options.length > 1) select.remove(1);
-  for (const model of models) { const option = document.createElement('option'); option.value = model; option.textContent = model; select.appendChild(option); }
-  if (models.includes(current)) select.value = current;
-  else { state.model = ''; select.value = ''; }
+  const normalized = Array.isArray(models) ? models.filter(model => typeof model === 'string') : [];
+  const container = byId('model-filter');
+  const availableChanged = normalized.join('\0') !== state.availableModels.join('\0');
+  state.availableModels = normalized;
+  if (availableChanged) {
+    state.models = state.models.filter(model => normalized.includes(model));
+    if (!state.models.length) state.models = [...normalized];
+    clearRows(container);
+    for (const model of normalized) addFilterOption(container, model);
+  } else {
+    setCheckedValues(container, state.models);
+  }
 }
 
 function render(payload) {
@@ -209,8 +245,34 @@ for (const button of document.querySelectorAll('[data-range]')) {
     if (state.range !== 'custom') refresh();
   });
 }
-byId('source-filter').addEventListener('change', event => { state.source = event.target.value; state.resetOffset = 0; refresh(); });
-byId('model-filter').addEventListener('change', event => { state.model = event.target.value; state.resetOffset = 0; refresh(); });
+byId('source-filter').addEventListener('change', event => {
+  const source = event.target.value;
+  state.sources = checkedValues(byId('source-filter'));
+  if (!state.sources.length) { event.target.checked = true; state.sources = [source]; }
+  state.resetOffset = 0;
+  refresh();
+});
+byId('model-filter').addEventListener('change', event => {
+  const model = event.target.value;
+  state.models = checkedValues(byId('model-filter'));
+  if (!state.models.length) { event.target.checked = true; state.models = [model]; }
+  state.resetOffset = 0;
+  refresh();
+});
+byId('select-all-models').addEventListener('click', () => {
+  state.models = [...state.availableModels];
+  setCheckedValues(byId('model-filter'), state.models);
+  state.resetOffset = 0;
+  refresh();
+});
+byId('select-gpt-5-6').addEventListener('click', () => {
+  const gpt56 = state.availableModels.filter(model => ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'].includes(model));
+  if (!gpt56.length) { setMessage('analytics-error', 'No GPT 5.6 Sol, Terra, or Luna model is available in this archive.'); return; }
+  state.models = gpt56;
+  setCheckedValues(byId('model-filter'), state.models);
+  state.resetOffset = 0;
+  refresh();
+});
 byId('reset-filter').addEventListener('change', event => { state.resetType = event.target.value; state.resetOffset = 0; refresh(); });
 byId('apply-dates').addEventListener('click', () => {
   state.fromDate = byId('from-date').value; state.toDate = byId('to-date').value; state.resetOffset = 0;

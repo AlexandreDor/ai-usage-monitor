@@ -31,17 +31,22 @@
         <button type="button" data-range="custom">Custom</button>
       </div>
       <div class="filter-fields">
-        <label>Application
-          <select id="source-filter">
-            <option value="all">All applications</option>
-            <option value="codex">Codex</option>
-            <option value="opencode">OpenCode</option>
-            <option value="hermes">Hermes</option>
-          </select>
-        </label>
-        <label>Model
-          <select id="model-filter"><option value="">All models</option></select>
-        </label>
+        <fieldset class="multi-filter">
+          <legend>Applications</legend>
+          <div class="filter-options" id="source-filter">
+            <label class="filter-option"><input type="checkbox" value="codex" checked> Codex</label>
+            <label class="filter-option"><input type="checkbox" value="opencode" checked> OpenCode</label>
+            <label class="filter-option"><input type="checkbox" value="hermes" checked> Hermes</label>
+          </div>
+        </fieldset>
+        <fieldset class="multi-filter model-filter">
+          <legend>Models</legend>
+          <div class="filter-actions">
+            <button type="button" id="select-gpt-5-6">GPT 5.6</button>
+            <button type="button" id="select-all-models">All models</button>
+          </div>
+          <div class="filter-options" id="model-filter" aria-live="polite"></div>
+        </fieldset>
         <div class="custom-dates" id="custom-dates" hidden>
           <label>From <input id="from-date" type="date"></label>
           <label>To <input id="to-date" type="date"></label>

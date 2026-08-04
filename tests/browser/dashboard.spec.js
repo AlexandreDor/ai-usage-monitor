@@ -62,8 +62,8 @@ test('clears a previous chart when history becomes empty', async ({ page }) => {
 const analyticsPayload = {
   schema_version: 1,
   period: { range: '30d', from: '2026-07-05T10:00:00Z', to: '2026-08-04T10:00:00Z', timezone: 'Europe/Paris', granularity_seconds: 86400 },
-  filters: { source: 'all', model: null, reset_type: 'all' },
-  available: { sources: ['codex', 'opencode'], models: ['gpt-5.6-sol', 'unknown-model'] },
+  filters: { sources: [], models: [], reset_type: 'all' },
+  available: { sources: ['codex', 'opencode'], models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'unknown-model'] },
   freshness: { limits_last_sample_at: '2026-08-04T09:45:00Z', collectors: { codex: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, opencode: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, hermes: { status: 'disabled', last_success_at: null } } },
   limits: { samples: 2, series: [{ at: '2026-08-03T00:00:00Z', five_h_pct: 80, weekly_pct: 60 }, { at: '2026-08-04T00:00:00Z', five_h_pct: 55, weekly_pct: 52 }] },
   tokens: {
@@ -79,10 +79,14 @@ const analyticsPayload = {
 
 test('renders advanced analytics and remains local', async ({ page }) => {
   const externalRequests = [];
+  const analyticsQueries = [];
   page.on('request', request => {
     if (new URL(request.url()).hostname !== '127.0.0.1') externalRequests.push(request.url());
   });
-  await page.route('**/api/analytics?*', route => route.fulfill({ json: analyticsPayload }));
+  await page.route('**/api/analytics?*', route => {
+    analyticsQueries.push(new URL(route.request().url()).searchParams);
+    return route.fulfill({ json: analyticsPayload });
+  });
   await page.goto('/analytics.html');
 
   await expect(page.locator('#total-tokens')).toHaveText('1.7M');
@@ -91,6 +95,11 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#reset-count')).toHaveText('0');
   await expect(page.locator('#breakdown-body')).toContainText('gpt-5.6-sol');
   await expect(page.locator('#analytics-warnings')).toContainText('assumed zero');
+  await expect(page.locator('#model-filter input')).toHaveCount(4);
+  await page.getByRole('button', { name: 'GPT 5.6' }).click();
+  await expect.poll(() => analyticsQueries.at(-1)?.get('models')).toBe('gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna');
+  await page.locator('#source-filter input[value="codex"]').uncheck();
+  await expect.poll(() => analyticsQueries.at(-1)?.get('sources')).toBe('opencode,hermes');
   expect(externalRequests).toEqual([]);
 
   const results = await new AxeBuilder({ page }).analyze();

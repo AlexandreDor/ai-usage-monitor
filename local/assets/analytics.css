@@ -73,6 +73,59 @@
 
 .filter-fields { margin-top: 12px; }
 
+.multi-filter {
+  min-width: 220px;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+}
+
+.multi-filter legend {
+  color: var(--muted);
+  font-size: .7rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  margin-bottom: 6px;
+}
+
+.filter-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.filter-option {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 6px 9px;
+  color: #cbdcf5;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: #0b1930;
+  cursor: pointer;
+  font-size: .74rem;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+.filter-option:has(input:checked) {
+  color: #fff;
+  border-color: rgba(96, 165, 250, .85);
+  background: rgba(37, 99, 235, .36);
+}
+
+.filter-option input {
+  display: inline-block;
+  width: auto;
+  min-height: auto;
+  margin: 0 6px 0 0;
+  accent-color: #60a5fa;
+}
+
+.filter-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.filter-actions button { padding: 6px 9px; font-size: .7rem; }
+
 button,
 select,
 input {
@@ -203,8 +256,7 @@ td { color: #dbeafe; }
   .metric-card { min-height: 120px; }
   .filter-panel { position: static; }
   .range-group button { flex: 1 0 20%; }
-  .filter-fields > label { flex: 1; }
-  .filter-fields select { width: 100%; }
+  .multi-filter { width: 100%; }
   .chart-wrap { height: 230px; }
   .analytics-card { padding: 18px; }
   .reset-heading { align-items: end; }

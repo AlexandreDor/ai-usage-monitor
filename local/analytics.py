@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 from zoneinfo import ZoneInfo
 
 from storage import connect_database
@@ -97,15 +97,26 @@ def cost_row(row: dict[str, Any], prices: dict[tuple[str, str], dict[str, Any]])
     return amount, False
 
 
-def token_conditions(start: int, end: int, source: str, model: str) -> tuple[str, list[Any]]:
+def selected_values(raw: str, *, name: str, allowed: Sequence[str] | None = None) -> tuple[str, ...]:
+    if raw in ("", "all"):
+        return ()
+    values = tuple(dict.fromkeys(item.strip() for item in raw.split(",") if item.strip()))
+    if not values or len(values) > 50 or any(len(item) > 200 or any(ord(character) < 32 for character in item) for item in values):
+        raise AnalyticsError(f"{name} filter is invalid")
+    if allowed is not None and any(item not in allowed for item in values):
+        raise AnalyticsError(f"{name} must contain only {', '.join(allowed)}")
+    return values
+
+
+def token_conditions(start: int, end: int, sources: Sequence[str], models: Sequence[str]) -> tuple[str, list[Any]]:
     clauses = ["occurred_at_epoch >= ?", "occurred_at_epoch < ?"]
     values: list[Any] = [start, end]
-    if source != "all":
-        clauses.append("source = ?")
-        values.append(source)
-    if model:
-        clauses.append("model = ?")
-        values.append(model)
+    if sources:
+        clauses.append(f"source IN ({', '.join('?' for _ in sources)})")
+        values.extend(sources)
+    if models:
+        clauses.append(f"model IN ({', '.join('?' for _ in models)})")
+        values.extend(models)
     return " AND ".join(clauses), values
 
 
@@ -119,10 +130,10 @@ def token_analytics(
     start: int,
     end: int,
     granularity: int,
-    source: str,
-    model: str,
+    sources: Sequence[str],
+    models: Sequence[str],
 ) -> tuple[dict[str, Any], list[str]]:
-    conditions, values = token_conditions(start, end, source, model)
+    conditions, values = token_conditions(start, end, sources, models)
     sums = ", ".join(f"SUM({field}) AS {field}" for field in TOKEN_FIELDS)
     breakdown_rows = connection.execute(
         f"SELECT source, provider, model, {sums}, COUNT(*) AS events FROM token_usage_events WHERE {conditions} GROUP BY source, provider, model ORDER BY source, model",
@@ -272,14 +283,13 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
     try:
         current = int(now if now is not None else datetime.now(timezone.utc).timestamp())
         start, end, range_label, granularity = period(connection, params, current)
-        source, model = params.get("source", "all"), params.get("model", "")
+        if "source" in params and "sources" in params or "model" in params and "models" in params:
+            raise AnalyticsError("use either the singular or plural token filter")
+        sources = selected_values(params.get("sources", params.get("source", "all")), name="source", allowed=SOURCES)
+        models = selected_values(params.get("models", params.get("model", "")), name="model")
         reset_type = params.get("reset_type", "all")
-        if source not in ("all", *SOURCES):
-            raise AnalyticsError("source must be all, codex, opencode, or hermes")
         if reset_type not in ("all", "5h", "weekly"):
             raise AnalyticsError("reset_type must be all, 5h, or weekly")
-        if len(model) > 200 or any(ord(character) < 32 for character in model):
-            raise AnalyticsError("model filter is invalid")
         try:
             reset_offset = int(params.get("reset_offset", "0"))
             reset_limit = int(params.get("reset_limit", "25"))
@@ -288,7 +298,7 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
         if reset_offset < 0 or not 1 <= reset_limit <= 100:
             raise AnalyticsError("reset_offset must be positive and reset_limit must be 1..100")
 
-        tokens, warnings = token_analytics(connection, catalog, start, end, granularity, source, model)
+        tokens, warnings = token_analytics(connection, catalog, start, end, granularity, sources, models)
         available_sources = [row[0] for row in connection.execute("SELECT DISTINCT source FROM token_usage_events ORDER BY source")]
         available_models = [row[0] for row in connection.execute("SELECT DISTINCT model FROM token_usage_events ORDER BY model")]
         freshness = collector_freshness(connection)
@@ -306,7 +316,7 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
                 "timezone": "Europe/Paris",
                 "granularity_seconds": granularity,
             },
-            "filters": {"source": source, "model": model or None, "reset_type": reset_type},
+            "filters": {"sources": list(sources), "models": list(models), "reset_type": reset_type},
             "available": {"sources": available_sources, "models": available_models},
             "freshness": freshness,
             "limits": limit_series(connection, start, end, granularity),
