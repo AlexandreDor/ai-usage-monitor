@@ -88,15 +88,18 @@
 
     <section class="analytics-grid">
       <article class="card analytics-card wide">
-        <div class="section-heading">
+        <div class="section-heading chart-heading">
           <div><span class="section-kicker">Codex limits</span><h2>Long-term availability</h2></div>
-          <span class="sample-count" id="limit-samples">—</span>
+          <div class="chart-heading-actions">
+            <button type="button" id="toggle-token-overlay" aria-pressed="false" aria-controls="tokens-chart-card">Overlay tokens</button>
+            <span class="sample-count" id="limit-samples">—</span>
+          </div>
         </div>
         <div class="chart-wrap" id="limits-chart-wrap"><canvas id="limits-chart"></canvas></div>
         <p class="empty-state" id="limits-empty" hidden>No limit samples in this period.</p>
       </article>
 
-      <article class="card analytics-card wide">
+      <article class="card analytics-card wide" id="tokens-chart-card">
         <div class="section-heading">
           <div><span class="section-kicker">Local consumption</span><h2>Tokens over time</h2></div>
           <span class="sample-count" id="event-count">—</span>

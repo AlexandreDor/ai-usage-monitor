@@ -95,6 +95,13 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#random-reset-count')).toHaveText('1');
   await expect(page.locator('#random-reset-impact')).toContainText('Gain +30.004 pts');
   await expect(page.locator('#end-week-reset-count')).toHaveText('1');
+  await expect(page.locator('#toggle-token-overlay')).toHaveAttribute('aria-pressed', 'false');
+  await page.locator('#toggle-token-overlay').click();
+  await expect(page.locator('#toggle-token-overlay')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#tokens-chart-card')).toBeHidden();
+  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.length)).toBe(5);
+  await page.locator('#toggle-token-overlay').click();
+  await expect(page.locator('#tokens-chart-card')).toBeVisible();
   await expect(page.locator('#resets-body')).toContainText('Random');
   await expect(page.locator('#breakdown-body')).toContainText('gpt-5.6-sol');
   await expect(page.locator('#analytics-warnings')).toContainText('assumed zero');

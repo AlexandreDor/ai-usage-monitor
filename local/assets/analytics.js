@@ -12,10 +12,15 @@ const state = {
   resetOffset: 0,
   fromDate: '',
   toDate: '',
+  tokenOverlay: false,
 };
 let limitsChart = null;
 let tokensChart = null;
 let refreshTimer = null;
+let limitPoints = [];
+let tokenPoints = [];
+let limitDatasets = [];
+let tokenDatasets = [];
 
 const dateTime = new Intl.DateTimeFormat('en-GB', {
   timeZone: PARIS_ZONE, day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
@@ -75,39 +80,76 @@ function chartBase() {
   };
 }
 
+function tokenAxis() {
+  return {
+    beginAtZero: true,
+    position: 'right',
+    grid: { drawOnChartArea: false },
+    ticks: { color: '#c4b5fd', callback: formatTokens },
+  };
+}
+
+function overlayTokenDatasets() {
+  return tokenDatasets.map(dataset => ({
+    ...dataset,
+    type: 'bar',
+    yAxisID: 'tokens',
+    borderWidth: 0,
+    barPercentage: 0.8,
+    categoryPercentage: 0.8,
+  }));
+}
+
+function updateTokenOverlay() {
+  const available = limitPoints.length > 0 && tokenPoints.length > 0;
+  const active = state.tokenOverlay && available;
+  const toggle = byId('toggle-token-overlay');
+  toggle.disabled = !available;
+  toggle.setAttribute('aria-pressed', String(active));
+  toggle.textContent = active ? 'Show tokens separately' : 'Overlay tokens';
+  byId('tokens-chart-card').hidden = active;
+  if (!limitsChart) return;
+  limitsChart.data.datasets = active ? [...limitDatasets, ...overlayTokenDatasets()] : [...limitDatasets];
+  if (active) limitsChart.options.scales.tokens = tokenAxis();
+  else delete limitsChart.options.scales.tokens;
+  limitsChart.update('none');
+}
+
 function renderLimits(data) {
-  const points = Array.isArray(data.series) ? data.series : [];
+  limitPoints = Array.isArray(data.series) ? data.series : [];
   byId('limit-samples').textContent = `${formatFullTokens(data.samples)} samples`;
-  byId('limits-empty').hidden = points.length > 0;
-  byId('limits-chart-wrap').hidden = points.length === 0;
-  const datasets = [
-    { label: '5-hour remaining', data: points.map(point => ({ x: Date.parse(point.at), y: point.five_h_pct })), borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,.10)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false },
-    { label: 'Weekly remaining', data: points.map(point => ({ x: Date.parse(point.at), y: point.weekly_pct })), borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.07)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false },
+  byId('limits-empty').hidden = limitPoints.length > 0;
+  byId('limits-chart-wrap').hidden = limitPoints.length === 0;
+  limitDatasets = [
+    { label: '5-hour remaining', data: limitPoints.map(point => ({ x: Date.parse(point.at), y: point.five_h_pct })), borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,.10)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false },
+    { label: 'Weekly remaining', data: limitPoints.map(point => ({ x: Date.parse(point.at), y: point.weekly_pct })), borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.07)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false },
   ];
-  if (limitsChart) { limitsChart.data.datasets = datasets; limitsChart.update('none'); return; }
+  if (limitsChart) { limitsChart.data.datasets = [...limitDatasets]; limitsChart.update('none'); updateTokenOverlay(); return; }
   if (typeof Chart !== 'function') throw new Error('Chart.js failed to load');
   const options = chartBase();
   options.scales.y.max = 100;
   options.scales.y.ticks.callback = value => `${value}%`;
-  limitsChart = new Chart(byId('limits-chart').getContext('2d'), { type: 'line', data: { datasets }, options });
+  limitsChart = new Chart(byId('limits-chart').getContext('2d'), { type: 'line', data: { datasets: limitDatasets }, options });
+  updateTokenOverlay();
 }
 
 function renderTokens(data) {
-  const points = Array.isArray(data.series) ? data.series : [];
+  tokenPoints = Array.isArray(data.series) ? data.series : [];
   byId('event-count').textContent = `${formatFullTokens(data.summary.events)} events`;
-  byId('tokens-empty').hidden = points.length > 0;
-  byId('tokens-chart-wrap').hidden = points.length === 0;
-  const datasets = [
-    { label: 'Input', data: points.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.input_tokens) })), backgroundColor: '#3b82f6', stack: 'tokens' },
-    { label: 'Cache read/write', data: points.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.cache_read_tokens) + safeNumber(point.cache_write_tokens) })), backgroundColor: '#a78bfa', stack: 'tokens' },
-    { label: 'Output', data: points.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.output_tokens) })), backgroundColor: '#22c55e', stack: 'tokens' },
+  byId('tokens-empty').hidden = tokenPoints.length > 0;
+  byId('tokens-chart-wrap').hidden = tokenPoints.length === 0;
+  tokenDatasets = [
+    { label: 'Input', data: tokenPoints.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.input_tokens) })), backgroundColor: '#3b82f6', stack: 'tokens' },
+    { label: 'Cache read/write', data: tokenPoints.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.cache_read_tokens) + safeNumber(point.cache_write_tokens) })), backgroundColor: '#a78bfa', stack: 'tokens' },
+    { label: 'Output', data: tokenPoints.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.output_tokens) })), backgroundColor: '#22c55e', stack: 'tokens' },
   ];
-  if (tokensChart) { tokensChart.data.datasets = datasets; tokensChart.update('none'); return; }
+  if (tokensChart) { tokensChart.data.datasets = tokenDatasets; tokensChart.update('none'); updateTokenOverlay(); return; }
   if (typeof Chart !== 'function') throw new Error('Chart.js failed to load');
   const options = chartBase();
   options.scales.y.stacked = true;
   options.scales.y.ticks.callback = formatTokens;
-  tokensChart = new Chart(byId('tokens-chart').getContext('2d'), { type: 'bar', data: { datasets }, options });
+  tokensChart = new Chart(byId('tokens-chart').getContext('2d'), { type: 'bar', data: { datasets: tokenDatasets }, options });
+  updateTokenOverlay();
 }
 
 function clearRows(body) { while (body.firstChild) body.removeChild(body.firstChild); }
@@ -300,5 +342,10 @@ byId('apply-dates').addEventListener('click', () => {
 });
 byId('resets-previous').addEventListener('click', () => { state.resetOffset = Math.max(0, state.resetOffset - RESET_PAGE_SIZE); refresh(); });
 byId('resets-next').addEventListener('click', () => { state.resetOffset += RESET_PAGE_SIZE; refresh(); });
+byId('toggle-token-overlay').addEventListener('click', () => {
+  if (!limitPoints.length || !tokenPoints.length) return;
+  state.tokenOverlay = !state.tokenOverlay;
+  updateTokenOverlay();
+});
 
 refresh();
