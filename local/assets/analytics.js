@@ -138,7 +138,7 @@ function renderResets(data) {
     cell(row, formatDate(item.observed_at));
     cell(row, `${item.before_pct ?? '—'}% → ${item.after_pct ?? '—'}%`);
     const impact = item.category === 'random'
-      ? `${item.adjustment_pct_points >= 0 ? '+' : ''}${item.adjustment_pct_points ?? 0} pts vs baseline`
+      ? `${item.pace_delta_vs_ideal_pct >= 0 ? '+' : ''}${item.pace_delta_vs_ideal_pct ?? 0}% vs ideal pace`
       : item.category === 'end_of_week' && item.unused_pct_points > 0
         ? `${item.unused_pct_points}% unused expired`
         : '—';
@@ -222,7 +222,7 @@ function render(payload) {
   const random = weeklySummary.random || {};
   const endOfWeek = weeklySummary.end_of_week || {};
   byId('random-reset-count').textContent = formatFullTokens(random.count);
-  byId('random-reset-impact').textContent = `Gain ${formatPoints(random.gained_pct_points)} · loss ${formatPoints(random.lost_pct_points)} vs baseline`;
+  byId('random-reset-impact').textContent = `Gain ${formatPercent(random.gained_vs_ideal_pct)} · loss ${formatPercent(random.lost_vs_ideal_pct)} vs ideal pace`;
   byId('end-week-reset-count').textContent = formatFullTokens(endOfWeek.count);
   byId('end-week-reset-impact').textContent = `${formatPercent(endOfWeek.unused_pct_points)} of unused quota expired`;
   byId('period-label').textContent = `${shortDate.format(new Date(payload.period.from))} – ${shortDate.format(new Date(payload.period.to))}`;
