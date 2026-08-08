@@ -210,6 +210,16 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   expect(layout.resets).toBeLessThan(layout.allocation);
   expect(layout.allocation).toBeLessThan(layout.health);
   expect(layout.health).toBeLessThan(layout.pricingWarning);
+  const filterBehavior = await page.evaluate(() => {
+    const panel = document.querySelector('.filter-panel');
+    const initialTop = panel.getBoundingClientRect().top;
+    window.scrollTo(0, 400);
+    return {
+      position: getComputedStyle(panel).position,
+      movesWithPage: panel.getBoundingClientRect().top < initialTop,
+    };
+  });
+  expect(filterBehavior).toEqual({ position: 'static', movesWithPage: true });
   expect(externalRequests).toEqual([]);
 
   const results = await new AxeBuilder({ page }).analyze();
