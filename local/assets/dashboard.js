@@ -6,18 +6,22 @@ const REFRESH_INTERVAL_MS = 900_000;
 const DECIMATION_THRESHOLD = 1000;
 const DECIMATION_SAMPLES = 600;
 const PARIS_TIME_ZONE = 'Europe/Paris';
-const parisDateTimeFormatter = new Intl.DateTimeFormat('en-GB', {
-  timeZone: PARIS_TIME_ZONE,
-  day: '2-digit',
-  month: '2-digit',
-  year: 'numeric',
-  hour: '2-digit',
-  minute: '2-digit',
-  hourCycle: 'h23',
-});
 
 let chart = null;
 let refreshTimer = null;
+let dashboardData = null;
+let dashboardHistory = null;
+let historyFailure = null;
+let mainFailure = null;
+let dashboardMode = null;
+
+function t(key, values = {}) {
+  return typeof CodexPreferences === 'object' ? CodexPreferences.t(`dashboard.${key}`, values) : key;
+}
+
+function currentLocale() {
+  return typeof CodexPreferences === 'object' ? CodexPreferences.locale() : 'en-GB';
+}
 
 function validPct(value) {
   if (value === null || value === undefined || value === '') return null;
@@ -44,8 +48,17 @@ function formatParisDateTime(value, includeYear = true) {
   const timestamp = typeof value === 'number' ? value : Date.parse(value);
   if (!Number.isFinite(timestamp)) return '-';
 
+  const formatter = new Intl.DateTimeFormat(currentLocale(), {
+    timeZone: PARIS_TIME_ZONE,
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  });
   const parts = Object.fromEntries(
-    parisDateTimeFormatter
+    formatter
       .formatToParts(new Date(timestamp))
       .filter(part => part.type !== 'literal')
       .map(part => [part.type, part.value]),
@@ -79,7 +92,7 @@ function renderWeeklyPaceDelta(data) {
 
   if (actual === null || ideal === null) {
     element.textContent = '--';
-    element.title = 'Weekly pace unavailable';
+    element.title = t('weeklyPaceUnavailable');
     return;
   }
 
@@ -88,12 +101,12 @@ function renderWeeklyPaceDelta(data) {
   const relativeDifference = ideal > 0
     ? Math.round((Math.abs(rawDifference) / ideal) * 1000) / 10
     : null;
-  const direction = pointDifference === 0 ? 'on pace' : pointDifference > 0 ? 'above' : 'below';
+  const direction = pointDifference === 0 ? t('onPace') : pointDifference > 0 ? t('above') : t('below');
   const sign = pointDifference > 0 ? '+' : '';
   const relativeLabel = relativeDifference === null ? '' : ` / ${relativeDifference.toFixed(1)}% ${direction}`;
 
-  element.textContent = `${sign}${pointDifference.toFixed(1)} pts${relativeLabel}`;
-  element.title = `Actual remaining: ${actual.toFixed(1)}% / Ideal remaining: ${ideal.toFixed(1)}%`;
+  element.textContent = `${sign}${pointDifference.toFixed(1)} ${t('points')}${relativeLabel}`;
+  element.title = `${t('actualRemaining')}: ${actual.toFixed(1)}% / ${t('idealRemaining')}: ${ideal.toFixed(1)}%`;
   element.classList.add(pointDifference >= 0 ? 'ahead' : 'behind');
 }
 
@@ -108,17 +121,18 @@ function setBar(barId, pctId, pct) {
 
 function setMainError(message = '') {
   const element = document.getElementById('error-banner');
-  element.textContent = message ? `Warning: ${displayText(message, 'Unable to load dashboard data')}` : '';
+  mainFailure = message || null;
+  element.textContent = message ? `${t('warningPrefix')}: ${displayText(message, t('warningFallback'))}` : '';
   element.hidden = !message;
 }
 
 function setHistoryError(message = '') {
   const element = document.getElementById('history-error');
-  element.textContent = message ? `Chart: ${displayText(message, 'Unable to render history')}` : '';
+  element.textContent = message ? `${t('chartPrefix')}: ${displayText(message, t('chartFallback'))}` : '';
   element.hidden = !message;
 }
 
-function destroyChart(title = 'History unavailable') {
+function destroyChart(title = t('historyUnavailable')) {
   if (chart) {
     chart.destroy();
     chart = null;
@@ -127,8 +141,8 @@ function destroyChart(title = 'History unavailable') {
 }
 
 function normalizeHistory(history) {
-  if (!Array.isArray(history)) throw new Error('history.json is not an array');
-  if (history.length === 0) throw new Error('History is empty');
+  if (!Array.isArray(history)) throw new Error(t('invalidHistory'));
+  if (history.length === 0) throw new Error(t('historyEmpty'));
 
   const byTimestamp = new Map();
   for (const item of history) {
@@ -147,20 +161,22 @@ function normalizeHistory(history) {
   }
 
   const points = [...byTimestamp.values()].sort((a, b) => a.timestamp - b.timestamp);
-  if (points.length === 0) throw new Error('History contains no valid samples');
+  if (points.length === 0) throw new Error(t('historyNoValidSamples'));
   return points;
 }
 
 function historyTitle(points) {
   const start = formatParisDateTime(points[0].timestamp, false);
   const end = formatParisDateTime(points[points.length - 1].timestamp, false);
-  return points.length === 1 ? `History / ${start}` : `History / ${start} - ${end}`;
+  return points.length === 1
+    ? t('historyTitleSingle', { start })
+    : t('historyTitleRange', { start, end });
 }
 
 function chartDatasets(points) {
   return [
     {
-      label: '5h Limit %',
+      label: t('fiveHourDataset'),
       data: points.map(point => ({ x: point.timestamp, y: point.fiveHour })),
       borderColor: '#22c55e',
       backgroundColor: 'rgba(34,197,94,0.1)',
@@ -171,7 +187,7 @@ function chartDatasets(points) {
       spanGaps: false,
     },
     {
-      label: 'Weekly Limit %',
+      label: t('weeklyDataset'),
       data: points.map(point => ({ x: point.timestamp, y: point.weekly })),
       borderColor: '#4ade80',
       backgroundColor: 'rgba(74,222,128,0.08)',
@@ -182,7 +198,7 @@ function chartDatasets(points) {
       spanGaps: false,
     },
     {
-      label: 'Ideal weekly pace',
+      label: t('idealDataset'),
       data: points.map(point => ({
         x: point.timestamp,
         y: idealWeeklyRemaining(point.timestamp, point.weeklyReset),
@@ -211,6 +227,8 @@ function chartTimeBounds(points) {
 
 function renderHistory(history) {
   const points = normalizeHistory(history);
+  dashboardHistory = history;
+  historyFailure = null;
   const datasets = chartDatasets(points);
   const timeBounds = chartTimeBounds(points);
   document.getElementById('history-label').textContent = historyTitle(points);
@@ -230,7 +248,7 @@ function renderHistory(history) {
     return;
   }
 
-  if (typeof Chart !== 'function') throw new Error('Chart.js failed to load');
+  if (typeof Chart !== 'function') throw new Error(t('chartFailed'));
   const context = document.getElementById('history-chart').getContext('2d');
   chart = new Chart(context, {
     type: 'line',
@@ -271,22 +289,27 @@ function renderHistory(history) {
 }
 
 function renderHistoryFailure(message) {
+  historyFailure = message;
+  dashboardHistory = null;
   destroyChart();
   setHistoryError(message);
 }
 
-function renderData(data) {
+function renderData(data, { schedule = true } = {}) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
-    throw new Error('Invalid dashboard data');
+    throw new Error(t('invalidDashboardData'));
   }
+  dashboardData = data;
   setBar('five-h-bar', 'five-h-pct', data.five_h_pct);
   setBar('weekly-bar', 'weekly-pct', data.weekly_pct);
   document.getElementById('five-h-reset').textContent = formatParisUnixTimestamp(data.five_h_reset_at);
   document.getElementById('weekly-reset').textContent = formatParisUnixTimestamp(data.weekly_reset_at);
   renderWeeklyPaceDelta(data);
-  document.getElementById('last-updated').textContent = `Last scraped ${formatParisDateTime(displayText(data.scraped_at, ''))}`;
+  document.getElementById('last-updated').textContent = t('lastScraped', {
+    value: formatParisDateTime(displayText(data.scraped_at, '')),
+  });
   setMainError();
-  scheduleRefresh(data);
+  if (schedule) scheduleRefresh(data);
 }
 
 async function fetchJson(url, missingMessage) {
@@ -296,32 +319,34 @@ async function fetchJson(url, missingMessage) {
 }
 
 async function fetchLocal() {
-  document.getElementById('mode-badge').textContent = 'LOCAL';
-  const data = await fetchJson('data.json', 'data.json not found; run monitor.sh first');
+  dashboardMode = 'local';
+  document.getElementById('mode-badge').textContent = t(dashboardMode);
+  const data = await fetchJson('data.json', t('dataNotFound'));
   renderData(data);
 
   try {
-    renderHistory(await fetchJson('history.json', 'history.json not found'));
+    renderHistory(await fetchJson('history.json', t('historyNotFound')));
   } catch (error) {
-    renderHistoryFailure(error instanceof Error ? error.message : 'Unable to load history');
+    renderHistoryFailure(error instanceof Error ? error.message : t('unableToLoadHistory'));
   }
 }
 
 async function fetchGist() {
-  document.getElementById('mode-badge').textContent = 'EXTERNAL';
+  dashboardMode = 'external';
+  document.getElementById('mode-badge').textContent = t(dashboardMode);
   const response = await fetch(`https://api.github.com/gists/${encodeURIComponent(GIST_ID)}?_=${Date.now()}`);
-  if (!response.ok) throw new Error(`GitHub API returned HTTP ${response.status}; check GIST_ID`);
+  if (!response.ok) throw new Error(t('githubApiError', { status: response.status }));
   const gist = await response.json();
   const dataContent = gist?.files?.['data.json']?.content;
-  if (!dataContent) throw new Error('data.json not found in Gist');
+  if (!dataContent) throw new Error(t('gistDataNotFound'));
   renderData(JSON.parse(dataContent));
 
   try {
     const historyContent = gist?.files?.['history.json']?.content;
-    if (!historyContent) throw new Error('history.json not found in Gist');
+    if (!historyContent) throw new Error(t('gistHistoryNotFound'));
     renderHistory(JSON.parse(historyContent));
   } catch (error) {
-    renderHistoryFailure(error instanceof Error ? error.message : 'Unable to load history');
+    renderHistoryFailure(error instanceof Error ? error.message : t('unableToLoadHistory'));
   }
 }
 
@@ -329,10 +354,27 @@ async function refresh() {
   try {
     await (GIST_ID ? fetchGist() : fetchLocal());
   } catch (error) {
-    setMainError(error instanceof Error ? error.message : 'Unable to load dashboard data');
-    document.getElementById('mode-badge').textContent = 'ERROR';
+    setMainError(error instanceof Error ? error.message : t('unableToLoadData'));
+    dashboardMode = 'error';
+    document.getElementById('mode-badge').textContent = t(dashboardMode);
     scheduleRefresh();
   }
 }
 
+function refreshLocalizedDashboard() {
+  if (dashboardMode) document.getElementById('mode-badge').textContent = t(dashboardMode);
+  if (dashboardData) renderData(dashboardData, { schedule: false });
+  else if (mainFailure) setMainError(mainFailure);
+  if (dashboardHistory) {
+    try {
+      renderHistory(dashboardHistory);
+    } catch (error) {
+      renderHistoryFailure(error instanceof Error ? error.message : t('unableToLoadHistory'));
+    }
+  } else if (historyFailure) {
+    setHistoryError(historyFailure);
+  }
+}
+
+if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(refreshLocalizedDashboard);
 refresh();

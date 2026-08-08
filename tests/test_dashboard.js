@@ -43,6 +43,7 @@ const context = vm.createContext({
   console,
   Date,
   Error,
+  Intl,
   Map,
   Number,
   Chart: FakeChart,
@@ -56,6 +57,8 @@ const context = vm.createContext({
   clearTimeout: () => {},
 });
 
+const preferencesSource = fs.readFileSync(path.join(__dirname, '..', 'local', 'assets', 'preferences.js'), 'utf8');
+vm.runInContext(preferencesSource, context, { filename: 'preferences.js' });
 const source = fs.readFileSync(path.join(__dirname, '..', 'local', 'assets', 'dashboard.js'), 'utf8');
 vm.runInContext(source, context, { filename: 'dashboard.js' });
 

@@ -125,6 +125,7 @@ public_files = {
     "/analytics.html": "/analytics.html",
     "/assets/dashboard.css": "/assets/dashboard.css",
     "/assets/dashboard.js": "/assets/dashboard.js",
+    "/assets/preferences.js": "/assets/preferences.js",
     "/assets/analytics.css": "/assets/analytics.css",
     "/assets/analytics.js": "/assets/analytics.js",
     "/assets/chart.umd.min.js": "/assets/chart.umd.min.js",

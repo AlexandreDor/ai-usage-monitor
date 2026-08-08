@@ -119,6 +119,75 @@ header h1 {
   border-color: #fff;
 }
 
+.preference-controls {
+  position: absolute;
+  top: 24px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 0;
+}
+
+.preference-setting {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.preference-label {
+  color: var(--muted);
+  font-size: 0.64rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+
+.preference-controls .preference-toggle {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(24px, 1fr));
+  min-height: 26px;
+  margin: 0;
+  padding: 2px;
+  color: var(--muted);
+  border: 1px solid rgba(96, 165, 250, 0.22);
+  border-radius: 999px;
+  background: rgba(3, 8, 23, 0.42);
+  box-shadow: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.64rem;
+  font-weight: 750;
+  line-height: 1;
+}
+
+.preference-toggle span {
+  min-width: 24px;
+  padding: 5px 6px;
+  border-radius: 999px;
+  transition: color 140ms ease, background-color 140ms ease;
+}
+
+.preference-toggle[data-selected="en"] [data-preference-value="en"],
+.preference-toggle[data-selected="fr"] [data-preference-value="fr"],
+.preference-toggle[data-selected="EUR"] [data-preference-value="EUR"],
+.preference-toggle[data-selected="USD"] [data-preference-value="USD"] {
+  color: #eaf3ff;
+  background: rgba(59, 130, 246, 0.28);
+}
+
+.preference-controls .preference-toggle:hover {
+  color: #cfe3ff;
+  border-color: rgba(96, 165, 250, 0.42);
+  background: rgba(11, 25, 48, 0.66);
+}
+
+.preference-controls .preference-toggle:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: 2px;
+}
+
 .grid {
   max-width: 960px;
   margin: 0 auto;
@@ -300,6 +369,16 @@ canvas {
 
   .pct-value {
     font-size: 4rem;
+  }
+
+  .preference-controls {
+    top: 24px;
+    right: 12px;
+    gap: 8px;
+  }
+
+  .preference-label {
+    display: none;
   }
 }
 

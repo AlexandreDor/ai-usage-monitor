@@ -8,6 +8,7 @@ for test_file in "$TEST_DIR"/test_*.sh; do
 done
 
 if command -v node >/dev/null 2>&1; then
+  node "$TEST_DIR/test_preferences.js"
   node "$TEST_DIR/test_dashboard.js"
 else
   printf 'FAIL: node is required for dashboard tests\n' >&2

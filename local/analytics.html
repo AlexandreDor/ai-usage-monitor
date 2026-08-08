@@ -3,36 +3,53 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Advanced Analytics · Codex Usage Monitor</title>
-  <meta name="description" content="Long-term limits, reset history, local token usage and API-equivalent cost estimates">
+  <title data-i18n="analytics.pageTitle">Advanced Analytics · Codex Usage Monitor</title>
+  <meta name="description" data-i18n-content="analytics.description" content="Long-term limits, reset history, local token usage and API-equivalent cost estimates">
   <link rel="icon" type="image/png" sizes="128x128" href="images/favicon.png">
   <link rel="stylesheet" href="assets/dashboard.css">
   <link rel="stylesheet" href="assets/analytics.css">
   <script src="assets/chart.umd.min.js" defer></script>
+  <script src="assets/preferences.js" defer></script>
   <script src="assets/analytics.js" defer></script>
 </head>
 <body class="analytics-page">
   <header class="analytics-header">
-    <a class="back-link" href="dashboard.html"><span aria-hidden="true">←</span> Live limits</a>
-    <div class="eyebrow">Local intelligence</div>
-    <h1>Advanced Analytics</h1>
-    <p>Long-range limits, token consumption and API-equivalent cost—kept on this machine.</p>
+    <a class="back-link" href="dashboard.html"><span aria-hidden="true">←</span> <span data-i18n="analytics.backToLive">Live limits</span></a>
+    <div class="eyebrow" data-i18n="analytics.eyebrow">Local intelligence</div>
+    <h1 data-i18n="analytics.heading">Advanced Analytics</h1>
+    <p data-i18n="analytics.intro">Long-range limits, token consumption and API-equivalent cost—kept on this machine.</p>
+    <div class="preference-controls" data-i18n-aria-label="preferences.ariaLabel" aria-label="Display preferences">
+      <div class="preference-setting">
+        <span class="preference-label" data-i18n="preferences.language">Language</span>
+        <button class="preference-toggle" id="language-toggle" type="button" data-preference-toggle="language" data-preference-values="en,fr" data-selected="en" aria-label="Language: English">
+          <span data-preference-value="en">EN</span>
+          <span data-preference-value="fr">FR</span>
+        </button>
+      </div>
+      <div class="preference-setting">
+        <span class="preference-label" data-i18n="preferences.currency">Currency</span>
+        <button class="preference-toggle" id="currency-toggle" type="button" data-preference-toggle="currency" data-preference-values="EUR,USD" data-selected="EUR" aria-label="Currency: Euro">
+          <span data-preference-value="EUR">€</span>
+          <span data-preference-value="USD">$</span>
+        </button>
+      </div>
+    </div>
   </header>
 
   <main class="analytics-shell">
-    <section class="filter-panel" aria-label="Analytics filters">
-      <div class="range-group" id="range-group" aria-label="Date range">
+    <section class="filter-panel" data-i18n-aria-label="analytics.filtersAria" aria-label="Analytics filters">
+      <div class="range-group" id="range-group" data-i18n-aria-label="analytics.dateRange" aria-label="Date range">
         <button type="button" data-range="24h">24h</button>
         <button type="button" data-range="7d">7d</button>
         <button type="button" data-range="30d" class="active">30d</button>
         <button type="button" data-range="90d">90d</button>
         <button type="button" data-range="1y">1y</button>
-        <button type="button" data-range="all">All</button>
-        <button type="button" data-range="custom">Custom</button>
+        <button type="button" data-range="all" data-i18n="analytics.all">All</button>
+        <button type="button" data-range="custom" data-i18n="analytics.custom">Custom</button>
       </div>
       <div class="filter-fields">
         <fieldset class="multi-filter">
-          <legend>Applications</legend>
+          <legend data-i18n="analytics.applications">Applications</legend>
           <div class="filter-options" id="source-filter">
             <label class="filter-option"><input type="checkbox" value="codex" checked> Codex</label>
             <label class="filter-option"><input type="checkbox" value="opencode" checked> OpenCode</label>
@@ -40,17 +57,17 @@
           </div>
         </fieldset>
         <fieldset class="multi-filter model-filter">
-          <legend>Models</legend>
+          <legend data-i18n="analytics.models">Models</legend>
           <div class="filter-actions">
-            <button type="button" id="select-gpt-5-6">GPT 5.6</button>
-            <button type="button" id="select-all-models">All models</button>
+            <button type="button" id="select-gpt-5-6" data-i18n="analytics.selectGpt">GPT 5.6</button>
+            <button type="button" id="select-all-models" data-i18n="analytics.allModels">All models</button>
           </div>
           <div class="filter-options" id="model-filter" aria-live="polite"></div>
         </fieldset>
         <div class="custom-dates" id="custom-dates" hidden>
-          <label>From <input id="from-date" type="date"></label>
-          <label>To <input id="to-date" type="date"></label>
-          <button type="button" id="apply-dates">Apply</button>
+          <label><span data-i18n="analytics.from">From</span> <input id="from-date" type="date"></label>
+          <label><span data-i18n="analytics.to">To</span> <input id="to-date" type="date"></label>
+          <button type="button" id="apply-dates" data-i18n="analytics.apply">Apply</button>
         </div>
       </div>
     </section>
@@ -58,99 +75,99 @@
     <div id="analytics-error" class="analytics-message error-message" role="alert" hidden></div>
     <div id="analytics-warnings" class="analytics-message warning-message" role="status" hidden></div>
 
-    <section class="metric-grid" aria-label="Period summary">
+    <section class="metric-grid" data-i18n-aria-label="analytics.metricSummaryAria" aria-label="Period summary">
       <article class="metric-card">
-        <span class="metric-label">Billable tokens</span>
+        <span class="metric-label" data-i18n="analytics.billableTokens">Billable tokens</span>
         <strong id="total-tokens">—</strong>
-        <small id="token-detail">Input, cache and output</small>
+        <small id="token-detail" data-i18n="analytics.tokenDetail">Input, cache and output</small>
       </article>
       <article class="metric-card cost-card">
-        <span class="metric-label">API-equivalent cost</span>
+        <span class="metric-label" data-i18n="analytics.apiCost">API-equivalent cost</span>
         <strong id="estimated-cost">—</strong>
-        <small id="pricing-note">Current catalog · USD</small>
+        <small id="pricing-note" data-i18n="analytics.currentCatalogUsd">Current catalog · USD</small>
       </article>
       <article class="metric-card">
-        <span class="metric-label">Random weekly resets</span>
+        <span class="metric-label" data-i18n="analytics.randomWeeklyResets">Random weekly resets</span>
         <strong id="random-reset-count">—</strong>
-        <small id="random-reset-impact">Gain/loss versus ideal weekly pace</small>
+        <small id="random-reset-impact" data-i18n="analytics.randomImpactHint">Gain/loss versus ideal weekly pace</small>
       </article>
       <article class="metric-card">
-        <span class="metric-label">End-of-week resets</span>
+        <span class="metric-label" data-i18n="analytics.endWeekResets">End-of-week resets</span>
         <strong id="end-week-reset-count">—</strong>
-        <small id="end-week-reset-impact">Unused quota lost at reset</small>
+        <small id="end-week-reset-impact" data-i18n="analytics.endWeekImpactHint">Unused quota lost at reset</small>
       </article>
       <article class="metric-card">
-        <span class="metric-label">Selected period</span>
+        <span class="metric-label" data-i18n="analytics.selectedPeriod">Selected period</span>
         <strong class="period-value" id="period-label">—</strong>
-        <small id="granularity-label">—</small>
+        <small id="granularity-label" data-i18n="analytics.granularityUnknown">—</small>
       </article>
     </section>
 
     <section class="analytics-grid">
       <article class="card analytics-card wide">
         <div class="section-heading chart-heading">
-          <div><span class="section-kicker">Codex limits</span><h2>Long-term availability</h2></div>
+          <div><span class="section-kicker" data-i18n="analytics.codexLimits">Codex limits</span><h2 data-i18n="analytics.longTermAvailability">Long-term availability</h2></div>
           <div class="chart-heading-actions">
-            <button type="button" id="toggle-token-overlay" aria-pressed="false" aria-controls="tokens-chart-card">Overlay tokens</button>
+            <button type="button" id="toggle-token-overlay" aria-pressed="false" aria-controls="tokens-chart-card" data-i18n="analytics.overlayTokens">Overlay tokens</button>
             <span class="sample-count" id="limit-samples">—</span>
           </div>
         </div>
         <div class="chart-wrap" id="limits-chart-wrap"><canvas id="limits-chart"></canvas></div>
-        <p class="empty-state" id="limits-empty" hidden>No limit samples in this period.</p>
+        <p class="empty-state" id="limits-empty" data-i18n="analytics.noLimitSamples" hidden>No limit samples in this period.</p>
       </article>
 
       <article class="card analytics-card wide" id="tokens-chart-card">
         <div class="section-heading">
-          <div><span class="section-kicker">Local consumption</span><h2>Tokens over time</h2></div>
+          <div><span class="section-kicker" data-i18n="analytics.localConsumption">Local consumption</span><h2 data-i18n="analytics.tokensOverTime">Tokens over time</h2></div>
           <span class="sample-count" id="event-count">—</span>
         </div>
         <div class="chart-wrap" id="tokens-chart-wrap"><canvas id="tokens-chart"></canvas></div>
-        <p class="empty-state" id="tokens-empty" hidden>No token events in this period.</p>
+        <p class="empty-state" id="tokens-empty" data-i18n="analytics.noTokenEvents" hidden>No token events in this period.</p>
       </article>
 
       <article class="card analytics-card wide table-card">
         <div class="section-heading">
-          <div><span class="section-kicker">Cost allocation</span><h2>By application and model</h2></div>
-          <div class="allocation-total"><span>Total estimated cost</span><strong id="allocation-total-cost">—</strong></div>
+          <div><span class="section-kicker" data-i18n="analytics.costAllocation">Cost allocation</span><h2 data-i18n="analytics.byApplicationModel">By application and model</h2></div>
+          <div class="allocation-total"><span data-i18n="analytics.totalEstimatedCost">Total estimated cost</span><strong id="allocation-total-cost">—</strong></div>
         </div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Application</th><th>Provider / model</th><th>Input</th><th>Cache</th><th>Output</th><th>Est. cost</th></tr></thead>
+            <thead><tr><th data-i18n="analytics.application">Application</th><th data-i18n="analytics.providerModel">Provider / model</th><th data-i18n="analytics.input">Input</th><th data-i18n="analytics.cache">Cache</th><th data-i18n="analytics.output">Output</th><th data-i18n="analytics.estimatedCost">Est. cost</th></tr></thead>
             <tbody id="breakdown-body"></tbody>
           </table>
         </div>
-        <p class="empty-state" id="breakdown-empty" hidden>No model consumption to display.</p>
+        <p class="empty-state" id="breakdown-empty" data-i18n="analytics.noModelConsumption" hidden>No model consumption to display.</p>
       </article>
 
       <article class="card analytics-card wide table-card">
         <div class="section-heading reset-heading">
-          <div><span class="section-kicker">Reset history</span><h2>Previous limit resets</h2></div>
-          <label class="compact-filter">Window
-            <select id="reset-filter"><option value="all">All</option><option value="5h">5-hour</option><option value="weekly">Weekly</option></select>
+          <div><span class="section-kicker" data-i18n="analytics.resetHistory">Reset history</span><h2 data-i18n="analytics.previousLimitResets">Previous limit resets</h2></div>
+          <label class="compact-filter"><span data-i18n="analytics.window">Window</span>
+            <select id="reset-filter"><option value="all" data-i18n="analytics.all">All</option><option value="5h" data-i18n="analytics.fiveHour">5-hour</option><option value="weekly" data-i18n="analytics.weekly">Weekly</option></select>
           </label>
         </div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Window</th><th>Category</th><th>Scheduled reset</th><th>First observation</th><th>Before → after</th><th>Impact</th><th>Delay</th></tr></thead>
+            <thead><tr><th data-i18n="analytics.window">Window</th><th data-i18n="analytics.category">Category</th><th data-i18n="analytics.scheduledReset">Scheduled reset</th><th data-i18n="analytics.firstObservation">First observation</th><th data-i18n="analytics.beforeAfter">Before → after</th><th data-i18n="analytics.impact">Impact</th><th data-i18n="analytics.delay">Delay</th></tr></thead>
             <tbody id="resets-body"></tbody>
           </table>
         </div>
-        <p class="empty-state" id="resets-empty" hidden>No reset observed in this period.</p>
+        <p class="empty-state" id="resets-empty" data-i18n="analytics.noResetObserved" hidden>No reset observed in this period.</p>
         <div class="pagination" id="reset-pagination" hidden>
-          <button type="button" id="resets-previous">Previous</button>
+          <button type="button" id="resets-previous" data-i18n="analytics.previous">Previous</button>
           <span id="reset-page-label"></span>
-          <button type="button" id="resets-next">Next</button>
+          <button type="button" id="resets-next" data-i18n="analytics.next">Next</button>
         </div>
       </article>
 
       <article class="card analytics-card wide">
-        <div class="section-heading"><div><span class="section-kicker">Data health</span><h2>Collectors</h2></div></div>
+        <div class="section-heading"><div><span class="section-kicker" data-i18n="analytics.dataHealth">Data health</span><h2 data-i18n="analytics.collectors">Collectors</h2></div></div>
         <div class="collector-grid" id="collector-grid"></div>
         <p class="baseline-note" id="baseline-note" hidden></p>
       </article>
     </section>
   </main>
 
-  <footer class="analytics-footer">Costs are estimates based on the current local pricing catalog. Request, tool and contract charges are excluded.</footer>
+  <footer class="analytics-footer" data-i18n="analytics.costsFooter">Costs are estimates based on the current local pricing catalog. Request, tool and contract charges are excluded.</footer>
 </body>
 </html>

@@ -24,6 +24,13 @@
   line-height: 1.55;
 }
 
+.analytics-header .preference-controls {
+  justify-content: flex-start;
+  top: 20px;
+  right: 16px;
+  margin-top: 0;
+}
+
 .back-link {
   color: #bfdbfe;
   text-decoration: none;
@@ -254,6 +261,7 @@ td { color: #dbeafe; }
 
 @media (max-width: 560px) {
   .analytics-header { align-items: flex-start; }
+  .analytics-header .preference-controls { justify-content: flex-start; }
   .metric-grid { grid-template-columns: 1fr; }
   .metric-card { min-height: 120px; }
   .filter-panel { position: static; }

@@ -74,6 +74,7 @@ codex-usage-monitor/
 |   |-- token_usage.py    # Codex/OpenCode/Hermes token collectors
 |   |-- storage.py        # Shared SQLite schema and integrity checks
 |   |-- pricing.json      # Versioned API-equivalent pricing catalog
+|   |-- assets/preferences.js # Shared language/currency preferences
 |   |-- serve.sh          # Allowlisted HTTP server for LAN access
 |   |-- .env.example      # Config template; copy to .env
 |   |-- .env              # Your local config (git-ignored, created by you)
@@ -391,13 +392,15 @@ Open `http://localhost:8080/analytics.html` or follow **Advanced analytics** fro
 - token input, cache read/write, output, and reasoning counters collected from local Codex, OpenCode, and Hermes data stores;
 - breakdowns by application, provider, and model;
 - API-equivalent USD cost estimates using the current versioned `local/pricing.json` catalog;
+- language selection (English/French) and currency selection (EUR/USD), shared across both pages and saved in the browser;
+- EUR display conversion using the local fixed rate `1 USD = 0.86 EUR`, with the active rate shown on the cost tooltip;
 - collector freshness, failures, and Hermes pre-monitor baselines.
 
 Collection runs with every monitor cycle—every 15 minutes by default—and is independent of limit retrieval. In `TOKEN_USAGE_SOURCES=auto` mode, missing applications are disabled without failing the cycle. An explicitly requested missing source marks the cycle as failed/degraded.
 
 Codex and OpenCode histories are initially imported when their events have reliable dates. Existing cumulative Hermes counters become a separately displayed baseline and are excluded from dated totals. Collection only reads local usage metadata and counters; it does not read Codex authentication data or transmit analytics to the Gist.
 
-Cost values are estimates, not billing statements. They use the catalog active when the page is viewed, count reasoning as part of billable output rather than twice, and assume zero cost for unknown models while clearly flagging their tokens. Request, tool, search, cache-storage, batch, private-contract, and currency-conversion charges are excluded.
+Cost values are estimates, not billing statements. They use the catalog active when the page is viewed, count reasoning as part of billable output rather than twice, and assume zero cost for unknown models while clearly flagging their tokens. The API remains valued in USD; selecting EUR only converts the display using the fixed local rate documented above. Request, tool, search, cache-storage, batch, private-contract, and currency-conversion charges are excluded.
 
 The long-term page requires the local Python server because its API aggregates the private SQLite archive. It is intentionally unavailable on the optional static/Gist dashboard.
 

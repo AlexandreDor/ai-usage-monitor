@@ -90,8 +90,9 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await page.goto('/analytics.html');
 
   await expect(page.locator('#total-tokens')).toHaveText('1.7M');
-  await expect(page.locator('#estimated-cost')).toHaveText('$11.25');
-  await expect(page.locator('#allocation-total-cost')).toHaveText('$11.25');
+  await expect(page.locator('#estimated-cost')).toHaveText('€9.68');
+  await expect(page.locator('#allocation-total-cost')).toHaveText('€9.68');
+  await expect(page.locator('#estimated-cost')).toHaveAttribute('title', 'Converted from USD using fixed rate: 1 USD = €0.86');
   await expect(page.locator('#random-reset-count')).toHaveText('1');
   await expect(page.locator('#random-reset-impact')).toContainText('Gain +30.004 pts');
   await expect(page.locator('#end-week-reset-count')).toHaveText('1');
@@ -114,4 +115,36 @@ test('renders advanced analytics and remains local', async ({ page }) => {
 
   const results = await new AxeBuilder({ page }).analyze();
   expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+});
+
+test('switches locale and currency and persists the preference across pages', async ({ page }) => {
+  await mockUsage(page);
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: analyticsPayload }));
+  await page.goto('/analytics.html');
+
+  await expect(page.locator('.preference-controls select')).toHaveCount(0);
+  await expect(page.locator('#language-toggle')).toHaveAttribute('data-selected', 'en');
+  await expect(page.locator('#currency-toggle')).toHaveAttribute('data-selected', 'EUR');
+  await page.locator('#currency-toggle').click();
+  await expect(page.locator('#currency-toggle')).toHaveAttribute('data-selected', 'USD');
+  await expect(page.locator('#estimated-cost')).toHaveText('$11.25');
+  await expect(page.locator('#estimated-cost')).toHaveAttribute('title', '');
+
+  await page.locator('#language-toggle').click();
+  await expect(page.locator('#language-toggle')).toHaveAttribute('data-selected', 'fr');
+  await expect(page.locator('html')).toHaveAttribute('lang', 'fr');
+  await expect(page.locator('h1')).toHaveText('Analytics avancées');
+  await expect(page.locator('#estimated-cost')).toHaveText('11,25 $');
+  await page.locator('#currency-toggle').click();
+  await expect(page.locator('#currency-toggle')).toHaveAttribute('data-selected', 'EUR');
+  await expect(page.locator('#estimated-cost')).toHaveText('9,68 €');
+  await expect(page.locator('#estimated-cost')).toHaveAttribute('title', 'Converti depuis USD avec le taux fixe : 1 USD = 0,86 €');
+  const frenchResults = await new AxeBuilder({ page }).analyze();
+  expect(frenchResults.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#language-toggle')).toHaveAttribute('data-selected', 'fr');
+  await expect(page.locator('#currency-toggle')).toHaveAttribute('data-selected', 'EUR');
+  await expect(page.locator('h1')).toHaveText('Limites Codex');
+  await expect(page.locator('.nav-link')).toContainText('Analytics avancées');
 });

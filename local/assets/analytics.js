@@ -21,25 +21,42 @@ let limitPoints = [];
 let tokenPoints = [];
 let limitDatasets = [];
 let tokenDatasets = [];
-
-const dateTime = new Intl.DateTimeFormat('en-GB', {
-  timeZone: PARIS_ZONE, day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-});
-const shortDate = new Intl.DateTimeFormat('en-GB', { timeZone: PARIS_ZONE, day: '2-digit', month: 'short', year: 'numeric' });
-const compactNumber = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 2 });
-const preciseNumber = new Intl.NumberFormat('en');
+let lastPayload = null;
 
 function byId(id) { return document.getElementById(id); }
 function safeNumber(value) { const number = Number(value); return Number.isFinite(number) && number >= 0 ? number : 0; }
-function formatTokens(value) { return compactNumber.format(safeNumber(value)); }
-function formatFullTokens(value) { return preciseNumber.format(safeNumber(value)); }
-function formatDate(value) { const date = new Date(value); return Number.isFinite(date.getTime()) ? dateTime.format(date) : '—'; }
-function formatCost(value) { return `$${safeNumber(value).toFixed(safeNumber(value) < 1 ? 4 : 2)}`; }
+function t(key, values = {}) {
+  return typeof CodexPreferences === 'object' ? CodexPreferences.t(`analytics.${key}`, values) : key;
+}
+function locale() { return typeof CodexPreferences === 'object' ? CodexPreferences.locale() : 'en-GB'; }
+function dateFormatter() {
+  return new Intl.DateTimeFormat(locale(), {
+    timeZone: PARIS_ZONE, day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  });
+}
+function shortDateFormatter() {
+  return new Intl.DateTimeFormat(locale(), { timeZone: PARIS_ZONE, day: '2-digit', month: 'short', year: 'numeric' });
+}
+function numberFormatter(options = {}) {
+  const numberLocale = typeof CodexPreferences === 'object' ? CodexPreferences.numberLocale() : 'en';
+  return new Intl.NumberFormat(numberLocale, options);
+}
+function formatTokens(value) { return numberFormatter({ notation: 'compact', maximumFractionDigits: 2 }).format(safeNumber(value)); }
+function formatFullTokens(value) { return numberFormatter().format(safeNumber(value)); }
+function formatDate(value) { const date = new Date(value); return Number.isFinite(date.getTime()) ? dateFormatter().format(date) : '—'; }
+function formatCost(value) { return typeof CodexPreferences === 'object' ? CodexPreferences.formatCurrency(safeNumber(value)) : `$${safeNumber(value).toFixed(safeNumber(value) < 1 ? 4 : 2)}`; }
+function setCost(element, value) {
+  element.textContent = formatCost(value);
+  const currency = typeof CodexPreferences === 'object' ? CodexPreferences.get().currency : 'USD';
+  element.title = currency === 'EUR'
+    ? t('currencyTooltip', { rate: CodexPreferences.formatRate() })
+    : '';
+}
 function formatSignedPoints(value) {
   const number = Math.round(safeNumber(value) * 1000) / 1000;
-  return `${number >= 0 ? '+' : ''}${number} pts`;
+  return `${number >= 0 ? '+' : ''}${number} ${t('points')}`;
 }
-function formatPoints(value) { return `${Math.round(safeNumber(value) * 1000) / 1000} pts`; }
+function formatPoints(value) { return `${Math.round(safeNumber(value) * 1000) / 1000} ${t('points')}`; }
 function formatPercent(value) { return `${Math.round(safeNumber(value) * 10) / 10}%`; }
 function totalBillable(summary) { return safeNumber(summary.input_tokens) + safeNumber(summary.cache_read_tokens) + safeNumber(summary.cache_write_tokens) + safeNumber(summary.output_tokens); }
 function formatDuration(seconds) {
@@ -49,11 +66,22 @@ function formatDuration(seconds) {
   return `${Math.round(value / 360) / 10}h`;
 }
 
+function formatShortDate(value) { return shortDateFormatter().format(new Date(value)); }
+
 function setMessage(id, messages) {
   const element = byId(id);
-  const values = Array.isArray(messages) ? messages : messages ? [messages] : [];
+  const values = (Array.isArray(messages) ? messages : messages ? [messages] : []).map(localizeMessage);
   element.textContent = values.join(' · ');
   element.hidden = values.length === 0;
+}
+
+function localizeMessage(message) {
+  if (typeof message !== 'string') return message;
+  const priceWarning = /^No catalog price; assumed zero: (.+)$/u.exec(message);
+  if (priceWarning) return t('sourcePriceUnknown', { name: priceWarning[1] });
+  const collectorWarning = /^(.+) collector: (.+)$/u.exec(message);
+  if (collectorWarning) return t('collectorWarning', { name: collectorWarning[1], message: collectorWarning[2] });
+  return message;
 }
 
 function queryString() {
@@ -73,7 +101,7 @@ function chartBase() {
   return {
     responsive: true, maintainAspectRatio: false, parsing: false, normalized: true, animation: false,
     scales: {
-      x: { type: 'linear', grid: { color: 'rgba(255,255,255,.05)' }, ticks: { color: '#86a2c5', maxTicksLimit: 8, callback: value => shortDate.format(new Date(value)) } },
+      x: { type: 'linear', grid: { color: 'rgba(255,255,255,.05)' }, ticks: { color: '#86a2c5', maxTicksLimit: 8, callback: value => formatShortDate(value) } },
       y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,.05)' }, ticks: { color: '#86a2c5' } },
     },
     plugins: { legend: { labels: { color: '#edf5ff', boxWidth: 12 } }, tooltip: { callbacks: { title: items => items.length ? formatDate(items[0].parsed.x) : '' } } },
@@ -106,7 +134,7 @@ function updateTokenOverlay() {
   const toggle = byId('toggle-token-overlay');
   toggle.disabled = !available;
   toggle.setAttribute('aria-pressed', String(active));
-  toggle.textContent = active ? 'Show tokens separately' : 'Overlay tokens';
+  toggle.textContent = active ? t('showTokensSeparately') : t('overlayTokens');
   byId('tokens-chart-card').hidden = active;
   if (!limitsChart) return;
   limitsChart.data.datasets = active ? [...limitDatasets, ...overlayTokenDatasets()] : [...limitDatasets];
@@ -117,12 +145,12 @@ function updateTokenOverlay() {
 
 function renderLimits(data) {
   limitPoints = Array.isArray(data.series) ? data.series : [];
-  byId('limit-samples').textContent = `${formatFullTokens(data.samples)} samples`;
+  byId('limit-samples').textContent = t('samples', { value: formatFullTokens(data.samples) });
   byId('limits-empty').hidden = limitPoints.length > 0;
   byId('limits-chart-wrap').hidden = limitPoints.length === 0;
   limitDatasets = [
-    { label: '5-hour remaining', data: limitPoints.map(point => ({ x: Date.parse(point.at), y: point.five_h_pct })), borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,.10)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false },
-    { label: 'Weekly remaining', data: limitPoints.map(point => ({ x: Date.parse(point.at), y: point.weekly_pct })), borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.07)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false },
+    { label: t('fiveHourRemaining'), data: limitPoints.map(point => ({ x: Date.parse(point.at), y: point.five_h_pct })), borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,.10)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false },
+    { label: t('weeklyRemaining'), data: limitPoints.map(point => ({ x: Date.parse(point.at), y: point.weekly_pct })), borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.07)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false },
   ];
   if (limitsChart) { limitsChart.data.datasets = [...limitDatasets]; limitsChart.update('none'); updateTokenOverlay(); return; }
   if (typeof Chart !== 'function') throw new Error('Chart.js failed to load');
@@ -135,13 +163,13 @@ function renderLimits(data) {
 
 function renderTokens(data) {
   tokenPoints = Array.isArray(data.series) ? data.series : [];
-  byId('event-count').textContent = `${formatFullTokens(data.summary.events)} events`;
+  byId('event-count').textContent = t('events', { value: formatFullTokens(data.summary.events) });
   byId('tokens-empty').hidden = tokenPoints.length > 0;
   byId('tokens-chart-wrap').hidden = tokenPoints.length === 0;
   tokenDatasets = [
-    { label: 'Input', data: tokenPoints.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.input_tokens) })), backgroundColor: '#3b82f6', stack: 'tokens' },
-    { label: 'Cache read/write', data: tokenPoints.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.cache_read_tokens) + safeNumber(point.cache_write_tokens) })), backgroundColor: '#a78bfa', stack: 'tokens' },
-    { label: 'Output', data: tokenPoints.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.output_tokens) })), backgroundColor: '#22c55e', stack: 'tokens' },
+    { label: t('input'), data: tokenPoints.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.input_tokens) })), backgroundColor: '#3b82f6', stack: 'tokens' },
+    { label: t('cacheReadWrite'), data: tokenPoints.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.cache_read_tokens) + safeNumber(point.cache_write_tokens) })), backgroundColor: '#a78bfa', stack: 'tokens' },
+    { label: t('output'), data: tokenPoints.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.output_tokens) })), backgroundColor: '#22c55e', stack: 'tokens' },
   ];
   if (tokensChart) { tokensChart.data.datasets = tokenDatasets; tokensChart.update('none'); updateTokenOverlay(); return; }
   if (typeof Chart !== 'function') throw new Error('Chart.js failed to load');
@@ -166,8 +194,9 @@ function renderBreakdown(items) {
     cell(row, formatTokens(item.input_tokens));
     cell(row, formatTokens(safeNumber(item.cache_read_tokens) + safeNumber(item.cache_write_tokens)));
     cell(row, formatTokens(item.output_tokens));
-    const cost = cell(row, formatCost(item.estimated_cost_usd), item.pricing_status === 'assumed-zero' ? 'pricing-unknown' : '');
-    if (item.pricing_status === 'assumed-zero') cost.title = 'Model absent from pricing catalog; assumed zero';
+    const cost = cell(row, '', item.pricing_status === 'assumed-zero' ? 'pricing-unknown' : '');
+    setCost(cost, item.estimated_cost_usd);
+    if (item.pricing_status === 'assumed-zero') cost.title = t('pricingUnknownTitle');
     body.appendChild(row);
   }
 }
@@ -179,14 +208,14 @@ function renderResets(data) {
   for (const item of data.items) {
     const row = document.createElement('tr');
     cell(row, item.window, 'source-pill');
-    cell(row, item.category === 'random' ? 'Random' : item.category === 'end_of_week' ? 'End of week' : 'Scheduled', 'source-pill');
+    cell(row, item.category === 'random' ? t('random') : item.category === 'end_of_week' ? t('endOfWeek') : t('scheduled'), 'source-pill');
     cell(row, formatDate(item.reset_at));
     cell(row, formatDate(item.observed_at));
     cell(row, `${item.before_pct ?? '—'}% → ${item.after_pct ?? '—'}%`);
     const impact = item.category === 'random'
-      ? `${formatSignedPoints(item.pace_delta_pct_points)} vs ideal pace`
+      ? `${formatSignedPoints(item.pace_delta_pct_points)} ${t('vsIdealPace')}`
       : item.category === 'end_of_week' && item.unused_pct_points > 0
-        ? `${item.unused_pct_points}% unused expired`
+        ? t('unusedExpired', { value: item.unused_pct_points })
         : '—';
     cell(row, impact);
     cell(row, formatDuration(item.observation_delay_seconds));
@@ -197,7 +226,11 @@ function renderResets(data) {
   byId('resets-previous').disabled = data.offset === 0;
   byId('resets-next').disabled = data.offset + data.limit >= data.total;
   const first = data.total ? data.offset + 1 : 0;
-  byId('reset-page-label').textContent = `${first}–${Math.min(data.offset + data.limit, data.total)} of ${data.total}`;
+  byId('reset-page-label').textContent = t('pageOf', {
+    from: first,
+    to: Math.min(data.offset + data.limit, data.total),
+    total: data.total,
+  });
 }
 
 function renderCollectors(freshness, baselines) {
@@ -212,13 +245,17 @@ function renderCollectors(freshness, baselines) {
     const status = document.createElement('span'); status.className = `status-pill status-${collector.status}`; status.textContent = collector.status;
     heading.append(name, status);
     const detail = document.createElement('p'); detail.className = 'collector-detail';
-    detail.textContent = collector.last_success_at ? `Last success ${formatDate(collector.last_success_at)}` : 'No successful collection yet';
+    detail.textContent = collector.last_success_at
+      ? t('lastSuccess', { value: formatDate(collector.last_success_at) })
+      : t('noSuccessfulCollection');
     item.append(heading, detail); grid.appendChild(item);
   }
   const baselineTokens = (baselines.hermes || []).reduce((total, item) => total + safeNumber(item.tokens), 0);
   const note = byId('baseline-note');
   note.hidden = baselineTokens === 0;
-  note.textContent = baselineTokens ? `Hermes pre-monitor baseline excluded from dated totals: ${formatFullTokens(baselineTokens)} tokens.` : '';
+  note.textContent = baselineTokens
+    ? t('hermesBaseline', { value: formatFullTokens(baselineTokens) })
+    : '';
 }
 
 function checkedValues(container) {
@@ -257,22 +294,26 @@ function updateModelOptions(models) {
 }
 
 function render(payload) {
+  lastPayload = payload;
   const summary = payload.tokens.summary;
   byId('total-tokens').textContent = formatTokens(totalBillable(summary));
-  byId('total-tokens').title = `${formatFullTokens(totalBillable(summary))} billable tokens`;
-  byId('token-detail').textContent = `${formatTokens(summary.input_tokens)} input · ${formatTokens(summary.cache_read_tokens + summary.cache_write_tokens)} cache · ${formatTokens(summary.output_tokens)} output`;
-  byId('estimated-cost').textContent = formatCost(summary.estimated_cost_usd);
-  byId('allocation-total-cost').textContent = formatCost(summary.estimated_cost_usd);
-  byId('pricing-note').textContent = `Catalog ${payload.pricing.as_of} · ${payload.pricing.currency}`;
+  byId('total-tokens').title = t('billableTokensTitle', { value: formatFullTokens(totalBillable(summary)) });
+  byId('token-detail').textContent = `${formatTokens(summary.input_tokens)} ${t('input').toLowerCase()} · ${formatTokens(summary.cache_read_tokens + summary.cache_write_tokens)} ${t('cache').toLowerCase()} · ${formatTokens(summary.output_tokens)} ${t('output').toLowerCase()}`;
+  setCost(byId('estimated-cost'), summary.estimated_cost_usd);
+  setCost(byId('allocation-total-cost'), summary.estimated_cost_usd);
+  const currency = typeof CodexPreferences === 'object' ? CodexPreferences.get().currency : 'USD';
+  byId('pricing-note').textContent = currency === 'EUR'
+    ? t('catalogConverted', { date: payload.pricing.as_of, rate: CodexPreferences.formatRate() })
+    : t('catalog', { date: payload.pricing.as_of, currency: payload.pricing.currency });
   const weeklySummary = payload.resets.weekly_summary || { random: {}, end_of_week: {} };
   const random = weeklySummary.random || {};
   const endOfWeek = weeklySummary.end_of_week || {};
   byId('random-reset-count').textContent = formatFullTokens(random.count);
-  byId('random-reset-impact').textContent = `Gain ${formatSignedPoints(random.gained_vs_ideal_pct_points)} · loss ${formatPoints(random.lost_vs_ideal_pct_points)} vs ideal pace`;
+  byId('random-reset-impact').textContent = `${t('gain')} ${formatSignedPoints(random.gained_vs_ideal_pct_points)} · ${t('loss')} ${formatPoints(random.lost_vs_ideal_pct_points)} ${t('vsIdealPace')}`;
   byId('end-week-reset-count').textContent = formatFullTokens(endOfWeek.count);
-  byId('end-week-reset-impact').textContent = `${formatPercent(endOfWeek.unused_pct_points)} of unused quota expired`;
-  byId('period-label').textContent = `${shortDate.format(new Date(payload.period.from))} – ${shortDate.format(new Date(payload.period.to))}`;
-  byId('granularity-label').textContent = `Buckets of ${formatDuration(payload.period.granularity_seconds)}`;
+  byId('end-week-reset-impact').textContent = t('ofUnusedQuotaExpired', { value: formatPercent(endOfWeek.unused_pct_points) });
+  byId('period-label').textContent = `${formatShortDate(payload.period.from)} – ${formatShortDate(payload.period.to)}`;
+  byId('granularity-label').textContent = t('bucketsOf', { value: formatDuration(payload.period.granularity_seconds) });
   renderLimits(payload.limits);
   renderTokens(payload.tokens);
   renderBreakdown(payload.tokens.breakdown);
@@ -291,7 +332,7 @@ async function refresh() {
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
     render(payload);
   } catch (error) {
-    setMessage('analytics-error', error instanceof Error ? error.message : 'Unable to load analytics');
+    setMessage('analytics-error', error instanceof Error ? error.message : t('unableToLoadAnalytics'));
   } finally {
     refreshTimer = setTimeout(refresh, ANALYTICS_REFRESH_MS);
   }
@@ -328,7 +369,7 @@ byId('select-all-models').addEventListener('click', () => {
 });
 byId('select-gpt-5-6').addEventListener('click', () => {
   const gpt56 = state.availableModels.filter(model => ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'].includes(model));
-  if (!gpt56.length) { setMessage('analytics-error', 'No GPT 5.6 Sol, Terra, or Luna model is available in this archive.'); return; }
+  if (!gpt56.length) { setMessage('analytics-error', t('gptModelsUnavailable')); return; }
   state.models = gpt56;
   setCheckedValues(byId('model-filter'), state.models);
   state.resetOffset = 0;
@@ -337,7 +378,7 @@ byId('select-gpt-5-6').addEventListener('click', () => {
 byId('reset-filter').addEventListener('change', event => { state.resetType = event.target.value; state.resetOffset = 0; refresh(); });
 byId('apply-dates').addEventListener('click', () => {
   state.fromDate = byId('from-date').value; state.toDate = byId('to-date').value; state.resetOffset = 0;
-  if (!state.fromDate || !state.toDate) { setMessage('analytics-error', 'Choose both custom dates.'); return; }
+  if (!state.fromDate || !state.toDate) { setMessage('analytics-error', t('chooseBothDates')); return; }
   refresh();
 });
 byId('resets-previous').addEventListener('click', () => { state.resetOffset = Math.max(0, state.resetOffset - RESET_PAGE_SIZE); refresh(); });
@@ -348,4 +389,14 @@ byId('toggle-token-overlay').addEventListener('click', () => {
   updateTokenOverlay();
 });
 
+function refreshLocalizedAnalytics() {
+  if (!lastPayload) return;
+  try {
+    render(lastPayload);
+  } catch (error) {
+    setMessage('analytics-error', error instanceof Error ? error.message : t('unableToLoadAnalytics'));
+  }
+}
+
+if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(refreshLocalizedAnalytics);
 refresh();
