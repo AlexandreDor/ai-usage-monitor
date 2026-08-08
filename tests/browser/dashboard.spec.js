@@ -119,9 +119,10 @@ test('renders advanced analytics and remains local', async ({ page }) => {
     return {
       afterDataHealth: Boolean(grid && priceWarnings && grid.nextElementSibling === priceWarnings),
       beforeFooter: Boolean(priceWarnings && footer && (priceWarnings.compareDocumentPosition(footer) & Node.DOCUMENT_POSITION_FOLLOWING)),
+      marginTop: priceWarnings ? getComputedStyle(priceWarnings).marginTop : '',
     };
   });
-  expect(warningPosition).toEqual({ afterDataHealth: true, beforeFooter: true });
+  expect(warningPosition).toEqual({ afterDataHealth: true, beforeFooter: true, marginTop: '18px' });
   await expect(page.locator('#model-filter input')).toHaveCount(4);
   await page.getByRole('button', { name: 'GPT 5.6' }).click();
   await expect.poll(() => analyticsQueries.at(-1)?.get('models')).toBe('gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna');

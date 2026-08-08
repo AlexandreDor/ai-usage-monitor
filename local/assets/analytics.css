@@ -177,6 +177,8 @@ input { display: block; min-height: 36px; margin-top: 4px; padding: 7px 10px; }
   font-size: 0.84rem;
 }
 
+.analytics-grid + #analytics-price-warnings { margin-top: 18px; }
+
 .error-message { color: #fecaca; border: 1px solid #7f1d1d; background: rgba(69, 10, 10, .72); }
 .warning-message { color: #fde68a; border: 1px solid #854d0e; background: rgba(66, 32, 6, .68); }
 
