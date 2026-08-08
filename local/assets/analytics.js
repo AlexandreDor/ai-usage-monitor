@@ -3,6 +3,7 @@
 const ANALYTICS_REFRESH_MS = 900_000;
 const RESET_PAGE_SIZE = 10;
 const PARIS_ZONE = 'Europe/Paris';
+const PRICE_WARNING_PATTERN = /^No catalog price; assumed zero: (.+)$/u;
 const state = {
   range: '30d',
   sources: ['codex', 'opencode', 'hermes'],
@@ -75,13 +76,23 @@ function setMessage(id, messages) {
   element.hidden = values.length === 0;
 }
 
+function isPriceWarning(message) {
+  return typeof message === 'string' && PRICE_WARNING_PATTERN.test(message);
+}
+
 function localizeMessage(message) {
   if (typeof message !== 'string') return message;
-  const priceWarning = /^No catalog price; assumed zero: (.+)$/u.exec(message);
+  const priceWarning = PRICE_WARNING_PATTERN.exec(message);
   if (priceWarning) return t('sourcePriceUnknown', { name: priceWarning[1] });
   const collectorWarning = /^(.+) collector: (.+)$/u.exec(message);
   if (collectorWarning) return t('collectorWarning', { name: collectorWarning[1], message: collectorWarning[2] });
   return message;
+}
+
+function renderWarnings(warnings) {
+  const values = Array.isArray(warnings) ? warnings : warnings ? [warnings] : [];
+  setMessage('analytics-warnings', values.filter(message => !isPriceWarning(message)));
+  setMessage('analytics-price-warnings', values.filter(isPriceWarning));
 }
 
 function queryString() {
@@ -320,7 +331,7 @@ function render(payload) {
   renderResets(payload.resets);
   renderCollectors(payload.freshness, payload.baselines);
   updateModelOptions(payload.available.models);
-  setMessage('analytics-warnings', payload.warnings);
+  renderWarnings(payload.warnings);
   setMessage('analytics-error', '');
 }
 

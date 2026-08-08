@@ -74,7 +74,10 @@ const analyticsPayload = {
   resets: { total: 2, weekly_total: 2, weekly_summary: { random: { count: 1, gained_vs_ideal_pct_points: 30.004, lost_vs_ideal_pct_points: 0 }, end_of_week: { count: 1, unused_pct_points: 5 } }, offset: 0, limit: 10, items: [{ window: 'weekly', category: 'random', reset_at: '2026-08-04T08:00:00Z', observed_at: '2026-08-04T08:15:00Z', observation_delay_seconds: 900, before_pct: 28, after_pct: 100, ideal_weekly_pace_pct: 58.004, pace_delta_pct_points: 30.004, unused_pct_points: 0 }] },
   baselines: { hermes: [{ tokens: 42 }] },
   pricing: { currency: 'USD', as_of: '2026-08-04', valuation_mode: 'current_catalog' },
-  warnings: ['No catalog price; assumed zero: other/unknown-model'],
+  warnings: [
+    'No catalog price; assumed zero: other/unknown-model',
+    'codex collector: delayed',
+  ],
 };
 
 test('renders advanced analytics and remains local', async ({ page }) => {
@@ -105,7 +108,20 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#tokens-chart-card')).toBeVisible();
   await expect(page.locator('#resets-body')).toContainText('Random');
   await expect(page.locator('#breakdown-body')).toContainText('gpt-5.6-sol');
-  await expect(page.locator('#analytics-warnings')).toContainText('assumed zero');
+  await expect(page.locator('#analytics-warnings')).toContainText('codex collector: delayed');
+  await expect(page.locator('#analytics-warnings')).not.toContainText('assumed zero');
+  await expect(page.locator('#analytics-price-warnings')).toContainText('assumed zero');
+  await expect(page.getByText('No catalog price; assumed zero: other/unknown-model')).toHaveCount(1);
+  const warningPosition = await page.evaluate(() => {
+    const grid = document.querySelector('.analytics-grid');
+    const priceWarnings = document.querySelector('#analytics-price-warnings');
+    const footer = document.querySelector('.analytics-footer');
+    return {
+      afterDataHealth: Boolean(grid && priceWarnings && grid.nextElementSibling === priceWarnings),
+      beforeFooter: Boolean(priceWarnings && footer && (priceWarnings.compareDocumentPosition(footer) & Node.DOCUMENT_POSITION_FOLLOWING)),
+    };
+  });
+  expect(warningPosition).toEqual({ afterDataHealth: true, beforeFooter: true });
   await expect(page.locator('#model-filter input')).toHaveCount(4);
   await page.getByRole('button', { name: 'GPT 5.6' }).click();
   await expect.poll(() => analyticsQueries.at(-1)?.get('models')).toBe('gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna');
@@ -115,6 +131,14 @@ test('renders advanced analytics and remains local', async ({ page }) => {
 
   const results = await new AxeBuilder({ page }).analyze();
   expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+});
+
+test('hides analytics warning containers when the API returns no warnings', async ({ page }) => {
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: { ...analyticsPayload, warnings: [] } }));
+  await page.goto('/analytics.html');
+
+  await expect(page.locator('#analytics-warnings')).toBeHidden();
+  await expect(page.locator('#analytics-price-warnings')).toBeHidden();
 });
 
 test('switches locale and currency and persists the preference across pages', async ({ page }) => {
@@ -134,6 +158,7 @@ test('switches locale and currency and persists the preference across pages', as
   await expect(page.locator('#language-toggle')).toHaveAttribute('data-selected', 'fr');
   await expect(page.locator('html')).toHaveAttribute('lang', 'fr');
   await expect(page.locator('h1')).toHaveText('Analytics avancées');
+  await expect(page.locator('#analytics-price-warnings')).toContainText('Aucun prix catalogue');
   await expect(page.locator('#estimated-cost')).toHaveText('11,25 $');
   await page.locator('#currency-toggle').click();
   await expect(page.locator('#currency-toggle')).toHaveAttribute('data-selected', 'EUR');
