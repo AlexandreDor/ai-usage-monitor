@@ -26,7 +26,8 @@ MEDIUM_SECONDS = 7 * 24 * 60 * 60
 MEDIUM_BUCKET_SECONDS = 30 * 60
 OLD_BUCKET_SECONDS = 60 * 60
 RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT = 20
-RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS = 6 * 60 * 60
+RANDOM_WEEKLY_RESET_FULL_REFILL_PCT = 99
+RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS = 2 * 60 * 60
 MAX_RETENTION_DAYS = 36500
 
 
@@ -233,14 +234,25 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
     rows = connection.execute(
         """
         SELECT scraped_at_epoch, five_h_pct, five_h_reset_at,
-               weekly_pct, weekly_reset_at
-        FROM snapshots
+               weekly_pct, weekly_reset_at, sample_interval_seconds
+          FROM snapshots
         ORDER BY scraped_at_epoch
         """
     ).fetchall()
     connection.execute("DELETE FROM reset_events")
     windows = (("5h", 1, 2), ("weekly", 3, 4))
     for previous, current in zip(rows, rows[1:]):
+        gap = current[0] - previous[0]
+        intervals = [
+            value for value in (previous[5], current[5])
+            if isinstance(value, (int, float)) and value > 0
+        ]
+        expected_interval = int(max(intervals, default=900))
+        # A reset deadline crossing a long observation gap is not enough
+        # evidence that the reset was observed. Keep the event history
+        # conservative instead of inventing missed resets.
+        if gap <= 0 or gap > max(3_600, expected_interval * 2):
+            continue
         for window, pct_index, reset_index in windows:
             reset_at = previous[reset_index]
             if not isinstance(reset_at, int) or reset_at <= 0:
@@ -267,15 +279,24 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
         # the event is anchored to the first post-reset observation.
         previous_pct, current_pct = previous[3], current[3]
         previous_deadline, current_deadline = previous[4], current[4]
-        if (
-            isinstance(previous_pct, (int, float))
+        refill_change = (
+            current_pct - previous_pct
+            if isinstance(previous_pct, (int, float))
             and isinstance(current_pct, (int, float))
+            else None
+        )
+        if (
+            refill_change is not None
             and isinstance(previous_deadline, int)
             and isinstance(current_deadline, int)
             and previous[0] < previous_deadline
             and not previous[0] < previous_deadline <= current[0]
             and current_deadline >= previous_deadline + RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS
-            and abs(current_pct - previous_pct) >= RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT
+            and refill_change > 0
+            and (
+                refill_change >= RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT
+                or current_pct >= RANDOM_WEEKLY_RESET_FULL_REFILL_PCT
+            )
         ):
             connection.execute(
                 """

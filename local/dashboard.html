@@ -3,43 +3,60 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Codex Usage Monitor</title>
-  <meta name="description" content="Live dashboard for OpenAI Codex CLI usage limits">
+  <title data-i18n="dashboard.pageTitle">Codex Usage Monitor</title>
+  <meta name="description" data-i18n-content="dashboard.description" content="Live dashboard for OpenAI Codex CLI usage limits">
   <link rel="icon" type="image/png" sizes="128x128" href="images/favicon.png">
   <link rel="stylesheet" href="assets/dashboard.css">
   <script src="assets/chart.umd.min.js" defer></script>
+  <script src="assets/preferences.js" defer></script>
   <script src="assets/dashboard.js" defer></script>
 </head>
 <body>
   <header>
     <span class="live-dot"></span>
-    <h1>Codex Limits</h1>
+    <h1 data-i18n="dashboard.heading">Codex Limits</h1>
     <span class="badge" id="mode-badge">-</span>
     <span id="last-updated">-</span>
-    <a class="nav-link" href="analytics.html">Advanced analytics <span aria-hidden="true">→</span></a>
+    <a class="nav-link" href="analytics.html"><span data-i18n="dashboard.analyticsLink">Advanced analytics</span> <span aria-hidden="true">→</span></a>
+    <div class="preference-controls" data-i18n-aria-label="preferences.ariaLabel" aria-label="Display preferences">
+      <div class="preference-setting">
+        <span class="preference-label" data-i18n="preferences.language">Language</span>
+        <button class="preference-toggle" id="language-toggle" type="button" data-preference-toggle="language" data-preference-values="en,fr" data-selected="en" aria-label="Language: English">
+          <span data-preference-value="en">EN</span>
+          <span data-preference-value="fr">FR</span>
+        </button>
+      </div>
+      <div class="preference-setting">
+        <span class="preference-label" data-i18n="preferences.currency">Currency</span>
+        <button class="preference-toggle" id="currency-toggle" type="button" data-preference-toggle="currency" data-preference-values="EUR,USD" data-selected="EUR" aria-label="Currency: Euro">
+          <span data-preference-value="EUR">€</span>
+          <span data-preference-value="USD">$</span>
+        </button>
+      </div>
+    </div>
   </header>
 
   <div id="error-banner" role="alert" hidden></div>
 
   <main class="grid">
     <section class="card limit-card">
-      <div class="card-label">5-Hour Limit</div>
+      <div class="card-label" data-i18n="dashboard.fiveHourLimit">5-Hour Limit</div>
       <div class="pct-value unavailable" id="five-h-pct">--</div>
       <progress class="bar" id="five-h-bar" max="100" value="0"></progress>
-      <div class="reset-info">Resets at <span id="five-h-reset">-</span></div>
+      <div class="reset-info"><span data-i18n="dashboard.resetsAt">Resets at</span> <span id="five-h-reset">-</span></div>
     </section>
     <section class="card limit-card">
-      <div class="card-label">Weekly Limit</div>
+      <div class="card-label" data-i18n="dashboard.weeklyLimit">Weekly Limit</div>
       <div class="pct-value unavailable" id="weekly-pct">--</div>
       <progress class="bar" id="weekly-bar" max="100" value="0"></progress>
-      <div class="reset-info">Resets <span id="weekly-reset">-</span></div>
+      <div class="reset-info"><span data-i18n="dashboard.resets">Resets</span> <span id="weekly-reset">-</span></div>
       <div class="pace-indicator">
-        <div class="pace-label">Pace vs ideal</div>
+        <div class="pace-label" data-i18n="dashboard.paceVsIdeal">Pace vs ideal</div>
         <div class="pace-value" id="weekly-pace-delta">--</div>
       </div>
     </section>
     <section class="card full history-card">
-      <div class="card-label history-label" id="history-label">History</div>
+      <div class="card-label history-label" id="history-label" data-i18n="dashboard.history">History</div>
       <div id="history-error" class="history-error" role="alert" hidden></div>
       <canvas id="history-chart"></canvas>
     </section>

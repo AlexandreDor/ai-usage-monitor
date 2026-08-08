@@ -162,6 +162,25 @@ with sqlite3.connect(sys.argv[1]) as connection:
 PYEOF
 )" "reset event reconstruction created duplicates"
 
+# A reset deadline inside a long observation gap is not evidence of an
+# observed reset; reconstruction must not invent missed events.
+rm -f "$ARCHIVE_FILE"
+printf '[]\n' > "$HISTORY_FILE"
+long_gap_before=$((BASE - 3 * 3600))
+long_gap_reset=$((BASE - 2 * 3600))
+printf '{"five_h_pct":5,"five_h_reset_at":%s,"scraped_at":"%s"}\n' \
+  "$long_gap_reset" "$(iso_at "$long_gap_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+snapshot_at "$BASE" 100 100 | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("SELECT COUNT(*) FROM reset_events").fetchone()[0])
+PYEOF
+)" "long observation gap invented a reset"
+
 # An early weekly refill with a materially advanced deadline is classified as
 # a random reset rather than a scheduled end-of-week reset.
 rm -f "$ARCHIVE_FILE"
@@ -186,6 +205,47 @@ assert row == ("random_observed", 28.0, 100.0), row
 print(1)
 PYEOF
 )" "random weekly reset was not derived"
+
+# A refill to full is also a random reset when little quota was consumed. The
+# deadline jump disambiguates it from an ordinary percentage fluctuation.
+rm -f "$ARCHIVE_FILE"
+small_refill_before=$((BASE - 900))
+small_refill_previous_deadline=$((BASE + 4 * 86400))
+small_refill_current_deadline=$((small_refill_previous_deadline + 2 * 3600))
+printf '{"weekly_pct":92,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+  "$small_refill_previous_deadline" "$(iso_at "$small_refill_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+  "$small_refill_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '1' "$(python3 - "$ARCHIVE_FILE" "$BASE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    row = connection.execute(
+        "SELECT detection_method, before_pct, after_pct FROM reset_events WHERE reset_at_epoch = ?",
+        (int(sys.argv[2]),),
+    ).fetchone()
+assert row == ("random_observed", 92.0, 100.0), row
+print(1)
+PYEOF
+)" "small weekly refill to full was not derived as a random reset"
+
+# A deadline jump without any refill remains insufficient evidence of a reset.
+rm -f "$ARCHIVE_FILE"
+printf '{"weekly_pct":92,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+  "$small_refill_previous_deadline" "$(iso_at "$small_refill_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"weekly_pct":92,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+  "$small_refill_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("SELECT COUNT(*) FROM reset_events").fetchone()[0])
+PYEOF
+)" "deadline jump without a refill was classified as a random reset"
 
 mode="$(stat -c '%a' "$ARCHIVE_FILE")"
 assert_eq 600 "$mode" "archive permissions are not private"
