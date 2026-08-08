@@ -15,7 +15,7 @@ import sys
 import time
 from typing import Any, Iterable
 
-from storage import connect_database
+from storage import ArchiveCorruptionError, ArchiveSchemaError, connect_database
 
 
 SOURCES = ("codex", "opencode", "hermes")
@@ -28,6 +28,10 @@ SESSION_ID_RE = re.compile(
 
 class CollectorError(RuntimeError):
     """A configured local source cannot be read safely."""
+
+
+class SourceUnavailable(CollectorError):
+    """A requested source exists but does not expose a usable data set."""
 
 
 def warn(message: str) -> None:
@@ -245,6 +249,15 @@ def rollout_key(path: Path) -> str:
     return match.group(1).lower() if match else stable_id(path.name)
 
 
+def codex_rollout_files(data_dir: Path) -> list[Path]:
+    roots = (data_dir / "sessions", data_dir / "archived_sessions")
+    files: list[Path] = []
+    for root in roots:
+        if root.exists():
+            files.extend(root.rglob("*.jsonl"))
+    return sorted(files)
+
+
 def collect_codex(
     connection: sqlite3.Connection,
     data_dir: Path,
@@ -252,25 +265,37 @@ def collect_codex(
     now: int,
 ) -> int:
     started = tracking_started(connection, "codex", now)
-    roots = (data_dir / "sessions", data_dir / "archived_sessions")
-    files: list[Path] = []
-    for root in roots:
-        if root.exists():
-            files.extend(root.rglob("*.jsonl"))
+    files = codex_rollout_files(data_dir)
     if not files:
-        raise CollectorError(f"no Codex rollout files found under {data_dir}")
+        raise SourceUnavailable("no Codex rollout files found")
 
     inserted_before = connection.total_changes
+    read_failures = 0
     for path in sorted(files):
         try:
             stat = path.stat()
-        except OSError:
+        except OSError as exc:
+            warn(f"Could not inspect Codex rollout {path}: {exc}")
+            read_failures += 1
             continue
         key = rollout_key(path)
         state_key = f"rollout:{key}"
         state = read_state(connection, "codex", state_key) or {}
+        previous_size = finite_nonnegative_int(state.get("size"))
+        previous_inode = finite_nonnegative_int(state.get("inode"))
+        previous_device = finite_nonnegative_int(state.get("device"))
         offset = finite_nonnegative_int(state.get("offset"))
-        if offset > stat.st_size:
+        # A rollout can be atomically replaced during rotation while retaining
+        # its name. Seeking into the new inode would silently skip its prefix.
+        # Treat old state written before inode tracking as unsafe as well.
+        identity_unknown = bool(state) and (previous_inode <= 0 or previous_device <= 0)
+        identity_changed = bool(state) and (
+            identity_unknown
+            or previous_inode != int(stat.st_ino)
+            or previous_device != int(stat.st_dev)
+        )
+        truncated = bool(state) and stat.st_size < previous_size
+        if identity_changed or truncated or offset > stat.st_size:
             offset = 0
             state = {}
         if stat.st_mtime < cutoff and not state:
@@ -284,13 +309,20 @@ def collect_codex(
         try:
             with path.open("r", encoding="utf-8", errors="replace") as source_file:
                 source_file.seek(offset)
+                partial_line_offset: int | None = None
                 while True:
+                    line_offset = source_file.tell()
                     line = source_file.readline()
                     if not line:
                         break
                     try:
                         item = json.loads(line)
                     except json.JSONDecodeError:
+                        # Do not consume an incomplete final JSONL record. The
+                        # next monitor cycle may observe its completed form.
+                        if not line.endswith(("\n", "\r")):
+                            partial_line_offset = line_offset
+                            break
                         continue
                     payload = json_object(item.get("payload"))
                     item_type = item.get("type")
@@ -345,9 +377,10 @@ def collect_codex(
                             imported=occurred_at < started,
                             quality="exact",
                         )
-                offset = source_file.tell()
+                offset = partial_line_offset if partial_line_offset is not None else source_file.tell()
         except OSError as exc:
             warn(f"Could not read Codex rollout {path}: {exc}")
+            read_failures += 1
             continue
         write_state(
             connection,
@@ -357,6 +390,8 @@ def collect_codex(
                 "offset": offset,
                 "size": stat.st_size,
                 "mtime": int(stat.st_mtime),
+                "inode": int(stat.st_ino),
+                "device": int(stat.st_dev),
                 "totals": totals,
                 "model": model,
                 "provider": provider,
@@ -365,6 +400,8 @@ def collect_codex(
             },
             now,
         )
+    if read_failures:
+        raise CollectorError(f"could not read {read_failures} Codex rollout file(s)")
     return connection.total_changes - inserted_before
 
 
@@ -393,7 +430,7 @@ def collect_opencode(
         with sqlite_read_only(database_path) as source:
             columns = table_columns(source, "message")
             if not {"id", "time_updated", "data"}.issubset(columns):
-                raise CollectorError("OpenCode message schema is not recognized")
+                raise SourceUnavailable("OpenCode message schema is not recognized")
             rows = source.execute(
                 "SELECT id, time_updated, data FROM message WHERE time_updated >= ? ORDER BY time_updated",
                 (watermark,),
@@ -442,7 +479,7 @@ def collect_opencode(
                 )
             write_state(connection, "opencode", "watermark", {"time_updated": max_updated}, now)
     except sqlite3.DatabaseError as exc:
-        raise CollectorError(f"OpenCode database read failed: {exc}") from exc
+        raise CollectorError("OpenCode database read failed") from exc
     return connection.total_changes - inserted_before
 
 
@@ -477,7 +514,7 @@ def hermes_rows(source: sqlite3.Connection) -> tuple[str, Iterable[sqlite3.Row]]
             FROM sessions
             """
         )
-    raise CollectorError("Hermes usage schema is not recognized")
+    raise SourceUnavailable("Hermes usage schema is not recognized")
 
 
 def collect_hermes(
@@ -544,7 +581,7 @@ def collect_hermes(
                 )
             write_state(connection, "hermes", "initialized", {"at": now}, now)
     except sqlite3.DatabaseError as exc:
-        raise CollectorError(f"Hermes database read failed: {exc}") from exc
+        raise CollectorError("Hermes database read failed") from exc
     return connection.total_changes - inserted_before, schema
 
 
@@ -576,7 +613,10 @@ def collect(args: argparse.Namespace) -> int:
     database_path = Path(args.database)
     database_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(database_path.parent, 0o700)
-    connection = connect_database(database_path)
+    try:
+        connection = connect_database(database_path)
+    except (ArchiveCorruptionError, ArchiveSchemaError, OSError, sqlite3.DatabaseError) as exc:
+        raise CollectorError(f"analytics archive cannot be opened: {exc}") from exc
     failed = False
     try:
         with connection:
@@ -593,7 +633,7 @@ def collect(args: argparse.Namespace) -> int:
                         enabled=True,
                         status="unavailable" if explicit else "disabled",
                         now=now,
-                        error=f"source path not found: {path}" if explicit else None,
+                        error="source path not found" if explicit else None,
                     )
                     failed = failed or explicit
                     continue
@@ -609,12 +649,26 @@ def collect(args: argparse.Namespace) -> int:
                         schema = f"hermes-{hermes_schema}-v1"
                     record_run(connection, source, enabled=True, status="ok", now=now, schema=schema)
                     print(f"[OK] {source}: analytics collection completed ({count} database changes).")
+                except SourceUnavailable as exc:
+                    status = "unavailable" if explicit else "disabled"
+                    record_run(
+                        connection,
+                        source,
+                        enabled=True,
+                        status=status,
+                        now=now,
+                        error=str(exc) if explicit else None,
+                    )
+                    if explicit:
+                        warn(f"{source}: {exc}")
+                    failed = failed or explicit
                 except (CollectorError, OSError, UnicodeError) as exc:
-                    record_run(connection, source, enabled=True, status="error", now=now, error=str(exc))
+                    record_run(connection, source, enabled=True, status="error", now=now, error=f"{source} collector failed")
                     warn(f"{source}: {exc}")
                     failed = True
             if retention_days > 0:
                 connection.execute("DELETE FROM token_usage_events WHERE occurred_at_epoch < ?", (cutoff,))
+                connection.execute("DELETE FROM reset_events WHERE reset_at_epoch < ?", (cutoff,))
     finally:
         connection.close()
     os.chmod(database_path, 0o600)
@@ -642,15 +696,32 @@ def check(args: argparse.Namespace) -> int:
             print(f"[{label}] {source}: source path not found: {path}", file=sys.stderr if explicit else sys.stdout)
             failed = failed or explicit
             continue
-        if source != "codex":
-            try:
-                connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
-                connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
-                connection.close()
-            except sqlite3.DatabaseError as exc:
-                print(f"[ERROR] {source}: database read failed: {exc}", file=sys.stderr)
-                failed = True
-                continue
+        try:
+            if source == "codex":
+                if not codex_rollout_files(path):
+                    label = "ERROR" if explicit else "INFO"
+                    stream = sys.stderr if explicit else sys.stdout
+                    print(f"[{label}] codex: no Codex rollout files found under {path}", file=stream)
+                    failed = failed or explicit
+                    continue
+            elif source == "opencode":
+                with sqlite_read_only(path) as connection:
+                    columns = table_columns(connection, "message")
+                    if not {"id", "time_updated", "data"}.issubset(columns):
+                        raise CollectorError("OpenCode message schema is not recognized")
+            else:
+                with sqlite_read_only(path) as connection:
+                    schema, _rows = hermes_rows(connection)
+                    # hermes_rows executes the SELECT eagerly, so schema
+                    # incompatibilities are detected before --check returns.
+                    if schema not in ("session_model_usage", "sessions"):
+                        raise CollectorError("Hermes usage schema is not recognized")
+        except (CollectorError, OSError, sqlite3.DatabaseError) as exc:
+            label = "ERROR" if explicit else "INFO"
+            stream = sys.stderr if explicit else sys.stdout
+            print(f"[{label}] {source}: source validation failed: {exc}", file=stream)
+            failed = failed or explicit
+            continue
         print(f"[OK] {source}: source is readable.")
     print(f"[OK] pricing: {Path(args.pricing).expanduser()}")
     return 1 if failed else 0
@@ -677,6 +748,6 @@ if __name__ == "__main__":
     try:
         arguments = build_parser().parse_args()
         raise SystemExit(check(arguments) if arguments.check else collect(arguments))
-    except (CollectorError, ValueError) as exc:
+    except (CollectorError, ValueError, ArchiveCorruptionError, ArchiveSchemaError, sqlite3.DatabaseError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         raise SystemExit(1)

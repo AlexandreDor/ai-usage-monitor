@@ -29,10 +29,14 @@ if (JSON.stringify(defaults.CodexPreferences.get()) !== JSON.stringify({ languag
 }
 if (defaults.CodexPreferences.formatCurrency(11.25) !== '€9.68') fail('default EUR formatting is incorrect');
 if (defaults.CodexPreferences.formatRate() !== '0.86') fail('conversion rate formatting is incorrect');
+if (defaults.CodexPreferences.t('analytics.showCost') !== 'Show cost') fail('analytics cost toggle translation is missing');
+if (defaults.CodexPreferences.t('analytics.uncachedInput') !== 'Uncached input') fail('analytics metric translation is missing');
 
 defaults.CodexPreferences.set({ language: 'fr', currency: 'USD' });
 if (defaults.CodexPreferences.formatCurrency(11.25) !== '11,25 $') fail('French USD formatting is incorrect');
 if (defaults.CodexPreferences.get().language !== 'fr') fail('language preference was not saved in memory');
+if (defaults.CodexPreferences.t('analytics.showCost') !== 'Afficher le coût') fail('French analytics cost toggle translation is missing');
+if (defaults.CodexPreferences.t('analytics.freshness') !== 'Fraîcheur') fail('French analytics freshness translation is missing');
 
 const invalid = createContext('{not-json');
 if (JSON.stringify(invalid.CodexPreferences.get()) !== JSON.stringify({ language: 'en', currency: 'EUR' })) {

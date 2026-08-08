@@ -162,6 +162,25 @@ with sqlite3.connect(sys.argv[1]) as connection:
 PYEOF
 )" "reset event reconstruction created duplicates"
 
+# A reset deadline inside a long observation gap is not evidence of an
+# observed reset; reconstruction must not invent missed events.
+rm -f "$ARCHIVE_FILE"
+printf '[]\n' > "$HISTORY_FILE"
+long_gap_before=$((BASE - 3 * 3600))
+long_gap_reset=$((BASE - 2 * 3600))
+printf '{"five_h_pct":5,"five_h_reset_at":%s,"scraped_at":"%s"}\n' \
+  "$long_gap_reset" "$(iso_at "$long_gap_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+snapshot_at "$BASE" 100 100 | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("SELECT COUNT(*) FROM reset_events").fetchone()[0])
+PYEOF
+)" "long observation gap invented a reset"
+
 # An early weekly refill with a materially advanced deadline is classified as
 # a random reset rather than a scheduled end-of-week reset.
 rm -f "$ARCHIVE_FILE"

@@ -5,6 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ANALYTICS_DATABASE_PATH="${DASHBOARD_ANALYTICS_DATABASE:-${SCRIPT_DIR}/runtime/usage-history.sqlite3}"
+ANALYTICS_PRICING_PATH="${DASHBOARD_PRICING_FILE:-${TOKEN_PRICING_FILE:-}}"
 PORT=8080
 BIND_ADDRESS="127.0.0.1"
 POSITIONAL_PORT=""
@@ -66,6 +67,28 @@ while (($#)); do
   esac
 done
 
+# Reuse TOKEN_PRICING_FILE from the monitor's .env without sourcing arbitrary
+# shell code. An explicit environment override always wins.
+if [[ -e "${SCRIPT_DIR}/.env" && ( -L "${SCRIPT_DIR}/.env" || ! -O "${SCRIPT_DIR}/.env" ) ]]; then
+  echo "[ERROR] local/.env must be a regular file owned by the current user." >&2
+  exit 2
+fi
+if [[ -z "$ANALYTICS_PRICING_PATH" && -f "${SCRIPT_DIR}/.env" ]]; then
+  while IFS= read -r env_line || [[ -n "$env_line" ]]; do
+    env_line="${env_line%$'\r'}"
+    [[ "$env_line" =~ ^[[:space:]]*TOKEN_PRICING_FILE[[:space:]]*= ]] || continue
+    env_value="${env_line#*=}"
+    env_value="${env_value#"${env_value%%[![:space:]]*}"}"
+    env_value="${env_value%"${env_value##*[![:space:]]}"}"
+    if (( ${#env_value} >= 2 )) && { [[ "$env_value" == \"*\" ]] || [[ "$env_value" == \'*\' ]]; }; then
+      env_value="${env_value:1:${#env_value}-2}"
+    fi
+    ANALYTICS_PRICING_PATH="$env_value"
+    break
+  done < "${SCRIPT_DIR}/.env"
+fi
+ANALYTICS_PRICING_PATH="${ANALYTICS_PRICING_PATH:-${SCRIPT_DIR}/pricing.json}"
+
 if ! command -v python3 &>/dev/null; then
   echo "[ERROR] python3 is required to serve the dashboard." >&2
   exit 1
@@ -73,6 +96,11 @@ fi
 
 if [[ "$ANALYTICS_DATABASE_PATH" != /* ]] || [[ -e "$ANALYTICS_DATABASE_PATH" && -L "$ANALYTICS_DATABASE_PATH" ]]; then
   echo "[ERROR] DASHBOARD_ANALYTICS_DATABASE must be an absolute path and not a symbolic link." >&2
+  exit 2
+fi
+
+if [[ "$ANALYTICS_PRICING_PATH" != /* ]] || [[ ! -f "$ANALYTICS_PRICING_PATH" || ! -r "$ANALYTICS_PRICING_PATH" || -L "$ANALYTICS_PRICING_PATH" ]]; then
+  echo "[ERROR] TOKEN_PRICING_FILE must be an absolute readable regular file and not a symbolic link." >&2
   exit 2
 fi
 
@@ -103,12 +131,13 @@ fi
 echo "Serving dashboard at http://${DISPLAY_ADDRESS}:${PORT}/dashboard.html"
 echo "Only allowlisted dashboard assets and usage JSON are exposed. Press Ctrl+C to stop."
 
-python3 - "$SCRIPT_DIR" "$PORT" "$BIND_ADDRESS" "$ANALYTICS_DATABASE_PATH" <<'PYEOF'
+python3 - "$SCRIPT_DIR" "$PORT" "$BIND_ADDRESS" "$ANALYTICS_DATABASE_PATH" "$ANALYTICS_PRICING_PATH" <<'PYEOF'
 import functools
 import http.server
 import pathlib
 import socket
 import socketserver
+import sqlite3
 import sys
 import threading
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -120,6 +149,7 @@ root = pathlib.Path(sys.argv[1]).resolve()
 port = int(sys.argv[2])
 bind_address = sys.argv[3]
 analytics_database = pathlib.Path(sys.argv[4])
+analytics_pricing = pathlib.Path(sys.argv[5])
 public_files = {
     "/dashboard.html": "/dashboard.html",
     "/analytics.html": "/analytics.html",
@@ -160,9 +190,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             if set(raw) - allowed:
                 raise AnalyticsError("unknown query parameter")
             params = {key: values[0] for key, values in raw.items()}
-            payload = build_payload(analytics_database, root / "pricing.json", params)
-        except (AnalyticsError, ValueError) as error:
-            status = 503 if "not available" in str(error) or "cannot be read" in str(error) else 400
+            payload = build_payload(analytics_database, analytics_pricing, params)
+        except (AnalyticsError, ValueError, OSError, sqlite3.DatabaseError) as error:
+            status = 503 if error.__class__.__name__.endswith("UnavailableError") or "not available" in str(error) or "cannot be read" in str(error) else 400
             self.send_json(status, {"error": str(error)}, include_body=include_body)
             return
         self.send_json(200, payload, include_body=include_body)

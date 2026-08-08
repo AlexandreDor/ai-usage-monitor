@@ -103,6 +103,33 @@ with sqlite3.connect(sys.argv[1]) as connection:
     ).fetchone()[0] == 0
 PYEOF
 
+python3 - "$OPENCODE_DB" <<'PYEOF'
+import json
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    connection.execute(
+        "UPDATE message SET time_updated = ?, data = ? WHERE id = ?",
+        (
+            1_600_000,
+            json.dumps({
+                "role": "assistant",
+                "modelID": "gpt-5.6-terra",
+                "providerID": "openai",
+                "time": {"completed": 1_600_000},
+                "tokens": {
+                    "input": 12,
+                    "output": 8,
+                    "reasoning": 3,
+                    "cache": {"read": 6, "write": 2},
+                },
+            }),
+            "message-1",
+        ),
+    )
+PYEOF
+
 python3 - "$HERMES_DB" <<'PYEOF'
 import sqlite3
 import sys
@@ -121,6 +148,17 @@ with sqlite3.connect(sys.argv[1]) as connection:
     print(connection.execute("SELECT COUNT(*) FROM token_usage_events").fetchone()[0])
 PYEOF
 )" "Hermes delta was not added or exact imports duplicated"
+
+python3 - "$ANALYTICS_DB" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    opencode = connection.execute(
+        "SELECT input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens "
+        "FROM token_usage_events WHERE source = 'opencode'"
+    ).fetchone()
+    assert opencode == (12, 6, 2, 11, 3), opencode
+PYEOF
 
 python3 - "$ANALYTICS_DB" <<'PYEOF'
 import sqlite3
@@ -145,5 +183,43 @@ with sqlite3.connect(sys.argv[1]) as connection:
     print(connection.execute("SELECT COUNT(*) FROM token_usage_events").fetchone()[0])
 PYEOF
 )" "idempotent collection created duplicate events"
+
+python3 - "$HERMES_DB" <<'PYEOF'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    connection.execute(
+        "UPDATE session_model_usage SET input_tokens = 1, output_tokens = 1, "
+        "cache_read_tokens = 0, reasoning_tokens = 0, last_seen = 2300"
+    )
+PYEOF
+collect 2400
+assert_eq 4 "$(python3 - "$ANALYTICS_DB" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("SELECT COUNT(*) FROM token_usage_events").fetchone()[0])
+PYEOF
+)" "Hermes counter reset produced a negative event"
+
+python3 - "$HERMES_DB" <<'PYEOF'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    connection.execute(
+        "UPDATE session_model_usage SET input_tokens = 4, output_tokens = 3, "
+        "cache_read_tokens = 1, reasoning_tokens = 1, last_seen = 2400"
+    )
+PYEOF
+collect 2500
+assert_eq 5 "$(python3 - "$ANALYTICS_DB" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("SELECT COUNT(*) FROM token_usage_events").fetchone()[0])
+PYEOF
+)" "Hermes resumed counter was not collected"
 
 printf 'PASS: local token usage collector tests\n'

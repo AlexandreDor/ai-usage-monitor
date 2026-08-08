@@ -51,9 +51,9 @@
         <fieldset class="multi-filter">
           <legend data-i18n="analytics.applications">Applications</legend>
           <div class="filter-options" id="source-filter">
-            <label class="filter-option"><input type="checkbox" value="codex" checked> Codex</label>
-            <label class="filter-option"><input type="checkbox" value="opencode" checked> OpenCode</label>
-            <label class="filter-option"><input type="checkbox" value="hermes" checked> Hermes</label>
+            <button type="button" class="filter-option" data-filter-value="codex" aria-pressed="true">Codex</button>
+            <button type="button" class="filter-option" data-filter-value="opencode" aria-pressed="true">OpenCode</button>
+            <button type="button" class="filter-option" data-filter-value="hermes" aria-pressed="true">Hermes</button>
           </div>
         </fieldset>
         <fieldset class="multi-filter model-filter">
@@ -72,10 +72,37 @@
       </div>
     </section>
 
-    <div id="analytics-error" class="analytics-message error-message" role="alert" hidden></div>
-    <div id="analytics-warnings" class="analytics-message warning-message" role="status" hidden></div>
+    <div id="analytics-loading" class="analytics-message loading-message" role="status" aria-live="polite" hidden data-i18n="analytics.loading">Loading analytics…</div>
+    <div id="analytics-local-only" class="analytics-message warning-message" role="status" aria-live="polite" hidden data-i18n="analytics.localOnly">Advanced analytics are available in LOCAL mode only.</div>
+    <div id="analytics-error" class="analytics-message error-message" role="alert" aria-live="assertive" hidden></div>
+    <div id="analytics-warnings" class="analytics-message warning-message" role="status" aria-live="polite" hidden></div>
 
     <section class="metric-grid" data-i18n-aria-label="analytics.metricSummaryAria" aria-label="Period summary">
+      <article class="metric-card metric-card-detail">
+        <span class="metric-label" data-i18n="analytics.uncachedInput">Uncached input</span>
+        <strong id="input-tokens">—</strong>
+        <small data-i18n="analytics.inputDescription">Input tokens excluding cache</small>
+      </article>
+      <article class="metric-card metric-card-detail">
+        <span class="metric-label" data-i18n="analytics.cacheRead">Cache read</span>
+        <strong id="cache-read-tokens">—</strong>
+        <small data-i18n="analytics.cacheReadDescription">Tokens read from cache</small>
+      </article>
+      <article class="metric-card metric-card-detail">
+        <span class="metric-label" data-i18n="analytics.cacheWrite">Cache write</span>
+        <strong id="cache-write-tokens">—</strong>
+        <small data-i18n="analytics.cacheWriteDescription">Tokens written to cache</small>
+      </article>
+      <article class="metric-card metric-card-detail">
+        <span class="metric-label" data-i18n="analytics.output">Output</span>
+        <strong id="output-tokens">—</strong>
+        <small data-i18n="analytics.outputDescription">Reasoning included</small>
+      </article>
+      <article class="metric-card metric-card-detail">
+        <span class="metric-label" data-i18n="analytics.reasoning">Reasoning</span>
+        <strong id="reasoning-tokens">—</strong>
+        <small data-i18n="analytics.reasoningDescription">Subset of output</small>
+      </article>
       <article class="metric-card">
         <span class="metric-label" data-i18n="analytics.billableTokens">Billable tokens</span>
         <strong id="total-tokens">—</strong>
@@ -87,59 +114,70 @@
         <small id="pricing-note" data-i18n="analytics.currentCatalogUsd">Current catalog · USD</small>
       </article>
       <article class="metric-card">
-        <span class="metric-label" data-i18n="analytics.randomWeeklyResets">Random weekly resets</span>
+        <span class="metric-label" data-i18n="analytics.weeklyResets">Weekly resets</span>
         <strong id="random-reset-count">—</strong>
-        <small id="random-reset-impact" data-i18n="analytics.randomImpactHint">Gain/loss versus ideal weekly pace</small>
+        <small id="random-reset-impact">—</small>
       </article>
       <article class="metric-card">
         <span class="metric-label" data-i18n="analytics.endWeekResets">End-of-week resets</span>
         <strong id="end-week-reset-count">—</strong>
         <small id="end-week-reset-impact" data-i18n="analytics.endWeekImpactHint">Unused quota lost at reset</small>
       </article>
-      <article class="metric-card">
-        <span class="metric-label" data-i18n="analytics.selectedPeriod">Selected period</span>
-        <strong class="period-value" id="period-label">—</strong>
-        <small id="granularity-label" data-i18n="analytics.granularityUnknown">—</small>
-      </article>
     </section>
 
     <section class="analytics-grid">
-      <article class="card analytics-card wide">
+      <article class="card analytics-card wide" id="limits-chart-card">
         <div class="section-heading chart-heading">
           <div><span class="section-kicker" data-i18n="analytics.codexLimits">Codex limits</span><h2 data-i18n="analytics.longTermAvailability">Long-term availability</h2></div>
           <div class="chart-heading-actions">
-            <button type="button" id="toggle-token-overlay" aria-pressed="false" aria-controls="tokens-chart-card" data-i18n="analytics.overlayTokens">Overlay tokens</button>
+            <button type="button" id="token-metric-toggle" aria-pressed="false" data-i18n="analytics.showCost">Show cost</button>
+            <button type="button" id="toggle-token-overlay" aria-pressed="true" aria-controls="tokens-chart-card" data-i18n="analytics.showTokensSeparately">Show tokens separately</button>
             <span class="sample-count" id="limit-samples">—</span>
           </div>
         </div>
-        <div class="chart-wrap" id="limits-chart-wrap"><canvas id="limits-chart"></canvas></div>
+        <div class="chart-wrap" id="limits-chart-wrap"><canvas id="limits-chart" role="img" aria-describedby="limits-chart-summary limits-data-table-caption"></canvas></div>
         <p class="empty-state" id="limits-empty" data-i18n="analytics.noLimitSamples" hidden>No limit samples in this period.</p>
+        <p class="chart-summary" id="limits-chart-summary" role="status" aria-live="polite"></p>
+        <details class="chart-data-details">
+          <summary data-i18n="analytics.showLimitTable">Show limit data table</summary>
+          <div class="table-scroll">
+            <table class="chart-data-table"><caption id="limits-data-table-caption" data-i18n="analytics.limitTableCaption">Limit history data</caption><thead><tr><th data-i18n="analytics.date">Date</th><th data-i18n="analytics.fiveHour">5-hour</th><th data-i18n="analytics.weekly">Weekly</th></tr></thead><tbody id="limits-data-body"></tbody></table>
+          </div>
+        </details>
       </article>
 
-      <article class="card analytics-card wide" id="tokens-chart-card">
-        <div class="section-heading">
+      <article class="card analytics-card wide" id="tokens-chart-card" hidden>
+          <div class="section-heading">
           <div><span class="section-kicker" data-i18n="analytics.localConsumption">Local consumption</span><h2 data-i18n="analytics.tokensOverTime">Tokens over time</h2></div>
           <span class="sample-count" id="event-count">—</span>
         </div>
-        <div class="chart-wrap" id="tokens-chart-wrap"><canvas id="tokens-chart"></canvas></div>
+        <div class="chart-wrap" id="tokens-chart-wrap"><canvas id="tokens-chart" role="img" aria-describedby="tokens-chart-summary tokens-data-table-caption"></canvas></div>
         <p class="empty-state" id="tokens-empty" data-i18n="analytics.noTokenEvents" hidden>No token events in this period.</p>
+        <p class="chart-summary" id="tokens-chart-summary" role="status" aria-live="polite"></p>
+        <details class="chart-data-details">
+          <summary data-i18n="analytics.showTokenTable">Show token data table</summary>
+          <div class="table-scroll">
+            <table class="chart-data-table"><caption id="tokens-data-table-caption" data-i18n="analytics.tokenTableCaption">Token consumption data</caption><thead><tr><th data-i18n="analytics.date">Date</th><th data-i18n="analytics.application">Application</th><th data-i18n="analytics.total">Total</th><th data-i18n="analytics.estimatedCost">Est. cost</th></tr></thead><tbody id="tokens-data-body"></tbody></table>
+          </div>
+        </details>
       </article>
 
-      <article class="card analytics-card wide table-card">
+      <article class="card analytics-card wide table-card" id="allocation-card">
         <div class="section-heading">
           <div><span class="section-kicker" data-i18n="analytics.costAllocation">Cost allocation</span><h2 data-i18n="analytics.byApplicationModel">By application and model</h2></div>
           <div class="allocation-total"><span data-i18n="analytics.totalEstimatedCost">Total estimated cost</span><strong id="allocation-total-cost">—</strong></div>
         </div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th data-i18n="analytics.application">Application</th><th data-i18n="analytics.providerModel">Provider / model</th><th data-i18n="analytics.input">Input</th><th data-i18n="analytics.cache">Cache</th><th data-i18n="analytics.output">Output</th><th data-i18n="analytics.estimatedCost">Est. cost</th></tr></thead>
+            <caption class="sr-only" data-i18n="analytics.breakdownCaption">Token and cost breakdown by application, provider and model</caption>
+            <thead><tr><th data-i18n="analytics.application">Application</th><th data-i18n="analytics.provider">Provider</th><th data-i18n="analytics.model">Model</th><th data-i18n="analytics.input">Input</th><th data-i18n="analytics.cacheRead">Cache read</th><th data-i18n="analytics.cacheWrite">Cache write</th><th data-i18n="analytics.output">Output</th><th data-i18n="analytics.reasoning">Reasoning</th><th data-i18n="analytics.total">Total</th><th data-i18n="analytics.estimatedCost">Est. cost</th><th data-i18n="analytics.pricingStatus">Pricing</th></tr></thead>
             <tbody id="breakdown-body"></tbody>
           </table>
         </div>
         <p class="empty-state" id="breakdown-empty" data-i18n="analytics.noModelConsumption" hidden>No model consumption to display.</p>
       </article>
 
-      <article class="card analytics-card wide table-card">
+      <article class="card analytics-card wide table-card" id="reset-history-card">
         <div class="section-heading reset-heading">
           <div><span class="section-kicker" data-i18n="analytics.resetHistory">Reset history</span><h2 data-i18n="analytics.previousLimitResets">Previous limit resets</h2></div>
           <label class="compact-filter"><span data-i18n="analytics.window">Window</span>
@@ -147,8 +185,9 @@
           </label>
         </div>
         <div class="table-scroll">
-          <table>
-            <thead><tr><th data-i18n="analytics.window">Window</th><th data-i18n="analytics.category">Category</th><th data-i18n="analytics.scheduledReset">Scheduled reset</th><th data-i18n="analytics.firstObservation">First observation</th><th data-i18n="analytics.beforeAfter">Before → after</th><th data-i18n="analytics.impact">Impact</th><th data-i18n="analytics.delay">Delay</th></tr></thead>
+          <table class="reset-table">
+            <caption class="sr-only" data-i18n="analytics.resetCaption">Detected limit resets</caption>
+            <thead><tr><th data-i18n="analytics.window">Window</th><th data-i18n="analytics.category">Category</th><th data-i18n="analytics.scheduledReset">Scheduled reset</th><th data-i18n="analytics.firstObservation">First observation</th><th data-i18n="analytics.beforeAfter">Before → after</th></tr></thead>
             <tbody id="resets-body"></tbody>
           </table>
         </div>
@@ -160,11 +199,15 @@
         </div>
       </article>
 
-      <article class="card analytics-card wide">
-        <div class="section-heading"><div><span class="section-kicker" data-i18n="analytics.dataHealth">Data health</span><h2 data-i18n="analytics.collectors">Collectors</h2></div></div>
+      <section class="freshness-panel card analytics-card wide" id="freshness-panel" aria-live="polite" aria-label="Data freshness">
+        <div class="section-heading compact-heading">
+          <div><span class="section-kicker" data-i18n="analytics.dataHealth">Data health</span><h2 data-i18n="analytics.freshness">Freshness</h2></div>
+          <span id="analytics-freshness" class="freshness-summary">—</span>
+        </div>
         <div class="collector-grid" id="collector-grid"></div>
         <p class="baseline-note" id="baseline-note" hidden></p>
-      </article>
+      </section>
+
     </section>
 
     <div id="analytics-price-warnings" class="analytics-message warning-message" role="status" hidden></div>

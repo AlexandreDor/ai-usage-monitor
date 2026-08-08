@@ -234,14 +234,25 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
     rows = connection.execute(
         """
         SELECT scraped_at_epoch, five_h_pct, five_h_reset_at,
-               weekly_pct, weekly_reset_at
-        FROM snapshots
+               weekly_pct, weekly_reset_at, sample_interval_seconds
+          FROM snapshots
         ORDER BY scraped_at_epoch
         """
     ).fetchall()
     connection.execute("DELETE FROM reset_events")
     windows = (("5h", 1, 2), ("weekly", 3, 4))
     for previous, current in zip(rows, rows[1:]):
+        gap = current[0] - previous[0]
+        intervals = [
+            value for value in (previous[5], current[5])
+            if isinstance(value, (int, float)) and value > 0
+        ]
+        expected_interval = int(max(intervals, default=900))
+        # A reset deadline crossing a long observation gap is not enough
+        # evidence that the reset was observed. Keep the event history
+        # conservative instead of inventing missed resets.
+        if gap <= 0 or gap > max(3_600, expected_interval * 2):
+            continue
         for window, pct_index, reset_index in windows:
             reset_at = previous[reset_index]
             if not isinstance(reset_at, int) or reset_at <= 0:

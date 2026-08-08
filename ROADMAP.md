@@ -1,6 +1,17 @@
 # Feuille de route des améliorations
 
-Cette feuille de route regroupe les améliorations identifiées lors de l'audit du projet. Elle privilégie d'abord la fiabilité de la collecte et des alertes, puis la qualité du code, l'expérience utilisateur et les nouvelles fonctionnalités.
+Cette feuille de route regroupe les améliorations identifiées lors de l'audit du projet et remplace les anciens plans de travail séparés. Elle privilégie d'abord la fiabilité de la collecte et l'intégrité des données, puis l'API Analytics, les alertes, l'expérience utilisateur, la sécurité et la maintenance.
+
+Le programme conserve les choix structurants suivants :
+
+- Bash et Python standard library ;
+- une architecture locale sans nouveau service cloud ;
+- SQLite comme archive longue durée ;
+- le dashboard principal et Analytics comme interfaces séparées ;
+- la synchronisation Gist limitée aux données de quotas ;
+- Linux et WSL comme environnements cibles.
+
+Le multi-compte et les nouvelles plateformes de notification restent différés jusqu'à la stabilisation du socle.
 
 ## Échelle d'effort
 
@@ -344,42 +355,193 @@ Ces évolutions sont utiles, mais doivent venir après la stabilisation des fonc
 - Interface CLI complète : `--help`, `--check`, `--once`, `--loop`, `--bind` et `--port`.
 - Mode simulation avec fixtures anonymisées pour développer sans compte Codex.
 
+## Spécifications techniques consolidées
+
+Les éléments ci-dessous précisent les comportements attendus pour les chantiers encore ouverts. Ils complètent les priorités et statuts précédents sans remettre en cause les fonctionnalités déjà terminées.
+
+### Collecte des tokens et tolérance aux sources absentes
+
+Pour `TOKEN_USAGE_SOURCES=auto` :
+
+- un chemin absent, un répertoire Codex vide ou une base OpenCode/Hermes absente produit l'état `disabled` ;
+- un schéma non reconnu produit l'état `disabled` avec un avertissement ;
+- une erreur de permission, une corruption ou une erreur de lecture produit l'état `error` et un cycle dégradé.
+
+Pour une source explicitement demandée :
+
+- un chemin absent ou un schéma invalide produit l'état `unavailable` ;
+- une erreur de lecture produit l'état `error` et marque le cycle en échec.
+
+Chaque source conserve `last_success_at` et `last_error`. Une erreur ne supprime jamais les données collectées précédemment.
+
+Le collecteur Codex doit utiliser un curseur robuste par fichier contenant au minimum :
+
+```json
+{
+  "device": 0,
+  "inode": 0,
+  "offset": 0,
+  "size": 0,
+  "mtime": 0,
+  "session_id": "",
+  "totals": {},
+  "model": "",
+  "provider": ""
+}
+```
+
+Le collecteur doit :
+
+- lire uniquement les lignes JSONL terminées ;
+- reprendre une ligne partielle au cycle suivant ;
+- réinitialiser l'offset après un changement d'inode ou une troncature ;
+- rescanner après une rotation ;
+- garantir l'idempotence au moyen de `external_id` ;
+- ne pas utiliser uniquement `mtime` pour ignorer un fichier ancien.
+
+Les tests doivent couvrir une ligne partielle, une troncature, une rotation, un changement de modèle, un événement dupliqué et un fichier modifié pendant sa lecture.
+
+### Historique JSON et configuration partagée
+
+Extraire la gestion inline de l'historique de `monitor.sh` vers `local/history.py`. Le module doit :
+
+- valider les snapshots et normaliser les timestamps en epoch ;
+- refuser les pourcentages hors de l'intervalle `0..100` ;
+- trier et dédupliquer selon le timestamp réel ;
+- appliquer une rétention temporelle ;
+- écrire atomiquement ;
+- sauvegarder sous un nom unique tout historique corrompu ;
+- conserver au plus 10 000 entrées et 16 MiB sans provoquer de crash.
+
+La rétention JSON par défaut reste fixée à `HISTORY_RETENTION_HOURS=192`.
+
+Créer `local/config.py` pour assurer une lecture non exécutable de `.env`, une validation typée, le contrôle des permissions et le partage des valeurs entre le monitor et le serveur. Le serveur doit lire le même `TOKEN_PRICING_FILE` depuis `.env` que le monitor. L'ordre de priorité est :
+
+1. option CLI explicite ;
+2. variable d'environnement ;
+3. valeur de `local/.env` ;
+4. valeur par défaut.
+
+L'aide de `monitor.sh` doit documenter `--once`, `--loop [SECONDS]`, `--check`, `--status-json` et `--fail-fast`.
+
+### Migrations et concurrence SQLite
+
+Le stockage doit :
+
+- lire `PRAGMA user_version` et rejeter les versions inconnues ou supérieures ;
+- migrer la version 1 vers la version 2 dans une transaction ;
+- sauvegarder toute base existante avant une opération susceptible de l'altérer ;
+- conserver les snapshots existants ;
+- exécuter `quick_check` après une migration.
+
+Le test de migration doit partir d'une véritable base version 1 préexistante.
+
+Passer progressivement du journal `DELETE` à `WAL`, avec un `busy_timeout` explicite, une gestion des erreurs `locked`, un test de lecture/écriture concurrente et un nettoyage contrôlé des fichiers WAL.
+
+### Contrat et robustesse de l'API Analytics
+
+Conserver la réponse Analytics en `schema_version: 1` pour les consommateurs existants et y ajouter :
+
+- la période effective, le fuseau et la granularité ;
+- la date du dernier relevé de limites, son âge, son statut de fraîcheur et l'intervalle d'échantillonnage ;
+- la devise, la date et l'empreinte SHA-256 du catalogue tarifaire.
+
+L'API ne doit jamais exposer de chemin local, identifiant de session, prompt, contenu de message, compte ou secret d'authentification.
+
+La granularité cible est :
+
+- jusqu'à 48 heures : 15 minutes ;
+- jusqu'à 30 jours : 30 minutes ;
+- au-delà : 1 heure.
+
+Chaque bucket de quota conserve le dernier relevé observé. Les volumes et coûts de tokens sont additionnés, avec un regroupement possible par application et par bucket.
+
+Les erreurs de catalogue ou SQLite retournent HTTP 503 ; les dates invalides retournent HTTP 400. L'API doit également refuser les paramètres contradictoires ou répétés, borner les filtres et le nombre de points, et toujours retourner un JSON d'erreur court. Les tests couvrent catalogue invalide, base absente ou corrompue, date extrême, requête trop grande et accès concurrent.
+
+### Livraison fiable des alertes
+
+Faire évoluer l'état vers `state_version=4` et suivre séparément, pour chaque `alert_id`, l'état `pending`, `delivered` ou `failed` de Discord et Telegram.
+
+- Une alerte est entièrement livrée uniquement lorsque tous les canaux configurés ont réussi.
+- Les erreurs HTTP 4xx permanentes ne sont pas retentées.
+- Les erreurs 429, 5xx et les timeouts sont retentés en respectant `Retry-After`.
+- Les états v1 à v3 restent lisibles.
+- Une alerte déjà livrée ne doit jamais être rejouée après migration.
+- Les diagnostics ne doivent contenir aucun token ni URL sensible.
+
+### Finalisation d'Analytics et de l'accessibilité
+
+L'interface Analytics doit ajouter :
+
+- des marqueurs de reset sur les quotas ;
+- des séries de tokens par application ;
+- une bascule tokens/coût et un coût par bucket ;
+- une légende explicite pour les données estimées ;
+- des cartes distinctes pour input non mis en cache, cache read, cache write, output, reasoning, total, tokens sans tarif et coût API équivalent ;
+- un tableau par application, fournisseur et modèle, paginé par groupes de 50 lignes.
+
+Le reasoning reste un sous-ensemble de l'output et ne doit pas être facturé deux fois. Le coût présenté est une estimation API, pas une facture réelle.
+
+Chaque collecteur affiche son statut, sa dernière tentative, son dernier succès, sa dernière erreur et l'âge de la dernière donnée. Après un échec, les dernières données valides restent visibles avec un avertissement.
+
+L'accessibilité doit inclure un résumé textuel et un tableau alternatif des graphiques, des régions `aria-live`, des labels complets, des jauges ARIA, un état compréhensible sans la couleur et une navigation clavier complète. Les tests navigateur couvrent notamment langue, devise, historique vide, données périmées, collecteur en erreur et absence de graphique.
+
+### Sécurité réseau, tests et distribution
+
+Le serveur reste lié par défaut à `127.0.0.1`. Tout bind non local exige `--allow-insecure-lan` et un avertissement explicite. L'authentification et TLS restent délégués à un reverse proxy. L'allowlist, la CSP, l'absence d'accès SQLite direct et l'absence de synchronisation Analytics vers Gist restent obligatoires.
+
+La suite de validation doit comprendre des tests unitaires Python, migrations, concurrence, changement d'heure, rotation Codex, réinitialisation Hermes, catalogue personnalisé, limites de l'API et reprise après erreur. La CI fixe les versions de Python et Node, compile le Python, vérifie le shell, mesure la couverture, contrôle les migrations et audite les dépendances.
+
+Ajouter au `.gitignore` les sorties générées suivantes lorsqu'elles ne sont pas encore ignorées :
+
+```text
+test-results/
+playwright-report/
+coverage/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+```
+
+La documentation de release doit corriger les références obsolètes, expliquer la personnalisation du catalogue et les états de fraîcheur, puis fournir sauvegarde, restauration, installation, mise à jour et désinstallation. Le projet doit disposer d'un `CHANGELOG.md`, d'une version publiée et d'archives avec checksum.
+
 ## Plan d'exécution recommandé
 
-### Phase 1 - Stabilisation
+### Phase 1 - Stabilisation de la collecte
 
-1. Fiabiliser les appels réseau.
-2. Corriger les alertes de seuil.
-3. Ajouter le verrou global.
+1. Corriger le comportement de `TOKEN_USAGE_SOURCES`.
+2. Fiabiliser le curseur et la rotation du collecteur Codex.
+3. Extraire et fiabiliser l'historique JSON.
 4. Détecter les données périmées.
 
-### Phase 2 - Robustesse des données
+### Phase 2 - Configuration et stockage
 
-1. Rendre la rétention temporelle.
-2. Renforcer le parsing Codex.
-3. Valider toute la configuration.
-4. Améliorer l'observabilité.
+1. Centraliser et valider la configuration.
+2. Partager le catalogue tarifaire.
+3. Versionner et tester les migrations SQLite.
+4. Fiabiliser la concurrence avec `busy_timeout` et des retries bornés.
 
-### Phase 3 - Qualité continue
+### Phase 3 - API et alertes
 
-1. Isoler les effets de bord.
-2. Étendre les tests.
-3. Ajouter la CI.
-4. Ajouter les tests HTTP et navigateur.
+1. Renforcer le contrat Analytics v1 sans rupture de compatibilité.
+2. Appliquer la granularité et les bornes de réponse.
+3. Normaliser les erreurs HTTP.
+4. Migrer les alertes vers un suivi par canal.
 
-### Phase 4 - Dashboard et sécurité
+### Phase 4 - Interface et accessibilité
 
-1. Rendre le dashboard autonome.
-2. Corriger et optimiser le graphique.
-3. Améliorer l'accessibilité.
-4. Sécuriser l'exposition réseau.
+1. Finaliser les graphiques, cartes et tableaux Analytics.
+2. Exposer la fraîcheur et les erreurs de chaque collecteur.
+3. Terminer l'accessibilité et les tests navigateur.
+4. Vérifier le fonctionnement autonome du dashboard.
 
-### Phase 5 - Distribution et fonctionnalités
+### Phase 5 - Sécurité, qualité et distribution
 
-1. Corriger la documentation.
-2. Préparer le packaging et les releases.
-3. Réduire progressivement le script monolithique.
-4. Ajouter les nouvelles fonctionnalités selon les besoins utilisateurs.
+1. Verrouiller l'exposition réseau et documenter le reverse proxy.
+2. Étendre les tests, la CI et l'observabilité.
+3. Corriger la documentation et préparer les releases.
+4. Réduire progressivement le script monolithique.
+5. Ajouter les évolutions P3 selon les besoins utilisateurs.
 
 ## Définition globale de terminé
 
@@ -391,3 +553,15 @@ Une amélioration est considérée comme terminée lorsque :
 - la CI valide le changement ;
 - la documentation utilisateur est mise à jour ;
 - aucun secret ou identifiant de compte n'est ajouté aux données exposées.
+
+Le programme consolidé est terminé lorsque, en plus de ces règles générales :
+
+- une source absente en mode `auto` ne fait plus échouer le cycle ;
+- aucune ligne JSONL partielle n'est perdue et une rotation est correctement reprise ;
+- l'API et le monitor utilisent le même catalogue tarifaire ;
+- une base SQLite v1 est migrée sans perte ;
+- les erreurs Analytics renvoient un statut 400 ou 503 sans traceback ;
+- les quotas affichés proviennent de valeurs réellement observées ;
+- les alertes sont suivies indépendamment pour chaque canal ;
+- les tests shell, Python, HTTP et navigateur passent en CI ;
+- aucune donnée privée, aucun chemin local et aucun secret n'est exposé.

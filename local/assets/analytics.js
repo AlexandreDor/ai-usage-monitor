@@ -1,7 +1,7 @@
 'use strict';
 
 const ANALYTICS_REFRESH_MS = 900_000;
-const RESET_PAGE_SIZE = 10;
+const RESET_PAGE_SIZE = 50;
 const PARIS_ZONE = 'Europe/Paris';
 const PRICE_WARNING_PATTERN = /^No catalog price; assumed zero: (.+)$/u;
 const state = {
@@ -13,19 +13,30 @@ const state = {
   resetOffset: 0,
   fromDate: '',
   toDate: '',
-  tokenOverlay: false,
+  tokenOverlay: true,
+  tokenMetric: 'tokens',
 };
 let limitsChart = null;
 let tokensChart = null;
 let refreshTimer = null;
 let limitPoints = [];
 let tokenPoints = [];
+let tokenSourcePoints = [];
 let limitDatasets = [];
 let tokenDatasets = [];
 let lastPayload = null;
+let currentPeriod = {};
 
 function byId(id) { return document.getElementById(id); }
-function safeNumber(value) { const number = Number(value); return Number.isFinite(number) && number >= 0 ? number : 0; }
+function safeNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+function finiteNumber(value) {
+  if (value === null || value === undefined || value === '' || typeof value === 'boolean') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
 function t(key, values = {}) {
   return typeof CodexPreferences === 'object' ? CodexPreferences.t(`analytics.${key}`, values) : key;
 }
@@ -44,9 +55,27 @@ function numberFormatter(options = {}) {
 }
 function formatTokens(value) { return numberFormatter({ notation: 'compact', maximumFractionDigits: 2 }).format(safeNumber(value)); }
 function formatFullTokens(value) { return numberFormatter().format(safeNumber(value)); }
-function formatDate(value) { const date = new Date(value); return Number.isFinite(date.getTime()) ? dateFormatter().format(date) : '—'; }
-function formatCost(value) { return typeof CodexPreferences === 'object' ? CodexPreferences.formatCurrency(safeNumber(value)) : `$${safeNumber(value).toFixed(safeNumber(value) < 1 ? 4 : 2)}`; }
+function formatDate(value) {
+  const timestamp = timestampMs(value);
+  return timestamp === null ? '—' : dateFormatter().format(new Date(timestamp));
+}
+function formatShortDate(value) {
+  const timestamp = timestampMs(value);
+  return timestamp === null ? '—' : shortDateFormatter().format(new Date(timestamp));
+}
+function timestampMs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value > 1e12 ? value : value * 1000;
+  if (typeof value !== 'string' || !value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function formatCost(value) {
+  return typeof CodexPreferences === 'object'
+    ? CodexPreferences.formatCurrency(safeNumber(value))
+    : `$${safeNumber(value).toFixed(safeNumber(value) < 1 ? 4 : 2)}`;
+}
 function setCost(element, value) {
+  if (!element) return;
   element.textContent = formatCost(value);
   const currency = typeof CodexPreferences === 'object' ? CodexPreferences.get().currency : 'USD';
   element.title = currency === 'EUR'
@@ -54,12 +83,26 @@ function setCost(element, value) {
     : '';
 }
 function formatSignedPoints(value) {
-  const number = Math.round(safeNumber(value) * 1000) / 1000;
+  const number = Math.round((finiteNumber(value) || 0) * 1000) / 1000;
   return `${number >= 0 ? '+' : ''}${number} ${t('points')}`;
 }
 function formatPoints(value) { return `${Math.round(safeNumber(value) * 1000) / 1000} ${t('points')}`; }
-function formatPercent(value) { return `${Math.round(safeNumber(value) * 10) / 10}%`; }
-function totalBillable(summary) { return safeNumber(summary.input_tokens) + safeNumber(summary.cache_read_tokens) + safeNumber(summary.cache_write_tokens) + safeNumber(summary.output_tokens); }
+function formatPercent(value) {
+  const number = finiteNumber(value);
+  return number === null ? '—' : `${Math.round(number * 10) / 10}%`;
+}
+function totalBillable(summary) {
+  return safeNumber(summary?.input_tokens)
+    + safeNumber(summary?.cache_read_tokens)
+    + safeNumber(summary?.cache_write_tokens)
+    + safeNumber(summary?.output_tokens);
+}
+function pointTotal(point) {
+  return totalBillable(point || {});
+}
+function pointCost(point) {
+  return safeNumber(point?.estimated_cost_usd ?? point?.cost_usd ?? point?.cost);
+}
 function formatDuration(seconds) {
   const value = safeNumber(seconds);
   if (value < 60) return `${value}s`;
@@ -67,19 +110,35 @@ function formatDuration(seconds) {
   return `${Math.round(value / 360) / 10}h`;
 }
 
-function formatShortDate(value) { return shortDateFormatter().format(new Date(value)); }
-
+function clearRows(body) {
+  if (!body) return;
+  while (body.firstChild) body.removeChild(body.firstChild);
+}
+function cell(row, value, className = '') {
+  const element = document.createElement('td');
+  element.textContent = value === null || value === undefined ? '—' : String(value);
+  if (className) element.className = className;
+  row.appendChild(element);
+  return element;
+}
+function pillCell(row, value) {
+  const element = cell(row, '');
+  const pill = document.createElement('span');
+  pill.className = 'source-pill';
+  pill.textContent = value === null || value === undefined ? '—' : String(value);
+  element.appendChild(pill);
+  return element;
+}
 function setMessage(id, messages) {
   const element = byId(id);
+  if (!element) return;
   const values = (Array.isArray(messages) ? messages : messages ? [messages] : []).map(localizeMessage);
   element.textContent = values.join(' · ');
   element.hidden = values.length === 0;
 }
-
 function isPriceWarning(message) {
   return typeof message === 'string' && PRICE_WARNING_PATTERN.test(message);
 }
-
 function localizeMessage(message) {
   if (typeof message !== 'string') return message;
   const priceWarning = PRICE_WARNING_PATTERN.exec(message);
@@ -88,7 +147,6 @@ function localizeMessage(message) {
   if (collectorWarning) return t('collectorWarning', { name: collectorWarning[1], message: collectorWarning[2] });
   return message;
 }
-
 function renderWarnings(warnings) {
   const values = Array.isArray(warnings) ? warnings : warnings ? [warnings] : [];
   setMessage('analytics-warnings', values.filter(message => !isPriceWarning(message)));
@@ -96,7 +154,11 @@ function renderWarnings(warnings) {
 }
 
 function queryString() {
-  const query = new URLSearchParams({ reset_type: state.resetType, reset_offset: String(state.resetOffset), reset_limit: String(RESET_PAGE_SIZE) });
+  const query = new URLSearchParams({
+    reset_type: state.resetType,
+    reset_offset: String(state.resetOffset),
+    reset_limit: String(RESET_PAGE_SIZE),
+  });
   if (state.sources.length) query.set('sources', state.sources.join(','));
   if (state.models.length) query.set('models', state.models.join(','));
   if (state.range === 'custom') {
@@ -108,26 +170,61 @@ function queryString() {
   return query.toString();
 }
 
-function chartBase() {
-  return {
-    responsive: true, maintainAspectRatio: false, parsing: false, normalized: true, animation: false,
+function pointTimestamp(point) {
+  return timestampMs(point?.at ?? point?.x);
+}
+function chartBounds(points) {
+  const timestamps = points.map(pointTimestamp).filter(value => value !== null);
+  if (!timestamps.length) return {};
+  const firstData = Math.min(...timestamps);
+  const periodStart = timestampMs(currentPeriod.from);
+  const periodEnd = timestampMs(currentPeriod.to);
+  const min = periodStart === null ? firstData : Math.max(periodStart, firstData);
+  const max = periodEnd === null ? Date.now() : periodEnd;
+  return max > min ? { min, max } : { min };
+}
+function applyChartBounds(options, points) {
+  if (!options?.scales?.x) return;
+  const bounds = chartBounds(points);
+  if (bounds.min === undefined) delete options.scales.x.min;
+  else options.scales.x.min = bounds.min;
+  if (bounds.max === undefined) delete options.scales.x.max;
+  else options.scales.x.max = bounds.max;
+}
+function chartBase(points = []) {
+  const options = {
+    responsive: true,
+    maintainAspectRatio: false,
+    parsing: false,
+    normalized: true,
+    animation: false,
     scales: {
-      x: { type: 'linear', grid: { color: 'rgba(255,255,255,.05)' }, ticks: { color: '#86a2c5', maxTicksLimit: 8, callback: value => formatShortDate(value) } },
+      x: {
+        type: 'linear',
+        grid: { color: 'rgba(255,255,255,.05)' },
+        ticks: { color: '#86a2c5', maxTicksLimit: 8, callback: value => formatShortDate(value) },
+      },
       y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,.05)' }, ticks: { color: '#86a2c5' } },
     },
-    plugins: { legend: { labels: { color: '#edf5ff', boxWidth: 12 } }, tooltip: { callbacks: { title: items => items.length ? formatDate(items[0].parsed.x) : '' } } },
+    plugins: {
+      legend: { labels: { color: '#edf5ff', boxWidth: 12 } },
+      tooltip: { callbacks: { title: items => items.length ? formatDate(items[0].parsed.x) : '' } },
+    },
   };
+  applyChartBounds(options, points);
+  return options;
 }
-
 function tokenAxis() {
   return {
     beginAtZero: true,
     position: 'right',
     grid: { drawOnChartArea: false },
-    ticks: { color: '#c4b5fd', callback: formatTokens },
+    ticks: {
+      color: '#c4b5fd',
+      callback: value => state.tokenMetric === 'cost' ? formatCost(value) : formatTokens(value),
+    },
   };
 }
-
 function overlayTokenDatasets() {
   return tokenDatasets.map(dataset => ({
     ...dataset,
@@ -138,214 +235,436 @@ function overlayTokenDatasets() {
     categoryPercentage: 0.8,
   }));
 }
-
+function updateTokenMetricToggle() {
+  const toggle = byId('token-metric-toggle');
+  if (!toggle) return;
+  const cost = state.tokenMetric === 'cost';
+  toggle.setAttribute('aria-pressed', String(cost));
+  toggle.textContent = cost ? t('showTokens') : t('showCost');
+}
 function updateTokenOverlay() {
   const available = limitPoints.length > 0 && tokenPoints.length > 0;
   const active = state.tokenOverlay && available;
   const toggle = byId('toggle-token-overlay');
-  toggle.disabled = !available;
-  toggle.setAttribute('aria-pressed', String(active));
-  toggle.textContent = active ? t('showTokensSeparately') : t('overlayTokens');
-  byId('tokens-chart-card').hidden = active;
+  if (toggle) {
+    toggle.disabled = !available;
+    toggle.setAttribute('aria-pressed', String(active));
+    toggle.textContent = active ? t('showTokensSeparately') : t('overlayTokens');
+  }
+  const tokenCard = byId('tokens-chart-card');
+  if (tokenCard) tokenCard.hidden = active;
   if (!limitsChart) return;
   limitsChart.data.datasets = active ? [...limitDatasets, ...overlayTokenDatasets()] : [...limitDatasets];
+  applyChartBounds(limitsChart.options, active ? [...limitPoints, ...tokenPoints] : limitPoints);
   if (active) limitsChart.options.scales.tokens = tokenAxis();
   else delete limitsChart.options.scales.tokens;
   limitsChart.update('none');
 }
 
-function renderLimits(data) {
+function markerDataset(markers, window) {
+  const values = markers
+    .filter(marker => marker && (marker.window === window || marker.kind === window))
+    .map(marker => timestampMs(marker.at ?? marker.reset_at))
+    .filter(value => value !== null);
+  if (!values.length) return null;
+  const label = window === '5h' ? t('fiveHourResetMarkers') : t('weeklyResetMarkers');
+  const data = [];
+  for (const x of values) data.push({ x, y: 0 }, { x, y: 100 }, { x, y: null });
+  return {
+    label,
+    data,
+    borderColor: window === '5h' ? '#fbbf24' : '#f0abfc',
+    borderDash: [4, 4],
+    borderWidth: 1,
+    pointRadius: 0,
+    fill: false,
+    spanGaps: false,
+    resetMarker: true,
+  };
+}
+function renderLimitTable(points) {
+  const body = byId('limits-data-body');
+  clearRows(body);
+  for (const point of points) {
+    const row = document.createElement('tr');
+    cell(row, formatDate(point.at));
+    cell(row, formatPercent(point.five_h_pct));
+    cell(row, formatPercent(point.weekly_pct));
+    body?.appendChild(row);
+  }
+}
+function renderLimits(data = {}) {
   limitPoints = Array.isArray(data.series) ? data.series : [];
-  byId('limit-samples').textContent = t('samples', { value: formatFullTokens(data.samples) });
+  const markers = Array.isArray(data.reset_markers)
+    ? data.reset_markers
+    : Array.isArray(data.markers) ? data.markers : [];
+  const sampleCount = data.samples ?? limitPoints.reduce((total, point) => total + safeNumber(point.samples || 1), 0);
+  byId('limit-samples').textContent = t('samples', { value: formatFullTokens(sampleCount) });
   byId('limits-empty').hidden = limitPoints.length > 0;
-  byId('limits-chart-wrap').hidden = limitPoints.length === 0;
-  limitDatasets = [
-    { label: t('fiveHourRemaining'), data: limitPoints.map(point => ({ x: Date.parse(point.at), y: point.five_h_pct })), borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,.10)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false },
-    { label: t('weeklyRemaining'), data: limitPoints.map(point => ({ x: Date.parse(point.at), y: point.weekly_pct })), borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.07)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false },
+  byId('limits-chart-wrap').hidden = limitPoints.length === 0 || typeof Chart !== 'function';
+  renderLimitTable(limitPoints);
+  const first = limitPoints[0];
+  const last = limitPoints[limitPoints.length - 1];
+  byId('limits-chart-summary').textContent = limitPoints.length
+    ? t('limitChartSummary', {
+      samples: formatFullTokens(sampleCount),
+      from: formatDate(first.at),
+      to: formatDate(last.at),
+      resets: formatFullTokens(markers.length),
+    })
+    : t('noLimitSamples');
+  const limitCandidates = [
+    {
+      label: t('fiveHourRemaining'),
+      data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.five_h_pct) })),
+      borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,.10)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false,
+    },
+    {
+      label: t('weeklyRemaining'),
+      data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.weekly_pct) })),
+      borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.07)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false,
+    },
   ];
-  if (limitsChart) { limitsChart.data.datasets = [...limitDatasets]; limitsChart.update('none'); updateTokenOverlay(); return; }
-  if (typeof Chart !== 'function') throw new Error('Chart.js failed to load');
-  const options = chartBase();
+  limitDatasets = limitCandidates.filter(dataset => dataset.data.some(point => point.y !== null));
+  for (const window of ['5h', 'weekly']) {
+    const dataset = markerDataset(markers, window);
+    if (dataset) limitDatasets.push(dataset);
+  }
+  if (typeof Chart !== 'function' || !limitPoints.length) {
+    if (limitsChart) { limitsChart.destroy(); limitsChart = null; }
+    updateTokenOverlay();
+    return;
+  }
+  if (limitsChart) {
+    limitsChart.data.datasets = [...limitDatasets];
+    applyChartBounds(limitsChart.options, limitPoints);
+    limitsChart.update('none');
+    updateTokenOverlay();
+    return;
+  }
+  const options = chartBase(limitPoints);
   options.scales.y.max = 100;
   options.scales.y.ticks.callback = value => `${value}%`;
   limitsChart = new Chart(byId('limits-chart').getContext('2d'), { type: 'line', data: { datasets: limitDatasets }, options });
   updateTokenOverlay();
 }
 
-function renderTokens(data) {
-  tokenPoints = Array.isArray(data.series) ? data.series : [];
-  byId('event-count').textContent = t('events', { value: formatFullTokens(data.summary.events) });
-  byId('tokens-empty').hidden = tokenPoints.length > 0;
-  byId('tokens-chart-wrap').hidden = tokenPoints.length === 0;
-  tokenDatasets = [
-    { label: t('input'), data: tokenPoints.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.input_tokens) })), backgroundColor: '#3b82f6', stack: 'tokens' },
-    { label: t('cacheReadWrite'), data: tokenPoints.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.cache_read_tokens) + safeNumber(point.cache_write_tokens) })), backgroundColor: '#a78bfa', stack: 'tokens' },
-    { label: t('output'), data: tokenPoints.map(point => ({ x: Date.parse(point.at), y: safeNumber(point.output_tokens) })), backgroundColor: '#22c55e', stack: 'tokens' },
+function sourceSeries(tokens) {
+  const candidate = tokens?.series_by_source ?? tokens?.series_by_application ?? tokens?.by_source_series;
+  if (Array.isArray(candidate)) return candidate.filter(item => item && typeof item === 'object');
+  if (candidate && typeof candidate === 'object') {
+    return Object.entries(candidate).flatMap(([source, points]) => (Array.isArray(points) ? points.map(point => ({ ...point, source })) : []));
+  }
+  return [];
+}
+function groupedSourceSeries(tokens) {
+  const flat = sourceSeries(tokens);
+  const groups = new Map();
+  for (const point of flat) {
+    const source = String(point.source ?? point.application ?? 'all');
+    if (!groups.has(source)) groups.set(source, []);
+    groups.get(source).push(point);
+  }
+  return groups;
+}
+function sourceLabel(source) {
+  return source === 'all' ? t('allApplications') : source;
+}
+function tokenDatasetValue(point) {
+  return state.tokenMetric === 'cost' ? pointCost(point) : pointTotal(point);
+}
+function renderTokenTable(tokens) {
+  const body = byId('tokens-data-body');
+  clearRows(body);
+  const groups = groupedSourceSeries(tokens);
+  if (!groups.size) groups.set('all', tokenPoints);
+  for (const [source, points] of groups) {
+    for (const point of points) {
+      const row = document.createElement('tr');
+      cell(row, formatDate(point.at));
+      cell(row, sourceLabel(source));
+      cell(row, formatFullTokens(pointTotal(point)));
+      const cost = cell(row, '');
+      setCost(cost, pointCost(point));
+      body?.appendChild(row);
+    }
+  }
+}
+function datasetsForTokens(tokens) {
+  const groups = groupedSourceSeries(tokens);
+  if (groups.size) {
+    return [...groups.entries()].map(([source, points]) => ({
+      label: sourceLabel(source),
+      data: points.map(point => ({ x: timestampMs(point.at), y: tokenDatasetValue(point) })),
+      backgroundColor: source === 'codex' ? '#3b82f6' : source === 'opencode' ? '#a78bfa' : source === 'hermes' ? '#22c55e' : '#38bdf8',
+      stack: 'applications',
+    }));
+  }
+  if (state.tokenMetric === 'cost') {
+    return [{
+      label: t('estimatedCost'),
+      data: tokenPoints.map(point => ({ x: timestampMs(point.at), y: pointCost(point) })),
+      backgroundColor: '#a78bfa', stack: 'tokens',
+    }];
+  }
+  return [
+    { label: t('input'), data: tokenPoints.map(point => ({ x: timestampMs(point.at), y: safeNumber(point.input_tokens) })), backgroundColor: '#3b82f6', stack: 'tokens' },
+    { label: t('cacheReadWrite'), data: tokenPoints.map(point => ({ x: timestampMs(point.at), y: safeNumber(point.cache_read_tokens) + safeNumber(point.cache_write_tokens) })), backgroundColor: '#a78bfa', stack: 'tokens' },
+    { label: t('output'), data: tokenPoints.map(point => ({ x: timestampMs(point.at), y: safeNumber(point.output_tokens) })), backgroundColor: '#22c55e', stack: 'tokens' },
   ];
-  if (tokensChart) { tokensChart.data.datasets = tokenDatasets; tokensChart.update('none'); updateTokenOverlay(); return; }
-  if (typeof Chart !== 'function') throw new Error('Chart.js failed to load');
-  const options = chartBase();
+}
+function renderTokens(data = {}) {
+  const summary = data.summary || {};
+  tokenPoints = Array.isArray(data.series) ? data.series : [];
+  tokenSourcePoints = sourceSeries(data);
+  byId('event-count').textContent = t('events', { value: formatFullTokens(summary.events) });
+  byId('tokens-empty').hidden = tokenPoints.length > 0;
+  byId('tokens-chart-wrap').hidden = tokenPoints.length === 0 || typeof Chart !== 'function';
+  byId('tokens-chart-summary').textContent = tokenPoints.length
+    ? t('tokenChartSummary', { events: formatFullTokens(summary.events), applications: formatFullTokens(new Set(tokenSourcePoints.map(point => point.source || point.application)).size || 1) })
+    : t('noTokenEvents');
+  renderTokenTable(data);
+  tokenDatasets = datasetsForTokens(data);
+  updateTokenMetricToggle();
+  if (typeof Chart !== 'function' || !tokenPoints.length) {
+    if (tokensChart) { tokensChart.destroy(); tokensChart = null; }
+    updateTokenOverlay();
+    return;
+  }
+  if (tokensChart) {
+    tokensChart.data.datasets = tokenDatasets;
+    applyChartBounds(tokensChart.options, tokenPoints);
+    tokensChart.options.scales.y.ticks.callback = value => state.tokenMetric === 'cost' ? formatCost(value) : formatTokens(value);
+    tokensChart.update('none');
+    updateTokenOverlay();
+    return;
+  }
+  const options = chartBase(tokenPoints);
   options.scales.y.stacked = true;
-  options.scales.y.ticks.callback = formatTokens;
+  options.scales.y.ticks.callback = value => state.tokenMetric === 'cost' ? formatCost(value) : formatTokens(value);
   tokensChart = new Chart(byId('tokens-chart').getContext('2d'), { type: 'bar', data: { datasets: tokenDatasets }, options });
   updateTokenOverlay();
 }
 
-function clearRows(body) { while (body.firstChild) body.removeChild(body.firstChild); }
-function cell(row, text, className = '') { const value = document.createElement('td'); value.textContent = text; if (className) value.className = className; row.appendChild(value); return value; }
-
 function renderBreakdown(items) {
   const body = byId('breakdown-body');
   clearRows(body);
-  byId('breakdown-empty').hidden = items.length > 0;
-  for (const item of items) {
+  const values = Array.isArray(items) ? items : [];
+  byId('breakdown-empty').hidden = values.length > 0;
+  for (const item of values) {
     const row = document.createElement('tr');
-    cell(row, item.source, 'source-pill');
-    cell(row, `${item.provider || 'unknown'} / ${item.model}`);
+    pillCell(row, item.source || '—');
+    cell(row, item.provider || 'unknown');
+    cell(row, item.model || 'unknown');
     cell(row, formatTokens(item.input_tokens));
-    cell(row, formatTokens(safeNumber(item.cache_read_tokens) + safeNumber(item.cache_write_tokens)));
+    cell(row, formatTokens(item.cache_read_tokens));
+    cell(row, formatTokens(item.cache_write_tokens));
     cell(row, formatTokens(item.output_tokens));
+    cell(row, formatTokens(item.reasoning_tokens));
+    cell(row, formatTokens(item.total_tokens ?? pointTotal(item)));
     const cost = cell(row, '', item.pricing_status === 'assumed-zero' ? 'pricing-unknown' : '');
     setCost(cost, item.estimated_cost_usd);
     if (item.pricing_status === 'assumed-zero') cost.title = t('pricingUnknownTitle');
+    cell(row, item.pricing_status || '—', item.pricing_status === 'assumed-zero' ? 'pricing-unknown' : '');
     body.appendChild(row);
   }
 }
 
-function renderResets(data) {
+function renderResets(data = {}) {
   const body = byId('resets-body');
   clearRows(body);
-  byId('resets-empty').hidden = data.items.length > 0;
-  for (const item of data.items) {
+  const items = Array.isArray(data.items) ? data.items : [];
+  byId('resets-empty').hidden = items.length > 0;
+  for (const item of items) {
     const row = document.createElement('tr');
-    cell(row, item.window, 'source-pill');
-    cell(row, item.category === 'random' ? t('random') : item.category === 'end_of_week' ? t('endOfWeek') : t('scheduled'), 'source-pill');
+    pillCell(row, item.window);
+    pillCell(row, item.category === 'random' ? t('random') : item.category === 'end_of_week' ? t('endOfWeek') : t('scheduled'));
     cell(row, formatDate(item.reset_at));
     cell(row, formatDate(item.observed_at));
     cell(row, `${item.before_pct ?? '—'}% → ${item.after_pct ?? '—'}%`);
-    const impact = item.category === 'random'
-      ? `${formatSignedPoints(item.pace_delta_pct_points)} ${t('vsIdealPace')}`
-      : item.category === 'end_of_week' && item.unused_pct_points > 0
-        ? t('unusedExpired', { value: item.unused_pct_points })
-        : '—';
-    cell(row, impact);
-    cell(row, formatDuration(item.observation_delay_seconds));
     body.appendChild(row);
   }
   const pagination = byId('reset-pagination');
-  pagination.hidden = data.total <= RESET_PAGE_SIZE;
-  byId('resets-previous').disabled = data.offset === 0;
-  byId('resets-next').disabled = data.offset + data.limit >= data.total;
-  const first = data.total ? data.offset + 1 : 0;
-  byId('reset-page-label').textContent = t('pageOf', {
-    from: first,
-    to: Math.min(data.offset + data.limit, data.total),
-    total: data.total,
-  });
+  const total = safeNumber(data.total);
+  const limit = Math.max(1, safeNumber(data.limit) || RESET_PAGE_SIZE);
+  const offset = safeNumber(data.offset);
+  pagination.hidden = total <= limit;
+  byId('resets-previous').disabled = offset === 0;
+  byId('resets-next').disabled = offset + limit >= total;
+  const first = total ? offset + 1 : 0;
+  byId('reset-page-label').textContent = t('pageOf', { from: first, to: Math.min(offset + limit, total), total });
 }
 
-function renderCollectors(freshness, baselines) {
+function freshnessAge(value, explicit) {
+  const given = finiteNumber(explicit);
+  if (given !== null && given >= 0) return given;
+  const timestamp = timestampMs(value);
+  return timestamp === null ? null : Math.max(0, (Date.now() - timestamp) / 1000);
+}
+function collectorStatus(collector, age, interval) {
+  if (collector?.status === 'error') return 'error';
+  if (collector?.status === 'disabled' || collector?.status === 'unavailable') return collector.status;
+  if (collector?.freshness_status === 'stale' || collector?.status === 'stale' || (age !== null && age > interval * 2)) return 'stale';
+  return collector?.status || 'unavailable';
+}
+function renderCollectors(freshness = {}, baselines = {}, period = {}) {
   const grid = byId('collector-grid');
   clearRows(grid);
+  const interval = safeNumber(freshness.sample_interval_seconds ?? period.sample_interval_seconds) || 900;
+  const collectors = freshness.collectors || {};
   for (const source of ['codex', 'opencode', 'hermes']) {
-    const collector = freshness.collectors[source] || { status: 'unavailable', last_success_at: null };
+    const collector = collectors[source] || { status: 'unavailable' };
+    const latestAt = collector.latest_data_at || collector.last_data_at || collector.last_success_at;
+    const age = freshnessAge(latestAt, collector.age_seconds);
+    const status = collectorStatus(collector, age, interval);
     const item = document.createElement('div');
     item.className = 'collector-item';
     const heading = document.createElement('div'); heading.className = 'collector-name';
     const name = document.createElement('span'); name.textContent = source;
-    const status = document.createElement('span'); status.className = `status-pill status-${collector.status}`; status.textContent = collector.status;
-    heading.append(name, status);
+    const statusPill = document.createElement('span'); statusPill.className = `status-pill status-${status}`; statusPill.textContent = status;
+    heading.append(name, statusPill);
     const detail = document.createElement('p'); detail.className = 'collector-detail';
-    detail.textContent = collector.last_success_at
-      ? t('lastSuccess', { value: formatDate(collector.last_success_at) })
-      : t('noSuccessfulCollection');
-    item.append(heading, detail); grid.appendChild(item);
+    const lines = [
+      `${t('lastAttempt')}: ${formatDate(collector.last_attempt_at)}`,
+      collector.last_success_at
+        ? t('lastSuccess', { value: formatDate(collector.last_success_at) })
+        : t('noSuccessfulCollection'),
+      `${t('dataAge')}: ${age === null ? '—' : formatDuration(age)}`,
+    ];
+    if (collector.last_error) lines.push(`${t('lastError')}: ${collector.last_error}`);
+    detail.textContent = lines.join('\n');
+    item.append(heading, detail);
+    grid.appendChild(item);
   }
   const baselineTokens = (baselines.hermes || []).reduce((total, item) => total + safeNumber(item.tokens), 0);
   const note = byId('baseline-note');
   note.hidden = baselineTokens === 0;
-  note.textContent = baselineTokens
-    ? t('hermesBaseline', { value: formatFullTokens(baselineTokens) })
-    : '';
+  note.textContent = baselineTokens ? t('hermesBaseline', { value: formatFullTokens(baselineTokens) }) : '';
+}
+function renderFreshness(freshness = {}, period = {}) {
+  const interval = safeNumber(freshness.sample_interval_seconds ?? period.sample_interval_seconds) || 900;
+  const age = freshnessAge(freshness.limits_last_sample_at, freshness.limits_age_seconds);
+  const status = freshness.limits_status || freshness.limits_freshness_status || (age === null ? 'unavailable' : age > interval * 2 ? 'stale' : 'fresh');
+  const summary = byId('analytics-freshness');
+  summary.textContent = age === null
+    ? t('noLimitSample')
+    : `${t('lastLimitSample')}: ${formatDate(freshness.limits_last_sample_at)} · ${t('dataAge')}: ${formatDuration(age)} · ${status}`;
+  summary.className = `freshness-summary freshness-${status}`;
+  renderCollectors(freshness, lastPayload?.baselines || {}, period);
 }
 
-function checkedValues(container) {
-  return [...container.querySelectorAll('input[type="checkbox"]:checked')].map(input => input.value);
+function pressedValues(container) {
+  return [...container.querySelectorAll('[data-filter-value][aria-pressed="true"]')]
+    .map(button => button.dataset.filterValue);
 }
-
-function setCheckedValues(container, values) {
+function setPressedValues(container, values) {
   const selected = new Set(values);
-  for (const input of container.querySelectorAll('input[type="checkbox"]')) input.checked = selected.has(input.value);
+  for (const button of container.querySelectorAll('[data-filter-value]')) {
+    button.setAttribute('aria-pressed', String(selected.has(button.dataset.filterValue)));
+  }
 }
-
 function addFilterOption(container, value) {
-  const label = document.createElement('label');
-  label.className = 'filter-option';
-  const input = document.createElement('input');
-  input.type = 'checkbox';
-  input.value = value;
-  input.checked = state.models.includes(value);
-  label.append(input, ` ${value}`);
-  container.appendChild(label);
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'filter-option';
+  button.dataset.filterValue = value;
+  button.setAttribute('aria-pressed', String(state.models.includes(value)));
+  button.textContent = value;
+  container.appendChild(button);
 }
-
 function updateModelOptions(models) {
   const normalized = Array.isArray(models) ? models.filter(model => typeof model === 'string') : [];
   const container = byId('model-filter');
-  const availableChanged = normalized.join('\0') !== state.availableModels.join('\0');
+  const changed = normalized.join('\0') !== state.availableModels.join('\0');
   state.availableModels = normalized;
-  if (availableChanged) {
+  if (changed) {
     state.models = state.models.filter(model => normalized.includes(model));
     if (!state.models.length) state.models = [...normalized];
     clearRows(container);
     for (const model of normalized) addFilterOption(container, model);
-  } else {
-    setCheckedValues(container, state.models);
-  }
+  } else setPressedValues(container, state.models);
 }
 
 function render(payload) {
   lastPayload = payload;
-  const summary = payload.tokens.summary;
-  byId('total-tokens').textContent = formatTokens(totalBillable(summary));
-  byId('total-tokens').title = t('billableTokensTitle', { value: formatFullTokens(totalBillable(summary)) });
-  byId('token-detail').textContent = `${formatTokens(summary.input_tokens)} ${t('input').toLowerCase()} · ${formatTokens(summary.cache_read_tokens + summary.cache_write_tokens)} ${t('cache').toLowerCase()} · ${formatTokens(summary.output_tokens)} ${t('output').toLowerCase()}`;
+  const summary = payload.tokens?.summary || {};
+  const fields = {
+    input: safeNumber(summary.input_tokens),
+    cacheRead: safeNumber(summary.cache_read_tokens),
+    cacheWrite: safeNumber(summary.cache_write_tokens),
+    output: safeNumber(summary.output_tokens),
+    reasoning: safeNumber(summary.reasoning_tokens),
+  };
+  const total = totalBillable(summary);
+  byId('input-tokens').textContent = formatTokens(fields.input);
+  byId('cache-read-tokens').textContent = formatTokens(fields.cacheRead);
+  byId('cache-write-tokens').textContent = formatTokens(fields.cacheWrite);
+  byId('output-tokens').textContent = formatTokens(fields.output);
+  byId('reasoning-tokens').textContent = formatTokens(fields.reasoning);
+  byId('total-tokens').textContent = formatTokens(total);
+  byId('total-tokens').title = t('billableTokensTitle', { value: formatFullTokens(total) });
+  byId('token-detail').textContent = `${formatTokens(fields.input)} ${t('input').toLowerCase()} · ${formatTokens(fields.cacheRead + fields.cacheWrite)} ${t('cache').toLowerCase()} · ${formatTokens(fields.output)} ${t('output').toLowerCase()}`;
   setCost(byId('estimated-cost'), summary.estimated_cost_usd);
   setCost(byId('allocation-total-cost'), summary.estimated_cost_usd);
+  const pricing = payload.pricing || {};
   const currency = typeof CodexPreferences === 'object' ? CodexPreferences.get().currency : 'USD';
   byId('pricing-note').textContent = currency === 'EUR'
-    ? t('catalogConverted', { date: payload.pricing.as_of, rate: CodexPreferences.formatRate() })
-    : t('catalog', { date: payload.pricing.as_of, currency: payload.pricing.currency });
-  const weeklySummary = payload.resets.weekly_summary || { random: {}, end_of_week: {} };
+    ? t('catalogConverted', { date: pricing.as_of || '—', rate: CodexPreferences.formatRate() })
+    : t('catalog', { date: pricing.as_of || '—', currency: pricing.currency || 'USD' });
+  const weeklySummary = payload.resets?.weekly_summary || { random: {}, end_of_week: {} };
   const random = weeklySummary.random || {};
   const endOfWeek = weeklySummary.end_of_week || {};
-  byId('random-reset-count').textContent = formatFullTokens(random.count);
-  byId('random-reset-impact').textContent = `${t('gain')} ${formatSignedPoints(random.gained_vs_ideal_pct_points)} · ${t('loss')} ${formatPoints(random.lost_vs_ideal_pct_points)} ${t('vsIdealPace')}`;
+  const weeklyTotal = safeNumber(payload.resets?.weekly_total ?? safeNumber(random.count) + safeNumber(endOfWeek.count));
+  byId('random-reset-count').textContent = formatFullTokens(weeklyTotal);
+  byId('random-reset-impact').textContent = t('weeklyResetBreakdown', {
+    random: formatFullTokens(random.count),
+    regular: formatFullTokens(endOfWeek.count),
+  });
   byId('end-week-reset-count').textContent = formatFullTokens(endOfWeek.count);
   byId('end-week-reset-impact').textContent = t('ofUnusedQuotaExpired', { value: formatPercent(endOfWeek.unused_pct_points) });
-  byId('period-label').textContent = `${formatShortDate(payload.period.from)} – ${formatShortDate(payload.period.to)}`;
-  byId('granularity-label').textContent = t('bucketsOf', { value: formatDuration(payload.period.granularity_seconds) });
-  renderLimits(payload.limits);
-  renderTokens(payload.tokens);
-  renderBreakdown(payload.tokens.breakdown);
-  renderResets(payload.resets);
-  renderCollectors(payload.freshness, payload.baselines);
-  updateModelOptions(payload.available.models);
-  renderWarnings(payload.warnings);
+  const period = payload.period || {};
+  currentPeriod = period;
+  renderLimits(payload.limits || {});
+  renderTokens(payload.tokens || {});
+  renderBreakdown(payload.tokens?.breakdown || []);
+  renderResets(payload.resets || {});
+  renderFreshness(payload.freshness || {}, period);
+  updateModelOptions(payload.available?.models || []);
+  renderWarnings(payload.warnings || []);
   setMessage('analytics-error', '');
+  setMessage('analytics-local-only', '');
 }
 
+function refreshSchedule(payload = lastPayload) {
+  const intervalSeconds = Number(payload?.freshness?.sample_interval_seconds ?? payload?.period?.sample_interval_seconds);
+  const intervalMs = Number.isFinite(intervalSeconds) && intervalSeconds > 0 ? intervalSeconds * 1000 : ANALYTICS_REFRESH_MS;
+  const now = Date.now();
+  const nextUpdate = (Math.floor((now - 5_000) / intervalMs) + 1) * intervalMs + 5_000;
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(refresh, Math.max(1000, nextUpdate - now));
+}
 async function refresh() {
   clearTimeout(refreshTimer);
+  const loading = byId('analytics-loading');
+  if (loading) loading.hidden = false;
   try {
     const response = await fetch(`/api/analytics?${queryString()}`, { headers: { Accept: 'application/json' } });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    let payload;
+    try { payload = await response.json(); } catch (_error) { payload = {}; }
+    if (!response.ok) {
+      const error = new Error(payload.error || `HTTP ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
     render(payload);
   } catch (error) {
-    setMessage('analytics-error', error instanceof Error ? error.message : t('unableToLoadAnalytics'));
+    const message = error instanceof Error ? error.message : t('unableToLoadAnalytics');
+    const localOnly = !lastPayload || error?.status === 503 || /not available|cannot be read|local mode/i.test(message);
+    setMessage('analytics-local-only', localOnly ? t('localOnly') : '');
+    setMessage('analytics-error', lastPayload ? `${message} · ${t('showingLastData')}` : message);
   } finally {
-    refreshTimer = setTimeout(refresh, ANALYTICS_REFRESH_MS);
+    if (loading) loading.hidden = true;
+    refreshSchedule();
   }
 }
 
@@ -358,23 +677,33 @@ for (const button of document.querySelectorAll('[data-range]')) {
     if (state.range !== 'custom') refresh();
   });
 }
-byId('source-filter').addEventListener('change', event => {
-  const source = event.target.value;
-  state.sources = checkedValues(byId('source-filter'));
-  if (!state.sources.length) { event.target.checked = true; state.sources = [source]; }
+byId('source-filter').addEventListener('click', event => {
+  const button = event.target.closest('[data-filter-value]');
+  if (!button) return;
+  button.setAttribute('aria-pressed', String(button.getAttribute('aria-pressed') !== 'true'));
+  state.sources = pressedValues(byId('source-filter'));
+  if (!state.sources.length) {
+    button.setAttribute('aria-pressed', 'true');
+    state.sources = [button.dataset.filterValue];
+  }
   state.resetOffset = 0;
   refresh();
 });
-byId('model-filter').addEventListener('change', event => {
-  const model = event.target.value;
-  state.models = checkedValues(byId('model-filter'));
-  if (!state.models.length) { event.target.checked = true; state.models = [model]; }
+byId('model-filter').addEventListener('click', event => {
+  const button = event.target.closest('[data-filter-value]');
+  if (!button) return;
+  button.setAttribute('aria-pressed', String(button.getAttribute('aria-pressed') !== 'true'));
+  state.models = pressedValues(byId('model-filter'));
+  if (!state.models.length) {
+    button.setAttribute('aria-pressed', 'true');
+    state.models = [button.dataset.filterValue];
+  }
   state.resetOffset = 0;
   refresh();
 });
 byId('select-all-models').addEventListener('click', () => {
   state.models = [...state.availableModels];
-  setCheckedValues(byId('model-filter'), state.models);
+  setPressedValues(byId('model-filter'), state.models);
   state.resetOffset = 0;
   refresh();
 });
@@ -382,7 +711,7 @@ byId('select-gpt-5-6').addEventListener('click', () => {
   const gpt56 = state.availableModels.filter(model => ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'].includes(model));
   if (!gpt56.length) { setMessage('analytics-error', t('gptModelsUnavailable')); return; }
   state.models = gpt56;
-  setCheckedValues(byId('model-filter'), state.models);
+  setPressedValues(byId('model-filter'), state.models);
   state.resetOffset = 0;
   refresh();
 });
@@ -399,14 +728,14 @@ byId('toggle-token-overlay').addEventListener('click', () => {
   state.tokenOverlay = !state.tokenOverlay;
   updateTokenOverlay();
 });
+byId('token-metric-toggle').addEventListener('click', () => {
+  state.tokenMetric = state.tokenMetric === 'tokens' ? 'cost' : 'tokens';
+  if (lastPayload) renderTokens(lastPayload.tokens || {});
+});
 
 function refreshLocalizedAnalytics() {
   if (!lastPayload) return;
-  try {
-    render(lastPayload);
-  } catch (error) {
-    setMessage('analytics-error', error instanceof Error ? error.message : t('unableToLoadAnalytics'));
-  }
+  try { render(lastPayload); } catch (error) { setMessage('analytics-error', error instanceof Error ? error.message : t('unableToLoadAnalytics')); }
 }
 
 if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(refreshLocalizedAnalytics);

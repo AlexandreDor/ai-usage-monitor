@@ -2,9 +2,9 @@
 
 Track your OpenAI Codex CLI usage limits in real time locally, with optional external access. No cloud accounts required to get started.
 
-**Problem:** OpenAI already lets you check Codex usage in `codex /status` and in the ChatGPT Codex usage page, but those views do not give you rolling history or proactive notifications when you're running low.
+**Problem:** OpenAI already exposes Codex usage through its local app-server and in the ChatGPT Codex usage page, but those views do not give you rolling history or proactive notifications when you're running low.
 
-**Solution:** A local bash script that scrapes `codex /status` on exact 15-minute boundaries, writes a `data.json` snapshot, serves a dashboard in your browser, and fires Discord or Telegram alerts directly all from your own machine, with zero cloud dependency.
+**Solution:** A local bash script that reads the Codex app-server on exact 15-minute boundaries, writes a `data.json` snapshot, serves a dashboard in your browser, and fires Discord or Telegram alerts directly all from your own machine, with zero cloud dependency.
 
 ![Codex Limits dashboard hero](local/images/hero.png)
 
@@ -100,7 +100,7 @@ codex-usage-monitor/
 | Requirement | Check | Install / Setup |
 |---|---|---|
 | OpenAI Codex CLI | `codex --version` | `npm i -g @openai/codex` — [CLI docs](https://developers.openai.com/codex/cli/) |
-| Codex CLI authenticated | `codex /status` shows usage data | Run `codex` once and sign in (see note below) |
+| Codex CLI authenticated | Codex app-server returns usage data | Run Codex once and sign in (see note below) |
 | bash | `bash --version` | Pre-installed on Linux/WSL |
 | curl | `curl --version` | Pre-installed on most systems |
 | python3 | `python3 --version` | [python.org](https://python.org) — needed for dashboard server & JSON handling |
@@ -108,7 +108,7 @@ codex-usage-monitor/
 > [!NOTE]
 > **First-time Codex users — you must authenticate before using this tool.**
 > 
-> The monitor scrapes `codex /status`, which only works after you have signed in. If you have never run Codex before:
+> The monitor uses the local Codex app-server, which only works after you have signed in. If you have never run Codex before:
 > 
 > ```bash
 > # 1. Install the CLI
@@ -145,12 +145,13 @@ codex                     # first run — sign in when prompted
 codex /status             # verify — should show usage percentages
 
 # 1. Clone
-git clone https://github.com/YOUR_USERNAME/codex-usage-monitor.git
+git clone https://github.com/<your-account>/codex-usage-monitor.git
 cd codex-usage-monitor/local
 
 # 2. Configure
 cp .env.example .env
-# Edit .env — Discord/Telegram are optional, leave blank to skip
+# Edit .env — Discord/Telegram are optional, leave blank to skip.
+# Do not source .env; monitor.sh and serve.sh parse it as configuration data.
 chmod 600 .env
 
 # 3. Make executable
@@ -187,7 +188,7 @@ Important: `serve.sh` only hosts an explicit allowlist containing the two dashbo
 
 Pick the simplest option that fits your environment. In every setup:
 
-- `monitor.sh` scrapes Codex and writes `data.json` / `history.json`, while
+- `monitor.sh` reads Codex and writes `data.json` / `history.json`, while
   also maintaining the local SQLite archive
 - `serve.sh` serves `dashboard.html`, `analytics.html`, and the local read-only analytics API
 
@@ -203,9 +204,9 @@ cd /path/to/codex-usage-monitor/local
 ./monitor.sh --loop 900
 ```
 
-Loop mode scrapes immediately at startup, then aligns subsequent checks to the
+Loop mode reads immediately at startup, then aligns subsequent checks to the
 configured wall-clock boundaries. With `900`, checks run at `:00`, `:15`,
-`:30`, and `:45` instead of 15 minutes after the previous scrape completes.
+`:30`, and `:45` instead of 15 minutes after the previous collection completes.
 
 Terminal 2:
 ```bash
@@ -302,7 +303,7 @@ pct exec 200 -- bash
 
 # Inside the container:
 apt update && apt install -y bash curl python3 git grep
-git clone https://github.com/YOUR_USERNAME/codex-usage-monitor.git
+git clone https://github.com/<your-account>/codex-usage-monitor.git
 cd codex-usage-monitor/local
 cp .env.example .env && nano .env
 chmod +x monitor.sh serve.sh
@@ -388,21 +389,26 @@ crontab -e
 Open `http://localhost:8080/analytics.html` or follow **Advanced analytics** from the live limits page. This second, local-only page provides:
 
 - limit history over 24 hours, 7/30/90 days, one year, all retained data, or custom Paris calendar dates;
-- a paginated history of detected 5-hour and weekly resets;
-- token input, cache read/write, output, and reasoning counters collected from local Codex, OpenCode, and Hermes data stores;
+- reset markers on the limit chart and a paginated history of detected 5-hour and weekly resets (50 rows per page);
+- separate uncached input, cache read, cache write, output, reasoning, total and assumed-zero token counters collected from local Codex, OpenCode, and Hermes data stores;
+- token series stacked by application, with a tokens/cost API-equivalent toggle and cost per time bucket;
 - breakdowns by application, provider, and model;
 - API-equivalent USD cost estimates using the current versioned `local/pricing.json` catalog;
 - language selection (English/French) and currency selection (EUR/USD), shared across both pages and saved in the browser;
 - EUR display conversion using the local fixed rate `1 USD = 0.86 EUR`, with the active rate shown on the cost tooltip;
 - collector freshness, failures, and Hermes pre-monitor baselines.
 
-Collection runs with every monitor cycle—every 15 minutes by default—and is independent of limit retrieval. In `TOKEN_USAGE_SOURCES=auto` mode, missing applications are disabled without failing the cycle. An explicitly requested missing source marks the cycle as failed/degraded.
+Collection runs with every monitor cycle—every 15 minutes by default—and is independent of limit retrieval. In `TOKEN_USAGE_SOURCES=auto` mode, missing or empty applications are disabled without failing the cycle. An explicitly requested missing source marks the cycle as failed/degraded.
 
 Codex and OpenCode histories are initially imported when their events have reliable dates. Existing cumulative Hermes counters become a separately displayed baseline and are excluded from dated totals. Collection only reads local usage metadata and counters; it does not read Codex authentication data or transmit analytics to the Gist.
 
 Cost values are estimates, not billing statements. They use the catalog active when the page is viewed, count reasoning as part of billable output rather than twice, and assume zero cost for unknown models while clearly flagging their tokens. The API remains valued in USD; selecting EUR only converts the display using the fixed local rate documented above. Request, tool, search, cache-storage, batch, private-contract, and currency-conversion charges are excluded.
 
-The long-term page requires the local Python server because its API aggregates the private SQLite archive. It is intentionally unavailable on the optional static/Gist dashboard.
+The long-term page requires the local Python server because its API aggregates the private SQLite archive. It is intentionally unavailable on the optional static/Gist dashboard and displays `Advanced analytics are available in LOCAL mode only` when opened without the local API.
+
+Analytics buckets use 15 minutes through 48 hours, 30 minutes through 30 days, then 1 hour. The page displays collector freshness, stale-data warnings, reset markers and accessible text/table summaries in addition to the charts. The API keeps its version 1 response contract while adding these fields compatibly.
+
+To use a custom price catalog, set `TOKEN_PRICING_FILE=/absolute/path/to/pricing.json` in `local/.env`. The monitor and local API parse this file as data, validate its schema, and use the same catalog. Unknown models remain visible with `assumed-zero` pricing.
 
 ## Notifications (Discord & Telegram)
 
@@ -419,8 +425,8 @@ Both work via a **direct `curl` call from `monitor.sh`** — no server, no middl
 
 **Test it directly (no monitor needed):**
 ```bash
-source local/.env
-curl -X POST "$DISCORD_WEBHOOK" \
+# Replace the placeholder with the value from local/.env; do not source it.
+curl -X POST "https://discord.com/api/webhooks/<id>/<token>" \
   -H "Content-Type: application/json" \
   -d '{"content": "✅ Codex monitor test alert"}'
 ```
@@ -448,9 +454,9 @@ curl -X POST "$DISCORD_WEBHOOK" \
 
 **Test it directly:**
 ```bash
-source local/.env
-curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-  -d "chat_id=${TELEGRAM_CHAT_ID}" \
+# Replace the placeholders with values from local/.env; do not source it.
+curl -X POST "https://api.telegram.org/bot<bot-token>/sendMessage" \
+  -d "chat_id=<chat-id>" \
   --data-urlencode "text=✅ Codex monitor test alert"
 ```
 
@@ -691,12 +697,12 @@ PRs welcome. Some ideas:
 
 - Run `tests/run.sh` for the dependency-free suite and `npm ci && npm run test:browser` for Playwright/axe-core checks.
 - CI runs Bash syntax checks, ShellCheck, the complete shell/Node suite, and Chromium browser tests.
-- History retention remains entry-count based so existing long-term data behavior is preserved. Changing the scrape interval changes the effective time span represented by `HISTORY_RETENTION_HOURS`.
-- Long-term history is stored separately in `runtime/usage-history.sqlite3`: all limit points are kept for 24 hours, then the newest point in each 30-minute UTC bucket is kept through 7 days, and the newest point in each hourly UTC bucket is kept thereafter. Token events and reconstructed resets use the same retention period without limit-series downsampling. The default retention is one year; `ARCHIVE_RETENTION_DAYS=0` keeps it indefinitely. SQLite is provided by Python's standard library; the raw archive is not served by `serve.sh` or synchronized to the Gist.
+- History retention remains entry-count based so existing long-term data behavior is preserved. Changing the collection interval changes the effective time span represented by `HISTORY_RETENTION_HOURS`.
+- Long-term history is stored separately in `runtime/usage-history.sqlite3`: all limit points are kept for 24 hours, then the archive's retention compaction applies. Analytics uses 15-minute buckets through 48 hours, 30-minute buckets through 30 days, then hourly buckets. Token events and reconstructed resets use the same retention period without limit-series downsampling. The default retention is one year; `ARCHIVE_RETENTION_DAYS=0` keeps it indefinitely. SQLite is provided by Python's standard library; the raw archive is not served by `serve.sh` or synchronized to the Gist.
 - The SQLite archive is local state, not an off-machine backup. Back it up separately if the long-term history must survive disk loss.
 - Docker should only be used when the container can access an authenticated Codex CLI config. A common setup is mounting `~/.codex` into `/root/.codex`. If `codex /status` does not work on the host, it will not work inside Docker either — authenticate first.
-- The container now performs a startup scrape and exits if monitoring cannot start, so it will not keep serving stale data after the scraper dies.
-- A graph failure is isolated from the primary quota metrics. Age-based stale-data detection remains a separate roadmap item.
+- The container now performs a startup collection and exits if monitoring cannot start, so it will not keep serving stale data after the monitor dies.
+- A graph failure is isolated from the primary quota metrics. Advanced Analytics reports age-based freshness separately for limits and token collectors.
 
 
 ## License

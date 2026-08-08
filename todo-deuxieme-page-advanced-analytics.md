@@ -1,24 +1,20 @@
 # Deuxième page « Advanced Analytics »
 
-> **Statut : partiellement implémenté sur la branche `dev` le 4 août 2026.** Le socle est livré : stockage v2, collecteurs, API locale, page responsive, documentation et tests de régression principaux. Ce fichier est conservé pour suivre les écarts ci-dessous.
+> **Statut : terminé sur la branche `dev`.** Toutes les propositions restantes ont été implémentées et vérifiées sans modifier le contrat `schema_version: 1`.
 
-## État de vérification
+## État de vérification finale
 
-### Livré
+Les points qui restaient ouverts sont maintenant couverts :
 
-- archive SQLite v2, rétention, récupération après corruption et reconstruction des resets ;
-- collecteurs Codex, OpenCode et Hermes, avec baseline Hermes et catalogue tarifaire local ;
-- API locale `/api/analytics`, filtres, dates Europe/Paris, pagination bornée et allowlist HTTP ;
-- page locale avec périodes, filtres, graphiques limites/tokens, ventilation des coûts, reset history et statut des collecteurs ;
-- documentation de l'usage local et tests shell, HTTP, Node et Playwright.
-
-### Reste à faire avant de supprimer ce todo
-
-- Corriger le mode `TOKEN_USAGE_SOURCES=auto` : un répertoire Codex présent mais sans rollout doit rester `disabled`, sans faire échouer le cycle.
-- Faire utiliser à l'API le catalogue configuré par `TOKEN_PRICING_FILE`, et non systématiquement `local/pricing.json`.
-- Aligner l'interface sur le périmètre prévu : marqueurs de reset, graphe coût, ventilation par application, colonnes reasoning/total/statut tarifaire et pagination de 50 lignes.
-- Ajouter les résumés textuels des graphiques, les annonces de fraîcheur et les tests manquants (concurrence API/écriture, rotation Codex, mises à jour OpenCode, réinitialisation Hermes, changement d'heure et maintien de données après erreur).
-- Harmoniser la granularité et le rafraîchissement avec les règles définies dans ce document, ou documenter explicitement la règle finalement retenue.
+- [x] archive SQLite v2, migration v1, rétention, récupération après corruption et reconstruction des resets ;
+- [x] mode `TOKEN_USAGE_SOURCES=auto` tolérant aux sources absentes ou vides, avec états de collecte ;
+- [x] curseur Codex résistant aux lignes JSONL partielles, à la troncature et à la rotation, avec reprise idempotente ;
+- [x] catalogue `TOKEN_PRICING_FILE` partagé avec le monitor et lu depuis `.env` sans exécuter sa syntaxe ;
+- [x] API locale, filtres, dates Europe/Paris, coût par bucket, marqueurs de reset, fraîcheur et pagination bornée ;
+- [x] interface Advanced Analytics, ventilation par application/fournisseur/modèle, métriques détaillées, bascule tokens/coût et tableaux accessibles ;
+- [x] granularité harmonisée : 15 minutes jusqu'à 48 heures, 30 minutes jusqu'à 30 jours, puis 1 heure ;
+- [x] tests de migration, collecte Codex/OpenCode/Hermes, concurrence lecture/écriture, DST, tarification personnalisée et maintien après erreur UI ;
+- [x] documentation README, feuille de route, `.env.example` et sorties de test ignorées.
 
 ## Résumé
 
@@ -280,10 +276,9 @@ Réponse versionnée :
 
 Granularité automatique :
 
-- jusqu’à 48 h : 15 minutes ;
-- jusqu’à 14 jours : 30 minutes ;
-- jusqu’à 90 jours : 6 heures ;
-- au-delà : 1 jour.
+- jusqu'à 48 h : 15 minutes ;
+- jusqu'à 30 jours : 30 minutes ;
+- au-delà : 1 heure.
 
 L’API utilisera uniquement des requêtes SQL paramétrées, limitera le nombre de points retournés et n’exposera jamais session, prompt, chemin de projet, compte, jeton d’authentification ou contenu de message.
 

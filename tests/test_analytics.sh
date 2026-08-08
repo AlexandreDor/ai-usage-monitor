@@ -20,6 +20,10 @@ with connection:
         (1785859200, "2026-08-04T08:00:00Z", 50, "later", 1785862800, 75, "later", 1786000000, 900, 192, "fixture"),
     )
     connection.execute(
+        "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (1785859300, "2026-08-04T08:01:40Z", 45, "later", 1785862800, 70, "later", 1786000000, 900, 192, "fixture-latest"),
+    )
+    connection.execute(
         "INSERT INTO reset_events VALUES (?, ?, ?, ?, ?, ?)",
         ("5h", 1785862800, 1785863700, 5, 100, "scheduled_crossing"),
     )
@@ -74,7 +78,7 @@ with connection:
     )
     connection.execute(
         "INSERT INTO collector_state VALUES (?, ?, ?, ?)",
-        ("hermes", "session:model", json.dumps({"baseline": {"input_tokens": 42}}), 1785859500),
+        ("hermes", "session:model", json.dumps({"baseline": {"input_tokens": 42, "output_tokens": 10, "reasoning_tokens": 4}}), 1785859500),
     )
 connection.close()
 PY
@@ -95,7 +99,9 @@ assert_eq 2 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]
 assert_eq 1 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["weekly_summary"]["random"]["count"])' <<<"$payload")" "random reset count"
 assert_eq 7.348 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["weekly_summary"]["random"]["lost_vs_ideal_pct_points"])' <<<"$payload")" "random reset loss versus ideal pace"
 assert_eq 35.0 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["weekly_summary"]["end_of_week"]["unused_pct_points"])' <<<"$payload")" "end-of-week unused quota"
-assert_eq 42 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["baselines"]["hermes"][0]["tokens"])' <<<"$payload")" "Hermes baseline"
+assert_eq 52 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["baselines"]["hermes"][0]["tokens"])' <<<"$payload")" "Hermes baseline excludes the reasoning sub-counter"
+assert_eq 2 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["limits"]["series"][0]["samples"])' <<<"$payload")" "limit bucket sample count"
+assert_eq 45.0 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["limits"]["series"][0]["five_h_pct"])' <<<"$payload")" "limit bucket keeps the latest sample"
 
 filtered="$(python3 "$ROOT_DIR/local/analytics.py" \
   --database "$database" \
@@ -113,8 +119,24 @@ multi_filtered="$(python3 "$ROOT_DIR/local/analytics.py" \
   --now 1785866400)"
 assert_eq 3 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["summary"]["events"])' <<<"$multi_filtered")" "multiple source/model filters"
 
+dst_period="$(python3 "$ROOT_DIR/local/analytics.py" \
+  --database "$database" \
+  --pricing "$ROOT_DIR/local/pricing.json" \
+  --params '{"from_date":"2026-03-29","to_date":"2026-03-30"}' \
+  --now 1785866400)"
+assert_eq 169200 "$(python3 -c 'import json,sys; value=json.load(sys.stdin)["period"]; print(int((__import__("datetime").datetime.fromisoformat(value["to"].replace("Z","+00:00")).timestamp()) - (__import__("datetime").datetime.fromisoformat(value["from"].replace("Z","+00:00")).timestamp())))' <<<"$dst_period")" "Europe/Paris DST custom period duration"
+assert_eq 900 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["period"]["granularity_seconds"])' <<<"$dst_period")" "DST custom period granularity"
+
 python3 "$ROOT_DIR/local/analytics.py" --database "$database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"range":"invalid"}' >/dev/null 2>&1 && fail "invalid range accepted"
 python3 "$ROOT_DIR/local/analytics.py" --database "$database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"from_date":"2026-08-04"}' >/dev/null 2>&1 && fail "unpaired custom date accepted"
 python3 "$ROOT_DIR/local/analytics.py" --database "$database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"range":"24h","sources":"codex,invalid"}' >/dev/null 2>&1 && fail "invalid source list accepted"
+extreme_date_error="${TEST_ROOT}/extreme-date-error"
+if python3 "$ROOT_DIR/local/analytics.py" --database "$database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"from_date":"9999-12-31","to_date":"9999-12-31"}' >/dev/null 2>"$extreme_date_error"; then
+  fail "out-of-range custom date accepted"
+fi
+assert_contains "$(<"$extreme_date_error")" '[ERROR] dates must use YYYY-MM-DD' "out-of-range date error"
+if grep -Fq 'Traceback' "$extreme_date_error"; then
+  fail "out-of-range custom date exposed a traceback"
+fi
 
 printf 'PASS: advanced analytics query tests\n'

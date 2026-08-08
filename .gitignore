@@ -2,8 +2,6 @@
 local/.env
 local/.alert_state
 local/.monitor.lock
-local/data.json
-local/history.json
 local/runtime/
 
 # User alert scripts stay local. Keep only the directory placeholder tracked.
@@ -15,6 +13,12 @@ local/tests/
 node_modules/
 npm-debug.log*
 __pycache__/
+test-results/
+playwright-report/
+coverage/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # macOS
 .DS_Store
