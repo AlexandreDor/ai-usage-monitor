@@ -158,7 +158,7 @@ validate_config
 printf 'state_version=2\nprev_5h_pct=40\nprev_weekly_pct=100\n' > "$STATE_FILE"
 check_thresholds 40 100 later unknown '' '' "$now"
 [[ ! -e "$HOOK_LOG" ]] || fail "state migration replayed a historical threshold"
-assert_eq 3 "$(state_value state_version)" "alert state was not upgraded to version 3"
+assert_eq 4 "$(state_value state_version)" "alert state was not upgraded to version 4"
 assert_eq 1 "$(state_value script_tracking_initialized)" "script tracking was not initialized"
 
 printf 'PASS: monitor alert script tests\n'

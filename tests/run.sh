@@ -7,6 +7,9 @@ for test_file in "$TEST_DIR"/test_*.sh; do
   bash "$test_file"
 done
 
+python3 -m unittest discover -s "$TEST_DIR" -p 'test_config.py'
+python3 -m unittest discover -s "$TEST_DIR" -p 'test_history.py'
+
 if command -v node >/dev/null 2>&1; then
   node "$TEST_DIR/test_preferences.js"
   node "$TEST_DIR/test_dashboard.js"

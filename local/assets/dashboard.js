@@ -3,17 +3,89 @@
 // Set a Gist ID to use the GitHub API instead of local JSON files.
 const GIST_ID = '';
 const REFRESH_INTERVAL_MS = 900_000;
+const DEFAULT_SAMPLE_INTERVAL_SECONDS = REFRESH_INTERVAL_MS / 1000;
+const FRESHNESS_CHECK_MAX_DELAY_MS = 60_000;
 const DECIMATION_THRESHOLD = 1000;
 const DECIMATION_SAMPLES = 600;
 const PARIS_TIME_ZONE = 'Europe/Paris';
 
+const LOCAL_COPY = Object.freeze({
+  en: Object.freeze({
+    freshnessLabel: 'Freshness',
+    fresh: 'FRESH',
+    stale: 'STALE',
+    error: 'ERROR',
+    unknown: 'UNKNOWN',
+    dataAge: 'Data age',
+    ageUnavailable: 'Age unavailable',
+    expectedInterval: 'Expected every {value}',
+    seconds: '{value} seconds',
+    minutes: '{value} minutes',
+    hours: '{value} hours',
+    days: '{value} days',
+    availability: 'Availability',
+    criticality: 'Criticality',
+    available: 'Available',
+    unavailable: 'Unavailable',
+    normal: 'Normal',
+    attention: 'Attention',
+    critical: 'Critical',
+    freshnessChanged: 'Freshness changed: {status}.',
+    freshnessFresh: 'The latest successful sample is within the expected interval.',
+    freshnessStale: 'The latest successful sample is older than two expected intervals.',
+    freshnessError: 'The latest refresh failed; the last successful data remains visible.',
+    freshnessUnknown: 'The age of the latest sample is unavailable.',
+    historyData: 'History data',
+    sampleTime: 'Sample time',
+    showHistoryTable: 'Show history table',
+    hideHistoryTable: 'Hide history table',
+    noValue: '—',
+    historySummary: '{count} samples from {from} to {to}. Latest: 5-hour {fiveHour}; weekly {weekly}; ideal weekly {ideal}.',
+  }),
+  fr: Object.freeze({
+    freshnessLabel: 'Fraîcheur',
+    fresh: 'FRESH',
+    stale: 'STALE',
+    error: 'ERROR',
+    unknown: 'UNKNOWN',
+    dataAge: 'Âge des données',
+    ageUnavailable: 'Âge indisponible',
+    expectedInterval: 'Intervalle attendu : {value}',
+    seconds: '{value} secondes',
+    minutes: '{value} minutes',
+    hours: '{value} heures',
+    days: '{value} jours',
+    availability: 'Disponibilité',
+    criticality: 'Criticité',
+    available: 'Disponible',
+    unavailable: 'Indisponible',
+    normal: 'Normal',
+    attention: 'Attention',
+    critical: 'Critique',
+    freshnessChanged: 'Fraîcheur modifiée : {status}.',
+    freshnessFresh: 'Le dernier relevé réussi est dans l’intervalle attendu.',
+    freshnessStale: 'Le dernier relevé réussi date de plus de deux intervalles attendus.',
+    freshnessError: 'Le dernier rafraîchissement a échoué ; les dernières données réussies restent visibles.',
+    freshnessUnknown: 'L’âge du dernier relevé est indisponible.',
+    historyData: 'Données historiques',
+    sampleTime: 'Heure du relevé',
+    showHistoryTable: 'Afficher le tableau historique',
+    hideHistoryTable: 'Masquer le tableau historique',
+    noValue: '—',
+    historySummary: '{count} relevés du {from} au {to}. Dernier relevé : 5 heures {fiveHour} ; hebdomadaire {weekly} ; rythme idéal {ideal}.',
+  }),
+});
+
 let chart = null;
 let refreshTimer = null;
+let freshnessTimer = null;
 let dashboardData = null;
 let dashboardHistory = null;
 let historyFailure = null;
 let mainFailure = null;
 let dashboardMode = null;
+let freshnessState = 'unknown';
+let historyTableBound = false;
 
 function t(key, values = {}) {
   return typeof CodexPreferences === 'object' ? CodexPreferences.t(`dashboard.${key}`, values) : key;
@@ -21,6 +93,35 @@ function t(key, values = {}) {
 
 function currentLocale() {
   return typeof CodexPreferences === 'object' ? CodexPreferences.locale() : 'en-GB';
+}
+
+function currentLanguage() {
+  if (typeof CodexPreferences === 'object' && typeof CodexPreferences.get === 'function') {
+    return CodexPreferences.get().language === 'fr' ? 'fr' : 'en';
+  }
+  return currentLocale().toLowerCase().startsWith('fr') ? 'fr' : 'en';
+}
+
+function localCopy(key, values = {}) {
+  const language = currentLanguage();
+  const template = LOCAL_COPY[language][key] || LOCAL_COPY.en[key] || key;
+  return template.replace(/\{(\w+)\}/g, (_match, name) => values[name] === undefined ? `{${name}}` : String(values[name]));
+}
+
+function setAttribute(element, name, value) {
+  if (element && typeof element.setAttribute === 'function') element.setAttribute(name, String(value));
+}
+
+function removeAttribute(element, name) {
+  if (element && typeof element.removeAttribute === 'function') element.removeAttribute(name);
+}
+
+function setDataAttribute(element, name, value) {
+  setAttribute(element, `data-${name}`, value);
+}
+
+function setText(element, value) {
+  if (element) element.textContent = value;
 }
 
 function validPct(value) {
@@ -33,11 +134,113 @@ function displayText(value, fallback = '-', maxLength = 200) {
   return typeof value === 'string' && value.length <= maxLength ? value : fallback;
 }
 
+function parseScrapedTimestamp(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.abs(value) < 1_000_000_000_000 ? value * 1000 : value;
+  }
+  const timestamp = Date.parse(displayText(value, ''));
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function sampleIntervalSeconds(data) {
+  const interval = Number(data?.sample_interval_seconds);
+  return Number.isFinite(interval) && interval > 0 ? interval : DEFAULT_SAMPLE_INTERVAL_SECONDS;
+}
+
+function freshnessInfo(data, now = Date.now()) {
+  const scrapedAtMs = parseScrapedTimestamp(data?.scraped_at);
+  const intervalSeconds = sampleIntervalSeconds(data);
+  const ageSeconds = scrapedAtMs === null
+    ? null
+    : Math.max(0, (now - scrapedAtMs) / 1000);
+  const staleAfterSeconds = intervalSeconds * 2;
+  return {
+    scrapedAtMs,
+    intervalSeconds,
+    ageSeconds,
+    staleAfterSeconds,
+    state: ageSeconds === null ? 'unknown' : ageSeconds >= staleAfterSeconds ? 'stale' : 'fresh',
+  };
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds)) return localCopy('ageUnavailable');
+  const safeSeconds = Math.max(0, Math.floor(seconds));
+  if (safeSeconds < 60) return localCopy('seconds', { value: safeSeconds });
+  const minutes = Math.floor(safeSeconds / 60);
+  if (minutes < 60) return localCopy('minutes', { value: minutes });
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return localCopy('hours', { value: hours });
+  return localCopy('days', { value: Math.floor(hours / 24) });
+}
+
+function freshnessStatusLabel(state) {
+  return LOCAL_COPY[currentLanguage()][state] || LOCAL_COPY.en[state] || state.toUpperCase();
+}
+
+function freshnessDetail(state, info) {
+  if (state === 'fresh') return localCopy('freshnessFresh');
+  if (state === 'stale') return localCopy('freshnessStale');
+  if (state === 'error') return localCopy('freshnessError');
+  return localCopy('freshnessUnknown');
+}
+
+function setFreshnessState(state, { announce = true, info = null } = {}) {
+  const nextState = ['fresh', 'stale', 'error', 'unknown'].includes(state) ? state : 'unknown';
+  const changed = freshnessState !== nextState;
+  freshnessState = nextState;
+  const status = document.getElementById('freshness-status');
+  const announcement = document.getElementById('freshness-announcement');
+  const label = freshnessStatusLabel(nextState);
+  setText(status, label);
+  setDataAttribute(status, 'state', nextState);
+  setAttribute(status, 'aria-label', `${localCopy('freshnessLabel')}: ${label}`);
+  if (changed && announce && announcement) {
+    const detail = freshnessDetail(nextState, info);
+    announcement.textContent = `${localCopy('freshnessChanged', { status: label })} ${detail}`;
+  }
+}
+
+function updateFreshnessAge(info) {
+  const age = document.getElementById('freshness-age');
+  const ageLabel = document.getElementById('freshness-age-label');
+  const interval = document.getElementById('freshness-interval');
+  if (!age || !ageLabel || !interval) return;
+  const value = info.ageSeconds === null ? localCopy('ageUnavailable') : formatDuration(info.ageSeconds);
+  ageLabel.textContent = localCopy('dataAge');
+  age.textContent = value;
+  setAttribute(age, 'aria-label', `${localCopy('dataAge')}: ${value}`);
+  if (info.scrapedAtMs !== null) setAttribute(age, 'datetime', new Date(info.scrapedAtMs).toISOString());
+  else removeAttribute(age, 'datetime');
+  interval.textContent = localCopy('expectedInterval', { value: formatDuration(info.intervalSeconds) });
+}
+
+function updateFreshness({ announce = true } = {}) {
+  if (!dashboardData) return null;
+  const info = freshnessInfo(dashboardData);
+  updateFreshnessAge(info);
+  if (freshnessState !== 'error') setFreshnessState(info.state, { announce, info });
+  return info;
+}
+
+function scheduleFreshnessCheck(data = dashboardData) {
+  clearTimeout(freshnessTimer);
+  if (!data) return;
+  const info = freshnessInfo(data);
+  const remainingMs = info.ageSeconds === null
+    ? FRESHNESS_CHECK_MAX_DELAY_MS
+    : Math.max(0, (info.staleAfterSeconds - info.ageSeconds) * 1000);
+  const delay = info.state === 'fresh'
+    ? Math.max(1_000, Math.min(FRESHNESS_CHECK_MAX_DELAY_MS, remainingMs + 50))
+    : FRESHNESS_CHECK_MAX_DELAY_MS;
+  freshnessTimer = setTimeout(() => {
+    updateFreshness();
+    scheduleFreshnessCheck(data);
+  }, delay);
+}
+
 function scheduleRefresh(data = null) {
-  const intervalSeconds = Number(data?.sample_interval_seconds);
-  const intervalMs = Number.isFinite(intervalSeconds) && intervalSeconds > 0
-    ? intervalSeconds * 1000
-    : REFRESH_INTERVAL_MS;
+  const intervalMs = sampleIntervalSeconds(data) * 1000;
   const now = Date.now();
   const nextUpdate = (Math.floor((now - 5_000) / intervalMs) + 1) * intervalMs + 5_000;
   clearTimeout(refreshTimer);
@@ -86,13 +289,18 @@ function idealWeeklyRemaining(sampledAt, resetTimestamp) {
 
 function renderWeeklyPaceDelta(data) {
   const element = document.getElementById('weekly-pace-delta');
+  const actualElement = document.getElementById('weekly-pace-actual');
+  const idealElement = document.getElementById('weekly-pace-ideal');
   const actual = validPct(data.weekly_pct);
   const ideal = idealWeeklyRemaining(data.scraped_at, data.weekly_reset_at);
   element.classList.remove('ahead', 'behind');
 
   if (actual === null || ideal === null) {
     element.textContent = '--';
-    element.title = t('weeklyPaceUnavailable');
+    setText(actualElement, actual === null ? '--' : `${actual.toFixed(1)}%`);
+    setText(idealElement, ideal === null ? '--' : `${ideal.toFixed(1)}%`);
+    setAttribute(element, 'aria-label', t('weeklyPaceUnavailable'));
+    removeAttribute(element, 'title');
     return;
   }
 
@@ -106,17 +314,40 @@ function renderWeeklyPaceDelta(data) {
   const relativeLabel = relativeDifference === null ? '' : ` / ${relativeDifference.toFixed(1)}% ${direction}`;
 
   element.textContent = `${sign}${pointDifference.toFixed(1)} ${t('points')}${relativeLabel}`;
-  element.title = `${t('actualRemaining')}: ${actual.toFixed(1)}% / ${t('idealRemaining')}: ${ideal.toFixed(1)}%`;
+  setText(actualElement, `${actual.toFixed(1)}%`);
+  setText(idealElement, `${ideal.toFixed(1)}%`);
+  setAttribute(element, 'aria-label', `${t('paceVsIdeal')}: ${element.textContent}. ${t('actualRemaining')}: ${actual.toFixed(1)}%. ${t('idealRemaining')}: ${ideal.toFixed(1)}%.`);
+  removeAttribute(element, 'title');
   element.classList.add(pointDifference >= 0 ? 'ahead' : 'behind');
+}
+
+function quotaCriticality(pct) {
+  if (pct === null) return { level: 'unavailable', label: localCopy('unavailable') };
+  if (pct <= 10) return { level: 'critical', label: localCopy('critical') };
+  if (pct <= 25) return { level: 'attention', label: localCopy('attention') };
+  return { level: 'normal', label: localCopy('normal') };
 }
 
 function setBar(barId, pctId, pct) {
   const safePct = validPct(pct);
   const bar = document.getElementById(barId);
   const value = document.getElementById(pctId);
+  const stateIds = barId === 'five-h-bar'
+    ? { availability: 'five-h-availability', criticality: 'five-h-criticality', label: 'fiveHourLimit' }
+    : { availability: 'weekly-availability', criticality: 'weekly-criticality', label: 'weeklyLimit' };
+  const availability = document.getElementById(stateIds.availability);
+  const criticality = document.getElementById(stateIds.criticality);
+  const status = quotaCriticality(safePct);
   bar.value = safePct ?? 0;
   value.textContent = safePct === null ? '--' : `${safePct}%`;
   value.classList.toggle('unavailable', safePct === null);
+  setAttribute(bar, 'aria-label', t(stateIds.label));
+  setAttribute(bar, 'aria-valuenow', safePct ?? 0);
+  setAttribute(bar, 'aria-valuetext', safePct === null ? localCopy('unavailable') : `${safePct}%`);
+  setText(availability, `${localCopy('availability')}: ${safePct === null ? localCopy('unavailable') : localCopy('available')}`);
+  setDataAttribute(availability, 'available', safePct !== null);
+  setText(criticality, `${localCopy('criticality')}: ${status.label}`);
+  setDataAttribute(criticality, 'level', status.level);
 }
 
 function setMainError(message = '') {
@@ -171,6 +402,77 @@ function historyTitle(points) {
   return points.length === 1
     ? t('historyTitleSingle', { start })
     : t('historyTitleRange', { start, end });
+}
+
+function historyPercentage(value) {
+  return value === null ? localCopy('noValue') : `${value.toFixed(1)}%`;
+}
+
+function historySummary(points) {
+  const latest = points[points.length - 1];
+  const ideal = idealWeeklyRemaining(latest.timestamp, latest.weeklyReset);
+  return localCopy('historySummary', {
+    count: points.length,
+    from: formatParisDateTime(points[0].timestamp),
+    to: formatParisDateTime(latest.timestamp),
+    fiveHour: historyPercentage(latest.fiveHour),
+    weekly: historyPercentage(latest.weekly),
+    ideal: historyPercentage(ideal),
+  });
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function setHistoryTableVisibility(visible) {
+  const wrap = document.getElementById('history-table-wrap');
+  const toggle = document.getElementById('history-table-toggle');
+  if (!wrap || !toggle) return;
+  wrap.hidden = !visible;
+  toggle.textContent = visible ? localCopy('hideHistoryTable') : localCopy('showHistoryTable');
+  setAttribute(toggle, 'aria-expanded', visible);
+}
+
+function clearHistoryTable() {
+  const body = document.getElementById('history-table-body');
+  const toggle = document.getElementById('history-table-toggle');
+  if (body) body.innerHTML = '';
+  if (toggle) toggle.disabled = true;
+  setHistoryTableVisibility(false);
+}
+
+function renderHistoryTable(points) {
+  const body = document.getElementById('history-table-body');
+  const caption = document.getElementById('history-table-caption');
+  const sampleHeading = document.getElementById('history-sample-heading');
+  const toggle = document.getElementById('history-table-toggle');
+  const wrap = document.getElementById('history-table-wrap');
+  if (!body || !caption || !sampleHeading || !toggle || !wrap) return;
+  const wasVisible = !wrap.hidden;
+  caption.textContent = localCopy('historyData');
+  sampleHeading.textContent = localCopy('sampleTime');
+  body.innerHTML = points.map(point => {
+    const ideal = idealWeeklyRemaining(point.timestamp, point.weeklyReset);
+    return `<tr><th scope="row">${escapeHtml(formatParisDateTime(point.timestamp))}</th><td>${escapeHtml(historyPercentage(point.fiveHour))}</td><td>${escapeHtml(historyPercentage(point.weekly))}</td><td>${escapeHtml(historyPercentage(ideal))}</td></tr>`;
+  }).join('');
+  toggle.disabled = false;
+  setHistoryTableVisibility(wasVisible);
+}
+
+function bindHistoryTableControls() {
+  if (historyTableBound) return;
+  const toggle = document.getElementById('history-table-toggle');
+  if (!toggle || typeof toggle.addEventListener !== 'function') return;
+  historyTableBound = true;
+  toggle.addEventListener('click', () => {
+    setHistoryTableVisibility(document.getElementById('history-table-wrap').hidden);
+  });
 }
 
 function chartDatasets(points) {
@@ -232,6 +534,8 @@ function renderHistory(history) {
   const datasets = chartDatasets(points);
   const timeBounds = chartTimeBounds(points);
   document.getElementById('history-label').textContent = historyTitle(points);
+  setText(document.getElementById('history-summary'), historySummary(points));
+  renderHistoryTable(points);
 
   if (chart) {
     const xScale = chart.options.scales.x;
@@ -248,57 +552,67 @@ function renderHistory(history) {
     return;
   }
 
-  if (typeof Chart !== 'function') throw new Error(t('chartFailed'));
-  const context = document.getElementById('history-chart').getContext('2d');
-  chart = new Chart(context, {
-    type: 'line',
-    data: { datasets },
-    options: {
-      responsive: true,
-      maintainAspectRatio: true,
-      parsing: false,
-      normalized: true,
-      animation: false,
-      scales: {
-        y: {
-          min: 0,
-          max: 100,
-          grid: { color: 'rgba(255,255,255,0.05)' },
-          ticks: { color: '#8b949e', callback: value => `${value}%` },
+  try {
+    if (typeof Chart !== 'function') throw new Error(t('chartFailed'));
+    const context = document.getElementById('history-chart').getContext('2d');
+    chart = new Chart(context, {
+      type: 'line',
+      data: { datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: true,
+        parsing: false,
+        normalized: true,
+        animation: false,
+        scales: {
+          y: {
+            min: 0,
+            max: 100,
+            grid: { color: 'rgba(255,255,255,0.05)' },
+            ticks: { color: '#8b949e', callback: value => `${value}%` },
+          },
+          x: {
+            type: 'linear',
+            ...(timeBounds || {}),
+            grid: { color: 'rgba(255,255,255,0.05)' },
+            ticks: { color: '#8b949e', maxTicksLimit: 12, callback: formatChartTimestamp },
+          },
         },
-        x: {
-          type: 'linear',
-          ...(timeBounds || {}),
-          grid: { color: 'rgba(255,255,255,0.05)' },
-          ticks: { color: '#8b949e', maxTicksLimit: 12, callback: formatChartTimestamp },
+        plugins: {
+          decimation: {
+            enabled: true,
+            algorithm: 'lttb',
+            samples: DECIMATION_SAMPLES,
+            threshold: DECIMATION_THRESHOLD,
+          },
+          legend: { labels: { color: '#e6edf3', boxWidth: 12 } },
+          tooltip: { callbacks: { title: items => items.length ? formatParisDateTime(items[0].parsed.x) : '' } },
         },
       },
-      plugins: {
-        decimation: {
-          enabled: true,
-          algorithm: 'lttb',
-          samples: DECIMATION_SAMPLES,
-          threshold: DECIMATION_THRESHOLD,
-        },
-        legend: { labels: { color: '#e6edf3', boxWidth: 12 } },
-        tooltip: { callbacks: { title: items => items.length ? formatParisDateTime(items[0].parsed.x) : '' } },
-      },
-    },
-  });
-  setHistoryError();
+    });
+    setHistoryError();
+  } catch (error) {
+    chart = null;
+    historyFailure = error instanceof Error ? error.message : t('chartFailed');
+    setHistoryTableVisibility(true);
+    setHistoryError(historyFailure);
+  }
 }
 
 function renderHistoryFailure(message) {
   historyFailure = message;
   dashboardHistory = null;
   destroyChart();
+  setText(document.getElementById('history-summary'), t('historyUnavailable'));
+  clearHistoryTable();
   setHistoryError(message);
 }
 
-function renderData(data, { schedule = true } = {}) {
+function renderData(data, { schedule = true, clearError = true } = {}) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     throw new Error(t('invalidDashboardData'));
   }
+  const hadFailure = Boolean(mainFailure);
   dashboardData = data;
   setBar('five-h-bar', 'five-h-pct', data.five_h_pct);
   setBar('weekly-bar', 'weekly-pct', data.weekly_pct);
@@ -308,7 +622,11 @@ function renderData(data, { schedule = true } = {}) {
   document.getElementById('last-updated').textContent = t('lastScraped', {
     value: formatParisDateTime(displayText(data.scraped_at, '')),
   });
-  setMainError();
+  if (clearError) setMainError();
+  const info = freshnessInfo(data);
+  updateFreshnessAge(info);
+  setFreshnessState(!clearError && hadFailure ? 'error' : info.state, { info });
+  scheduleFreshnessCheck(data);
   if (schedule) scheduleRefresh(data);
 }
 
@@ -355,16 +673,19 @@ async function refresh() {
     await (GIST_ID ? fetchGist() : fetchLocal());
   } catch (error) {
     setMainError(error instanceof Error ? error.message : t('unableToLoadData'));
-    dashboardMode = 'error';
+    if (!dashboardMode) dashboardMode = GIST_ID ? 'external' : 'local';
     document.getElementById('mode-badge').textContent = t(dashboardMode);
-    scheduleRefresh();
+    if (dashboardData) updateFreshnessAge(freshnessInfo(dashboardData));
+    setFreshnessState('error', { info: dashboardData ? freshnessInfo(dashboardData) : null });
+    scheduleRefresh(dashboardData);
   }
 }
 
 function refreshLocalizedDashboard() {
   if (dashboardMode) document.getElementById('mode-badge').textContent = t(dashboardMode);
-  if (dashboardData) renderData(dashboardData, { schedule: false });
+  if (dashboardData) renderData(dashboardData, { schedule: false, clearError: false });
   else if (mainFailure) setMainError(mainFailure);
+  if (mainFailure) setMainError(mainFailure);
   if (dashboardHistory) {
     try {
       renderHistory(dashboardHistory);
@@ -376,5 +697,6 @@ function refreshLocalizedDashboard() {
   }
 }
 
+bindHistoryTableControls();
 if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(refreshLocalizedDashboard);
 refresh();

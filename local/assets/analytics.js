@@ -2,6 +2,7 @@
 
 const ANALYTICS_REFRESH_MS = 900_000;
 const RESET_PAGE_SIZE = 50;
+const BREAKDOWN_PAGE_SIZE = 50;
 const PARIS_ZONE = 'Europe/Paris';
 const PRICE_WARNING_PATTERN = /^No catalog price; assumed zero: (.+)$/u;
 const state = {
@@ -11,6 +12,8 @@ const state = {
   availableModels: [],
   resetType: 'all',
   resetOffset: 0,
+  breakdownOffset: 0,
+  breakdownLimit: BREAKDOWN_PAGE_SIZE,
   fromDate: '',
   toDate: '',
   tokenOverlay: true,
@@ -31,6 +34,14 @@ function byId(id) { return document.getElementById(id); }
 function safeNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+function nonNegativeInteger(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
+}
+function positiveInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : fallback;
 }
 function finiteNumber(value) {
   if (value === null || value === undefined || value === '' || typeof value === 'boolean') return null;
@@ -158,6 +169,8 @@ function queryString() {
     reset_type: state.resetType,
     reset_offset: String(state.resetOffset),
     reset_limit: String(RESET_PAGE_SIZE),
+    breakdown_offset: String(state.breakdownOffset),
+    breakdown_limit: String(state.breakdownLimit || BREAKDOWN_PAGE_SIZE),
   });
   if (state.sources.length) query.set('sources', state.sources.join(','));
   if (state.models.length) query.set('models', state.models.join(','));
@@ -446,10 +459,10 @@ function renderTokens(data = {}) {
   updateTokenOverlay();
 }
 
-function renderBreakdown(items) {
+function renderBreakdown(tokens = {}) {
   const body = byId('breakdown-body');
   clearRows(body);
-  const values = Array.isArray(items) ? items : [];
+  const values = Array.isArray(tokens) ? tokens : Array.isArray(tokens.breakdown) ? tokens.breakdown : [];
   byId('breakdown-empty').hidden = values.length > 0;
   for (const item of values) {
     const row = document.createElement('tr');
@@ -468,6 +481,34 @@ function renderBreakdown(items) {
     cell(row, item.pricing_status || '—', item.pricing_status === 'assumed-zero' ? 'pricing-unknown' : '');
     body.appendChild(row);
   }
+  const pagination = byId('breakdown-pagination');
+  const previous = byId('breakdown-previous');
+  const next = byId('breakdown-next');
+  const pageLabel = byId('breakdown-page-label');
+  const metadata = !Array.isArray(tokens) && tokens && typeof tokens.breakdown_pagination === 'object'
+    ? tokens.breakdown_pagination
+    : null;
+  if (!pagination || !previous || !next || !pageLabel) return;
+  if (!metadata) {
+    pagination.hidden = true;
+    previous.disabled = true;
+    next.disabled = true;
+    pageLabel.textContent = '';
+    return;
+  }
+  const offset = nonNegativeInteger(metadata.offset);
+  const limit = positiveInteger(metadata.limit, BREAKDOWN_PAGE_SIZE);
+  const total = nonNegativeInteger(metadata.total);
+  state.breakdownOffset = offset;
+  state.breakdownLimit = limit;
+  const hasPreviousPage = offset > 0;
+  const hasAnotherPage = offset + limit < total;
+  pagination.hidden = !(hasPreviousPage || hasAnotherPage);
+  previous.disabled = !hasPreviousPage;
+  next.disabled = !hasAnotherPage;
+  const first = offset < total ? offset + 1 : 0;
+  const last = offset < total ? Math.min(offset + limit, total) : 0;
+  pageLabel.textContent = t('pageOf', { from: first, to: last, total });
 }
 
 function renderResets(data = {}) {
@@ -626,7 +667,7 @@ function render(payload) {
   currentPeriod = period;
   renderLimits(payload.limits || {});
   renderTokens(payload.tokens || {});
-  renderBreakdown(payload.tokens?.breakdown || []);
+  renderBreakdown(payload.tokens || {});
   renderResets(payload.resets || {});
   renderFreshness(payload.freshness || {}, period);
   updateModelOptions(payload.available?.models || []);
@@ -673,6 +714,8 @@ for (const button of document.querySelectorAll('[data-range]')) {
     document.querySelectorAll('[data-range]').forEach(item => item.classList.toggle('active', item === button));
     state.range = button.dataset.range;
     state.resetOffset = 0;
+    state.breakdownOffset = 0;
+    state.breakdownLimit = BREAKDOWN_PAGE_SIZE;
     byId('custom-dates').hidden = state.range !== 'custom';
     if (state.range !== 'custom') refresh();
   });
@@ -687,6 +730,8 @@ byId('source-filter').addEventListener('click', event => {
     state.sources = [button.dataset.filterValue];
   }
   state.resetOffset = 0;
+  state.breakdownOffset = 0;
+  state.breakdownLimit = BREAKDOWN_PAGE_SIZE;
   refresh();
 });
 byId('model-filter').addEventListener('click', event => {
@@ -699,12 +744,16 @@ byId('model-filter').addEventListener('click', event => {
     state.models = [button.dataset.filterValue];
   }
   state.resetOffset = 0;
+  state.breakdownOffset = 0;
+  state.breakdownLimit = BREAKDOWN_PAGE_SIZE;
   refresh();
 });
 byId('select-all-models').addEventListener('click', () => {
   state.models = [...state.availableModels];
   setPressedValues(byId('model-filter'), state.models);
   state.resetOffset = 0;
+  state.breakdownOffset = 0;
+  state.breakdownLimit = BREAKDOWN_PAGE_SIZE;
   refresh();
 });
 byId('select-gpt-5-6').addEventListener('click', () => {
@@ -713,16 +762,29 @@ byId('select-gpt-5-6').addEventListener('click', () => {
   state.models = gpt56;
   setPressedValues(byId('model-filter'), state.models);
   state.resetOffset = 0;
+  state.breakdownOffset = 0;
+  state.breakdownLimit = BREAKDOWN_PAGE_SIZE;
   refresh();
 });
 byId('reset-filter').addEventListener('change', event => { state.resetType = event.target.value; state.resetOffset = 0; refresh(); });
 byId('apply-dates').addEventListener('click', () => {
   state.fromDate = byId('from-date').value; state.toDate = byId('to-date').value; state.resetOffset = 0;
+  state.breakdownOffset = 0;
+  state.breakdownLimit = BREAKDOWN_PAGE_SIZE;
   if (!state.fromDate || !state.toDate) { setMessage('analytics-error', t('chooseBothDates')); return; }
   refresh();
 });
 byId('resets-previous').addEventListener('click', () => { state.resetOffset = Math.max(0, state.resetOffset - RESET_PAGE_SIZE); refresh(); });
 byId('resets-next').addEventListener('click', () => { state.resetOffset += RESET_PAGE_SIZE; refresh(); });
+byId('breakdown-previous').addEventListener('click', () => {
+  if (state.breakdownOffset <= 0) return;
+  state.breakdownOffset = Math.max(0, state.breakdownOffset - state.breakdownLimit);
+  refresh();
+});
+byId('breakdown-next').addEventListener('click', () => {
+  state.breakdownOffset += state.breakdownLimit;
+  refresh();
+});
 byId('toggle-token-overlay').addEventListener('click', () => {
   if (!limitPoints.length || !tokenPoints.length) return;
   state.tokenOverlay = !state.tokenOverlay;

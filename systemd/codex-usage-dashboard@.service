@@ -1,0 +1,19 @@
+[Unit]
+Description=Codex Usage Dashboard (%i)
+Documentation=https://github.com/AlexandreDor/ai-usage-monitor
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=%h/ai-usage-monitor/local
+ExecStart=/usr/bin/env bash %h/ai-usage-monitor/local/serve.sh --port 8080
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

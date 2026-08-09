@@ -16,9 +16,12 @@ __pycache__/
 test-results/
 playwright-report/
 coverage/
+.coverage
+.coverage.*
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+dist/
 
 # macOS
 .DS_Store

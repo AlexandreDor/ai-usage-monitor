@@ -3,14 +3,29 @@
 
 from __future__ import annotations
 
-import sqlite3
+from collections.abc import Callable
 import os
 from pathlib import Path
+import sqlite3
+import time
+from typing import TypeVar
 
 
 SCHEMA_VERSION = "2"
 SCHEMA_VERSION_NUMBER = 2
-SQLITE_BUSY_TIMEOUT_MS = 10_000
+# Keep SQLite's own wait short.  The retry loop below supplies a second,
+# explicit and bounded chance for the handful of setup/commit operations that
+# are expected to contend with the monitor or the analytics reader.
+SQLITE_BUSY_TIMEOUT_MS = 150
+SQLITE_RETRY_ATTEMPTS = 5
+SQLITE_RETRY_DELAY_SECONDS = 0.02
+SQLITE_RETRY_MAX_DELAY_SECONDS = 0.1
+SQLITE_CONNECT_TIMEOUT_SECONDS = SQLITE_BUSY_TIMEOUT_MS / 1000
+V1_BACKUP_SUFFIX = ".v1.bak"
+V1_BACKUP_COLLISION_LIMIT = 100
+
+
+_Result = TypeVar("_Result")
 
 
 class ArchiveCorruptionError(RuntimeError):
@@ -33,6 +48,101 @@ def is_corruption_error(exc: sqlite3.DatabaseError) -> bool:
             "database disk image is malformed",
         )
     )
+
+
+def _is_locked_error(exc: sqlite3.DatabaseError) -> bool:
+    """Return whether SQLite reported a transient lock/busy condition."""
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    lock_codes = {
+        code
+        for name in (
+            "SQLITE_BUSY",
+            "SQLITE_BUSY_RECOVERY",
+            "SQLITE_BUSY_SNAPSHOT",
+            "SQLITE_LOCKED",
+            "SQLITE_LOCKED_SHAREDCACHE",
+            "SQLITE_LOCKED_VTAB",
+        )
+        if (code := getattr(sqlite3, name, None)) is not None
+    }
+    if error_code in lock_codes:
+        return True
+    message = str(exc).lower()
+    return "busy" in message or "locked" in message
+
+
+def _retry_locked(operation: Callable[[], _Result]) -> _Result:
+    """Run a SQLite operation with a short, finite lock retry policy."""
+    delay = SQLITE_RETRY_DELAY_SECONDS
+    for attempt in range(SQLITE_RETRY_ATTEMPTS):
+        try:
+            return operation()
+        except sqlite3.DatabaseError as exc:
+            if not _is_locked_error(exc) or attempt + 1 >= SQLITE_RETRY_ATTEMPTS:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, SQLITE_RETRY_MAX_DELAY_SECONDS)
+    raise AssertionError("unreachable retry loop")
+
+
+class _RetryingCursor(sqlite3.Cursor):
+    """Cursor that gives individual statements the same bounded retry policy."""
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        return _retry_locked(lambda: sqlite3.Cursor.execute(self, sql, parameters))
+
+
+class _RetryingConnection(sqlite3.Connection):
+    """SQLite connection preserving the public sqlite3 API with safe retries."""
+
+    def cursor(self, factory: type[sqlite3.Cursor] | None = None) -> sqlite3.Cursor:
+        return sqlite3.Connection.cursor(self, factory or _RetryingCursor)
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        return _retry_locked(lambda: sqlite3.Connection.execute(self, sql, parameters))
+
+    def commit(self) -> None:
+        _retry_locked(lambda: sqlite3.Connection.commit(self))
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        if exc_type is None:
+            self.commit()
+        else:
+            sqlite3.Connection.rollback(self)
+        return False
+
+
+def _execute(
+    connection: sqlite3.Connection,
+    sql: str,
+    parameters: object = (),
+) -> sqlite3.Cursor:
+    """Execute through the base class so callers get exactly one retry loop."""
+    return _retry_locked(
+        lambda: sqlite3.Connection.execute(connection, sql, parameters)
+    )
+
+
+def _commit(connection: sqlite3.Connection) -> None:
+    _retry_locked(lambda: sqlite3.Connection.commit(connection))
+
+
+def _rollback(connection: sqlite3.Connection) -> None:
+    try:
+        sqlite3.Connection.rollback(connection)
+    except sqlite3.DatabaseError:
+        # Rollback is cleanup.  Do not hide the migration/opening error with a
+        # second error from a connection that may already be closing.
+        pass
+
+
+def _close_connection(connection: sqlite3.Connection) -> None:
+    """Rollback and close a failed setup without touching SQLite sidecars."""
+    _rollback(connection)
+    try:
+        sqlite3.Connection.close(connection)
+    except sqlite3.DatabaseError:
+        pass
 
 
 _V1_TABLE_COLUMNS = {
@@ -144,7 +254,10 @@ _V2_SCHEMA_STATEMENTS = (
 def _table_names(connection: sqlite3.Connection) -> set[str]:
     return {
         str(row[0])
-        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        for row in _execute(
+            connection,
+            "SELECT name FROM sqlite_master WHERE type = 'table'",
+        )
     }
 
 
@@ -162,7 +275,8 @@ def _validate_tables(
         )
     for table, columns in expected.items():
         actual = {
-            str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')
+            str(row[1])
+            for row in _execute(connection, f'PRAGMA table_info("{table}")')
         }
         missing_columns = sorted(columns - actual)
         if missing_columns:
@@ -184,7 +298,8 @@ def _validate_existing_tables(
         if table not in tables:
             continue
         actual = {
-            str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')
+            str(row[1])
+            for row in _execute(connection, f'PRAGMA table_info("{table}")')
         }
         missing_columns = sorted(columns - actual)
         if missing_columns:
@@ -195,7 +310,8 @@ def _validate_existing_tables(
 
 
 def _set_schema_metadata(connection: sqlite3.Connection) -> None:
-    connection.execute(
+    _execute(
+        connection,
         """
         INSERT INTO metadata(key, value) VALUES('schema_version', ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -204,15 +320,17 @@ def _set_schema_metadata(connection: sqlite3.Connection) -> None:
     )
 
 
-def create_schema(connection: sqlite3.Connection) -> None:
-    """Create the archive or migrate an explicitly recognized v1 archive to v2."""
-    raw_version = connection.execute("PRAGMA user_version").fetchone()
+def _schema_state(connection: sqlite3.Connection) -> tuple[int, set[str]]:
+    raw_version = _execute(connection, "PRAGMA user_version").fetchone()
     try:
         version = int(raw_version[0]) if raw_version else 0
     except (TypeError, ValueError) as exc:
         raise ArchiveSchemaError("archive schema version is not an integer") from exc
+    return version, _table_names(connection)
 
-    tables = _table_names(connection)
+
+def _migration_kind(version: int, tables: set[str]) -> tuple[bool, bool]:
+    """Return (fresh, v1 migration) after checking the version marker."""
     fresh = version == 0 and not tables
     legacy_without_pragma = version == 0 and {"metadata", "snapshots"}.issubset(tables)
     if version not in (0, 1, SCHEMA_VERSION_NUMBER):
@@ -221,43 +339,224 @@ def create_schema(connection: sqlite3.Connection) -> None:
         )
     if version == 0 and not fresh and not legacy_without_pragma:
         raise ArchiveSchemaError("archive has tables but no recognized schema version")
+    return fresh, version == 1 or legacy_without_pragma
 
-    if version == 1 or legacy_without_pragma:
-        _validate_tables(connection, _V1_TABLE_COLUMNS, version=1)
-        _validate_existing_tables(connection, _V2_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
-    elif version == SCHEMA_VERSION_NUMBER:
-        _validate_tables(connection, _V2_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+
+def _connection_database_path(connection: sqlite3.Connection) -> Path | None:
+    row = _execute(connection, "PRAGMA database_list").fetchone()
+    if not row or not row[2]:
+        return None
+    return Path(str(row[2]))
+
+
+def _read_only_uri(database_path: Path) -> str:
+    return f"{database_path.resolve().as_uri()}?mode=ro"
+
+
+def _v1_backup_candidate(database_path: Path, suffix: int | None = None) -> Path:
+    name = f"{database_path.name}{V1_BACKUP_SUFFIX}"
+    if suffix is not None:
+        name = f"{name}.{suffix}"
+    return database_path.with_name(name)
+
+
+def _is_restorable_v1_backup(backup_path: Path) -> bool:
+    if not backup_path.is_file():
+        return False
+    backup_connection: sqlite3.Connection | None = None
+    try:
+        backup_connection = sqlite3.connect(
+            str(backup_path),
+            timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+            factory=_RetryingConnection,
+        )
+        _execute(
+            backup_connection,
+            f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}",
+        )
+        check_integrity(backup_connection)
+        version, tables = _schema_state(backup_connection)
+        return version in (0, 1) and {"metadata", "snapshots"}.issubset(tables)
+    except (OSError, sqlite3.DatabaseError, ArchiveCorruptionError):
+        return False
+    finally:
+        if backup_connection is not None:
+            _close_connection(backup_connection)
+
+
+def _reserve_v1_backup(database_path: Path) -> tuple[Path, bool]:
+    """Find an existing valid backup or reserve a never-overwritten pathname."""
+    for suffix in [None, *range(1, V1_BACKUP_COLLISION_LIMIT)]:
+        candidate = _v1_backup_candidate(database_path, suffix)
+        if candidate.exists():
+            if _is_restorable_v1_backup(candidate):
+                return candidate, False
+            continue
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        else:
+            os.close(descriptor)
+            return candidate, True
+    raise FileExistsError(
+        f"could not reserve a unique v1 backup for {database_path}"
+    )
+
+
+def _backup_v1_database(
+    connection: sqlite3.Connection,
+    database_path: Path | None,
+    *,
+    transaction_owned: bool,
+) -> Path | None:
+    """Create one coherent, restorable v1 backup before changing the source."""
+    if database_path is None:
+        # In-memory databases have no durable artifact to preserve.  Keep the
+        # direct create_schema(connection) API useful for tests and callers
+        # that intentionally use an in-memory archive.
+        return None
+
+    backup_path, reserved = _reserve_v1_backup(database_path)
+    if not reserved:
+        return backup_path
+
+    backup_connection: sqlite3.Connection | None = None
+    source_connection: sqlite3.Connection | None = None
+    try:
+        backup_connection = sqlite3.connect(
+            str(backup_path),
+            timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+            factory=_RetryingConnection,
+        )
+        if transaction_owned:
+            # A backup invoked on the same connection that owns BEGIN IMMEDIATE
+            # can wait on its own write transaction.  WAL explicitly permits a
+            # second read connection, so use that stable reader while the
+            # writer lock held by `connection` prevents another process from
+            # changing the v1 source.
+            source_connection = sqlite3.connect(
+                _read_only_uri(database_path),
+                uri=True,
+                timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+                factory=_RetryingConnection,
+            )
+            _configure_connection(source_connection, read_only=True)
+            # The source transaction is already serialized with BEGIN
+            # IMMEDIATE; backup captures the v1 pages including any committed
+            # state represented by an active WAL without copying the WAL file.
+            _retry_locked(lambda: source_connection.backup(backup_connection))
+        else:
+            # Preserve the long-standing direct create_schema(connection) API
+            # when its caller already owns an uncommitted transaction.  A
+            # second SQLite connection cannot see those pages, so use SQLite's
+            # own dump iterator to build the backup from this exact snapshot.
+            backup_connection.executescript("\n".join(connection.iterdump()))
+            user_version = _execute(connection, "PRAGMA user_version").fetchone()[0]
+            _execute(backup_connection, f"PRAGMA user_version = {int(user_version)}")
+        _commit(backup_connection)
+        # The backup is now a standalone v1 artifact.  Keep its own journal
+        # lifecycle simple and let SQLite remove only these private sidecars;
+        # the source database's active WAL is never inspected or unlinked.
+        backup_journal = _execute(
+            backup_connection,
+            "PRAGMA journal_mode = DELETE",
+        ).fetchone()
+        if not backup_journal or str(backup_journal[0]).lower() != "delete":
+            raise sqlite3.DatabaseError(
+                f"could not finalize v1 backup journal: {backup_journal[0] if backup_journal else 'no result'}"
+            )
+        check_integrity(backup_connection)
+        version, tables = _schema_state(backup_connection)
+        if version not in (0, 1) or {"metadata", "snapshots"} - tables:
+            raise ArchiveSchemaError(
+                f"v1 backup {backup_path} is not a restorable legacy archive"
+            )
+        os.chmod(backup_path, 0o600)
+        return backup_path
+    except Exception:
+        if reserved:
+            try:
+                backup_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        if backup_connection is not None:
+            _close_connection(backup_connection)
+        if source_connection is not None:
+            _close_connection(source_connection)
+
+
+def create_schema(
+    connection: sqlite3.Connection,
+    *,
+    database_path: Path | None = None,
+) -> None:
+    """Create the archive or migrate an explicitly recognized v1 archive to v2."""
+    if database_path is None:
+        database_path = _connection_database_path(connection)
 
     started_transaction = not connection.in_transaction
     if started_transaction:
-        connection.execute("BEGIN IMMEDIATE")
+        _execute(connection, "BEGIN IMMEDIATE")
     try:
+        # Read the schema only after the write lock is acquired.  A second
+        # opener may have completed the migration while this connection was
+        # waiting; re-reading here prevents a second backup or stale v1 write.
+        version, tables = _schema_state(connection)
+        fresh, migrating_v1 = _migration_kind(version, tables)
+        if migrating_v1:
+            _validate_tables(connection, _V1_TABLE_COLUMNS, version=1)
+            _validate_existing_tables(
+                connection,
+                _V2_TABLE_COLUMNS,
+                version=SCHEMA_VERSION_NUMBER,
+            )
+            _backup_v1_database(
+                connection,
+                database_path,
+                transaction_owned=started_transaction,
+            )
+        elif version == SCHEMA_VERSION_NUMBER:
+            _validate_tables(
+                connection,
+                _V2_TABLE_COLUMNS,
+                version=SCHEMA_VERSION_NUMBER,
+            )
+
         if fresh or version in (0, 1):
             for statement in _V2_SCHEMA_STATEMENTS:
-                connection.execute(statement)
-            connection.execute("PRAGMA user_version = 2")
+                _execute(connection, statement)
+            _execute(connection, "PRAGMA user_version = 2")
         elif version == SCHEMA_VERSION_NUMBER:
             # Keep indexes repairable without silently accepting a partial table schema.
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_scraped_at ON snapshots(scraped_at_epoch)")
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_reset_events_observed_at ON reset_events(observed_at_epoch)")
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_token_events_time ON token_usage_events(occurred_at_epoch)")
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_token_events_source_model_time ON token_usage_events(source, model, occurred_at_epoch)")
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_token_events_provider_time ON token_usage_events(provider, occurred_at_epoch)")
+            _execute(connection, "CREATE INDEX IF NOT EXISTS idx_snapshots_scraped_at ON snapshots(scraped_at_epoch)")
+            _execute(connection, "CREATE INDEX IF NOT EXISTS idx_reset_events_observed_at ON reset_events(observed_at_epoch)")
+            _execute(connection, "CREATE INDEX IF NOT EXISTS idx_token_events_time ON token_usage_events(occurred_at_epoch)")
+            _execute(connection, "CREATE INDEX IF NOT EXISTS idx_token_events_source_model_time ON token_usage_events(source, model, occurred_at_epoch)")
+            _execute(connection, "CREATE INDEX IF NOT EXISTS idx_token_events_provider_time ON token_usage_events(provider, occurred_at_epoch)")
         _set_schema_metadata(connection)
         _validate_tables(connection, _V2_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+        # Validate the post-migration layout before making it durable.  This is
+        # also run for already-v2 connections so concurrent open/read cycles
+        # never silently accept a damaged archive.
+        check_integrity(connection)
         if started_transaction:
-            # Validate the post-migration layout before making it durable.
-            check_integrity(connection)
-            connection.commit()
+            _commit(connection)
     except Exception:
         if started_transaction:
-            connection.rollback()
+            _rollback(connection)
         raise
 
 
 def check_integrity(connection: sqlite3.Connection) -> None:
     try:
-        result = connection.execute("PRAGMA quick_check").fetchone()
+        result = _execute(connection, "PRAGMA quick_check").fetchone()
     except sqlite3.DatabaseError as exc:
         if is_corruption_error(exc):
             raise ArchiveCorruptionError(str(exc)) from exc
@@ -267,19 +566,42 @@ def check_integrity(connection: sqlite3.Connection) -> None:
         raise ArchiveCorruptionError(str(detail))
 
 
+def _configure_connection(
+    connection: sqlite3.Connection,
+    *,
+    read_only: bool,
+) -> None:
+    _execute(
+        connection,
+        f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}",
+    )
+    _execute(connection, "PRAGMA foreign_keys = ON")
+    if read_only:
+        _execute(connection, "PRAGMA query_only = ON")
+        return
+
+    journal_mode = _execute(connection, "PRAGMA journal_mode = WAL").fetchone()
+    if not journal_mode or str(journal_mode[0]).lower() != "wal":
+        raise sqlite3.DatabaseError(
+            f"SQLite did not enable WAL journal mode: {journal_mode[0] if journal_mode else 'no result'}"
+        )
+
+
 def connect_database(database_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
+    database_path = Path(database_path)
     if database_path.is_symlink():
         raise OSError(f"archive database must not be a symbolic link: {database_path}")
     if read_only:
         connection = sqlite3.connect(
-            f"file:{database_path}?mode=ro", uri=True, timeout=10
+            _read_only_uri(database_path),
+            uri=True,
+            timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+            factory=_RetryingConnection,
         )
         try:
-            connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
-            connection.execute("PRAGMA query_only = ON")
-            connection.execute("PRAGMA foreign_keys = ON")
+            _configure_connection(connection, read_only=True)
             check_integrity(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            version = int(_execute(connection, "PRAGMA user_version").fetchone()[0])
             if version != SCHEMA_VERSION_NUMBER:
                 raise ArchiveSchemaError(
                     f"read-only analytics requires archive schema v{SCHEMA_VERSION_NUMBER}; found v{version}"
@@ -287,24 +609,30 @@ def connect_database(database_path: Path, *, read_only: bool = False) -> sqlite3
             _validate_tables(connection, _V2_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
             return connection
         except Exception:
-            connection.close()
+            _close_connection(connection)
             raise
 
     existed = database_path.exists()
     connection: sqlite3.Connection | None = None
     try:
-        connection = sqlite3.connect(str(database_path), timeout=10)
-        connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.execute("PRAGMA foreign_keys = ON")
+        connection = sqlite3.connect(
+            str(database_path),
+            timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+            factory=_RetryingConnection,
+        )
+        _configure_connection(connection, read_only=False)
         if existed:
             check_integrity(connection)
-        create_schema(connection)
+        create_schema(connection, database_path=database_path)
         os.chmod(database_path, 0o600)
         return connection
-    except (ArchiveCorruptionError, sqlite3.DatabaseError) as exc:
+    except Exception as exc:
         if connection is not None:
-            connection.close()
-        if existed and is_corruption_error(exc):
+            _close_connection(connection)
+        if (
+            existed
+            and isinstance(exc, sqlite3.DatabaseError)
+            and is_corruption_error(exc)
+        ):
             raise ArchiveCorruptionError(str(exc)) from exc
         raise

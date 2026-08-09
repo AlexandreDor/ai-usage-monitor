@@ -12,14 +12,43 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.14.0'
+          cache: npm
+      - name: Install Python test tools
+        run: >-
+          python -m pip install
+          --disable-pip-version-check
+          --no-warn-script-location
+          coverage==7.8.0
+          iniconfig==2.1.0
+          packaging==25.0
+          pluggy==1.6.0
+          pygments==2.19.1
+          pytest==8.4.1
+      - name: Compile Python modules
+        run: python -m compileall -q local tests
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install --yes shellcheck
       - name: Check Bash syntax
         run: bash -n local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
       - name: Run tests
         run: tests/run.sh
+      - name: Run targeted Python tests with coverage
+        run: |
+          python -m coverage run --branch --source=local -m pytest -q \
+            tests/test_codex_read_race.py tests/test_config.py tests/test_history.py tests/test_storage.py
+          python -m coverage report --show-missing
       - name: Install browser test dependencies
         run: npm ci
+      - name: Audit npm dependencies
+        run: npm audit --audit-level=high
       - name: Install Chromium
         run: npx playwright install --with-deps chromium
       - name: Run browser tests

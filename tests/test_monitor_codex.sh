@@ -18,6 +18,12 @@ assert_eq 4.5 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["weekly
 assert_eq '18/05/2033 05:33' "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["five_h_reset"])' <<< "$result")" "5h reset is not formatted in Paris time"
 assert_eq '25/05/2033 04:13' "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["weekly_reset"])' <<< "$result")" "weekly reset is not formatted in Paris time"
 
+module_result="$(python3 "$ROOT_DIR/local/codex_status.py" \
+  --codex-bin "$CODEX_BIN" --timeout 5 --interval 900 --history-window-hours 192)"
+assert_eq "$(python3 -c 'import json,sys; value=json.load(sys.stdin); value.pop("scraped_at",None); print(json.dumps(value, sort_keys=True))' <<< "$result")" \
+  "$(python3 -c 'import json,sys; value=json.load(sys.stdin); value.pop("scraped_at",None); print(json.dumps(value, sort_keys=True))' <<< "$module_result")" \
+  "direct codex_status.py CLI changed the monitor payload"
+
 export FAKE_CODEX_FIXTURE="${ROOT_DIR}/tests/fixtures/codex/partial.json"
 diagnostic="${TEST_ROOT}/partial.err"
 result="$(fetch_status_json 900 2>"$diagnostic")"

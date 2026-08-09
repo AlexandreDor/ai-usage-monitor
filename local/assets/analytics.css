@@ -283,6 +283,8 @@ td { color: #dbeafe; }
 
 .compact-filter select { min-width: 110px; }
 .pagination { display: flex; justify-content: flex-end; align-items: center; gap: 12px; margin-top: 16px; color: var(--muted); font-size: .78rem; }
+.breakdown-pagination { justify-content: space-between; }
+.breakdown-pagination span { min-width: 8em; text-align: center; }
 
 .collector-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
 .collector-item { padding: 14px; border: 1px solid var(--border); border-radius: 11px; background: rgba(3, 8, 23, .4); }
@@ -314,6 +316,7 @@ td { color: #dbeafe; }
   .reset-heading { align-items: end; }
   .allocation-total span { font-size: .58rem; }
   .allocation-total strong { font-size: 1.05rem; }
+  .breakdown-pagination { justify-content: center; flex-wrap: wrap; }
 }
 
 @media (prefers-reduced-motion: reduce) {

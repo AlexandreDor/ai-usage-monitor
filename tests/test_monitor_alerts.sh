@@ -67,7 +67,7 @@ reset_case
 printf 'prev_5h_pct=80\nprev_weekly_pct=70\n' > "$STATE_FILE"
 check_thresholds 80 70 "later" "later" "$((now + 300))" "$((now + 3600))" "$now"
 assert_alert_count 0
-[[ "$(state_value state_version)" == "3" ]] || fail "state was not migrated"
+[[ "$(state_value state_version)" == "4" ]] || fail "state was not migrated"
 
 # A reset older than its whole window is discarded rather than reported late.
 reset_case

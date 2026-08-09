@@ -123,7 +123,7 @@ wait "$server_pid" 2>/dev/null || true
 server_pid=""
 serve_fixture="${TEST_ROOT}/serve-fixture"
 mkdir -p "$serve_fixture"
-cp "$SERVE" "$ROOT_DIR/local/analytics.py" "$ROOT_DIR/local/storage.py" "$ROOT_DIR/local/token_usage.py" "$serve_fixture/"
+cp "$SERVE" "$ROOT_DIR/local/analytics.py" "$ROOT_DIR/local/storage.py" "$ROOT_DIR/local/token_usage.py" "$ROOT_DIR/local/config.py" "$serve_fixture/"
 printf "TOKEN_PRICING_FILE='%s'\n" "$custom_pricing" > "${serve_fixture}/.env"
 env_port="$(python3 - <<'PY'
 import socket

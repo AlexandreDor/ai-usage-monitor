@@ -15,8 +15,15 @@
   <header>
     <span class="live-dot"></span>
     <h1 data-i18n="dashboard.heading">Codex Limits</h1>
-    <span class="badge" id="mode-badge">-</span>
+    <span class="badge origin-badge" id="mode-badge" aria-label="Data source">-</span>
+    <span class="badge freshness-badge" id="freshness-status" role="status" aria-live="polite" aria-atomic="true">-</span>
     <span id="last-updated">-</span>
+    <div class="freshness-panel" id="freshness-panel" aria-label="Data freshness">
+      <span class="freshness-age-label" id="freshness-age-label">Data age</span>
+      <time id="freshness-age">-</time>
+      <span class="freshness-interval" id="freshness-interval">-</span>
+    </div>
+    <div class="sr-only" id="freshness-announcement" aria-live="polite" aria-atomic="true"></div>
     <a class="nav-link" href="analytics.html"><span data-i18n="dashboard.analyticsLink">Advanced analytics</span> <span aria-hidden="true">→</span></a>
     <div class="preference-controls" data-i18n-aria-label="preferences.ariaLabel" aria-label="Display preferences">
       <div class="preference-setting">
@@ -39,26 +46,56 @@
   <div id="error-banner" role="alert" hidden></div>
 
   <main class="grid">
-    <section class="card limit-card">
-      <div class="card-label" data-i18n="dashboard.fiveHourLimit">5-Hour Limit</div>
+    <section class="card limit-card" aria-labelledby="five-h-heading">
+      <h2 class="card-label" id="five-h-heading" data-i18n="dashboard.fiveHourLimit">5-Hour Limit</h2>
       <div class="pct-value unavailable" id="five-h-pct">--</div>
-      <progress class="bar" id="five-h-bar" max="100" value="0"></progress>
+      <progress class="bar" id="five-h-bar" max="100" value="0" role="progressbar" aria-label="5-Hour Limit" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Unavailable"></progress>
+      <div class="metric-state" aria-live="polite">
+        <span class="metric-availability" id="five-h-availability">Availability: -</span>
+        <span class="metric-criticality" id="five-h-criticality">Criticality: -</span>
+      </div>
       <div class="reset-info"><span data-i18n="dashboard.resetsAt">Resets at</span> <span id="five-h-reset">-</span></div>
     </section>
-    <section class="card limit-card">
-      <div class="card-label" data-i18n="dashboard.weeklyLimit">Weekly Limit</div>
+    <section class="card limit-card" aria-labelledby="weekly-heading">
+      <h2 class="card-label" id="weekly-heading" data-i18n="dashboard.weeklyLimit">Weekly Limit</h2>
       <div class="pct-value unavailable" id="weekly-pct">--</div>
-      <progress class="bar" id="weekly-bar" max="100" value="0"></progress>
+      <progress class="bar" id="weekly-bar" max="100" value="0" role="progressbar" aria-label="Weekly Limit" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Unavailable"></progress>
+      <div class="metric-state" aria-live="polite">
+        <span class="metric-availability" id="weekly-availability">Availability: -</span>
+        <span class="metric-criticality" id="weekly-criticality">Criticality: -</span>
+      </div>
       <div class="reset-info"><span data-i18n="dashboard.resets">Resets</span> <span id="weekly-reset">-</span></div>
       <div class="pace-indicator">
         <div class="pace-label" data-i18n="dashboard.paceVsIdeal">Pace vs ideal</div>
-        <div class="pace-value" id="weekly-pace-delta">--</div>
+        <div class="pace-value" id="weekly-pace-delta" aria-describedby="weekly-pace-details">--</div>
+        <div class="pace-details" id="weekly-pace-details">
+          <span><span data-i18n="dashboard.actualRemaining">Actual remaining</span>: <strong id="weekly-pace-actual">--</strong></span>
+          <span><span data-i18n="dashboard.idealRemaining">Ideal remaining</span>: <strong id="weekly-pace-ideal">--</strong></span>
+        </div>
       </div>
     </section>
-    <section class="card full history-card">
-      <div class="card-label history-label" id="history-label" data-i18n="dashboard.history">History</div>
-      <div id="history-error" class="history-error" role="alert" hidden></div>
-      <canvas id="history-chart"></canvas>
+    <section class="card full history-card" aria-labelledby="history-label">
+      <h2 class="card-label history-label" id="history-label" data-i18n="dashboard.history">History</h2>
+      <p class="history-summary" id="history-summary">-</p>
+      <div class="history-actions">
+        <button id="history-table-toggle" type="button" aria-controls="history-table-wrap" aria-expanded="false">Show history table</button>
+      </div>
+      <div id="history-error" class="history-error" role="alert" aria-live="polite" hidden></div>
+      <canvas id="history-chart" role="img" aria-labelledby="history-label" aria-describedby="history-summary"></canvas>
+      <div id="history-table-wrap" class="history-table-wrap" hidden>
+        <table id="history-table" class="history-table">
+          <caption id="history-table-caption">History data</caption>
+          <thead>
+            <tr>
+              <th scope="col" id="history-sample-heading">Sample time</th>
+              <th scope="col" data-i18n="dashboard.fiveHourDataset">5h Limit %</th>
+              <th scope="col" data-i18n="dashboard.weeklyDataset">Weekly Limit %</th>
+              <th scope="col" data-i18n="dashboard.idealDataset">Ideal weekly pace</th>
+            </tr>
+          </thead>
+          <tbody id="history-table-body"></tbody>
+        </table>
+      </div>
     </section>
   </main>
 

@@ -1,0 +1,21 @@
+[Unit]
+Description=Codex Usage Monitor (%i)
+Documentation=https://github.com/AlexandreDor/ai-usage-monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=%h/ai-usage-monitor/local
+ExecStart=/usr/bin/env bash %h/ai-usage-monitor/local/monitor.sh --loop 900
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/ai-usage-monitor/local/runtime %h/ai-usage-monitor/local/.alert_state %h/ai-usage-monitor/local/.monitor.lock
+
+[Install]
+WantedBy=default.target

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -25,8 +26,12 @@ WEEKLY_WINDOW_SECONDS = 7 * 86400
 MAX_SERIES_POINTS = 10_000
 MAX_RESET_MARKERS = 2_000
 DEFAULT_RESET_PAGE_SIZE = 50
-MAX_BREAKDOWN_ROWS = 2_000
+DEFAULT_BREAKDOWN_PAGE_SIZE = 50
+MAX_BREAKDOWN_PAGE_SIZE = 100
 MAX_AVAILABLE_MODELS = 500
+SQLITE_MAX_INTEGER = 2**63 - 1
+BREAKDOWN_OFFSET_KEYS = ("breakdown_offset", "token_breakdown_offset", "token_offset", "offset")
+BREAKDOWN_LIMIT_KEYS = ("breakdown_limit", "token_breakdown_limit", "token_limit", "limit")
 _LOCAL_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])(?:~|/(?:[^\s'\"`,;:)\]}]+/)*[^\s'\"`,;:)\]}]+)")
 
 
@@ -140,6 +145,12 @@ def price_index(catalog: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]
     return result
 
 
+def pricing_fingerprint(catalog: dict[str, Any]) -> str:
+    """Return a stable SHA-256 for the validated catalog contents."""
+    canonical = json.dumps(catalog, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def cost_row(row: dict[str, Any], prices: dict[tuple[str, str], dict[str, Any]]) -> tuple[float, bool]:
     price = prices.get((row["provider"].lower(), row["model"].lower()))
     if price is None:
@@ -162,6 +173,51 @@ def selected_values(raw: str, *, name: str, allowed: Sequence[str] | None = None
     if allowed is not None and any(item not in allowed for item in values):
         raise AnalyticsError(f"{name} must contain only {', '.join(allowed)}")
     return values
+
+
+def normalize_params(params: Any) -> dict[str, str]:
+    """Normalize direct callers while retaining a useful duplicate error."""
+    if not isinstance(params, dict):
+        raise AnalyticsError("params must be a string map")
+    normalized: dict[str, str] = {}
+    for key, value in params.items():
+        if not isinstance(key, str):
+            raise AnalyticsError("params must be a string map")
+        if isinstance(value, str):
+            normalized[key] = value
+            continue
+        if isinstance(value, (list, tuple)):
+            if len(value) != 1:
+                raise AnalyticsError("query parameters must not be repeated")
+            value = value[0]
+        if not isinstance(value, str):
+            raise AnalyticsError("params must be a string map")
+        normalized[key] = value
+    return normalized
+
+
+def pagination_parameter(params: dict[str, str], aliases: Sequence[str], name: str) -> str | None:
+    present = [key for key in aliases if key in params]
+    if len(present) > 1:
+        raise AnalyticsError(f"{name} pagination parameters are contradictory")
+    return params[present[0]] if present else None
+
+
+def breakdown_pagination(params: dict[str, str]) -> tuple[int | None, int]:
+    raw_offset = pagination_parameter(params, BREAKDOWN_OFFSET_KEYS, "breakdown offset")
+    raw_limit = pagination_parameter(params, BREAKDOWN_LIMIT_KEYS, "breakdown limit")
+    if raw_offset is None and raw_limit is None:
+        return None, DEFAULT_BREAKDOWN_PAGE_SIZE
+    try:
+        offset = int(raw_offset) if raw_offset is not None else 0
+        limit = int(raw_limit) if raw_limit is not None else DEFAULT_BREAKDOWN_PAGE_SIZE
+    except (TypeError, ValueError) as exc:
+        raise AnalyticsError("breakdown pagination must use integers") from exc
+    if offset < 0 or offset > SQLITE_MAX_INTEGER:
+        raise AnalyticsError("breakdown_offset must be between 0 and 9223372036854775807")
+    if not 1 <= limit <= MAX_BREAKDOWN_PAGE_SIZE:
+        raise AnalyticsError("breakdown_limit must be 1..100")
+    return offset, limit
 
 
 def token_conditions(start: int, end: int, sources: Sequence[str], models: Sequence[str]) -> tuple[str, list[Any]]:
@@ -206,20 +262,26 @@ def token_analytics(
     granularity: int,
     sources: Sequence[str],
     models: Sequence[str],
+    breakdown_offset: int | None = None,
+    breakdown_limit: int = DEFAULT_BREAKDOWN_PAGE_SIZE,
 ) -> tuple[dict[str, Any], list[str]]:
     conditions, values = token_conditions(start, end, sources, models)
     sums = ", ".join(f"SUM({field}) AS {field}" for field in TOKEN_FIELDS)
+    breakdown_paginated = breakdown_offset is not None
     breakdown_count = int(scalar(
         connection,
         f"SELECT COUNT(*) FROM (SELECT 1 FROM token_usage_events WHERE {conditions} GROUP BY source, provider, model)",
         values,
     ) or 0)
-    if breakdown_count > MAX_BREAKDOWN_ROWS:
-        raise AnalyticsError(f"token breakdown exceeds the {MAX_BREAKDOWN_ROWS}-group response limit")
-    breakdown_rows = connection.execute(
-        f"SELECT source, provider, model, {sums}, COUNT(*) AS events FROM token_usage_events WHERE {conditions} GROUP BY source, provider, model ORDER BY source, model",
-        values,
-    ).fetchall()
+    breakdown_query = (
+        f"SELECT source, provider, model, {sums}, COUNT(*) AS events "
+        f"FROM token_usage_events WHERE {conditions} GROUP BY source, provider, model ORDER BY source, provider, model"
+    )
+    breakdown_parameters: list[Any] = list(values)
+    if breakdown_paginated:
+        breakdown_query += " LIMIT ? OFFSET ?"
+        breakdown_parameters.extend((breakdown_limit, breakdown_offset))
+    breakdown_rows = connection.execute(breakdown_query, breakdown_parameters).fetchall()
     prices = price_index(catalog)
     breakdown: list[dict[str, Any]] = []
     summary = {field: 0 for field in TOKEN_FIELDS}
@@ -231,22 +293,43 @@ def token_analytics(
         "total": 0,
     })
     unknown: list[str] = []
-    for raw in breakdown_rows:
-        item = token_row(raw)
-        normalize_token_counts(item)
+
+    def add_to_summary(item: dict[str, Any]) -> None:
         for field in TOKEN_FIELDS:
             summary[field] += item[field]
         item["events"] = int(item["events"])
         summary["events"] += item["events"]
         cost, assumed_zero = cost_row(item, prices)
-        item["estimated_cost_usd"] = round(cost, 8)
-        item["cost_usd"] = item["estimated_cost_usd"]
-        item["pricing_status"] = "assumed-zero" if assumed_zero else "priced"
         summary["estimated_cost_usd"] += cost
         summary["total_tokens"] += item["total_tokens"]
         if assumed_zero:
             summary["assumed_zero_tokens"] += item["total_tokens"]
             unknown.append(f"{item['provider']}/{item['model']}")
+
+    if breakdown_paginated:
+        # A paginated response still reports totals for the complete filtered
+        # period. Aggregate by priced identity without materializing every
+        # breakdown row in the response.
+        summary_rows = connection.execute(
+            f"SELECT provider, model, {sums}, COUNT(*) AS events "
+            f"FROM token_usage_events WHERE {conditions} GROUP BY provider, model ORDER BY provider, model",
+            values,
+        ).fetchall()
+        for raw in summary_rows:
+            item = token_row(raw)
+            normalize_token_counts(item)
+            add_to_summary(item)
+
+    for raw in breakdown_rows:
+        item = token_row(raw)
+        normalize_token_counts(item)
+        if not breakdown_paginated:
+            add_to_summary(item)
+        item["events"] = int(item["events"])
+        cost, assumed_zero = cost_row(item, prices)
+        item["estimated_cost_usd"] = round(cost, 8)
+        item["cost_usd"] = item["estimated_cost_usd"]
+        item["pricing_status"] = "assumed-zero" if assumed_zero else "priced"
         item["application"] = item["source"]
         breakdown.append(item)
     summary["estimated_cost_usd"] = round(summary["estimated_cost_usd"], 8)
@@ -300,12 +383,19 @@ def token_analytics(
             item["at"] = iso_utc(bucket_epoch)
             series_by_source.append(item)
     warnings = [f"No catalog price; assumed zero: {name}" for name in sorted(set(unknown))]
-    return {
+    result: dict[str, Any] = {
         "summary": summary,
         "series": series,
         "series_by_source": series_by_source,
         "breakdown": breakdown,
-    }, warnings
+    }
+    if breakdown_paginated:
+        result["breakdown_pagination"] = {
+            "offset": breakdown_offset,
+            "limit": breakdown_limit,
+            "total": breakdown_count,
+        }
+    return result, warnings
 
 
 def limit_series(connection: sqlite3.Connection, start: int, end: int, granularity: int) -> dict[str, Any]:
@@ -517,6 +607,7 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
         raise AnalyticsUnavailableError("analytics archive cannot be read") from exc
     connection.row_factory = sqlite3.Row
     try:
+        params = normalize_params(params)
         current = int(now if now is not None else datetime.now(timezone.utc).timestamp())
         start, end, range_label, granularity = period(connection, params, current)
         if "source" in params and "sources" in params or "model" in params and "models" in params:
@@ -534,7 +625,18 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
         if reset_offset < 0 or not 1 <= reset_limit <= 100:
             raise AnalyticsError("reset_offset must be positive and reset_limit must be 1..100")
 
-        tokens, warnings = token_analytics(connection, catalog, start, end, granularity, sources, models)
+        breakdown_offset, breakdown_limit = breakdown_pagination(params)
+        tokens, warnings = token_analytics(
+            connection,
+            catalog,
+            start,
+            end,
+            granularity,
+            sources,
+            models,
+            breakdown_offset,
+            breakdown_limit,
+        )
         available_sources = [row[0] for row in connection.execute("SELECT DISTINCT source FROM token_usage_events ORDER BY source")]
         available_models_count = int(scalar(connection, "SELECT COUNT(DISTINCT model) FROM token_usage_events") or 0)
         if available_models_count > MAX_AVAILABLE_MODELS:
@@ -546,6 +648,7 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
             for name, value in freshness["collectors"].items()
             if value["status"] == "error" and value["last_error"]
         )
+        catalog_hash = pricing_fingerprint(catalog)
         return {
             "schema_version": 1,
             "period": {
@@ -563,7 +666,13 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
             "tokens": tokens,
             "resets": reset_history(connection, start, end, reset_type, reset_offset, reset_limit),
             "baselines": {"hermes": hermes_baselines(connection)},
-            "pricing": {"currency": catalog["currency"], "as_of": catalog.get("as_of", "unknown"), "valuation_mode": catalog.get("valuation_mode", "current_catalog")},
+            "pricing": {
+                "currency": catalog["currency"],
+                "as_of": catalog.get("as_of", "unknown"),
+                "valuation_mode": catalog.get("valuation_mode", "current_catalog"),
+                "sha256": catalog_hash,
+                "catalog_sha256": catalog_hash,
+            },
             "warnings": warnings,
         }
     except AnalyticsError:

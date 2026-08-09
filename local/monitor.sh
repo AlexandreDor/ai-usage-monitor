@@ -36,47 +36,43 @@ HISTORY_FILE="${RUNTIME_DIR}/history.json"
 ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"
 HEALTH_FILE="${RUNTIME_DIR}/health.json"
 LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
-DEFAULT_INTERVAL_SECONDS=900
 INVALID_ALERT_SCRIPT_CONFIG=0
+# Retry-After is useful for rate-limited providers, but a remote endpoint must
+# never be allowed to stall the monitor indefinitely.
+ALERT_RETRY_MAX_DELAY_SECONDS=60
+
+declare -a ALERT_IDS=()
+declare -A ALERT_STATUS=()
+declare -A ALERT_EVENT=()
+declare -A ALERT_CHANNEL_STATUS=()
+declare -A ALERT_CHANNEL_RETRYABLE=()
+ALERT_DELIVERY_STATE_READY=0
+ALERT_DELIVERY_RETRYABLE_FAILURE=0
+ALERT_DELIVERY_PERMANENT_FAILURE=0
+ALERT_DELIVERY_COMPLETE=0
+HTTP_REQUEST_FAILURE_CLASS=retryable
 
 load_config() {
-  local line key value
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%$'\r'}"
-    [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
-
-    if [[ "$line" != *=* ]]; then
-      echo "[WARN] Ignoring malformed configuration line." >&2
-      continue
-    fi
-
-    key="${line%%=*}"
-    value="${line#*=}"
-    if [[ ! "$key" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
-      echo "[WARN] Ignoring invalid configuration key." >&2
-      continue
-    fi
-
+  local config_output key value
+  config_output="$(mktemp)" || return 1
+  if ! python3 "$SCRIPT_DIR/config.py" \
+      --env-file "$ENV_FILE" --base-dir "$SCRIPT_DIR" --lines > "$config_output"; then
+    rm -f "$config_output"
+    return 1
+  fi
+  while IFS=$'\t' read -r key value; do
     case "$key" in
-      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
-        if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
-          value="${value:1:${#value}-2}"
-        fi
-        printf -v "$key" '%s' "$value"
+      CONFIG_INVALID_ALERT_SCRIPT)
+        INVALID_ALERT_SCRIPT_CONFIG=1
+        ;;
+      '')
         ;;
       *)
-        if [[ "$key" =~ ^ALERT_SCRIPT_([1-9]|[1-9][0-9])(_EVENTS)?$ ]]; then
-          if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
-            value="${value:1:${#value}-2}"
-          fi
-          printf -v "$key" '%s' "$value"
-        else
-          echo "[WARN] Ignoring unsupported configuration key: $key" >&2
-          [[ "$key" == ALERT_SCRIPT_* ]] && INVALID_ALERT_SCRIPT_CONFIG=1
-        fi
+        printf -v "$key" '%s' "$value"
         ;;
     esac
-  done < "$ENV_FILE"
+  done < "$config_output"
+  rm -f "$config_output"
 }
 
 # ============================================================================
@@ -352,45 +348,18 @@ PYEOF
 initialize() {
   local codex_bin_override="${CODEX_BIN_OVERRIDE:-}"
   umask 077
-  if [[ -f "$ENV_FILE" ]]; then
-    if [[ -L "$ENV_FILE" || ! -O "$ENV_FILE" ]]; then
-      config_error ".env must be a regular file owned by the current user."
-      return 1
-    fi
-    chmod 600 "$ENV_FILE"
-    load_config
-  fi
+  load_config || return 1
 
   if [[ -n "$codex_bin_override" ]]; then
     CODEX_BIN="$codex_bin_override"
   fi
 
-  ALERT_THRESHOLDS="${ALERT_THRESHOLDS:-75,50,25,10,5}"
-  ALERT_SCRIPT_TIMEOUT_SECONDS="${ALERT_SCRIPT_TIMEOUT_SECONDS:-30}"
-  ARCHIVE_RETENTION_DAYS="${ARCHIVE_RETENTION_DAYS:-365}"
-  HISTORY_RETENTION_HOURS="${HISTORY_RETENTION_HOURS:-192}"
-  LOOP_INTERVAL="${LOOP_INTERVAL:-$DEFAULT_INTERVAL_SECONDS}"
-  CODEX_STATUS_TIMEOUT_SECONDS="${CODEX_STATUS_TIMEOUT_SECONDS:-20}"
-  CURL_CONNECT_TIMEOUT_SECONDS="${CURL_CONNECT_TIMEOUT_SECONDS:-5}"
-  CURL_MAX_TIME_SECONDS="${CURL_MAX_TIME_SECONDS:-20}"
-  CURL_RETRIES="${CURL_RETRIES:-2}"
-  CURL_RETRY_DELAY_SECONDS="${CURL_RETRY_DELAY_SECONDS:-1}"
-  MONITOR_DEBUG="${MONITOR_DEBUG:-0}"
-  DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}"
-  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-  TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
-  GITHUB_PAT="${GITHUB_PAT:-}"
-  GITHUB_GIST_ID="${GITHUB_GIST_ID:-}"
-  GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
-  TELEGRAM_API_URL="${TELEGRAM_API_URL:-https://api.telegram.org}"
-  TOKEN_USAGE_SOURCES="${TOKEN_USAGE_SOURCES:-auto}"
-  TOKEN_PRICING_FILE="${TOKEN_PRICING_FILE:-${SCRIPT_DIR}/pricing.json}"
-  CODEX_DATA_DIR="${CODEX_DATA_DIR:-${HOME}/.codex}"
-  OPENCODE_DB_PATH="${OPENCODE_DB_PATH:-${XDG_DATA_HOME:-${HOME}/.local/share}/opencode/opencode.db}"
-  HERMES_DB_PATH="${HERMES_DB_PATH:-${HOME}/.hermes/state.db}"
-
-  check_requirements || return 1
+  if ! python3 "$SCRIPT_DIR/config.py" \
+      --env-file "$ENV_FILE" --base-dir "$SCRIPT_DIR" --set "CODEX_BIN=${CODEX_BIN}" --validate >/dev/null; then
+    return 1
+  fi
   validate_config || return 1
+  check_requirements || return 1
   mkdir -p "$RUNTIME_DIR"
   chmod 700 "$RUNTIME_DIR"
   [[ -w "$RUNTIME_DIR" ]] || { config_error "Runtime directory is not writable: $RUNTIME_DIR"; return 1; }
@@ -400,217 +369,14 @@ fetch_status_json() {
   local interval_seconds="$1"
   local codex_cmd="${CODEX_BIN:-codex}"
 
-  python3 - "$codex_cmd" "${CODEX_STATUS_TIMEOUT_SECONDS:-20}" "$interval_seconds" "$HISTORY_RETENTION_HOURS" "${MONITOR_DEBUG:-0}" <<'PYEOF'
-import datetime
-import json
-import math
-import os
-import select
-import subprocess
-import sys
-import time
-from zoneinfo import ZoneInfo
-
-codex_cmd = sys.argv[1]
-timeout_seconds = max(5, int(sys.argv[2]))
-interval_seconds = max(1, int(sys.argv[3]))
-history_window_hours = float(sys.argv[4])
-debug = sys.argv[5] == "1"
-paris_timezone = ZoneInfo("Europe/Paris")
-
-# Do not pass notification or storage credentials to the Codex subprocess.
-codex_environment = os.environ.copy()
-for secret_name in ("DISCORD_WEBHOOK", "GITHUB_PAT", "TELEGRAM_BOT_TOKEN"):
-    codex_environment.pop(secret_name, None)
-
-process = subprocess.Popen(
-    [codex_cmd, "app-server", "--stdio"],
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    text=True,
-    bufsize=1,
-    close_fds=True,
-    env=codex_environment,
-)
-
-
-def send(message):
-    process.stdin.write(json.dumps(message) + "\n")
-    process.stdin.flush()
-
-
-def stop_process():
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=2)
-
-
-send({
-    "id": 1,
-    "method": "initialize",
-    "params": {
-        "clientInfo": {"name": "codex-usage-monitor", "version": "1.0.0"},
-        "capabilities": {"experimentalApi": True},
-    },
-})
-
-deadline = time.monotonic() + timeout_seconds
-result = None
-rate_limit_requested = False
-diagnostic = bytearray()
-
-
-def clean_diagnostic(raw):
-    text = raw.decode("utf-8", "replace")
-    return "".join(char if char in "\n\t" or ord(char) >= 32 else "?" for char in text).strip()[:4096]
-
-try:
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([process.stdout, process.stderr], [], [], 0.5)
-        if not ready:
-            if process.poll() is not None:
-                break
-            continue
-
-        if process.stderr in ready:
-            chunk = os.read(process.stderr.fileno(), 1024)
-            if len(diagnostic) < 4096:
-                diagnostic.extend(chunk[: 4096 - len(diagnostic)])
-            ready.remove(process.stderr)
-        if process.stdout not in ready:
-            continue
-        line = process.stdout.readline()
-        if not line:
-            break
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        if message.get("id") == 1 and not rate_limit_requested:
-            if message.get("error"):
-                break
-            send({"method": "initialized"})
-            send({"id": 2, "method": "account/rateLimits/read", "params": None})
-            rate_limit_requested = True
-        elif message.get("id") == 2:
-            result = message.get("result")
-            break
-finally:
-    stop_process()
-
-if not isinstance(result, dict):
-    sys.stderr.write("[ERROR] Codex app-server did not return usage limits.\n")
-    if debug and diagnostic:
-        sys.stderr.write(f"[DEBUG] Codex diagnostic: {clean_diagnostic(diagnostic)}\n")
-    raise SystemExit(1)
-
-snapshots_by_id = result.get("rateLimitsByLimitId")
-if isinstance(snapshots_by_id, dict) and snapshots_by_id:
-    snapshots = [(str(limit_id), snapshot) for limit_id, snapshot in snapshots_by_id.items()]
-else:
-    flat = result.get("rateLimits")
-    snapshots = [(str(flat.get("limitId", "default")), flat)] if isinstance(flat, dict) else []
-
-
-def finite_number(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-
-
-def classify_windows(snapshot):
-    short = weekly = None
-    for name in ("primary", "secondary"):
-        window = snapshot.get(name)
-        if not isinstance(window, dict):
-            continue
-        duration = window.get("windowDurationMins")
-        used = window.get("usedPercent")
-        if not finite_number(duration) or duration <= 0:
-            continue
-        if not finite_number(used) or not 0 <= used <= 100:
-            continue
-        if 1 <= duration <= 360 and short is None:
-            short = window
-        elif 7 * 24 * 60 <= duration <= 8 * 24 * 60 and weekly is None:
-            weekly = window
-    return short, weekly
-
-
-# Select one coherent limit group; never combine windows from different IDs.
-candidates = []
-for limit_id, snapshot in snapshots:
-    if isinstance(snapshot, dict):
-        short, weekly = classify_windows(snapshot)
-        if short is not None or weekly is not None:
-            candidates.append((int(short is not None) + int(weekly is not None), limit_id, short, weekly))
-
-if not candidates:
-    sys.stderr.write("[ERROR] Codex returned no valid recognized usage window.\n")
-    if debug and diagnostic:
-        sys.stderr.write(f"[DEBUG] Codex diagnostic: {clean_diagnostic(diagnostic)}\n")
-    raise SystemExit(1)
-
-candidates.sort(key=lambda item: item[0], reverse=True)
-_, selected_limit_id, five_hour_window, weekly_window = candidates[0]
-if five_hour_window is None or weekly_window is None:
-    missing = "short" if five_hour_window is None else "weekly"
-    sys.stderr.write(
-        f"[WARN] Codex returned a partial limit group '{selected_limit_id}'; "
-        f"the {missing} usage window is unavailable.\n"
-    )
-
-
-def remaining_percent(window):
-    if not window:
-        return None
-    used = window.get("usedPercent")
-    if not finite_number(used) or not 0 <= used <= 100:
-        return None
-    remaining = 100 - used
-    return int(remaining) if float(remaining).is_integer() else remaining
-
-
-def reset_time(window):
-    if not window:
-        return "unknown"
-    timestamp = window.get("resetsAt")
-    if not finite_number(timestamp):
-        return "unknown"
-    try:
-        reset = datetime.datetime.fromtimestamp(timestamp, paris_timezone)
-    except (OverflowError, OSError, ValueError):
-        return "unknown"
-    return reset.strftime("%d/%m/%Y %H:%M")
-
-
-def reset_timestamp(window):
-    if not window:
-        return None
-    timestamp = window.get("resetsAt")
-    if not finite_number(timestamp) or timestamp <= 0:
-        return None
-    return int(timestamp)
-
-payload = {
-    "five_h_pct": remaining_percent(five_hour_window),
-    "five_h_reset": reset_time(five_hour_window),
-    "five_h_reset_at": reset_timestamp(five_hour_window),
-    "weekly_pct": remaining_percent(weekly_window),
-    "weekly_reset": reset_time(weekly_window),
-    "weekly_reset_at": reset_timestamp(weekly_window),
-    "limit_id": selected_limit_id,
-    "scraped_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "sample_interval_seconds": interval_seconds,
-    "history_window_hours": history_window_hours,
-}
-print(json.dumps(payload, indent=2))
-PYEOF
+  local -a debug_args=()
+  [[ "${MONITOR_DEBUG:-0}" == 1 ]] && debug_args+=(--debug)
+  python3 "$SCRIPT_DIR/codex_status.py" \
+    --codex-bin "$codex_cmd" \
+    --timeout "${CODEX_STATUS_TIMEOUT_SECONDS:-20}" \
+    --interval "$interval_seconds" \
+    --history-window-hours "$HISTORY_RETENTION_HOURS" \
+    "${debug_args[@]}"
 }
 
 json_get_field() {
@@ -655,129 +421,13 @@ format_paris_timestamp() {
   TZ=Europe/Paris date -d "@${epoch}" '+%d/%m/%Y %H:%M'
 }
 
-history_max_entries() {
-  local interval_seconds="$1"
-
-  python3 - "$interval_seconds" "$HISTORY_RETENTION_HOURS" <<'PYEOF'
-import math
-import sys
-
-interval_seconds = max(1, int(sys.argv[1]))
-hours = float(sys.argv[2])
-entries = max(1, math.ceil((hours * 3600) / interval_seconds))
-print(entries)
-PYEOF
-}
-
 write_local_snapshot() {
   local json="$1"
-  local interval_seconds="$2"
-  local max_entries
-
-  max_entries="$(history_max_entries "$interval_seconds")"
-
-  python3 - "$HISTORY_FILE" "$DATA_FILE" "$json" "$max_entries" <<'PYEOF'
-import json
-import os
-import pathlib
-import shutil
-import sys
-import tempfile
-import time
-
-history_path = pathlib.Path(sys.argv[1])
-data_path = pathlib.Path(sys.argv[2])
-new_entry = json.loads(sys.argv[3])
-max_entries = int(sys.argv[4])
-public_fields = {
-    "five_h_pct",
-    "five_h_reset",
-    "five_h_reset_at",
-    "weekly_pct",
-    "weekly_reset",
-    "weekly_reset_at",
-    "scraped_at",
-    "sample_interval_seconds",
-    "history_window_hours",
-    "limit_id",
-}
-
-
-def sanitize_entry(entry):
-    if not isinstance(entry, dict):
-        return None
-    sanitized = {key: entry[key] for key in public_fields if key in entry}
-    for key in ("five_h_reset", "weekly_reset"):
-        value = sanitized.get(key)
-        if not isinstance(value, str) or len(value) > 100 or "@" in value:
-            sanitized[key] = "unknown"
-    value = sanitized.get("limit_id")
-    if value is not None and (not isinstance(value, str) or len(value) > 100 or any(ord(char) < 32 for char in value)):
-        sanitized.pop("limit_id", None)
-    for key in ("five_h_reset_at", "weekly_reset_at"):
-        value = sanitized.get(key)
-        if value is not None and (
-            not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0
-        ):
-            sanitized[key] = None
-    return sanitized
-
-
-new_entry = sanitize_entry(new_entry)
-if new_entry is None:
-    raise SystemExit("invalid usage snapshot")
-
-def atomic_write(path, content):
-    fd, temporary_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", text=True
-    )
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as temporary_file:
-            temporary_file.write(content)
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
-        os.replace(temporary_name, path)
-    finally:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-
-
-history = []
-if history_path.exists():
-    try:
-        history = json.loads(history_path.read_text(encoding="utf-8"))
-        if not isinstance(history, list):
-            raise ValueError("history root is not an array")
-    except Exception as error:
-        backup = history_path.with_name(f"{history_path.name}.corrupt.{int(time.time())}")
-        shutil.copy2(history_path, backup)
-        sys.stderr.write(f"[WARN] Corrupt history copied to {backup} before reconstruction: {error}\n")
-        history = []
-
-history = [entry for item in history if (entry := sanitize_entry(item)) is not None]
-new_timestamp = new_entry.get("scraped_at", "")
-existing_timestamps = {entry.get("scraped_at") for entry in history}
-if new_timestamp not in existing_timestamps:
-    history.append(new_entry)
-history.sort(key=lambda entry: entry.get("scraped_at", ""), reverse=True)
-history = history[:max_entries]
-
-current = None
-if data_path.exists():
-    try:
-        current = sanitize_entry(json.loads(data_path.read_text(encoding="utf-8")))
-    except Exception:
-        current = None
-
-atomic_write(history_path, json.dumps(history, indent=2) + "\n")
-if current is None or new_timestamp >= current.get("scraped_at", ""):
-    atomic_write(data_path, json.dumps(new_entry, indent=2) + "\n")
-else:
-    sys.stderr.write("[WARN] Older snapshot retained in history but did not replace data.json.\n")
-PYEOF
+  printf '%s\n' "$json" | python3 "$SCRIPT_DIR/history.py" \
+    --history "$HISTORY_FILE" \
+    --data "$DATA_FILE" \
+    --retention-hours "$HISTORY_RETENTION_HOURS" \
+    --snapshot -
 
   echo "[OK] Snapshot storage processed at ${DATA_FILE}"
 }
@@ -806,20 +456,58 @@ PYEOF
 # ============================================================================
 # Optional: sync to GitHub Gist (Tier 2, external dashboard)
 # ============================================================================
+retry_after_seconds() {
+  local headers_file="$1"
+  python3 - "$headers_file" <<'PYEOF'
+import email.utils
+import math
+import pathlib
+import sys
+import time
+
+try:
+    lines = pathlib.Path(sys.argv[1]).read_text(encoding="iso-8859-1").splitlines()
+except OSError:
+    raise SystemExit(0)
+
+for line in reversed(lines):
+    if ":" not in line:
+        continue
+    name, value = line.split(":", 1)
+    if name.strip().lower() != "retry-after":
+        continue
+    value = value.strip()
+    if value.isdigit():
+        print(int(value))
+        break
+    try:
+        retry_at = email.utils.parsedate_to_datetime(value).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        continue
+    print(max(0, math.ceil(retry_at - time.time())))
+    break
+PYEOF
+}
+
 http_request() {
   local service="$1" expected_status="$2" curl_config="$3" method="$4" output_file="$5"
   shift 5
-  local attempt=1 max_attempts=$((CURL_RETRIES + 1)) status="000" curl_status=0 delay error_file
+  local attempt=1 max_attempts=$((CURL_RETRIES + 1)) status="000" curl_status=0
+  local delay retry_after error_file headers_file
+  HTTP_REQUEST_FAILURE_CLASS=retryable
   error_file="$(mktemp "${RUNTIME_DIR}/.curl-error.XXXXXX")"
+  headers_file="$(mktemp "${RUNTIME_DIR}/.curl-headers.XXXXXX")"
 
   while (( attempt <= max_attempts )); do
     echo "[INFO] ${service}: delivery attempt ${attempt}/${max_attempts}."
     : > "$output_file"
     : > "$error_file"
+    : > "$headers_file"
     curl_status=0
     status="$(printf '%s\n' "$curl_config" | curl --config - --silent --show-error \
       --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" --max-time "$CURL_MAX_TIME_SECONDS" \
-      --request "$method" --output "$output_file" --write-out '%{http_code}' "$@" 2>"$error_file")" || curl_status=$?
+      --request "$method" --output "$output_file" --dump-header "$headers_file" \
+      --write-out '%{http_code}' "$@" 2>"$error_file")" || curl_status=$?
     if (( curl_status == 0 )) && [[ "$status" == "$expected_status" ]]; then
       if [[ "$service" != Telegram ]] || python3 - "$output_file" <<'PYEOF'
 import json
@@ -833,29 +521,40 @@ raise SystemExit(0 if isinstance(response, dict) and response.get("ok") is True 
 PYEOF
       then
         echo "[OK] ${service}: delivered (HTTP ${status})."
-        rm -f "$error_file"
+        HTTP_REQUEST_FAILURE_CLASS=none
+        rm -f "$error_file" "$headers_file"
         return 0
       fi
     fi
+    if (( curl_status == 0 )) \
+      && [[ "$status" =~ ^4[0-9]{2}$ ]] \
+      && [[ "$status" != 429 ]]; then
+      HTTP_REQUEST_FAILURE_CLASS=permanent
+    else
+      HTTP_REQUEST_FAILURE_CLASS=retryable
+    fi
     if [[ "${MONITOR_DEBUG:-0}" == 1 && -s "$error_file" ]]; then
-      python3 - "$service" "$error_file" <<'PYEOF'
-import pathlib
-import sys
-
-text = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace")[:2048]
-text = "".join(char if char in "\n\t" or ord(char) >= 32 else "?" for char in text).strip()
-if text:
-    sys.stderr.write(f"[DEBUG] {sys.argv[1]} curl: {text}\n")
-PYEOF
+      echo "[DEBUG] ${service}: request failed (curl=${curl_status}, HTTP ${status})." >&2
     fi
     echo "[WARN] ${service}: attempt failed (curl=${curl_status}, HTTP ${status})." >&2
+    if [[ "$HTTP_REQUEST_FAILURE_CLASS" == permanent ]]; then
+      break
+    fi
     if (( attempt < max_attempts )); then
       delay=$((CURL_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))))
+      retry_after="$(retry_after_seconds "$headers_file" || true)"
+      if [[ "$retry_after" =~ ^[0-9]+$ ]] && (( retry_after > delay )); then
+        delay="$retry_after"
+      fi
+      (( delay > ALERT_RETRY_MAX_DELAY_SECONDS )) && delay="$ALERT_RETRY_MAX_DELAY_SECONDS"
+      if (( delay > 0 )); then
+        echo "[INFO] ${service}: retrying in ${delay}s."
+      fi
       (( delay > 0 )) && sleep "$delay"
     fi
     ((attempt += 1))
   done
-  rm -f "$error_file"
+  rm -f "$error_file" "$headers_file"
   return 1
 }
 
@@ -891,6 +590,7 @@ PYEOF
 send_discord() {
   local message="$1"
   local payload
+  ALERT_CHANNEL_FAILURE_RETRYABLE=1
   if [[ -z "${DISCORD_WEBHOOK:-}" ]]; then return; fi
 
   payload="$(python3 - "$message" <<'PYEOF'
@@ -908,12 +608,14 @@ PYEOF
     rm -f "$response_file"
     return 0
   fi
+  [[ "${HTTP_REQUEST_FAILURE_CLASS:-retryable}" == permanent ]] && ALERT_CHANNEL_FAILURE_RETRYABLE=0
   rm -f "$response_file"
   return 1
 }
 
 send_telegram() {
   local message="$1"
+  ALERT_CHANNEL_FAILURE_RETRYABLE=1
   if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then return; fi
 
   local response_file
@@ -923,32 +625,289 @@ send_telegram() {
     rm -f "$response_file"
     return 0
   fi
+  [[ "${HTTP_REQUEST_FAILURE_CLASS:-retryable}" == permanent ]] && ALERT_CHANNEL_FAILURE_RETRYABLE=0
   echo "[WARN] Telegram: HTTP response did not confirm delivery." >&2
   rm -f "$response_file"
   return 1
 }
 
+alert_channel_configured() {
+  case "$1" in
+    discord) [[ -n "${DISCORD_WEBHOOK:-}" ]] ;;
+    telegram) [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+alert_channel_key() {
+  printf '%s|%s' "$1" "$2"
+}
+
+make_alert_id() {
+  python3 - "$1" <<'PYEOF'
+import hashlib
+import sys
+
+print(f"a-{hashlib.sha256(sys.argv[1].encode('utf-8')).hexdigest()[:32]}")
+PYEOF
+}
+
+alert_id_for_reset() {
+  make_alert_id "reset|$1|$2"
+}
+
+alert_id_for_threshold() {
+  make_alert_id "threshold|$1|$2|$3"
+}
+
+alert_id_is_valid() {
+  [[ "$1" =~ ^a-[a-f0-9]{32}$ ]]
+}
+
+reset_alert_delivery_state() {
+  ALERT_IDS=()
+  ALERT_STATUS=()
+  ALERT_EVENT=()
+  ALERT_CHANNEL_STATUS=()
+  ALERT_CHANNEL_RETRYABLE=()
+  ALERT_DELIVERY_STATE_READY=1
+}
+
+alert_record_exists() {
+  [[ -n "${ALERT_STATUS[$1]+present}" ]]
+}
+
+ensure_alert_record() {
+  local alert_id="$1" event="${2:-notification}" channel status
+  local existing_status
+  alert_id_is_valid "$alert_id" || return 1
+
+  if ! alert_record_exists "$alert_id"; then
+    ALERT_IDS+=("$alert_id")
+    ALERT_STATUS["$alert_id"]="pending"
+    ALERT_EVENT["$alert_id"]="$event"
+  elif [[ -z "${ALERT_EVENT[$alert_id]:-}" ]]; then
+    ALERT_EVENT["$alert_id"]="$event"
+  fi
+
+  existing_status="${ALERT_STATUS[$alert_id]:-pending}"
+  for channel in discord telegram; do
+    alert_channel_configured "$channel" || continue
+    local channel_key
+    channel_key="$(alert_channel_key "$alert_id" "$channel")"
+    if [[ -z "${ALERT_CHANNEL_STATUS[$channel_key]+present}" ]]; then
+      case "$existing_status" in
+        delivered) status=delivered ;;
+        failed) status=failed ;;
+        *) status=pending ;;
+      esac
+      ALERT_CHANNEL_STATUS["$channel_key"]="$status"
+      if [[ "$status" == failed ]]; then
+        ALERT_CHANNEL_RETRYABLE["$channel_key"]="${ALERT_CHANNEL_RETRYABLE[$channel_key]:-1}"
+      else
+        ALERT_CHANNEL_RETRYABLE["$channel_key"]="0"
+      fi
+    fi
+  done
+}
+
+recompute_alert_status() {
+  local alert_id="$1" channel channel_key channel_status configured=0 all_delivered=1
+  local has_pending=0 has_retryable_failure=0 has_permanent_failure=0
+  for channel in discord telegram; do
+    alert_channel_configured "$channel" || continue
+    configured=1
+    channel_key="$(alert_channel_key "$alert_id" "$channel")"
+    channel_status="${ALERT_CHANNEL_STATUS[$channel_key]:-pending}"
+    case "$channel_status" in
+      delivered) ;;
+      pending)
+        all_delivered=0
+        has_pending=1
+        ;;
+      failed)
+        all_delivered=0
+        if [[ "${ALERT_CHANNEL_RETRYABLE[$channel_key]:-1}" == 1 ]]; then
+          has_retryable_failure=1
+        else
+          has_permanent_failure=1
+        fi
+        ;;
+      *)
+        all_delivered=0
+        has_pending=1
+        ;;
+    esac
+  done
+
+  if (( configured == 0 || all_delivered == 1 )); then
+    ALERT_STATUS["$alert_id"]="delivered"
+    ALERT_DELIVERY_COMPLETE=1
+  elif (( has_pending == 1 || has_retryable_failure == 1 )); then
+    ALERT_STATUS["$alert_id"]="pending"
+    ALERT_DELIVERY_COMPLETE=0
+  else
+    ALERT_STATUS["$alert_id"]="failed"
+    ALERT_DELIVERY_COMPLETE=0
+  fi
+  ALERT_DELIVERY_RETRYABLE_FAILURE="$has_retryable_failure"
+  ALERT_DELIVERY_PERMANENT_FAILURE="$has_permanent_failure"
+}
+
+load_alert_delivery_state() {
+  local state_key state_value alert_id field channel_key
+  reset_alert_delivery_state
+  [[ -f "$STATE_FILE" ]] || return 0
+
+  while IFS='=' read -r state_key state_value; do
+    case "$state_key" in
+      alert_ids)
+        local old_ifs="$IFS"
+        IFS=',' read -r -a legacy_alert_ids <<< "$state_value"
+        IFS="$old_ifs"
+        for alert_id in "${legacy_alert_ids[@]}"; do
+          alert_id_is_valid "$alert_id" || continue
+          if ! alert_record_exists "$alert_id"; then
+            ALERT_IDS+=("$alert_id")
+            ALERT_STATUS["$alert_id"]="pending"
+          fi
+        done
+        ;;
+      alert_*)
+        if [[ "$state_key" =~ ^alert_([a-f0-9-]+)_(discord|telegram|status|event|discord_retryable|telegram_retryable)$ ]]; then
+          alert_id="${BASH_REMATCH[1]}"
+          field="${BASH_REMATCH[2]}"
+          alert_id_is_valid "$alert_id" || continue
+          if ! alert_record_exists "$alert_id"; then
+            ALERT_IDS+=("$alert_id")
+            ALERT_STATUS["$alert_id"]="pending"
+          fi
+          case "$field" in
+            status)
+              [[ "$state_value" == pending || "$state_value" == delivered || "$state_value" == failed ]] \
+                && ALERT_STATUS["$alert_id"]="$state_value"
+              ;;
+            event)
+              [[ "$state_value" =~ ^[A-Za-z0-9:._-]+$ ]] && ALERT_EVENT["$alert_id"]="$state_value"
+              ;;
+            discord|telegram)
+              [[ "$state_value" == pending || "$state_value" == delivered || "$state_value" == failed ]] \
+                && ALERT_CHANNEL_STATUS["$(alert_channel_key "$alert_id" "$field")"]="$state_value"
+              ;;
+            discord_retryable|telegram_retryable)
+              channel="${field%%_*}"
+              [[ "$state_value" == 0 || "$state_value" == 1 ]] \
+                && ALERT_CHANNEL_RETRYABLE["$(alert_channel_key "$alert_id" "$channel")"]="$state_value"
+              ;;
+          esac
+        fi
+        ;;
+    esac
+  done < "$STATE_FILE"
+}
+
+mark_alert_delivered() {
+  local alert_id="$1" event="${2:-notification}" channel channel_key
+  ensure_alert_record "$alert_id" "$event" || return 1
+  for channel in discord telegram; do
+    alert_channel_configured "$channel" || continue
+    channel_key="$(alert_channel_key "$alert_id" "$channel")"
+    ALERT_CHANNEL_STATUS["$channel_key"]="delivered"
+    ALERT_CHANNEL_RETRYABLE["$channel_key"]="0"
+  done
+  ALERT_STATUS["$alert_id"]="delivered"
+}
+
 send_alert() {
-  local message="$1"
-  local configured=0 delivered=0
+  local message="$1" alert_id="${2:-}" event="${3:-notification}"
+  local channel channel_key channel_status result
+  local persist_failed=0
+
+  ALERT_DELIVERY_RETRYABLE_FAILURE=0
+  ALERT_DELIVERY_PERMANENT_FAILURE=0
+  ALERT_DELIVERY_COMPLETE=0
+  [[ "$ALERT_DELIVERY_STATE_READY" == 1 ]] || load_alert_delivery_state
+  [[ -n "$alert_id" ]] || alert_id="$(make_alert_id "message|$message")"
+  if ! alert_id_is_valid "$alert_id"; then
+    echo "[ERROR] Alert delivery could not create a valid alert identifier." >&2
+    ALERT_DELIVERY_RETRYABLE_FAILURE=1
+    return 1
+  fi
+
   echo "[ALERT] Detected: $message"
-  if [[ -n "${DISCORD_WEBHOOK:-}" ]]; then
-    ((configured += 1))
-    if send_discord "$message"; then
-      ((delivered += 1))
-    fi
-  fi
-  if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
-    ((configured += 1))
-    if send_telegram "$message"; then
-      ((delivered += 1))
-    fi
-  fi
-  if (( configured == 0 )); then
+  ensure_alert_record "$alert_id" "$event" || {
+    echo "[ERROR] Alert delivery state could not be initialized." >&2
+    ALERT_DELIVERY_RETRYABLE_FAILURE=1
+    return 1
+  }
+
+  if ! alert_channel_configured discord && ! alert_channel_configured telegram; then
     echo "[INFO] No alert channel configured; alert acknowledged locally."
+    ALERT_STATUS["$alert_id"]="delivered"
+    persist_alert_state || return 1
+    ALERT_DELIVERY_COMPLETE=1
     return 0
   fi
-  (( delivered > 0 ))
+
+  for channel in discord telegram; do
+    alert_channel_configured "$channel" || continue
+    channel_key="$(alert_channel_key "$alert_id" "$channel")"
+    channel_status="${ALERT_CHANNEL_STATUS[$channel_key]:-pending}"
+    if [[ "$channel_status" == delivered ]]; then
+      continue
+    fi
+    if [[ "$channel_status" == failed && "${ALERT_CHANNEL_RETRYABLE[$channel_key]:-1}" != 1 ]]; then
+      continue
+    fi
+
+    ALERT_CHANNEL_STATUS["$channel_key"]="pending"
+    ALERT_CHANNEL_RETRYABLE["$channel_key"]="0"
+    if ! persist_alert_state; then
+      echo "[ERROR] Alert delivery state could not be journaled." >&2
+      ALERT_DELIVERY_RETRYABLE_FAILURE=1
+      persist_failed=1
+      break
+    fi
+
+    ALERT_CHANNEL_FAILURE_RETRYABLE=1
+    if [[ "$channel" == discord ]]; then
+      if send_discord "$message"; then result=0; else result=$?; fi
+    else
+      if send_telegram "$message"; then result=0; else result=$?; fi
+    fi
+    if (( result == 0 )); then
+      ALERT_CHANNEL_STATUS["$channel_key"]="delivered"
+      ALERT_CHANNEL_RETRYABLE["$channel_key"]="0"
+    else
+      ALERT_CHANNEL_STATUS["$channel_key"]="failed"
+      ALERT_CHANNEL_RETRYABLE["$channel_key"]="${ALERT_CHANNEL_FAILURE_RETRYABLE:-1}"
+    fi
+    if ! persist_alert_state; then
+      echo "[ERROR] Alert delivery state could not be journaled." >&2
+      persist_failed=1
+      break
+    fi
+  done
+
+  (( persist_failed == 0 )) || {
+    ALERT_DELIVERY_RETRYABLE_FAILURE=1
+    return 1
+  }
+  recompute_alert_status "$alert_id"
+  persist_alert_state || {
+    ALERT_DELIVERY_RETRYABLE_FAILURE=1
+    return 1
+  }
+  if (( ALERT_DELIVERY_COMPLETE == 1 )); then
+    return 0
+  fi
+  if (( ALERT_DELIVERY_RETRYABLE_FAILURE == 1 )); then
+    return 1
+  fi
+  if (( ALERT_DELIVERY_PERMANENT_FAILURE == 1 )); then
+    return 2
+  fi
+  return 2
 }
 
 weekly_pace_vs_ideal() {
@@ -1003,32 +962,56 @@ csv_contains() {
 }
 
 persist_alert_state() {
-  local state_tmp
+  local state_tmp alert_id channel channel_key
   state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || return 1
   if ! printf '%s\n' \
-    'state_version=3' \
-    "prev_5h_pct=${prev_5h_pct}" \
-    "prev_weekly_pct=${prev_weekly_pct}" \
-    "five_h_armed_reset_at=${five_h_armed_reset_at}" \
-    "weekly_armed_reset_at=${weekly_armed_reset_at}" \
-    "last_notified_5h_reset_at=${last_notified_5h_reset_at}" \
-    "last_notified_weekly_reset_at=${last_notified_weekly_reset_at}" \
-    "notified_5h_thresholds=${notified_5h_thresholds}" \
-    "notified_weekly_thresholds=${notified_weekly_thresholds}" \
-    "pending_5h_threshold=${pending_5h_threshold}" \
-    "pending_weekly_threshold=${pending_weekly_threshold}" \
-    "script_tracking_initialized=${script_tracking_initialized}" \
-    "script_prev_5h_pct=${script_prev_5h_pct}" \
-    "script_prev_weekly_pct=${script_prev_weekly_pct}" \
-    "attempted_script_5h_actions=${attempted_script_5h_actions}" \
-    "attempted_script_weekly_actions=${attempted_script_weekly_actions}" \
-    "script_5h_reset_attempted_at=${script_5h_reset_attempted_at}" \
-    "script_weekly_reset_attempted_at=${script_weekly_reset_attempted_at}" \
-    "attempted_script_5h_reset_actions=${attempted_script_5h_reset_actions}" \
-    "attempted_script_weekly_reset_actions=${attempted_script_weekly_reset_actions}" > "$state_tmp"; then
+    'state_version=4' \
+    "prev_5h_pct=${prev_5h_pct:-100}" \
+    "prev_weekly_pct=${prev_weekly_pct:-100}" \
+    "five_h_armed_reset_at=${five_h_armed_reset_at:-0}" \
+    "weekly_armed_reset_at=${weekly_armed_reset_at:-0}" \
+    "last_notified_5h_reset_at=${last_notified_5h_reset_at:-0}" \
+    "last_notified_weekly_reset_at=${last_notified_weekly_reset_at:-0}" \
+    "notified_5h_thresholds=${notified_5h_thresholds:-}" \
+    "notified_weekly_thresholds=${notified_weekly_thresholds:-}" \
+    "pending_5h_threshold=${pending_5h_threshold:-}" \
+    "pending_weekly_threshold=${pending_weekly_threshold:-}" \
+    "pending_5h_alert_id=${pending_5h_alert_id:-}" \
+    "pending_weekly_alert_id=${pending_weekly_alert_id:-}" \
+    "script_tracking_initialized=${script_tracking_initialized:-0}" \
+    "script_prev_5h_pct=${script_prev_5h_pct:-100}" \
+    "script_prev_weekly_pct=${script_prev_weekly_pct:-100}" \
+    "attempted_script_5h_actions=${attempted_script_5h_actions:-}" \
+    "attempted_script_weekly_actions=${attempted_script_weekly_actions:-}" \
+    "script_5h_reset_attempted_at=${script_5h_reset_attempted_at:-0}" \
+    "script_weekly_reset_attempted_at=${script_weekly_reset_attempted_at:-0}" \
+    "attempted_script_5h_reset_actions=${attempted_script_5h_reset_actions:-}" \
+    "attempted_script_weekly_reset_actions=${attempted_script_weekly_reset_actions:-}" \
+    "alert_ids=$(IFS=,; printf '%s' "${ALERT_IDS[*]:-}")" > "$state_tmp"; then
     rm -f "$state_tmp"
     return 1
   fi
+
+  for alert_id in "${ALERT_IDS[@]}"; do
+    alert_id_is_valid "$alert_id" || continue
+    printf '%s\n' \
+      "alert_${alert_id}_event=${ALERT_EVENT[$alert_id]:-notification}" \
+      "alert_${alert_id}_status=${ALERT_STATUS[$alert_id]:-pending}" >> "$state_tmp" || {
+        rm -f "$state_tmp"
+        return 1
+      }
+    for channel in discord telegram; do
+      channel_key="$(alert_channel_key "$alert_id" "$channel")"
+      [[ -n "${ALERT_CHANNEL_STATUS[$channel_key]+present}" ]] || continue
+      printf '%s\n' \
+        "alert_${alert_id}_${channel}=${ALERT_CHANNEL_STATUS[$channel_key]}" \
+        "alert_${alert_id}_${channel}_retryable=${ALERT_CHANNEL_RETRYABLE[$channel_key]:-0}" >> "$state_tmp" || {
+          rm -f "$state_tmp"
+          return 1
+        }
+    done
+  done
+
   if ! mv -f "$state_tmp" "$STATE_FILE"; then
     rm -f "$state_tmp"
     return 1
@@ -1104,6 +1087,8 @@ check_thresholds() {
   local notified_weekly_thresholds=""
   local pending_5h_threshold=""
   local pending_weekly_threshold=""
+  local pending_5h_alert_id=""
+  local pending_weekly_alert_id=""
   local script_tracking_initialized=0
   local script_prev_5h_pct=100
   local script_prev_weekly_pct=100
@@ -1114,12 +1099,17 @@ check_thresholds() {
   local attempted_script_5h_reset_actions=""
   local attempted_script_weekly_reset_actions=""
   local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold
+  local state_version_seen=1 alert_result cycle_marker alert_id
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 initialize_script_baseline=0
   local -a script_thresholds=()
   ALERT_PROCESSING_ERROR=""
+  load_alert_delivery_state
   if [[ -f "$STATE_FILE" ]]; then
     while IFS='=' read -r state_key state_value; do
       case "$state_key" in
+        state_version)
+          [[ "$state_value" =~ ^[1-9][0-9]*$ ]] && state_version_seen="$state_value"
+          ;;
         prev_5h_pct|prev_weekly_pct|script_prev_5h_pct|script_prev_weekly_pct)
           if [[ "$state_value" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
@@ -1136,6 +1126,10 @@ check_thresholds() {
         pending_5h_threshold|pending_weekly_threshold)
           [[ -z "$state_value" || "$state_value" =~ ^[0-9]+$ ]] && printf -v "$state_key" '%s' "$state_value"
           ;;
+        pending_5h_alert_id|pending_weekly_alert_id)
+          [[ -z "$state_value" || "$state_value" =~ ^a-[a-f0-9]{32}$ ]] \
+            && printf -v "$state_key" '%s' "$state_value"
+          ;;
         script_tracking_initialized)
           [[ "$state_value" == 0 || "$state_value" == 1 ]] && script_tracking_initialized="$state_value"
           ;;
@@ -1147,6 +1141,47 @@ check_thresholds() {
           ;;
       esac
     done < "$STATE_FILE"
+  fi
+
+  # v1-v3 only had aggregate notification markers. A recorded reset or
+  # threshold was already acknowledged by the old monitor, so carry it into
+  # the v4 journal as delivered instead of sending it again.
+  if (( state_version_seen < 4 )); then
+    if (( last_notified_5h_reset_at > 0 )); then
+      alert_id="$(alert_id_for_reset 5h "$last_notified_5h_reset_at")"
+      mark_alert_delivered "$alert_id" "reset:5h"
+    fi
+    if (( last_notified_weekly_reset_at > 0 )); then
+      alert_id="$(alert_id_for_reset weekly "$last_notified_weekly_reset_at")"
+      mark_alert_delivered "$alert_id" "reset:weekly"
+    fi
+    cycle_marker="$five_h_armed_reset_at"
+    [[ "$cycle_marker" =~ ^[1-9][0-9]*$ ]] || cycle_marker=legacy-5h
+    IFS=',' read -r -a legacy_thresholds <<< "$notified_5h_thresholds"
+    for t in "${legacy_thresholds[@]}"; do
+      [[ "$t" =~ ^[0-9]+$ ]] || continue
+      alert_id="$(alert_id_for_threshold 5h "$t" "$cycle_marker")"
+      mark_alert_delivered "$alert_id" "threshold:5h:${t}"
+    done
+    cycle_marker="$weekly_armed_reset_at"
+    [[ "$cycle_marker" =~ ^[1-9][0-9]*$ ]] || cycle_marker=legacy-weekly
+    IFS=',' read -r -a legacy_thresholds <<< "$notified_weekly_thresholds"
+    for t in "${legacy_thresholds[@]}"; do
+      [[ "$t" =~ ^[0-9]+$ ]] || continue
+      alert_id="$(alert_id_for_threshold weekly "$t" "$cycle_marker")"
+      mark_alert_delivered "$alert_id" "threshold:weekly:${t}"
+    done
+  fi
+
+  if [[ -n "$pending_5h_threshold" && -z "$pending_5h_alert_id" ]]; then
+    cycle_marker="$five_h_armed_reset_at"
+    [[ "$cycle_marker" =~ ^[1-9][0-9]*$ ]] || cycle_marker="legacy-5h-${scraped_at_epoch}"
+    pending_5h_alert_id="$(alert_id_for_threshold 5h "$pending_5h_threshold" "$cycle_marker")"
+  fi
+  if [[ -n "$pending_weekly_threshold" && -z "$pending_weekly_alert_id" ]]; then
+    cycle_marker="$weekly_armed_reset_at"
+    [[ "$cycle_marker" =~ ^[1-9][0-9]*$ ]] || cycle_marker="legacy-weekly-${scraped_at_epoch}"
+    pending_weekly_alert_id="$(alert_id_for_threshold weekly "$pending_weekly_threshold" "$cycle_marker")"
   fi
 
   mapfile -t thresholds < <(load_thresholds)
@@ -1170,8 +1205,17 @@ check_thresholds() {
     due_5h_reset_at="$five_h_armed_reset_at"
     reset_age=$(( scraped_at_epoch - five_h_armed_reset_at ))
     if (( reset_age <= 5 * 60 * 60 && last_notified_5h_reset_at != five_h_armed_reset_at )); then
-      if send_alert "*Codex 5h limit reset.* A new usage cycle is available."; then
+      alert_id="$(alert_id_for_reset 5h "$five_h_armed_reset_at")"
+      alert_result=0
+      send_alert "*Codex 5h limit reset.* A new usage cycle is available." "$alert_id" reset:5h || alert_result=$?
+      if (( alert_result == 0 )); then
         last_notified_5h_reset_at="$five_h_armed_reset_at"
+      elif (( alert_result == 2 )); then
+        # A permanent 4xx is journaled as failed and must not be retried on
+        # every collection cycle.
+        last_notified_5h_reset_at="$five_h_armed_reset_at"
+        status=1
+        ALERT_PROCESSING_ERROR="alert delivery failed"
       else
         status=1
         ALERT_PROCESSING_ERROR="alert delivery pending"
@@ -1181,6 +1225,7 @@ check_thresholds() {
       five_h_armed_reset_at=0
       notified_5h_thresholds=""
       pending_5h_threshold=""
+      pending_5h_alert_id=""
       prev_5h_pct=100
     fi
     if (( script_5h_reset_attempted_at != due_5h_reset_at )); then
@@ -1195,8 +1240,15 @@ check_thresholds() {
     due_weekly_reset_at="$weekly_armed_reset_at"
     reset_age=$(( scraped_at_epoch - weekly_armed_reset_at ))
     if (( reset_age <= 7 * 24 * 60 * 60 && last_notified_weekly_reset_at != weekly_armed_reset_at )); then
-      if send_alert "*Codex weekly limit reset.* A new usage cycle is available."; then
+      alert_id="$(alert_id_for_reset weekly "$weekly_armed_reset_at")"
+      alert_result=0
+      send_alert "*Codex weekly limit reset.* A new usage cycle is available." "$alert_id" reset:weekly || alert_result=$?
+      if (( alert_result == 0 )); then
         last_notified_weekly_reset_at="$weekly_armed_reset_at"
+      elif (( alert_result == 2 )); then
+        last_notified_weekly_reset_at="$weekly_armed_reset_at"
+        status=1
+        ALERT_PROCESSING_ERROR="alert delivery failed"
       else
         status=1
         ALERT_PROCESSING_ERROR="alert delivery pending"
@@ -1206,6 +1258,7 @@ check_thresholds() {
       weekly_armed_reset_at=0
       notified_weekly_thresholds=""
       pending_weekly_threshold=""
+      pending_weekly_alert_id=""
       prev_weekly_pct=100
     fi
     if (( script_weekly_reset_attempted_at != due_weekly_reset_at )); then
@@ -1249,7 +1302,16 @@ PYEOF
     done
     if [[ -n "$critical" ]]; then
       pending_5h_threshold="$critical"
-      if send_alert "*Codex 5h limit at ${five_h_pct}% remaining* (crossed ${critical}% threshold). Resets at ${five_h_reset}${pace_suffix}"; then
+      if [[ -z "$pending_5h_alert_id" ]]; then
+        cycle_marker="$five_h_armed_reset_at"
+        [[ "$cycle_marker" =~ ^[1-9][0-9]*$ ]] || cycle_marker="$five_h_reset_at"
+        [[ "$cycle_marker" =~ ^[1-9][0-9]*$ ]] || cycle_marker="sample-${scraped_at_epoch}"
+        pending_5h_alert_id="$(alert_id_for_threshold 5h "$critical" "$cycle_marker")"
+      fi
+      alert_result=0
+      send_alert "*Codex 5h limit at ${five_h_pct}% remaining* (crossed ${critical}% threshold). Resets at ${five_h_reset}${pace_suffix}" \
+        "$pending_5h_alert_id" "threshold:5h:${critical}" || alert_result=$?
+      if (( alert_result == 0 || alert_result == 2 )); then
         local notified="${notified_5h_thresholds}"
         for t in "${thresholds[@]}"; do
           if python3 - "$prev_5h_pct" "$critical" "$t" <<'PYEOF'
@@ -1262,7 +1324,12 @@ PYEOF
         done
         notified_5h_thresholds="$notified"
         pending_5h_threshold=""
+        pending_5h_alert_id=""
         prev_5h_pct="$five_h_pct"
+        if (( alert_result == 2 )); then
+          status=1
+          ALERT_PROCESSING_ERROR="alert delivery failed"
+        fi
       else
         status=1
         ALERT_PROCESSING_ERROR="alert delivery pending"
@@ -1287,7 +1354,16 @@ PYEOF
     done
     if [[ -n "$critical" ]]; then
       pending_weekly_threshold="$critical"
-      if send_alert "*Codex weekly limit at ${weekly_pct}% remaining* (crossed ${critical}% threshold). Resets ${weekly_reset}${pace_suffix}"; then
+      if [[ -z "$pending_weekly_alert_id" ]]; then
+        cycle_marker="$weekly_armed_reset_at"
+        [[ "$cycle_marker" =~ ^[1-9][0-9]*$ ]] || cycle_marker="$weekly_reset_at"
+        [[ "$cycle_marker" =~ ^[1-9][0-9]*$ ]] || cycle_marker="sample-${scraped_at_epoch}"
+        pending_weekly_alert_id="$(alert_id_for_threshold weekly "$critical" "$cycle_marker")"
+      fi
+      alert_result=0
+      send_alert "*Codex weekly limit at ${weekly_pct}% remaining* (crossed ${critical}% threshold). Resets ${weekly_reset}${pace_suffix}" \
+        "$pending_weekly_alert_id" "threshold:weekly:${critical}" || alert_result=$?
+      if (( alert_result == 0 || alert_result == 2 )); then
         local notified="${notified_weekly_thresholds}"
         for t in "${thresholds[@]}"; do
           if python3 - "$prev_weekly_pct" "$critical" "$t" <<'PYEOF'
@@ -1300,7 +1376,12 @@ PYEOF
         done
         notified_weekly_thresholds="$notified"
         pending_weekly_threshold=""
+        pending_weekly_alert_id=""
         prev_weekly_pct="$weekly_pct"
+        if (( alert_result == 2 )); then
+          status=1
+          ALERT_PROCESSING_ERROR="alert delivery failed"
+        fi
       else
         status=1
         ALERT_PROCESSING_ERROR="alert delivery pending"
@@ -1573,10 +1654,29 @@ seconds_until_next_interval() {
   printf '%s\n' "$((interval - now_epoch % interval))"
 }
 
+monitor_usage() {
+  cat <<'EOF'
+Usage: ./monitor.sh [OPTION]
+
+Collect Codex limits, update local JSON/SQLite history and deliver alerts.
+
+Options:
+  --once                 Run one collection cycle (default).
+  --loop [SECONDS]       Run immediately, then at aligned intervals. With no
+                         value, use LOOP_INTERVAL from the configuration.
+  --check                Validate configuration, dependencies, Codex and token
+                         analytics without changing analytics data.
+  --status-json          Print one validated Codex status JSON snapshot.
+  --fail-fast            In loop mode, exit after the first failed cycle.
+  -h, --help             Show this help without requiring Codex authentication.
+
+Configuration is resolved as CLI option, environment, local/.env, then default.
+The .env file is parsed as data and is never executed.
+EOF
+}
+
 main() {
-  local interval mode=once fail_fast=0 now_epoch delay next_epoch next_check
-  initialize || return 1
-  interval="$LOOP_INTERVAL"
+  local interval="" mode=once fail_fast=0 cli_interval=0 now_epoch delay next_epoch next_check
 
   while (( $# > 0 )); do
     case "$1" in
@@ -1584,6 +1684,7 @@ main() {
         mode=loop
         if [[ -n "${2:-}" && "${2:-}" != --* ]]; then
           interval="$2"
+          cli_interval=1
           shift
         fi
         ;;
@@ -1591,11 +1692,17 @@ main() {
       --check) mode=check ;;
       --fail-fast) fail_fast=1 ;;
       --once) mode=once ;;
+      -h|--help)
+        monitor_usage
+        return 0
+        ;;
       *) config_error "Unknown argument: $1"; return 1 ;;
     esac
     shift
   done
 
+  initialize || return 1
+  (( cli_interval == 1 )) || interval="$LOOP_INTERVAL"
   validate_interval "$interval" || return 1
   if [[ "$mode" == status_json ]]; then
     fetch_status_json "$interval"

@@ -68,9 +68,12 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
 codex-usage-monitor/
 |-- local/
 |   |-- monitor.sh        # Codex usage collector, alerts, optional Gist sync
+|   |-- config.py         # Safe shared .env parsing and typed validation
+|   |-- history.py        # Temporal history validation, retention and recovery
 |   |-- dashboard.html    # Local dashboard UI
 |   |-- analytics.html    # Local long-term limits/token analytics UI
 |   |-- analytics.py      # Read-only aggregation used by /api/analytics
+|   |-- codex_status.py   # Codex app-server status protocol
 |   |-- token_usage.py    # Codex/OpenCode/Hermes token collectors
 |   |-- storage.py        # Shared SQLite schema and integrity checks
 |   |-- pricing.json      # Versioned API-equivalent pricing catalog
@@ -88,6 +91,12 @@ codex-usage-monitor/
 |       |-- discord.png
 |       |-- logo.png
 |-- .gitignore
+|-- .github/workflows/ci.yml # Pinned CI, coverage, audit and browser checks
+|-- tests/                   # Shell, Python, Node and browser regression tests
+|-- systemd/                 # Versioned monitor/dashboard service templates
+|-- scripts/release.sh       # Archive and SHA-256 checksum builder
+|-- VERSION                  # Current SemVer release
+|-- CHANGELOG.md
 |-- LICENSE
 `-- README.md
 ```
@@ -145,8 +154,8 @@ codex                     # first run — sign in when prompted
 codex /status             # verify — should show usage percentages
 
 # 1. Clone
-git clone https://github.com/<your-account>/codex-usage-monitor.git
-cd codex-usage-monitor/local
+git clone https://github.com/AlexandreDor/ai-usage-monitor.git
+cd ai-usage-monitor/local
 
 # 2. Configure
 cp .env.example .env
@@ -159,8 +168,13 @@ chmod +x monitor.sh serve.sh
 
 # 4. Run once to verify
 ./monitor.sh --check
-./monitor.sh
+./monitor.sh --once
 # Output: parsed JSON printed to terminal, runtime/data.json written
+
+# Other useful modes
+./monitor.sh --help
+./monitor.sh --status-json
+./monitor.sh --loop 900
 
 # 5. Open the dashboard
 ./serve.sh
@@ -303,8 +317,8 @@ pct exec 200 -- bash
 
 # Inside the container:
 apt update && apt install -y bash curl python3 git grep
-git clone https://github.com/<your-account>/codex-usage-monitor.git
-cd codex-usage-monitor/local
+git clone https://github.com/AlexandreDor/ai-usage-monitor.git
+cd ai-usage-monitor/local
 cp .env.example .env && nano .env
 chmod +x monitor.sh serve.sh
 
@@ -320,54 +334,25 @@ chmod +x monitor.sh serve.sh
 Best for: servers, headless Linux boxes, Raspberry Pi — auto-starts on boot and restarts on failure.
 
 ```bash
-# Create service file (adjust paths)
-sudo tee /etc/systemd/system/codex-monitor.service << 'EOF'
-[Unit]
-Description=Codex Usage Monitor
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=youruser
-WorkingDirectory=/home/youruser/codex-usage-monitor/local
-EnvironmentFile=/home/youruser/codex-usage-monitor/local/.env
-ExecStart=/bin/bash /home/youruser/codex-usage-monitor/local/monitor.sh --loop 900
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Enable and start
+# The versioned templates use %h/ai-usage-monitor. Keep this clone path,
+# or adjust the two unit files before installing them.
+cd "$HOME/ai-usage-monitor"
+sudo install -m 644 systemd/codex-usage-monitor@.service /etc/systemd/system/
+sudo install -m 644 systemd/codex-usage-dashboard@.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now codex-monitor
+sudo systemctl enable --now "codex-usage-monitor@${USER}.service"
+
+# Optional local dashboard service
+sudo systemctl enable --now "codex-usage-dashboard@${USER}.service"
 
 # Check status and logs
-sudo systemctl status codex-monitor
-journalctl -u codex-monitor -f
+sudo systemctl status "codex-usage-monitor@${USER}.service"
+journalctl -u "codex-usage-monitor@${USER}.service" -f
 ```
 
-**Add a second service for the dashboard:**
-```bash
-sudo tee /etc/systemd/system/codex-dashboard.service << 'EOF'
-[Unit]
-Description=Codex Usage Dashboard
-After=network.target
-
-[Service]
-Type=simple
-User=youruser
-ExecStart=/bin/bash /home/youruser/codex-usage-monitor/local/serve.sh
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl enable --now codex-dashboard
-```
+The monitor unit reads `local/.env` through `config.py`; it does not use
+systemd's `EnvironmentFile` parser. The templates allow the Codex directory to
+be read and restrict writes to the local runtime and alert state.
 
 ---
 
@@ -383,6 +368,92 @@ crontab -e
 ```
 
 ---
+
+## Releases and maintenance
+
+The release version is stored in `VERSION` and follows Semantic Versioning.
+`CHANGELOG.md` records user-visible changes. Maintainers can validate the
+metadata and systemd templates, then create a deterministic source archive and
+matching checksum:
+
+```bash
+cd "$HOME/ai-usage-monitor"
+./scripts/release.sh --check
+./scripts/release.sh --output-dir /tmp/ai-usage-releases
+(cd /tmp/ai-usage-releases && sha256sum -c ai-usage-monitor-$(tr -d '[:space:]' < "$HOME/ai-usage-monitor/VERSION").tar.gz.sha256)
+```
+
+Publish the resulting archive and checksum with the corresponding annotated
+tag. The archive excludes `.env`, runtime state, test caches and dependencies;
+never publish those files separately.
+
+### Install or update
+
+```bash
+cd "$HOME"
+git clone https://github.com/AlexandreDor/ai-usage-monitor.git
+cd ai-usage-monitor/local
+cp .env.example .env
+chmod 600 .env
+# Edit .env, then validate without collecting:
+./monitor.sh --check
+```
+
+For an existing installation, stop the services, save local state, fast-forward
+the checkout, and start the same units again. `.env` and `local/runtime/` are
+ignored by Git and therefore survive a normal update:
+
+```bash
+cd "$HOME/ai-usage-monitor"
+sudo systemctl stop "codex-usage-monitor@${USER}.service" "codex-usage-dashboard@${USER}.service" || true
+BACKUP_DIR="$HOME/codex-usage-monitor-backups/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$BACKUP_DIR"
+[[ ! -e local/.env ]] || cp -a local/.env "$BACKUP_DIR/"
+[[ ! -e local/runtime ]] || cp -a local/runtime "$BACKUP_DIR/"
+git pull --ff-only
+sudo systemctl daemon-reload
+sudo systemctl start "codex-usage-monitor@${USER}.service" "codex-usage-dashboard@${USER}.service"
+```
+
+### Roll back, back up or restore
+
+Rollback changes code only; the configuration and runtime archive remain in
+place. Use a tag from the release you want, then reload systemd:
+
+```bash
+cd "$HOME/ai-usage-monitor"
+git fetch --tags
+git checkout v0.1.0
+sudo systemctl daemon-reload
+sudo systemctl restart "codex-usage-monitor@${USER}.service" "codex-usage-dashboard@${USER}.service"
+```
+
+The update commands above create a backup. To restore one, stop the services,
+copy the saved files back, restrict `.env` permissions, and start them again:
+
+```bash
+cd "$HOME/ai-usage-monitor"
+sudo systemctl stop "codex-usage-monitor@${USER}.service" "codex-usage-dashboard@${USER}.service" || true
+BACKUP_DIR="$(find "$HOME/codex-usage-monitor-backups" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort | tail -n 1)"
+test -n "$BACKUP_DIR"
+cp -a "$BACKUP_DIR/.env" local/.env
+rm -rf local/runtime
+cp -a "$BACKUP_DIR/runtime" local/runtime
+chmod 600 local/.env
+sudo systemctl start "codex-usage-monitor@${USER}.service" "codex-usage-dashboard@${USER}.service"
+```
+
+Keep backups of `local/.env`, `local/runtime/history.json` and
+`local/runtime/usage-history.sqlite3` off the machine if disk loss matters.
+To uninstall after making any desired backup, stop and disable the units,
+remove the installed unit files, and then remove the checkout:
+
+```bash
+sudo systemctl disable --now "codex-usage-monitor@${USER}.service" "codex-usage-dashboard@${USER}.service" || true
+sudo rm -f /etc/systemd/system/codex-usage-monitor@.service /etc/systemd/system/codex-usage-dashboard@.service
+sudo systemctl daemon-reload
+rm -rf "$HOME/ai-usage-monitor"
+```
 
 ## Advanced Analytics
 
@@ -559,7 +630,8 @@ This tier lets you view the dashboard from any browser anywhere, using:
 **Step 1 — Create a Gist**
 
 1. Go to [gist.github.com](https://gist.github.com)
-2. Create a **secret** Gist with a file named `data.json` (contents can be `{}` for now)
+2. Create a **secret** Gist with a file named `data.json` (contents can be `{}` for now).
+   A secret Gist is unlisted, not private: anyone with its URL can read it.
 3. Copy the Gist ID from the URL: `gist.github.com/<username>/<GIST_ID>`
 
 **Step 2 — Create a Personal Access Token**
@@ -575,7 +647,7 @@ GITHUB_PAT=ghp_yourTokenHere
 GITHUB_GIST_ID=abc123def456...
 ```
 
-Run `./monitor.sh` once — you should see `[OK] Gist updated` in the output.
+Run `./monitor.sh` once — a successful sync reports `[OK] GitHub Gist: delivered (HTTP 200).`.
 
 **Step 4 — Set your Gist ID in `local/assets/dashboard.js`**
 
@@ -621,10 +693,12 @@ All variables go in `local/.env` (copy from `local/.env.example`).
 | `ALERT_SCRIPT_<N>` | No | — | Absolute executable path for script rule 1..99 |
 | `ALERT_SCRIPT_<N>_EVENTS` | With matching script | — | Comma-separated threshold/reset selectors |
 | `ALERT_SCRIPT_TIMEOUT_SECONDS` | No | `30` | Per-script timeout, from `1` to `1800` seconds |
-| `HISTORY_RETENTION_HOURS` | No | `192` | Entry-count retention target, from `0.25` to `8760` hours |
+| `HISTORY_RETENTION_HOURS` | No | `192` | Age-based rolling history window, from `0.25` to `8760` hours; 10,000 entries/16 MiB defensive caps apply |
 | `ARCHIVE_RETENTION_DAYS` | No | `365` | Long-term SQLite archive retention; `0` means unlimited, maximum `36500` days |
 | `TOKEN_USAGE_SOURCES` | No | `auto` | `auto`, `none`, or a comma-separated list of `codex`, `opencode`, `hermes` |
 | `TOKEN_PRICING_FILE` | No | `local/pricing.json` | Absolute path to the validated versioned pricing catalog |
+| `DASHBOARD_ANALYTICS_DATABASE` | No | `local/runtime/usage-history.sqlite3` | Optional absolute SQLite archive path for `serve.sh` |
+| `DASHBOARD_PRICING_FILE` | No | `TOKEN_PRICING_FILE` | Optional absolute pricing catalog override for `serve.sh` |
 | `CODEX_DATA_DIR` | No | `~/.codex` | Absolute Codex data directory containing local rollout sessions |
 | `OPENCODE_DB_PATH` | No | XDG OpenCode path | Absolute path to `opencode.db` |
 | `HERMES_DB_PATH` | No | `~/.hermes/state.db` | Absolute path to the Hermes state database |
@@ -697,7 +771,7 @@ PRs welcome. Some ideas:
 
 - Run `tests/run.sh` for the dependency-free suite and `npm ci && npm run test:browser` for Playwright/axe-core checks.
 - CI runs Bash syntax checks, ShellCheck, the complete shell/Node suite, and Chromium browser tests.
-- History retention remains entry-count based so existing long-term data behavior is preserved. Changing the collection interval changes the effective time span represented by `HISTORY_RETENTION_HOURS`.
+- Rolling `history.json` retention is timestamp-based, so changing the collection interval does not change the requested time window. `history.py` validates timestamps and percentages, deduplicates equivalent instants, writes atomically, and warns if the 10,000-entry or 16 MiB defensive cap shortens the window.
 - Long-term history is stored separately in `runtime/usage-history.sqlite3`: all limit points are kept for 24 hours, then the archive's retention compaction applies. Analytics uses 15-minute buckets through 48 hours, 30-minute buckets through 30 days, then hourly buckets. Token events and reconstructed resets use the same retention period without limit-series downsampling. The default retention is one year; `ARCHIVE_RETENTION_DAYS=0` keeps it indefinitely. SQLite is provided by Python's standard library; the raw archive is not served by `serve.sh` or synchronized to the Gist.
 - The SQLite archive is local state, not an off-machine backup. Back it up separately if the long-term history must survive disk loss.
 - Docker should only be used when the container can access an authenticated Codex CLI config. A common setup is mounting `~/.codex` into `/root/.codex`. If `codex /status` does not work on the host, it will not work inside Docker either — authenticate first.

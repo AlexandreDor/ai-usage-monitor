@@ -16,14 +16,19 @@ function element(id) {
       id,
       hidden: false,
       textContent: '',
+      innerHTML: '',
       title: '',
+      disabled: false,
       value: 0,
+      attributes: new Map(),
       classList: {
         add: (...names) => names.forEach(name => classes.add(name)),
         remove: (...names) => names.forEach(name => classes.delete(name)),
         toggle: (name, force) => force ? classes.add(name) : classes.delete(name),
         contains: name => classes.has(name),
       },
+      setAttribute: (name, value) => elements.get(id).attributes.set(name, String(value)),
+      removeAttribute: name => elements.get(id).attributes.delete(name),
       getContext: () => ({}),
     });
   }
@@ -75,6 +80,11 @@ function evaluate(expression) {
   }
   if (evaluate(`formatParisDateTime('invalid')`) !== '-') fail('invalid timestamp did not use fallback');
   if (evaluate('formatParisUnixTimestamp(0)') !== '-') fail('invalid reset timestamp did not use fallback');
+
+  const fresh = evaluate(`freshnessInfo({scraped_at:'2026-08-03T00:00:00Z', sample_interval_seconds:60}, Date.parse('2026-08-03T00:00:59Z'))`);
+  if (fresh.state !== 'fresh' || fresh.ageSeconds !== 59 || fresh.staleAfterSeconds !== 120) fail('freshness interval comparison is incorrect');
+  const stale = evaluate(`freshnessInfo({scraped_at:'2026-08-03T00:00:00Z', sample_interval_seconds:60}, Date.parse('2026-08-03T00:02:00Z'))`);
+  if (stale.state !== 'stale' || stale.ageSeconds !== 120) fail('stale state does not start at two sample intervals');
 
   const points = evaluate(`normalizeHistory([
     {scraped_at:'2026-08-01T00:00:00Z', weekly_pct:90, weekly_reset_at:1786147200},

@@ -30,10 +30,14 @@ test('works offline and exposes no critical accessibility violations', async ({ 
   await expect(page.locator('#last-updated')).toHaveText('Last scraped 03/08/2026 19:30');
   await expect(page.locator('#five-h-reset')).toHaveText('03/08/2026 19:35');
   await expect(page.locator('#weekly-reset')).toHaveText('03/01/2026 13:34');
+  await expect(page.getByRole('progressbar', { name: '5-Hour Limit' })).toHaveAttribute('aria-valuetext', '72%');
+  await expect(page.getByRole('progressbar', { name: 'Weekly Limit' })).toHaveAttribute('aria-valuetext', '36%');
+  await expect(page.locator('#weekly-pace-actual')).toHaveText('36.0%');
+  await expect(page.locator('#history-summary')).toContainText('Latest: 5-hour 72.0%');
   expect(externalRequests).toEqual([]);
 
   const results = await new AxeBuilder({ page }).analyze();
-  expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+  expect(results.violations.filter(violation => ['critical', 'serious'].includes(violation.impact))).toEqual([]);
 });
 
 test('keeps metrics visible when Chart.js is unavailable', async ({ page }) => {
@@ -43,6 +47,8 @@ test('keeps metrics visible when Chart.js is unavailable', async ({ page }) => {
 
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   await expect(page.locator('#history-error')).toContainText('Chart.js failed to load');
+  await expect(page.locator('#history-table-wrap')).toBeVisible();
+  await expect(page.locator('#history-table-body tr')).toHaveCount(1);
   await expect(page.locator('#error-banner')).toBeHidden();
 });
 
@@ -57,6 +63,102 @@ test('clears a previous chart when history becomes empty', async ({ page }) => {
   await page.evaluate(() => refresh());
   await expect(page.locator('#history-error')).toContainText('History is empty');
   await expect(page.locator('#history-label')).toHaveText('History unavailable');
+});
+
+test('announces fresh, stale, error and recovered states while preserving the source', async ({ page }) => {
+  const fresh = {
+    ...snapshot,
+    scraped_at: new Date().toISOString(),
+    sample_interval_seconds: 60,
+  };
+  let dataRequests = 0;
+  await page.route('**/data.json?*', route => {
+    dataRequests += 1;
+    if (dataRequests === 2) {
+      return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'collector unavailable' }) });
+    }
+    return route.fulfill({ json: { ...fresh, scraped_at: dataRequests > 2 ? new Date().toISOString() : fresh.scraped_at } });
+  });
+  await page.route('**/history.json?*', route => route.fulfill({ json: [fresh] }));
+  await page.goto('/dashboard.html');
+
+  await expect(page.locator('#mode-badge')).toHaveText('LOCAL');
+  await expect(page.locator('#freshness-status')).toHaveText('FRESH');
+  await expect(page.locator('#freshness-status')).toHaveAttribute('aria-live', 'polite');
+
+  await page.evaluate(() => renderData({
+    ...dashboardData,
+    scraped_at: new Date(Date.now() - 121_000).toISOString(),
+    sample_interval_seconds: 60,
+  }));
+  await expect(page.locator('#freshness-status')).toHaveText('STALE');
+  await expect(page.locator('#freshness-age')).toContainText('2 minutes');
+  await expect(page.locator('#freshness-announcement')).toContainText('STALE');
+  await expect(page.locator('#mode-badge')).toHaveText('LOCAL');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+
+  await page.evaluate(() => refresh());
+  await expect(page.locator('#freshness-status')).toHaveText('ERROR');
+  await expect(page.locator('#error-banner')).toContainText('HTTP 503');
+  await expect(page.locator('#mode-badge')).toHaveText('LOCAL');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+
+  await page.evaluate(() => refresh());
+  await expect(page.locator('#freshness-status')).toHaveText('FRESH');
+  await expect(page.locator('#error-banner')).toBeHidden();
+  await expect(page.locator('#freshness-announcement')).toContainText('FRESH');
+});
+
+test('moves from fresh to stale automatically after two sample intervals', async ({ page }) => {
+  const fresh = {
+    ...snapshot,
+    scraped_at: new Date().toISOString(),
+    sample_interval_seconds: 1,
+  };
+  await page.route('**/data.json?*', route => route.fulfill({ json: fresh }));
+  await page.route('**/history.json?*', route => route.fulfill({ json: [fresh] }));
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#freshness-status')).toHaveText('FRESH');
+
+  await page.evaluate(() => {
+    clearTimeout(refreshTimer);
+    renderData({ ...dashboardData, scraped_at: new Date().toISOString(), sample_interval_seconds: 1 });
+    clearTimeout(refreshTimer);
+  });
+  await page.waitForFunction(() => document.querySelector('#freshness-status')?.textContent === 'STALE');
+  await expect(page.locator('#mode-badge')).toHaveText('LOCAL');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+});
+
+test('provides a keyboard-accessible history table and visible pace values', async ({ page }) => {
+  const resetAt = Math.floor((Date.now() + 2 * 24 * 60 * 60 * 1000) / 1000);
+  const current = {
+    ...snapshot,
+    scraped_at: new Date().toISOString(),
+    weekly_reset_at: resetAt,
+    sample_interval_seconds: 900,
+  };
+  await page.route('**/data.json?*', route => route.fulfill({ json: current }));
+  await page.route('**/history.json?*', route => route.fulfill({
+    json: [current, { ...current, scraped_at: new Date(Date.now() - 900_000).toISOString(), weekly_pct: 34 }],
+  }));
+  await page.goto('/dashboard.html');
+
+  await expect(page.locator('#weekly-pace-actual')).toHaveText('36.0%');
+  await expect(page.locator('#weekly-pace-ideal')).toHaveText(/\d+\.\d+%/);
+  await expect(page.locator('#weekly-pace-delta')).not.toHaveAttribute('title', /.+/);
+
+  const tableToggle = page.locator('#history-table-toggle');
+  await tableToggle.focus();
+  await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe('history-table-toggle');
+  await page.keyboard.press('Enter');
+  await expect(tableToggle).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.locator('#history-table-wrap')).toBeVisible();
+  await expect(page.locator('#history-table-body tr')).toHaveCount(2);
+  await expect(page.locator('#history-table')).toContainText('72.0%');
+
+  const results = await new AxeBuilder({ page }).analyze();
+  expect(results.violations.filter(violation => ['critical', 'serious'].includes(violation.impact))).toEqual([]);
 });
 
 const analyticsPayload = {
@@ -266,6 +368,69 @@ test('renders detailed analytics, reset markers, application series and cost mod
 
   await page.locator('#resets-next').click();
   await expect(page.locator('#reset-page-label')).toContainText('51–55');
+});
+
+test('paginates the server-side application/provider/model breakdown and handles empty pages', async ({ page }) => {
+  const rows = Array.from({ length: 55 }, (_, index) => ({
+    source: index % 2 ? 'opencode' : 'codex',
+    provider: 'openai',
+    model: `model-${index + 1}`,
+    input_tokens: index + 1,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
+    output_tokens: 0,
+    reasoning_tokens: 0,
+    estimated_cost_usd: 0,
+    pricing_status: 'priced',
+  }));
+  const queries = [];
+  await page.route('**/api/analytics?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    queries.push(query);
+    const offset = Number(query.get('breakdown_offset') || 0);
+    const limit = Number(query.get('breakdown_limit') || 0);
+    return route.fulfill({ json: {
+      ...enhancedAnalyticsPayload,
+      tokens: {
+        ...enhancedAnalyticsPayload.tokens,
+        breakdown: offset === rows.length ? [] : rows.slice(offset, offset + limit),
+        breakdown_pagination: { offset, limit, total: rows.length },
+      },
+    } });
+  });
+  await page.goto('/analytics.html');
+
+  await expect.poll(() => queries[0]?.get('breakdown_offset')).toBe('0');
+  await expect.poll(() => queries[0]?.get('breakdown_limit')).toBe('50');
+  await expect(page.locator('#breakdown-body tr')).toHaveCount(50);
+  await expect(page.locator('#breakdown-page-label')).toHaveText('1–50 of 55');
+  await expect(page.locator('#breakdown-pagination')).toBeVisible();
+  await expect(page.locator('#breakdown-previous')).toBeDisabled();
+  await expect(page.locator('#breakdown-next')).toBeEnabled();
+
+  await page.locator('#breakdown-next').click();
+  await expect.poll(() => queries.at(-1)?.get('breakdown_offset')).toBe('50');
+  await expect(page.locator('#breakdown-body tr')).toHaveCount(5);
+  await expect(page.locator('#breakdown-page-label')).toHaveText('51–55 of 55');
+  await expect(page.locator('#breakdown-previous')).toBeEnabled();
+  await expect(page.locator('#breakdown-next')).toBeDisabled();
+
+  await page.evaluate(() => {
+    state.breakdownOffset = 55;
+    return refresh();
+  });
+  await expect.poll(() => queries.at(-1)?.get('breakdown_offset')).toBe('55');
+  await expect(page.locator('#breakdown-body tr')).toHaveCount(0);
+  await expect(page.locator('#breakdown-empty')).toBeVisible();
+  await expect(page.locator('#breakdown-pagination')).toBeVisible();
+  await expect(page.locator('#breakdown-page-label')).toHaveText('0–0 of 55');
+  await expect(page.locator('#breakdown-previous')).toBeEnabled();
+  await expect(page.locator('#breakdown-next')).toBeDisabled();
+
+  await page.locator('#breakdown-previous').click();
+  await expect.poll(() => queries.at(-1)?.get('breakdown_offset')).toBe('5');
+  await expect(page.locator('#breakdown-body tr')).toHaveCount(50);
+  await expect(page.locator('#breakdown-empty')).toBeHidden();
 });
 
 test('does not render a 5-hour series when Codex returns null', async ({ page }) => {

@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ANALYTICS_DATABASE_PATH="${DASHBOARD_ANALYTICS_DATABASE:-${SCRIPT_DIR}/runtime/usage-history.sqlite3}"
+ANALYTICS_DATABASE_PATH="${DASHBOARD_ANALYTICS_DATABASE:-}"
 ANALYTICS_PRICING_PATH="${DASHBOARD_PRICING_FILE:-${TOKEN_PRICING_FILE:-}}"
 PORT=8080
 BIND_ADDRESS="127.0.0.1"
@@ -67,32 +67,32 @@ while (($#)); do
   esac
 done
 
-# Reuse TOKEN_PRICING_FILE from the monitor's .env without sourcing arbitrary
-# shell code. An explicit environment override always wins.
-if [[ -e "${SCRIPT_DIR}/.env" && ( -L "${SCRIPT_DIR}/.env" || ! -O "${SCRIPT_DIR}/.env" ) ]]; then
-  echo "[ERROR] local/.env must be a regular file owned by the current user." >&2
-  exit 2
-fi
-if [[ -z "$ANALYTICS_PRICING_PATH" && -f "${SCRIPT_DIR}/.env" ]]; then
-  while IFS= read -r env_line || [[ -n "$env_line" ]]; do
-    env_line="${env_line%$'\r'}"
-    [[ "$env_line" =~ ^[[:space:]]*TOKEN_PRICING_FILE[[:space:]]*= ]] || continue
-    env_value="${env_line#*=}"
-    env_value="${env_value#"${env_value%%[![:space:]]*}"}"
-    env_value="${env_value%"${env_value##*[![:space:]]}"}"
-    if (( ${#env_value} >= 2 )) && { [[ "$env_value" == \"*\" ]] || [[ "$env_value" == \'*\' ]]; }; then
-      env_value="${env_value:1:${#env_value}-2}"
-    fi
-    ANALYTICS_PRICING_PATH="$env_value"
-    break
-  done < "${SCRIPT_DIR}/.env"
-fi
-ANALYTICS_PRICING_PATH="${ANALYTICS_PRICING_PATH:-${SCRIPT_DIR}/pricing.json}"
-
 if ! command -v python3 &>/dev/null; then
   echo "[ERROR] python3 is required to serve the dashboard." >&2
   exit 1
 fi
+
+# Reuse TOKEN_PRICING_FILE from the monitor's configuration without sourcing
+# arbitrary shell code. An explicit dashboard override always wins.
+if [[ -e "${SCRIPT_DIR}/.env" && ( -L "${SCRIPT_DIR}/.env" || ! -O "${SCRIPT_DIR}/.env" ) ]]; then
+  echo "[ERROR] local/.env must be a regular file owned by the current user." >&2
+  exit 2
+fi
+if [[ -z "$ANALYTICS_DATABASE_PATH" || -z "$ANALYTICS_PRICING_PATH" ]]; then
+  configured_database=""
+  configured_pricing=""
+  if ! configured_database="$(python3 "${SCRIPT_DIR}/config.py" \
+      --env-file "${SCRIPT_DIR}/.env" --base-dir "$SCRIPT_DIR" --get DASHBOARD_ANALYTICS_DATABASE)" \
+    || ! configured_pricing="$(python3 "${SCRIPT_DIR}/config.py" \
+      --env-file "${SCRIPT_DIR}/.env" --base-dir "$SCRIPT_DIR" --get TOKEN_PRICING_FILE)"; then
+    echo "[ERROR] Unable to read local configuration." >&2
+    exit 2
+  fi
+  ANALYTICS_DATABASE_PATH="${ANALYTICS_DATABASE_PATH:-$configured_database}"
+  ANALYTICS_PRICING_PATH="${ANALYTICS_PRICING_PATH:-$configured_pricing}"
+fi
+ANALYTICS_DATABASE_PATH="${ANALYTICS_DATABASE_PATH:-${SCRIPT_DIR}/runtime/usage-history.sqlite3}"
+ANALYTICS_PRICING_PATH="${ANALYTICS_PRICING_PATH:-${SCRIPT_DIR}/pricing.json}"
 
 if [[ "$ANALYTICS_DATABASE_PATH" != /* ]] || [[ -e "$ANALYTICS_DATABASE_PATH" && -L "$ANALYTICS_DATABASE_PATH" ]]; then
   echo "[ERROR] DASHBOARD_ANALYTICS_DATABASE must be an absolute path and not a symbolic link." >&2
@@ -186,7 +186,13 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             raw = parse_qs(split.query, keep_blank_values=True, max_num_fields=20)
             if any(len(values) != 1 for values in raw.values()):
                 raise AnalyticsError("query parameters must not be repeated")
-            allowed = {"range", "from_date", "to_date", "source", "sources", "model", "models", "reset_type", "reset_offset", "reset_limit"}
+            allowed = {
+                "range", "from_date", "to_date", "source", "sources", "model", "models",
+                "reset_type", "reset_offset", "reset_limit",
+                "breakdown_offset", "breakdown_limit",
+                "token_breakdown_offset", "token_breakdown_limit",
+                "token_offset", "token_limit", "offset", "limit",
+            }
             if set(raw) - allowed:
                 raise AnalyticsError("unknown query parameter")
             params = {key: values[0] for key, values in raw.items()}

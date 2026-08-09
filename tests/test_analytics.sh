@@ -5,6 +5,8 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test_helper.sh"
 
 database="${TEST_ROOT}/analytics.sqlite3"
+pricing_file="${TEST_ROOT}/pricing.json"
+cp "$ROOT_DIR/local/pricing.json" "$pricing_file"
 python3 - "$ROOT_DIR" "$database" <<'PY'
 import json
 from pathlib import Path
@@ -91,6 +93,8 @@ payload="$(python3 "$ROOT_DIR/local/analytics.py" \
 assert_eq 21.75 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["summary"]["estimated_cost_usd"])' <<<"$payload")" "estimated cost including GPT-5.6 Sol provider aliases"
 assert_eq 900 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["period"]["granularity_seconds"])' <<<"$payload")" "24-hour analytics granularity"
 assert_eq 100 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["summary"]["assumed_zero_tokens"])' <<<"$payload")" "unknown model token count"
+assert_eq 8 "$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tokens"]["breakdown"]))' <<<"$payload")" "unpaginated breakdown keeps all groups"
+assert_eq absent "$(python3 -c 'import json,sys; print("present" if "breakdown_pagination" in json.load(sys.stdin)["tokens"] else "absent")' <<<"$payload")" "unpaginated breakdown has no pagination metadata"
 assert_eq priced "$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(item["pricing_status"] for item in data["tokens"]["breakdown"] if item["provider"] == "openai-codex"))' <<<"$payload")" "openai-codex GPT-5.6 Sol pricing"
 assert_eq priced "$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(item["pricing_status"] for item in data["tokens"]["breakdown"] if item["provider"] == "auto"))' <<<"$payload")" "auto GPT-5.6 Sol pricing"
 assert_eq 4 "$(python3 -c 'import json,sys; data=json.load(sys.stdin); configured={("ollama","gemma4:26b-a4b-it-q8_0"),("ollama","ornith:35b-q8_0"),("openai","unknown"),("opencode","nemotron-3-ultra-free")}; print(sum((item["provider"],item["model"]) in configured and item["pricing_status"] == "priced" for item in data["tokens"]["breakdown"]))' <<<"$payload")" "configured zero-price models"
@@ -102,6 +106,98 @@ assert_eq 35.0 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["reset
 assert_eq 52 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["baselines"]["hermes"][0]["tokens"])' <<<"$payload")" "Hermes baseline excludes the reasoning sub-counter"
 assert_eq 2 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["limits"]["series"][0]["samples"])' <<<"$payload")" "limit bucket sample count"
 assert_eq 45.0 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["limits"]["series"][0]["five_h_pct"])' <<<"$payload")" "limit bucket keeps the latest sample"
+
+pricing_hash="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pricing"]["sha256"])' <<<"$payload")"
+if [[ ! "$pricing_hash" =~ ^[0-9a-f]{64}$ ]]; then
+  fail "pricing fingerprint is not a SHA-256 digest"
+fi
+
+python3 - "$pricing_file" <<'PYEOF'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+catalog = json.loads(path.read_text(encoding="utf-8"))
+path.write_text(json.dumps(catalog, indent=4, sort_keys=True) + "\n", encoding="utf-8")
+PYEOF
+formatted_payload="$(python3 "$ROOT_DIR/local/analytics.py" \
+  --database "$database" \
+  --pricing "$pricing_file" \
+  --params '{"range":"24h"}' \
+  --now 1785866400)"
+formatted_hash="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pricing"]["sha256"])' <<<"$formatted_payload")"
+assert_eq "$pricing_hash" "$formatted_hash" "pricing fingerprint ignores JSON formatting"
+
+paged="$(python3 "$ROOT_DIR/local/analytics.py" \
+  --database "$database" \
+  --pricing "$ROOT_DIR/local/pricing.json" \
+  --params '{"range":"24h","breakdown_offset":"2","breakdown_limit":"3"}' \
+  --now 1785866400)"
+assert_eq 3 "$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tokens"]["breakdown"]))' <<<"$paged")" "breakdown page size"
+assert_eq 2 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["breakdown_pagination"]["offset"])' <<<"$paged")" "breakdown page offset"
+assert_eq 3 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["breakdown_pagination"]["limit"])' <<<"$paged")" "breakdown page limit"
+assert_eq 8 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["breakdown_pagination"]["total"])' <<<"$paged")" "breakdown page total"
+assert_eq 21.75 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["summary"]["estimated_cost_usd"])' <<<"$paged")" "paginated summary remains complete"
+
+empty_page="$(python3 "$ROOT_DIR/local/analytics.py" \
+  --database "$database" \
+  --pricing "$ROOT_DIR/local/pricing.json" \
+  --params '{"range":"24h","breakdown_offset":"8","breakdown_limit":"50"}' \
+  --now 1785866400)"
+assert_eq 0 "$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tokens"]["breakdown"]))' <<<"$empty_page")" "empty breakdown page"
+assert_eq 8 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["breakdown_pagination"]["total"])' <<<"$empty_page")" "empty breakdown page total"
+
+for invalid_params in \
+  '{"range":"24h","breakdown_limit":"0"}' \
+  '{"range":"24h","breakdown_limit":"101"}' \
+  '{"range":"24h","breakdown_offset":"-1"}' \
+  '{"range":"24h","breakdown_limit":"not-an-integer"}' \
+  '{"range":"24h","breakdown_offset":"1","token_offset":"2"}' \
+  '{"range":"24h","breakdown_limit":"50","token_limit":"50"}'; do
+  if python3 "$ROOT_DIR/local/analytics.py" --database "$database" --pricing "$ROOT_DIR/local/pricing.json" --params "$invalid_params" --now 1785866400 >/dev/null 2>&1; then
+    fail "invalid breakdown pagination accepted: $invalid_params"
+  fi
+done
+
+if python3 - "$ROOT_DIR" "$database" <<'PYEOF'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+database = Path(sys.argv[2])
+sys.path.insert(0, str(root / "local"))
+from analytics import AnalyticsError, build_payload
+
+try:
+    build_payload(database, root / "local" / "pricing.json", {"range": "24h", "breakdown_limit": ["50", "100"]}, now=1785866400)
+except AnalyticsError:
+    raise SystemExit(0)
+raise SystemExit("repeated breakdown pagination accepted")
+PYEOF
+then
+  :
+else
+  fail "repeated breakdown pagination did not raise AnalyticsError"
+fi
+
+python3 - "$pricing_file" <<'PYEOF'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+catalog = json.loads(path.read_text(encoding="utf-8"))
+catalog["entries"][0]["input_per_million"] += 0.001
+path.write_text(json.dumps(catalog, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PYEOF
+changed_payload="$(python3 "$ROOT_DIR/local/analytics.py" \
+  --database "$database" \
+  --pricing "$pricing_file" \
+  --params '{"range":"24h"}' \
+  --now 1785866400)"
+changed_hash="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pricing"]["sha256"])' <<<"$changed_payload")"
+[[ "$changed_hash" != "$pricing_hash" ]] || fail "pricing fingerprint did not change with the catalog"
 
 filtered="$(python3 "$ROOT_DIR/local/analytics.py" \
   --database "$database" \
