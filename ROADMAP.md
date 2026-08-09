@@ -1,567 +1,250 @@
-# Feuille de route des améliorations
+# Feuille de route active
 
-Cette feuille de route regroupe les améliorations identifiées lors de l'audit du projet et remplace les anciens plans de travail séparés. Elle privilégie d'abord la fiabilité de la collecte et l'intégrité des données, puis l'API Analytics, les alertes, l'expérience utilisateur, la sécurité et la maintenance.
+Ce document ne recense que les travaux restant à réaliser. Les fonctionnalités
+terminées sont conservées dans l'historique Git et ne sont pas répétées ici.
 
-Le programme conserve les choix structurants suivants :
+Les choix structurants restent les suivants :
 
-- Bash et Python standard library ;
-- une architecture locale sans nouveau service cloud ;
-- SQLite comme archive longue durée ;
-- le dashboard principal et Analytics comme interfaces séparées ;
-- la synchronisation Gist limitée aux données de quotas ;
+- Bash comme lanceur léger et Python standard library pour la logique complexe ;
+- architecture locale sans nouveau service cloud ;
+- SQLite pour l'archive longue durée ;
+- dashboard principal et Analytics séparés ;
+- synchronisation Gist limitée aux quotas et à leur historique JSON ;
 - Linux et WSL comme environnements cibles.
 
-Le multi-compte et les nouvelles plateformes de notification restent différés jusqu'à la stabilisation du socle.
+Effort indicatif : **S** (moins d'une journée), **M** (deux à quatre jours),
+**L** (une semaine ou plus).
 
-## Échelle d'effort
+## P0 — Fiabilité et intégrité des données
 
-| Taille | Estimation |
-|---|---:|
-| XS | Moins d'une demi-journée |
-| S | Entre une demi-journée et une journée |
-| M | Entre deux et quatre jours |
-| L | Une semaine ou plus |
+### 1. Suivre la livraison des alertes par canal — M
 
-## P0 - Fiabilité critique
+Faire évoluer l'état des alertes vers `state_version=4`.
 
-### 1. Fiabiliser les appels réseau
+Travail restant :
 
-**Statut : terminé.**
+- attribuer un `alert_id` stable à chaque alerte ;
+- suivre séparément Discord et Telegram avec les états `pending`, `delivered`
+  ou `failed` ;
+- considérer une alerte comme entièrement livrée uniquement lorsque tous les
+  canaux configurés ont réussi ;
+- ne pas retenter les erreurs HTTP 4xx permanentes ;
+- retenter les erreurs 429, 5xx et les timeouts avec une attente bornée tenant
+  compte de `Retry-After` ;
+- migrer les états v1 à v3 sans rejouer une alerte déjà livrée ;
+- conserver des diagnostics utiles sans token, URL sensible ou identifiant de
+  canal.
 
-**Problème :** les appels vers GitHub Gist, Discord et Telegram n'ont pas de timeout, de stratégie de retry bornée ni de vérification complète des réponses HTTP. Une panne réseau peut bloquer la collecte ou être considérée comme un succès.
+Validation :
 
-**Actions :**
+- la réussite d'un canal ne masque pas l'échec de l'autre ;
+- un canal déjà livré n'est pas sollicité une seconde fois ;
+- les migrations, timeouts, 4xx, 429, 5xx et livraisons partielles sont testés.
 
-- Ajouter un timeout de connexion et un timeout global à chaque appel `curl`.
-- Ajouter des retries limités avec attente progressive.
-- Vérifier les statuts HTTP attendus pour chaque service.
-- Rendre les transports indépendants : une panne Gist ne doit pas empêcher les alertes.
-- Distinguer dans les logs une alerte détectée, une tentative d'envoi et une livraison réussie.
-- Ne valider l'état d'une alerte qu'après une livraison réussie, ou conserver un état `pending`.
+### 2. Rendre l'historique JSON réellement temporel — M
 
-**Critères de validation :**
+Extraire la gestion de `history.json` de `monitor.sh` vers `local/history.py`
+sans modifier le format public consommé par le dashboard et le Gist.
 
-- Un service inaccessible ne bloque pas les collectes suivantes.
-- Les réponses HTTP 4xx et 5xx sont signalées comme des échecs.
-- Une panne d'un canal n'empêche pas l'envoi sur les autres canaux.
-- Les scénarios de succès, timeout, 4xx et 5xx sont testés.
+Travail restant :
 
-**Effort : S à M**
-
-### 2. Corriger les alertes lors du franchissement de plusieurs seuils
-
-**Statut : terminé.**
-
-**Problème :** si le quota passe rapidement de 80 % à 4 %, seul le premier seuil rencontré est envoyé. Les seuils plus critiques sont ensuite définitivement perdus.
-
-**Actions :**
-
-- Envoyer une alerte unique mentionnant tous les seuils franchis, ou sélectionner le seuil le plus critique.
-- Persister l'état par seuil et par fenêtre de quota.
-- Définir clairement le comportement lors du premier relevé et après un reset.
-
-**Critères de validation :**
-
-- Les transitions `80 -> 70`, `80 -> 4`, `4 -> 100` et les oscillations autour d'un seuil sont testées.
-- Une chute importante produit une alerte correspondant au niveau réellement critique.
-- Chaque seuil n'est notifié qu'une fois par cycle.
-
-**Effort : S**
-
-### 3. Ajouter un verrou global sur chaque cycle
-
-**Statut : terminé.**
-
-**Problème :** le verrou actuel couvre uniquement la mise à jour de l'historique. Plusieurs instances peuvent collecter simultanément, envoyer des alertes en double ou écraser leur état.
-
-**Actions :**
-
-- Poser un verrou non bloquant autour du cycle complet : collecte, stockage, alertes et synchronisation Gist.
-- Quitter proprement lorsqu'une autre instance est déjà active.
-- Refuser de remplacer un snapshot récent par un snapshot plus ancien.
-
-**Critères de validation :**
-
-- Deux lancements simultanés ne produisent qu'une collecte et une série d'alertes.
-- L'historique reste trié et sans doublons.
-- L'état des alertes ne peut pas régresser.
-
-**Effort : XS à S**
-
-### 4. Détecter les données périmées
-
-**Statut : différé.** La conservation et l'exploitation des données sur le long terme seront traitées séparément.
-
-**Problème :** le dashboard considère les données comme valides tant que les fichiers JSON restent accessibles, même si le collecteur est arrêté depuis plusieurs heures.
-
-**Actions :**
-
-- Comparer `scraped_at` à `sample_interval_seconds`.
-- Afficher un avertissement après environ deux intervalles sans mise à jour.
-- Rendre visible le statut `LOCAL`, `EXTERNAL` ou `STALE`.
-- Afficher l'âge réel des données.
-- Envisager un état de santé contenant le dernier succès et la dernière erreur.
-
-**Critères de validation :**
-
-- Des données anciennes sont visuellement distinguées des données fraîches.
-- Le dashboard affiche depuis combien de temps la collecte est arrêtée.
-- Une nouvelle collecte réussie restaure automatiquement l'état normal.
-
-**Effort : S**
-
-## P1 - Robustesse et qualité
-
-### 5. Rendre la rétention réellement temporelle
-
-**Statut : partiellement terminé.** L'archive SQLite longue durée applique désormais une rétention temporelle et un compactage par granularité. L'historique JSON utilisé par le dashboard principal reste toutefois limité par nombre d'entrées ; les critères ci-dessous restent donc ouverts pour ce flux.
-
-**Problème :** l'historique est tronqué selon un nombre d'entrées calculé à partir de l'intervalle courant, pas selon l'âge réel des relevés. Un changement d'intervalle peut raccourcir ou allonger fortement la période conservée.
-
-**Actions :**
-
-- Filtrer les relevés selon `scraped_at` et `HISTORY_RETENTION_HOURS`.
-- Dédupliquer et trier les entrées avant l'écriture.
-- Ajouter un plafond défensif sur le nombre d'entrées et la taille du fichier.
-- Évaluer JSONL ou SQLite si les intervalles courts deviennent un besoin réel.
-
-**Critères de validation :**
-
-- La durée conservée reste correcte après une interruption.
-- Les changements d'intervalle `900 -> 60 -> 900` ne détruisent pas la fenêtre historique.
-- Un fichier corrompu ne provoque pas une perte silencieuse de tout l'historique.
-
-**Effort : S à M**
-
-### 6. Renforcer le parsing des limites Codex
-
-**Statut : terminé.**
-
-**Problème :** les fenêtres de tous les snapshots sont aplaties, puis la première durée entre 1 et 360 minutes est considérée comme la fenêtre de cinq heures. Une évolution de l'API peut donc associer les mauvaises limites.
-
-**Actions :**
-
-- Conserver l'association entre une fenêtre et son `limitId`.
-- Valider explicitement les durées et les champs attendus.
-- Accepter les nombres JSON réels lorsqu'ils sont valides.
-- Capturer un diagnostic `stderr` borné et nettoyé.
-- Ajouter des fixtures représentant plusieurs versions de réponse.
-
-**Critères de validation :**
-
-- Les fenêtres courte et hebdomadaire ne peuvent pas provenir de limites incompatibles.
-- Une réponse inconnue produit une erreur explicite. Une réponse partielle observée sur l'API réelle reste exploitable sans fusion de `limitId`, avec un avertissement et des champs indisponibles à `null`.
-- Les variantes de réponse connues sont couvertes par des tests.
-
-**Effort : M**
-
-### 7. Valider toute la configuration au démarrage
-
-**Statut : terminé.**
-
-**Actions :**
-
-- Valider et borner `LOOP_INTERVAL`, `CODEX_STATUS_TIMEOUT_SECONDS` et `HISTORY_RETENTION_HOURS`.
-- Valider `TELEGRAM_CHAT_ID` et les paires de variables incomplètes.
-- Rejeter les caractères de contrôle dans les secrets utilisés par `curl`.
-- Documenter précisément la syntaxe acceptée dans `.env`.
-- Afficher des messages d'erreur lisibles sans traceback Python.
-- Documenter Python 3.9 ou supérieur et la dépendance à `tzdata`.
-
-**Critères de validation :**
-
-- Toute configuration invalide est rejetée avant la première collecte.
-- Les valeurs extrêmes ne provoquent ni débordement ni consommation excessive.
-- La référence de configuration décrit toutes les variables supportées.
-
-**Effort : S**
-
-### 8. Rendre le dashboard totalement autonome
-
-**Statut : terminé.**
-
-**Problème :** Chart.js et les polices sont chargés depuis des CDN. Une panne Internet peut rendre le dashboard local inutilisable malgré la disponibilité des données.
-
-**Actions :**
-
-- Fournir Chart.js comme actif local versionné.
-- Utiliser des polices système ou auto-héberger les polices.
-- Ajouter les nouveaux actifs à l'allowlist de `serve.sh`.
-- Isoler les erreurs du graphique afin qu'elles n'effacent jamais les métriques principales.
-- Séparer le JavaScript et le CSS pour réduire l'usage de `unsafe-inline` dans la CSP.
-
-**Critères de validation :**
-
-- Le dashboard fonctionne sans accès Internet.
-- Une erreur du graphique laisse les quotas et les resets visibles.
-- La politique CSP n'autorise que les ressources nécessaires.
-
-**Effort : S à M**
-
-### 9. Corriger et optimiser le graphique historique
-
-**Statut : terminé.**
-
-**Actions :**
-
-- Calculer l'allure idéale avec le `weekly_reset_at` de chaque relevé.
-- Détruire ou vider le graphique lorsque l'historique devient indisponible.
-- Faire correspondre le titre à la période réellement affichée.
-- Ajouter une décimation ou une agrégation pour les longues séries.
-- Réutiliser le graphique lorsque cela évite une reconstruction complète.
-
-**Critères de validation :**
-
-- La courbe reste correcte lorsqu'elle traverse un reset hebdomadaire.
-- Un historique vide ne laisse pas un ancien graphique affiché.
-- Le dashboard reste fluide avec la rétention maximale supportée.
-
-**Effort : S**
-
-### 10. Sécuriser l'exposition réseau
-
-**Statut : terminé.**
-
-**Actions :**
-
-- Écouter sur `127.0.0.1` par défaut.
-- Exiger une activation explicite pour l'accès LAN.
-- Documenter clairement l'absence d'authentification et de TLS.
-- Ajouter des options CLI nommées `--bind` et `--port`.
-- Envisager une limitation simple de concurrence pour le serveur HTTP.
-
-**Critères de validation :**
-
-- Une installation par défaut n'expose rien sur le réseau local.
-- Les fichiers sensibles restent inaccessibles, y compris via des chemins encodés ou du path traversal.
-
-**Effort : XS à S**
-
-### 11. Mettre en place les tests et la CI
-
-**Statut : terminé.**
-
-**Actions :**
-
-- Déplacer les effets de bord de `monitor.sh` dans `main` afin de rendre ses fonctions importables.
-- Rendre les chemins, commandes externes et URL injectables dans les tests.
-- Ajouter `bash -n`, ShellCheck et éventuellement shfmt à la CI.
-- Tester les transports réseau, le parsing Codex, la rétention, la concurrence et la corruption JSON.
-- Tester l'allowlist et les en-têtes de `serve.sh`.
-- Ajouter des tests Playwright et axe-core pour le dashboard.
-
-**Critères de validation :**
-
-- Les tests ne lisent pas le vrai `.env` et ne modifient pas le runtime du développeur.
-- Chaque pull request exécute automatiquement les validations.
-- Les principaux scénarios d'échec ont un test de non-régression.
-
-**Effort : M**
-
-### 12. Améliorer l'observabilité
-
-**Statut : terminé.**
-
-**Actions :**
-
-- Journaliser la durée et le résultat de chaque cycle.
-- Conserver le dernier succès, la dernière erreur et le nombre d'échecs consécutifs.
-- Capturer un diagnostic Codex borné en mode debug, sans exposer de secret.
-- Préserver une copie d'un historique corrompu avant reconstruction.
-- Ajouter une commande `--check` pour vérifier dépendances, configuration, authentification et permissions.
-- Prévoir un mode `--fail-fast` adapté à systemd.
-
-**Critères de validation :**
-
-- Une panne permanente est identifiable depuis les logs sans reproduire manuellement le problème.
-- systemd peut redémarrer le service après des échecs répétés.
-- Une corruption de données n'est jamais silencieuse.
-
-**Effort : M**
-
-## P2 - Expérience utilisateur et maintenance
-
-### 13. Améliorer l'accessibilité du dashboard
-
-**Statut : partiellement terminé.** La structure sémantique, les barres natives `<progress>`, les messages d'erreur et `prefers-reduced-motion` sont en place. Il reste un résumé accessible des graphiques, l'annonce de fraîcheur et les détails d'allure hors attribut `title`.
-
-**Actions :**
-
-- Ajouter une structure sémantique avec `<main>`, `<section>` et des titres.
-- Exposer les jauges avec `role="progressbar"` et les attributs ARIA associés.
-- Ajouter des régions `aria-live` pour la fraîcheur et les erreurs.
-- Fournir un résumé textuel ou tabulaire de l'historique.
-- Afficher les détails d'allure sans dépendre uniquement de l'attribut `title`.
-- Respecter `prefers-reduced-motion`.
-- Ne pas communiquer la criticité uniquement par la couleur.
-
-**Effort : M**
-
-### 14. Mettre la documentation en cohérence
-
-**Statut : partiellement terminé.** L'architecture, la configuration et l'analytics locale sont documentés. Les URL de clonage contiennent encore `YOUR_USERNAME` et les exemples de test d'alertes exécutent encore `.env` avec `source`.
-
-**Actions :**
-
-- Remplacer les anciens chemins `local/data.json` par `local/runtime/data.json`.
-- Décrire la collecte via `codex app-server` plutôt que comme un scraping de `/status`.
-- Remplacer l'URL de clonage contenant `YOUR_USERNAME` par l'URL canonique.
-- Corriger les procédures LXC, systemd et GitHub Pages.
-- Supprimer les exemples qui exécutent `.env` avec `source`.
-- Documenter toutes les variables et leurs bornes.
-- Expliquer qu'un Gist secret est non répertorié, mais pas privé.
-- Ajouter les commandes de test et le dossier `tests/` à la structure du projet.
-
-**Effort : S**
-
-### 15. Préparer le packaging et les releases
-
-**Statut : non commencé.**
-
-**Actions :**
-
-- Versionner les scripts avec le bit exécutable.
-- Ajouter des unités systemd réelles et les vérifier avec `systemd-analyze verify`.
-- Ajouter `CHANGELOG.md`, des tags et une politique de version.
-- Publier des archives de release avec checksums.
-- Documenter installation, mise à jour, retour arrière et désinstallation.
-
-**Effort : M**
-
-### 16. Réduire progressivement le script monolithique
-
-**Statut : partiellement terminé.** Le stockage, l'archivage et la collecte analytics sont désormais séparés en modules Python. Le protocole Codex, la validation principale et l'orchestration restent concentrés dans `monitor.sh`.
-
-**Objectif :** améliorer la testabilité sans lancer une réécriture prématurée.
-
-**Actions :**
-
-- Commencer par isoler les effets de bord et les interfaces externes.
-- Définir un schéma versionné pour les snapshots, l'historique et l'état d'alerte.
-- Déplacer progressivement le protocole Codex, la validation et le stockage dans un module Python.
-- Conserver Bash comme lanceur léger tant que cela reste utile.
-
-**Effort : L**
-
-## P3 - Évolutions fonctionnelles
-
-Ces évolutions sont utiles, mais doivent venir après la stabilisation des fonctions existantes.
-
-- Support de plusieurs comptes Codex.
-- Notifications Slack, ntfy ou e-mail.
-- Endpoint de santé et export Prometheus.
-- Agrégation quotidienne pour les historiques longs.
-- Fuseau horaire et langue configurables.
-- Interface CLI complète : `--help`, `--check`, `--once`, `--loop`, `--bind` et `--port`.
-- Mode simulation avec fixtures anonymisées pour développer sans compte Codex.
-
-## Spécifications techniques consolidées
-
-Les éléments ci-dessous précisent les comportements attendus pour les chantiers encore ouverts. Ils complètent les priorités et statuts précédents sans remettre en cause les fonctionnalités déjà terminées.
-
-### Collecte des tokens et tolérance aux sources absentes
-
-Pour `TOKEN_USAGE_SOURCES=auto` :
-
-- un chemin absent, un répertoire Codex vide ou une base OpenCode/Hermes absente produit l'état `disabled` ;
-- un schéma non reconnu produit l'état `disabled` avec un avertissement ;
-- une erreur de permission, une corruption ou une erreur de lecture produit l'état `error` et un cycle dégradé.
-
-Pour une source explicitement demandée :
-
-- un chemin absent ou un schéma invalide produit l'état `unavailable` ;
-- une erreur de lecture produit l'état `error` et marque le cycle en échec.
-
-Chaque source conserve `last_success_at` et `last_error`. Une erreur ne supprime jamais les données collectées précédemment.
-
-Le collecteur Codex doit utiliser un curseur robuste par fichier contenant au minimum :
-
-```json
-{
-  "device": 0,
-  "inode": 0,
-  "offset": 0,
-  "size": 0,
-  "mtime": 0,
-  "session_id": "",
-  "totals": {},
-  "model": "",
-  "provider": ""
-}
-```
-
-Le collecteur doit :
-
-- lire uniquement les lignes JSONL terminées ;
-- reprendre une ligne partielle au cycle suivant ;
-- réinitialiser l'offset après un changement d'inode ou une troncature ;
-- rescanner après une rotation ;
-- garantir l'idempotence au moyen de `external_id` ;
-- ne pas utiliser uniquement `mtime` pour ignorer un fichier ancien.
-
-Les tests doivent couvrir une ligne partielle, une troncature, une rotation, un changement de modèle, un événement dupliqué et un fichier modifié pendant sa lecture.
-
-### Historique JSON et configuration partagée
-
-Extraire la gestion inline de l'historique de `monitor.sh` vers `local/history.py`. Le module doit :
-
-- valider les snapshots et normaliser les timestamps en epoch ;
+- valider les snapshots et normaliser `scraped_at` en epoch ;
 - refuser les pourcentages hors de l'intervalle `0..100` ;
-- trier et dédupliquer selon le timestamp réel ;
-- appliquer une rétention temporelle ;
-- écrire atomiquement ;
-- sauvegarder sous un nom unique tout historique corrompu ;
-- conserver au plus 10 000 entrées et 16 MiB sans provoquer de crash.
+- trier et dédupliquer selon l'instant réel, pas selon la chaîne du timestamp ;
+- appliquer `HISTORY_RETENTION_HOURS` selon l'âge des relevés ;
+- conserver au maximum 10 000 entrées et 16 MiB ;
+- traiter ces deux plafonds comme des limites défensives et avertir lorsqu'ils
+  raccourcissent la fenêtre temporelle demandée ;
+- écrire atomiquement et créer une sauvegarde au nom unique avant de reconstruire
+  un historique corrompu.
 
-La rétention JSON par défaut reste fixée à `HISTORY_RETENTION_HOURS=192`.
+Validation :
 
-Créer `local/config.py` pour assurer une lecture non exécutable de `.env`, une validation typée, le contrôle des permissions et le partage des valeurs entre le monitor et le serveur. Le serveur doit lire le même `TOKEN_PRICING_FILE` depuis `.env` que le monitor. L'ordre de priorité est :
+- les changements d'intervalle `900 -> 60 -> 900` préservent la durée demandée
+  tant que les plafonds défensifs ne sont pas atteints ;
+- une interruption de collecte ne réduit pas artificiellement la rétention ;
+- les timestamps équivalents avec des offsets différents sont dédupliqués ;
+- les limites de taille et les corruptions répétées ne provoquent aucune perte
+  silencieuse.
 
-1. option CLI explicite ;
-2. variable d'environnement ;
-3. valeur de `local/.env` ;
-4. valeur par défaut.
+### 3. Sécuriser les migrations et la concurrence SQLite — M
 
-L'aide de `monitor.sh` doit documenter `--once`, `--loop [SECONDS]`, `--check`, `--status-json` et `--fail-fast`.
+Travail restant :
 
-### Migrations et concurrence SQLite
+- sauvegarder une base v1 avant sa migration en place vers v2 ;
+- passer du journal `DELETE` à `WAL` ;
+- gérer explicitement les erreurs `locked` avec des retries courts et bornés ;
+- contrôler la fermeture et le nettoyage des fichiers WAL sans supprimer un
+  journal actif.
 
-Le stockage doit :
+Validation :
 
-- lire `PRAGMA user_version` et rejeter les versions inconnues ou supérieures ;
-- migrer la version 1 vers la version 2 dans une transaction ;
-- sauvegarder toute base existante avant une opération susceptible de l'altérer ;
-- conserver les snapshots existants ;
-- exécuter `quick_check` après une migration.
+- une migration v1 conserve les snapshots et produit une sauvegarde restaurable ;
+- lectures Analytics et écritures du monitor peuvent s'exécuter simultanément ;
+- une contention prolongée échoue proprement sans corruption ni boucle infinie ;
+- `quick_check` reste valide après migration et après accès concurrent.
 
-Le test de migration doit partir d'une véritable base version 1 préexistante.
+### 4. Finaliser la fraîcheur et l'accessibilité du dashboard principal — M
 
-Passer progressivement du journal `DELETE` à `WAL`, avec un `busy_timeout` explicite, une gestion des erreurs `locked`, un test de lecture/écriture concurrente et un nettoyage contrôlé des fichiers WAL.
+Travail restant :
 
-### Contrat et robustesse de l'API Analytics
+- comparer `scraped_at` à `sample_interval_seconds` ;
+- afficher l'âge réel du dernier relevé ;
+- passer en état `STALE` après environ deux intervalles sans succès, tout en
+  conservant l'origine `LOCAL` ou `EXTERNAL` ;
+- annoncer les changements de fraîcheur avec une région `aria-live` ;
+- revenir automatiquement à l'état normal après une collecte réussie ;
+- donner un nom accessible explicite aux deux jauges `<progress>` ;
+- fournir un résumé textuel et un tableau alternatif du graphique historique ;
+- exposer visiblement les valeurs réelle et idéale utilisées pour l'allure
+  hebdomadaire, sans dépendre de l'attribut `title` ;
+- garantir que disponibilité, criticité et allure restent compréhensibles sans
+  couleur et au clavier.
 
-Conserver la réponse Analytics en `schema_version: 1` pour les consommateurs existants et y ajouter :
+Validation :
 
-- la période effective, le fuseau et la granularité ;
-- la date du dernier relevé de limites, son âge, son statut de fraîcheur et l'intervalle d'échantillonnage ;
-- la devise, la date et l'empreinte SHA-256 du catalogue tarifaire.
+- les états frais, périmé, erreur puis récupération sont testés dans le navigateur ;
+- les quotas restent visibles lorsque les données sont anciennes ;
+- le dashboard reste compréhensible sans Chart.js et sans couleur ;
+- les tests couvrent le clavier, un historique vide et le tableau alternatif ;
+- axe-core ne remonte aucune violation critique ou sérieuse.
 
-L'API ne doit jamais exposer de chemin local, identifiant de session, prompt, contenu de message, compte ou secret d'authentification.
+## P1 — Architecture, API et qualité
 
-La granularité cible est :
+### 5. Centraliser la configuration et compléter l'aide CLI — M
 
-- jusqu'à 48 heures : 15 minutes ;
-- jusqu'à 30 jours : 30 minutes ;
-- au-delà : 1 heure.
+Créer `local/config.py` comme source unique pour la lecture non exécutable de
+`.env`, la validation typée et le contrôle des permissions.
 
-Chaque bucket de quota conserve le dernier relevé observé. Les volumes et coûts de tokens sont additionnés, avec un regroupement possible par application et par bucket.
+Travail restant :
 
-Les erreurs de catalogue ou SQLite retournent HTTP 503 ; les dates invalides retournent HTTP 400. L'API doit également refuser les paramètres contradictoires ou répétés, borner les filtres et le nombre de points, et toujours retourner un JSON d'erreur court. Les tests couvrent catalogue invalide, base absente ou corrompue, date extrême, requête trop grande et accès concurrent.
+- partager la même résolution de configuration entre le monitor et le serveur ;
+- appliquer l'ordre de priorité : option CLI, variable d'environnement,
+  `local/.env`, valeur par défaut ;
+- permettre à chaque consommateur de demander uniquement les valeurs nécessaires
+  sans afficher les secrets ;
+- ajouter `monitor.sh --help` et documenter `--once`, `--loop [SECONDS]`,
+  `--check`, `--status-json` et `--fail-fast` ;
+- rendre l'aide disponible sans installation ni authentification Codex valide.
 
-### Livraison fiable des alertes
+Validation :
 
-Faire évoluer l'état vers `state_version=4` et suivre séparément, pour chaque `alert_id`, l'état `pending`, `delivered` ou `failed` de Discord et Telegram.
+- les variables d'environnement remplacent bien les valeurs de `.env` ;
+- le monitor et l'API utilisent toujours le même `TOKEN_PRICING_FILE` ;
+- une ligne `.env` malveillante reste du texte et n'est jamais exécutée ;
+- les erreurs de configuration restent lisibles et sans traceback.
 
-- Une alerte est entièrement livrée uniquement lorsque tous les canaux configurés ont réussi.
-- Les erreurs HTTP 4xx permanentes ne sont pas retentées.
-- Les erreurs 429, 5xx et les timeouts sont retentés en respectant `Retry-After`.
-- Les états v1 à v3 restent lisibles.
-- Une alerte déjà livrée ne doit jamais être rejouée après migration.
-- Les diagnostics ne doivent contenir aucun token ni URL sensible.
+### 6. Borner la ventilation Analytics et identifier le catalogue — M
 
-### Finalisation d'Analytics et de l'accessibilité
+Conserver `schema_version: 1` et ajouter les éléments suivants sans casser les
+consommateurs existants :
 
-L'interface Analytics doit ajouter :
+- l'empreinte SHA-256 du catalogue dans `pricing` ;
+- une pagination serveur du tableau application/fournisseur/modèle, avec des
+  pages de 50 lignes et une limite maximale de 100 ;
+- les métadonnées `offset`, `limit` et `total` associées à cette pagination ;
+- les contrôles de pagination correspondants dans `analytics.html`.
 
-- des marqueurs de reset sur les quotas ;
-- des séries de tokens par application ;
-- une bascule tokens/coût et un coût par bucket ;
-- une légende explicite pour les données estimées ;
-- des cartes distinctes pour input non mis en cache, cache read, cache write, output, reasoning, total, tokens sans tarif et coût API équivalent ;
-- un tableau par application, fournisseur et modèle, paginé par groupes de 50 lignes.
+Validation :
 
-Le reasoning reste un sous-ensemble de l'output et ne doit pas être facturé deux fois. Le coût présenté est une estimation API, pas une facture réelle.
+- une requête sans paramètres de pagination conserve le comportement actuel de
+  `tokens.breakdown` ;
+- une requête paginée retourne la page dans `tokens.breakdown` avec ses
+  métadonnées, sans changer `schema_version` ;
+- les nouveaux paramètres répétés, contradictoires ou hors limites retournent
+  HTTP 400 ;
+- l'empreinte change lorsque le catalogue change ;
+- les pages vides sont testées côté API et navigateur.
 
-Chaque collecteur affiche son statut, sa dernière tentative, son dernier succès, sa dernière erreur et l'âge de la dernière donnée. Après un échec, les dernières données valides restent visibles avec un avertissement.
+### 7. Durcir la suite de validation et la CI — M
 
-L'accessibilité doit inclure un résumé textuel et un tableau alternatif des graphiques, des régions `aria-live`, des labels complets, des jauges ARIA, un état compréhensible sans la couleur et une navigation clavier complète. Les tests navigateur couvrent notamment langue, devise, historique vide, données périmées, collecteur en erreur et absence de graphique.
+Travail restant :
 
-### Sécurité réseau, tests et distribution
+- fixer explicitement les versions de Python et Node utilisées en CI ;
+- compiler les modules Python dans le workflow ;
+- mesurer la couverture des nouveaux modules Python ;
+- auditer les dépendances npm ;
+- ajouter un test ciblé pour la modification d'un fichier Codex pendant sa
+  lecture.
 
-Le serveur reste lié par défaut à `127.0.0.1`. Tout bind non local exige `--allow-insecure-lan` et un avertissement explicite. L'authentification et TLS restent délégués à un reverse proxy. L'allowlist, la CSP, l'absence d'accès SQLite direct et l'absence de synchronisation Analytics vers Gist restent obligatoires.
+Validation :
 
-La suite de validation doit comprendre des tests unitaires Python, migrations, concurrence, changement d'heure, rotation Codex, réinitialisation Hermes, catalogue personnalisé, limites de l'API et reprise après erreur. La CI fixe les versions de Python et Node, compile le Python, vérifie le shell, mesure la couverture, contrôle les migrations et audite les dépendances.
+- le workflow échoue sur une erreur de compilation, une dépendance vulnérable ou
+  une régression de migration/concurrence ;
+- les tests restent indépendants du vrai `.env` et du runtime du développeur.
 
-Ajouter au `.gitignore` les sorties générées suivantes lorsqu'elles ne sont pas encore ignorées :
+### 8. Corriger les derniers écarts de documentation — S
 
-```text
-test-results/
-playwright-report/
-coverage/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-```
+Travail restant :
 
-La documentation de release doit corriger les références obsolètes, expliquer la personnalisation du catalogue et les états de fraîcheur, puis fournir sauvegarde, restauration, installation, mise à jour et désinstallation. Le projet doit disposer d'un `CHANGELOG.md`, d'une version publiée et d'archives avec checksum.
+- remplacer les URL de clonage génériques par
+  `https://github.com/AlexandreDor/ai-usage-monitor.git` ;
+- aligner les exemples de logs Gist sur la sortie réelle du monitor ;
+- compléter la structure du projet avec les modules Python, `tests/` et la CI ;
+- préciser qu'un Gist secret est non répertorié, mais pas privé ;
+- mettre à jour la référence de configuration après les chantiers 2 et 5.
 
-## Plan d'exécution recommandé
+Validation :
 
-### Phase 1 - Stabilisation de la collecte
+- toutes les commandes documentées sont exécutables telles quelles ;
+- aucune procédure ne demande d'exécuter `.env` avec `source` ;
+- les chemins, options et messages cités correspondent au dépôt.
 
-1. Corriger le comportement de `TOKEN_USAGE_SOURCES`.
-2. Fiabiliser le curseur et la rotation du collecteur Codex.
-3. Extraire et fiabiliser l'historique JSON.
-4. Détecter les données périmées.
+## P2 — Distribution et maintenance
 
-### Phase 2 - Configuration et stockage
+### 9. Préparer des releases installables — M
 
-1. Centraliser et valider la configuration.
-2. Partager le catalogue tarifaire.
-3. Versionner et tester les migrations SQLite.
-4. Fiabiliser la concurrence avec `busy_timeout` et des retries bornés.
+Travail restant :
 
-### Phase 3 - API et alertes
+- ajouter des unités systemd versionnées pour le monitor et le dashboard ;
+- les vérifier avec `systemd-analyze verify` ;
+- créer `CHANGELOG.md` et définir une politique de version ;
+- publier des tags et des archives accompagnées de checksums ;
+- documenter installation, mise à jour, retour arrière, sauvegarde, restauration
+  et désinstallation.
 
-1. Renforcer le contrat Analytics v1 sans rupture de compatibilité.
-2. Appliquer la granularité et les bornes de réponse.
-3. Normaliser les erreurs HTTP.
-4. Migrer les alertes vers un suivi par canal.
+Validation :
 
-### Phase 4 - Interface et accessibilité
+- une installation neuve et une mise à jour depuis la version précédente sont
+  reproductibles ;
+- le retour arrière conserve la configuration et les archives locales ;
+- les checksums publiés correspondent aux archives de release.
 
-1. Finaliser les graphiques, cartes et tableaux Analytics.
-2. Exposer la fraîcheur et les erreurs de chaque collecteur.
-3. Terminer l'accessibilité et les tests navigateur.
-4. Vérifier le fonctionnement autonome du dashboard.
+### 10. Réduire le reste de `monitor.sh` — L
 
-### Phase 5 - Sécurité, qualité et distribution
+Ce chantier vient après l'extraction de l'historique et de la configuration afin
+d'éviter deux migrations concurrentes du même code.
 
-1. Verrouiller l'exposition réseau et documenter le reverse proxy.
-2. Étendre les tests, la CI et l'observabilité.
-3. Corriger la documentation et préparer les releases.
-4. Réduire progressivement le script monolithique.
-5. Ajouter les évolutions P3 selon les besoins utilisateurs.
+Travail restant :
 
-## Définition globale de terminé
+- déplacer le protocole `codex app-server` vers `local/codex_status.py` ;
+- isoler les interfaces externes et les effets de bord restants ;
+- conserver Bash comme lanceur et orchestrateur léger ;
+- préserver les formats JSON, les options CLI et les codes de sortie existants.
 
-Une amélioration est considérée comme terminée lorsque :
+Validation :
 
-- son comportement attendu est documenté ;
-- les erreurs sont explicites et ne provoquent pas de perte silencieuse ;
-- un test de non-régression couvre le chemin principal et les principaux échecs ;
+- les fixtures Codex existantes passent sans modification de comportement ;
+- `monitor.sh` ne contient plus de bloc Python inline métier ;
+- les erreurs et timeouts restent identiques du point de vue utilisateur.
+
+## P3 — Évolutions différées
+
+Ces sujets ne doivent commencer qu'après les chantiers P0 et P1 :
+
+- endpoint de santé et export Prometheus ;
+- agrégation quotidienne pour les historiques très longs ;
+- fuseau horaire configurable.
+
+## Définition de terminé
+
+Un chantier est terminé lorsque :
+
+- le chemin principal et les principaux échecs ont des tests de non-régression ;
+- aucune erreur ne provoque de perte silencieuse ;
+- les migrations, lorsqu'il y en a, sont rétrocompatibles et disposent d'une
+  stratégie de retour arrière ;
 - la CI valide le changement ;
-- la documentation utilisateur est mise à jour ;
-- aucun secret ou identifiant de compte n'est ajouté aux données exposées.
-
-Le programme consolidé est terminé lorsque, en plus de ces règles générales :
-
-- une source absente en mode `auto` ne fait plus échouer le cycle ;
-- aucune ligne JSONL partielle n'est perdue et une rotation est correctement reprise ;
-- l'API et le monitor utilisent le même catalogue tarifaire ;
-- une base SQLite v1 est migrée sans perte ;
-- les erreurs Analytics renvoient un statut 400 ou 503 sans traceback ;
-- les quotas affichés proviennent de valeurs réellement observées ;
-- les alertes sont suivies indépendamment pour chaque canal ;
-- les tests shell, Python, HTTP et navigateur passent en CI ;
-- aucune donnée privée, aucun chemin local et aucun secret n'est exposé.
+- la documentation utilisateur est à jour ;
+- aucune donnée privée, chemin local, identité de compte ou secret n'est ajouté
+  aux fichiers ou API exposés.
