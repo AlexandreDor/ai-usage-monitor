@@ -95,10 +95,11 @@ boundary_medium=$((BASE - 7 * 86400))
 boundary_old=$((boundary_medium - 1801))
 
 for epoch in \
-  "$recent_one" "$recent_two" \
-  "$medium_one" "$medium_two" \
   "$old_one" "$old_two" \
-  "$boundary_recent" "$boundary_medium" "$boundary_old"; do
+  "$boundary_old" "$boundary_medium" \
+  "$medium_one" "$medium_two" \
+  "$boundary_recent" \
+  "$recent_one" "$recent_two"; do
   archive_at "$epoch"
 done
 archive_at "$BASE"

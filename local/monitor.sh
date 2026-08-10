@@ -30,53 +30,65 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/.env"
 RUNTIME_DIR="${SCRIPT_DIR}/runtime"
+SOURCE_ENV_FILE="$ENV_FILE"
+SOURCE_RUNTIME_DIR="$RUNTIME_DIR"
 STATE_FILE="${RUNTIME_DIR}/.alert_state"
 DATA_FILE="${RUNTIME_DIR}/data.json"
 HISTORY_FILE="${RUNTIME_DIR}/history.json"
 ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"
 HEALTH_FILE="${RUNTIME_DIR}/health.json"
 LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
-DEFAULT_INTERVAL_SECONDS=900
 INVALID_ALERT_SCRIPT_CONFIG=0
 
-load_config() {
-  local line key value
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%$'\r'}"
-    [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
+CONFIG_VARIABLES=(
+  ALERT_THRESHOLDS ALERT_SCRIPT_TIMEOUT_SECONDS ARCHIVE_RETENTION_DAYS
+  HISTORY_RETENTION_HOURS LOOP_INTERVAL CODEX_BIN CODEX_STATUS_TIMEOUT_SECONDS
+  CURL_CONNECT_TIMEOUT_SECONDS CURL_MAX_TIME_SECONDS CURL_RETRIES
+  CURL_RETRY_DELAY_SECONDS MONITOR_DEBUG DISCORD_WEBHOOK TELEGRAM_BOT_TOKEN
+  TELEGRAM_CHAT_ID GITHUB_PAT GITHUB_GIST_ID GITHUB_API_URL TELEGRAM_API_URL
+  TOKEN_USAGE_SOURCES TOKEN_PRICING_FILE CODEX_DATA_DIR OPENCODE_DB_PATH
+  HERMES_DB_PATH STATE_DIR
+)
 
-    if [[ "$line" != *=* ]]; then
-      echo "[WARN] Ignoring malformed configuration line." >&2
-      continue
+apply_resolved_config() {
+  local profile="$1" export_current="$2" output_file key value variable_name status=0 read_error=""
+  shift 2
+  output_file="$(mktemp)" || { config_error "Could not create a temporary configuration buffer."; return 1; }
+  chmod 600 "$output_file"
+
+  (
+    if [[ "$export_current" == 1 ]]; then
+      for variable_name in "${CONFIG_VARIABLES[@]}"; do
+        [[ -v "$variable_name" ]] && export "${variable_name?}"
+      done
+      while IFS= read -r variable_name; do
+        [[ "$variable_name" =~ ^ALERT_SCRIPT_([1-9]|[1-9][0-9])(_EVENTS)?$ ]] && export "${variable_name?}"
+      done < <(compgen -A variable ALERT_SCRIPT_)
     fi
+    python3 "$SCRIPT_DIR/config.py" --base-dir "$SCRIPT_DIR" --profile "$profile" "$@"
+  ) > "$output_file" || status=$?
+  if (( status != 0 )); then
+    rm -f "$output_file"
+    return 1
+  fi
 
-    key="${line%%=*}"
-    value="${line#*=}"
+  while IFS= read -r -d '' key; do
+    if ! IFS= read -r -d '' value; then
+      read_error="Configuration resolver returned an incomplete record."
+      break
+    fi
     if [[ ! "$key" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
-      echo "[WARN] Ignoring invalid configuration key." >&2
-      continue
+      read_error="Configuration resolver returned an invalid key."
+      break
     fi
+    printf -v "$key" '%s' "$value"
+  done < "$output_file"
+  rm -f "$output_file"
+  [[ -z "$read_error" ]] || { config_error "$read_error"; return 1; }
+}
 
-    case "$key" in
-      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
-        if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
-          value="${value:1:${#value}-2}"
-        fi
-        printf -v "$key" '%s' "$value"
-        ;;
-      *)
-        if [[ "$key" =~ ^ALERT_SCRIPT_([1-9]|[1-9][0-9])(_EVENTS)?$ ]]; then
-          if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
-            value="${value:1:${#value}-2}"
-          fi
-          printf -v "$key" '%s' "$value"
-        else
-          echo "[WARN] Ignoring unsupported configuration key: $key" >&2
-          [[ "$key" == ALERT_SCRIPT_* ]] && INVALID_ALERT_SCRIPT_CONFIG=1
-        fi
-        ;;
-    esac
-  done < "$ENV_FILE"
+load_config() {
+  apply_resolved_config monitor 0 --config "$ENV_FILE" --config-required --file-only
 }
 
 # ============================================================================
@@ -98,20 +110,7 @@ validate_integer() {
 
 validate_number() {
   local name="$1" value="$2" minimum="$3" maximum="$4"
-  python3 - "$name" "$value" "$minimum" "$maximum" <<'PYEOF'
-import math
-import sys
-
-name, raw, minimum, maximum = sys.argv[1:]
-try:
-    value = float(raw)
-except ValueError:
-    sys.stderr.write(f"[ERROR] {name} must be a number between {minimum} and {maximum}.\n")
-    raise SystemExit(1)
-if not math.isfinite(value) or not float(minimum) <= value <= float(maximum):
-    sys.stderr.write(f"[ERROR] {name} must be between {minimum} and {maximum}.\n")
-    raise SystemExit(1)
-PYEOF
+  python3 "$SCRIPT_DIR/monitor_utils.py" validate-number "$name" "$value" "$minimum" "$maximum"
 }
 
 has_control_characters() {
@@ -119,22 +118,38 @@ has_control_characters() {
 }
 
 validate_thresholds() {
-  python3 - "$ALERT_THRESHOLDS" <<'PYEOF'
+  python3 "$SCRIPT_DIR/monitor_utils.py" validate-thresholds "$ALERT_THRESHOLDS"
+}
+
+validate_api_url() {
+  python3 - "$SCRIPT_DIR" "$1" "$2" <<'PY'
 import sys
 
-parts = sys.argv[1].split(",")
-if not parts or any(not part.strip() for part in parts):
-    sys.stderr.write("[ERROR] ALERT_THRESHOLDS must be a comma-separated list of integers from 0 to 100.\n")
-    raise SystemExit(1)
+sys.path.insert(0, sys.argv[1])
+from config import ConfigError, _http_url
+
 try:
-    values = [int(part.strip()) for part in parts]
-except ValueError:
-    sys.stderr.write("[ERROR] ALERT_THRESHOLDS must contain integers only.\n")
+    _http_url(sys.argv[2], sys.argv[3])
+except ConfigError as error:
+    print(f"[ERROR] {error}", file=sys.stderr)
     raise SystemExit(1)
-if not values or any(value < 0 or value > 100 for value in values):
-    sys.stderr.write("[ERROR] ALERT_THRESHOLDS values must be between 0 and 100.\n")
-    raise SystemExit(1)
-PYEOF
+PY
+}
+
+validate_alert_script_path() {
+  local name="$1" path="$2" permissions
+  if has_control_characters "$path" || [[ "$path" != /* || -L "$path" || ! -f "$path" || ! -x "$path" || ! -O "$path" ]]; then
+    config_error "$name must be an executable, user-owned regular file that is not a symlink or group/world-writable."
+    return 1
+  fi
+  permissions="$(stat -c '%a' -- "$path" 2>/dev/null)" || {
+    config_error "$name must be an executable, user-owned regular file that is not a symlink or group/world-writable."
+    return 1
+  }
+  if (( (8#$permissions & 8#022) != 0 )); then
+    config_error "$name must be an executable, user-owned regular file that is not a symlink or group/world-writable."
+    return 1
+  fi
 }
 
 ALERT_SCRIPT_RULE_INDICES=()
@@ -190,13 +205,7 @@ validate_alert_scripts() {
       invalid=1
       continue
     fi
-    if has_control_characters "$path"; then
-      config_error "${path_name} must not contain control characters." || true
-      invalid=1
-      continue
-    fi
-    if [[ "$path" != /* || ! -f "$path" || ! -x "$path" ]]; then
-      config_error "${path_name} must be an absolute path to an executable regular file." || true
+    if ! validate_alert_script_path "$path_name" "$path"; then
       invalid=1
       continue
     fi
@@ -232,12 +241,7 @@ validate_alert_scripts() {
         continue
       fi
       seen_pairs[$pair]=1
-      action_id="$(python3 - "$path" "$event" <<'PYEOF'
-import hashlib
-import sys
-print(hashlib.sha256((sys.argv[1] + "\0" + sys.argv[2]).encode()).hexdigest()[:24])
-PYEOF
-)"
+      action_id="$(python3 "$SCRIPT_DIR/monitor_utils.py" action-id "$path" "$event")"
       ALERT_SCRIPT_RULE_INDICES+=("$index")
       ALERT_SCRIPT_RULE_PATHS+=("$path")
       ALERT_SCRIPT_RULE_EVENTS+=("$event")
@@ -277,8 +281,8 @@ validate_config() {
   [[ -z "$TELEGRAM_BOT_TOKEN" || "$TELEGRAM_BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || { config_error "TELEGRAM_BOT_TOKEN has an invalid format." || true; invalid=1; }
   [[ -z "$TELEGRAM_CHAT_ID" || "$TELEGRAM_CHAT_ID" =~ ^-?[1-9][0-9]*$ ]] || { config_error "TELEGRAM_CHAT_ID must be a non-zero numeric chat ID." || true; invalid=1; }
   [[ "$MONITOR_DEBUG" == 0 || "$MONITOR_DEBUG" == 1 ]] || { config_error "MONITOR_DEBUG must be 0 or 1." || true; invalid=1; }
-  [[ "$GITHUB_API_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || { config_error "GITHUB_API_URL is not a valid HTTP(S) base URL." || true; invalid=1; }
-  [[ "$TELEGRAM_API_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || { config_error "TELEGRAM_API_URL is not a valid HTTP(S) base URL." || true; invalid=1; }
+  validate_api_url GITHUB_API_URL "$GITHUB_API_URL" || invalid=1
+  validate_api_url TELEGRAM_API_URL "$TELEGRAM_API_URL" || invalid=1
   [[ "$TOKEN_USAGE_SOURCES" == auto || "$TOKEN_USAGE_SOURCES" == none || "$TOKEN_USAGE_SOURCES" =~ ^(codex|opencode|hermes)(,(codex|opencode|hermes))*$ ]] || { config_error "TOKEN_USAGE_SOURCES must be auto, none, or a comma-separated list of codex,opencode,hermes." || true; invalid=1; }
 
   for path_value in "$TOKEN_PRICING_FILE" "$CODEX_DATA_DIR" "$OPENCODE_DB_PATH" "$HERMES_DB_PATH"; do
@@ -321,16 +325,7 @@ check_requirements() {
   if ! command -v python3 &>/dev/null; then
     echo "[ERROR] 'python3' is required but not found."
     missing=1
-  elif ! python3 - <<'PYEOF'
-import sys
-if sys.version_info < (3, 9):
-    raise SystemExit(1)
-try:
-    from zoneinfo import ZoneInfo
-    ZoneInfo("Europe/Paris")
-except Exception:
-    raise SystemExit(2)
-PYEOF
+  elif ! python3 "$SCRIPT_DIR/monitor_utils.py" check-tzdata
   then
     echo "[ERROR] Python >= 3.9 with Europe/Paris tzdata is required." >&2
     missing=1
@@ -349,301 +344,106 @@ PYEOF
   (( missing == 0 ))
 }
 
-initialize() {
-  local codex_bin_override="${CODEX_BIN_OVERRIDE:-}"
-  umask 077
-  if [[ -f "$ENV_FILE" ]]; then
-    if [[ -L "$ENV_FILE" || ! -O "$ENV_FILE" ]]; then
-      config_error ".env must be a regular file owned by the current user."
-      return 1
-    fi
-    chmod 600 "$ENV_FILE"
-    load_config
+check_status_requirements() {
+  local missing=0 codex_command="${CODEX_BIN:-codex}"
+  if ! command -v "$codex_command" &>/dev/null; then
+    echo "[ERROR] 'codex' command not found. Is OpenAI Codex CLI installed and in PATH?" >&2
+    missing=1
   fi
+  if ! command -v python3 &>/dev/null; then
+    echo "[ERROR] 'python3' is required but not found." >&2
+    missing=1
+  elif ! python3 "$SCRIPT_DIR/monitor_utils.py" check-tzdata; then
+    echo "[ERROR] Python >= 3.9 with Europe/Paris tzdata is required." >&2
+    missing=1
+  fi
+  (( missing == 0 ))
+}
 
+configure_state_paths() {
+  RUNTIME_DIR="$1"
+  STATE_FILE="${RUNTIME_DIR}/.alert_state"
+  DATA_FILE="${RUNTIME_DIR}/data.json"
+  HISTORY_FILE="${RUNTIME_DIR}/history.json"
+  ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"
+  HEALTH_FILE="${RUNTIME_DIR}/health.json"
+  LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
+}
+
+initialize() {
+  local config_path="$1" config_required="$2" state_override="$3" interval_override="$4"
+  local codex_bin_override="${CODEX_BIN_OVERRIDE:-}" resolver_arguments=()
+  umask 077
+  if ! command -v python3 &>/dev/null; then
+    config_error "python3 is required to load configuration."
+    return 1
+  fi
+  if [[ -n "$config_path" ]]; then
+    resolver_arguments+=(--config "$config_path")
+    (( config_required == 0 )) || resolver_arguments+=(--config-required)
+  fi
+  [[ -z "$state_override" ]] || resolver_arguments+=(--set "STATE_DIR=${state_override}")
+  [[ -z "$interval_override" ]] || resolver_arguments+=(--set "LOOP_INTERVAL=${interval_override}")
+  apply_resolved_config monitor 1 "${resolver_arguments[@]}" || return 1
   if [[ -n "$codex_bin_override" ]]; then
     CODEX_BIN="$codex_bin_override"
   fi
-
-  ALERT_THRESHOLDS="${ALERT_THRESHOLDS:-75,50,25,10,5}"
-  ALERT_SCRIPT_TIMEOUT_SECONDS="${ALERT_SCRIPT_TIMEOUT_SECONDS:-30}"
-  ARCHIVE_RETENTION_DAYS="${ARCHIVE_RETENTION_DAYS:-365}"
-  HISTORY_RETENTION_HOURS="${HISTORY_RETENTION_HOURS:-192}"
-  LOOP_INTERVAL="${LOOP_INTERVAL:-$DEFAULT_INTERVAL_SECONDS}"
-  CODEX_STATUS_TIMEOUT_SECONDS="${CODEX_STATUS_TIMEOUT_SECONDS:-20}"
-  CURL_CONNECT_TIMEOUT_SECONDS="${CURL_CONNECT_TIMEOUT_SECONDS:-5}"
-  CURL_MAX_TIME_SECONDS="${CURL_MAX_TIME_SECONDS:-20}"
-  CURL_RETRIES="${CURL_RETRIES:-2}"
-  CURL_RETRY_DELAY_SECONDS="${CURL_RETRY_DELAY_SECONDS:-1}"
-  MONITOR_DEBUG="${MONITOR_DEBUG:-0}"
-  DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}"
-  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-  TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
-  GITHUB_PAT="${GITHUB_PAT:-}"
-  GITHUB_GIST_ID="${GITHUB_GIST_ID:-}"
-  GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
-  TELEGRAM_API_URL="${TELEGRAM_API_URL:-https://api.telegram.org}"
-  TOKEN_USAGE_SOURCES="${TOKEN_USAGE_SOURCES:-auto}"
-  TOKEN_PRICING_FILE="${TOKEN_PRICING_FILE:-${SCRIPT_DIR}/pricing.json}"
-  CODEX_DATA_DIR="${CODEX_DATA_DIR:-${HOME}/.codex}"
-  OPENCODE_DB_PATH="${OPENCODE_DB_PATH:-${XDG_DATA_HOME:-${HOME}/.local/share}/opencode/opencode.db}"
-  HERMES_DB_PATH="${HERMES_DB_PATH:-${HOME}/.hermes/state.db}"
-
+  configure_state_paths "$STATE_DIR"
   check_requirements || return 1
   validate_config || return 1
+  if [[ -e "$RUNTIME_DIR" && ( -L "$RUNTIME_DIR" || ! -d "$RUNTIME_DIR" || ! -O "$RUNTIME_DIR" ) ]]; then
+    config_error "State directory must be a directory owned by the current user: $RUNTIME_DIR"
+    return 1
+  fi
   mkdir -p "$RUNTIME_DIR"
   chmod 700 "$RUNTIME_DIR"
   [[ -w "$RUNTIME_DIR" ]] || { config_error "Runtime directory is not writable: $RUNTIME_DIR"; return 1; }
 }
 
+initialize_status() {
+  local config_path="$1" config_required="$2" interval_override="$3"
+  local codex_bin_override="${CODEX_BIN_OVERRIDE:-}" resolver_arguments=()
+  umask 077
+  if ! command -v python3 &>/dev/null; then
+    config_error "python3 is required to load configuration."
+    return 1
+  fi
+  if [[ -n "$config_path" ]]; then
+    resolver_arguments+=(--config "$config_path")
+    (( config_required == 0 )) || resolver_arguments+=(--config-required)
+  fi
+  [[ -z "$interval_override" ]] || resolver_arguments+=(--set "LOOP_INTERVAL=${interval_override}")
+  apply_resolved_config status 1 "${resolver_arguments[@]}" || return 1
+  if [[ -n "$codex_bin_override" ]]; then
+    CODEX_BIN="$codex_bin_override"
+  fi
+  check_status_requirements
+}
+
 fetch_status_json() {
   local interval_seconds="$1"
   local codex_cmd="${CODEX_BIN:-codex}"
-
-  python3 - "$codex_cmd" "${CODEX_STATUS_TIMEOUT_SECONDS:-20}" "$interval_seconds" "$HISTORY_RETENTION_HOURS" "${MONITOR_DEBUG:-0}" <<'PYEOF'
-import datetime
-import json
-import math
-import os
-import select
-import subprocess
-import sys
-import time
-from zoneinfo import ZoneInfo
-
-codex_cmd = sys.argv[1]
-timeout_seconds = max(5, int(sys.argv[2]))
-interval_seconds = max(1, int(sys.argv[3]))
-history_window_hours = float(sys.argv[4])
-debug = sys.argv[5] == "1"
-paris_timezone = ZoneInfo("Europe/Paris")
-
-# Do not pass notification or storage credentials to the Codex subprocess.
-codex_environment = os.environ.copy()
-for secret_name in ("DISCORD_WEBHOOK", "GITHUB_PAT", "TELEGRAM_BOT_TOKEN"):
-    codex_environment.pop(secret_name, None)
-
-process = subprocess.Popen(
-    [codex_cmd, "app-server", "--stdio"],
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    text=True,
-    bufsize=1,
-    close_fds=True,
-    env=codex_environment,
-)
-
-
-def send(message):
-    process.stdin.write(json.dumps(message) + "\n")
-    process.stdin.flush()
-
-
-def stop_process():
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=2)
-
-
-send({
-    "id": 1,
-    "method": "initialize",
-    "params": {
-        "clientInfo": {"name": "codex-usage-monitor", "version": "1.0.0"},
-        "capabilities": {"experimentalApi": True},
-    },
-})
-
-deadline = time.monotonic() + timeout_seconds
-result = None
-rate_limit_requested = False
-diagnostic = bytearray()
-
-
-def clean_diagnostic(raw):
-    text = raw.decode("utf-8", "replace")
-    return "".join(char if char in "\n\t" or ord(char) >= 32 else "?" for char in text).strip()[:4096]
-
-try:
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([process.stdout, process.stderr], [], [], 0.5)
-        if not ready:
-            if process.poll() is not None:
-                break
-            continue
-
-        if process.stderr in ready:
-            chunk = os.read(process.stderr.fileno(), 1024)
-            if len(diagnostic) < 4096:
-                diagnostic.extend(chunk[: 4096 - len(diagnostic)])
-            ready.remove(process.stderr)
-        if process.stdout not in ready:
-            continue
-        line = process.stdout.readline()
-        if not line:
-            break
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        if message.get("id") == 1 and not rate_limit_requested:
-            if message.get("error"):
-                break
-            send({"method": "initialized"})
-            send({"id": 2, "method": "account/rateLimits/read", "params": None})
-            rate_limit_requested = True
-        elif message.get("id") == 2:
-            result = message.get("result")
-            break
-finally:
-    stop_process()
-
-if not isinstance(result, dict):
-    sys.stderr.write("[ERROR] Codex app-server did not return usage limits.\n")
-    if debug and diagnostic:
-        sys.stderr.write(f"[DEBUG] Codex diagnostic: {clean_diagnostic(diagnostic)}\n")
-    raise SystemExit(1)
-
-snapshots_by_id = result.get("rateLimitsByLimitId")
-if isinstance(snapshots_by_id, dict) and snapshots_by_id:
-    snapshots = [(str(limit_id), snapshot) for limit_id, snapshot in snapshots_by_id.items()]
-else:
-    flat = result.get("rateLimits")
-    snapshots = [(str(flat.get("limitId", "default")), flat)] if isinstance(flat, dict) else []
-
-
-def finite_number(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-
-
-def classify_windows(snapshot):
-    short = weekly = None
-    for name in ("primary", "secondary"):
-        window = snapshot.get(name)
-        if not isinstance(window, dict):
-            continue
-        duration = window.get("windowDurationMins")
-        used = window.get("usedPercent")
-        if not finite_number(duration) or duration <= 0:
-            continue
-        if not finite_number(used) or not 0 <= used <= 100:
-            continue
-        if 1 <= duration <= 360 and short is None:
-            short = window
-        elif 7 * 24 * 60 <= duration <= 8 * 24 * 60 and weekly is None:
-            weekly = window
-    return short, weekly
-
-
-# Select one coherent limit group; never combine windows from different IDs.
-candidates = []
-for limit_id, snapshot in snapshots:
-    if isinstance(snapshot, dict):
-        short, weekly = classify_windows(snapshot)
-        if short is not None or weekly is not None:
-            candidates.append((int(short is not None) + int(weekly is not None), limit_id, short, weekly))
-
-if not candidates:
-    sys.stderr.write("[ERROR] Codex returned no valid recognized usage window.\n")
-    if debug and diagnostic:
-        sys.stderr.write(f"[DEBUG] Codex diagnostic: {clean_diagnostic(diagnostic)}\n")
-    raise SystemExit(1)
-
-candidates.sort(key=lambda item: item[0], reverse=True)
-_, selected_limit_id, five_hour_window, weekly_window = candidates[0]
-if five_hour_window is None or weekly_window is None:
-    missing = "short" if five_hour_window is None else "weekly"
-    sys.stderr.write(
-        f"[WARN] Codex returned a partial limit group '{selected_limit_id}'; "
-        f"the {missing} usage window is unavailable.\n"
-    )
-
-
-def remaining_percent(window):
-    if not window:
-        return None
-    used = window.get("usedPercent")
-    if not finite_number(used) or not 0 <= used <= 100:
-        return None
-    remaining = 100 - used
-    return int(remaining) if float(remaining).is_integer() else remaining
-
-
-def reset_time(window):
-    if not window:
-        return "unknown"
-    timestamp = window.get("resetsAt")
-    if not finite_number(timestamp):
-        return "unknown"
-    try:
-        reset = datetime.datetime.fromtimestamp(timestamp, paris_timezone)
-    except (OverflowError, OSError, ValueError):
-        return "unknown"
-    return reset.strftime("%d/%m/%Y %H:%M")
-
-
-def reset_timestamp(window):
-    if not window:
-        return None
-    timestamp = window.get("resetsAt")
-    if not finite_number(timestamp) or timestamp <= 0:
-        return None
-    return int(timestamp)
-
-payload = {
-    "five_h_pct": remaining_percent(five_hour_window),
-    "five_h_reset": reset_time(five_hour_window),
-    "five_h_reset_at": reset_timestamp(five_hour_window),
-    "weekly_pct": remaining_percent(weekly_window),
-    "weekly_reset": reset_time(weekly_window),
-    "weekly_reset_at": reset_timestamp(weekly_window),
-    "limit_id": selected_limit_id,
-    "scraped_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "sample_interval_seconds": interval_seconds,
-    "history_window_hours": history_window_hours,
-}
-print(json.dumps(payload, indent=2))
-PYEOF
+  local -a debug_option=()
+  [[ "${MONITOR_DEBUG:-0}" == 1 ]] && debug_option+=(--debug)
+  python3 "$SCRIPT_DIR/codex_status.py" \
+    --codex-bin="$codex_cmd" \
+    --timeout "${CODEX_STATUS_TIMEOUT_SECONDS:-20}" \
+    --interval "$interval_seconds" \
+    --history-window-hours "$HISTORY_RETENTION_HOURS" \
+    "${debug_option[@]}"
 }
 
 json_get_field() {
   local json="$1"
   local field="$2"
 
-  python3 - "$json" "$field" <<'PYEOF'
-import json
-import sys
-
-data = json.loads(sys.argv[1])
-value = data.get(sys.argv[2], "")
-if value is None:
-    value = ""
-if isinstance(value, float) and value.is_integer():
-    value = int(value)
-print(value)
-PYEOF
+  python3 "$SCRIPT_DIR/monitor_utils.py" json-get-field "$json" "$field"
 }
 
 timestamp_to_epoch() {
   local timestamp="$1"
 
-  python3 - "$timestamp" <<'PYEOF'
-import datetime
-import sys
-
-try:
-    value = datetime.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
-    print(int(value.timestamp()))
-except (ValueError, OverflowError):
-    raise SystemExit(1)
-PYEOF
+  python3 "$SCRIPT_DIR/monitor_utils.py" timestamp-to-epoch "$timestamp"
 }
 
 format_paris_now() {
@@ -655,152 +455,21 @@ format_paris_timestamp() {
   TZ=Europe/Paris date -d "@${epoch}" '+%d/%m/%Y %H:%M'
 }
 
-history_max_entries() {
-  local interval_seconds="$1"
-
-  python3 - "$interval_seconds" "$HISTORY_RETENTION_HOURS" <<'PYEOF'
-import math
-import sys
-
-interval_seconds = max(1, int(sys.argv[1]))
-hours = float(sys.argv[2])
-entries = max(1, math.ceil((hours * 3600) / interval_seconds))
-print(entries)
-PYEOF
-}
-
 write_local_snapshot() {
   local json="$1"
   local interval_seconds="$2"
-  local max_entries
+  : "$interval_seconds"
 
-  max_entries="$(history_max_entries "$interval_seconds")"
-
-  python3 - "$HISTORY_FILE" "$DATA_FILE" "$json" "$max_entries" <<'PYEOF'
-import json
-import os
-import pathlib
-import shutil
-import sys
-import tempfile
-import time
-
-history_path = pathlib.Path(sys.argv[1])
-data_path = pathlib.Path(sys.argv[2])
-new_entry = json.loads(sys.argv[3])
-max_entries = int(sys.argv[4])
-public_fields = {
-    "five_h_pct",
-    "five_h_reset",
-    "five_h_reset_at",
-    "weekly_pct",
-    "weekly_reset",
-    "weekly_reset_at",
-    "scraped_at",
-    "sample_interval_seconds",
-    "history_window_hours",
-    "limit_id",
-}
-
-
-def sanitize_entry(entry):
-    if not isinstance(entry, dict):
-        return None
-    sanitized = {key: entry[key] for key in public_fields if key in entry}
-    for key in ("five_h_reset", "weekly_reset"):
-        value = sanitized.get(key)
-        if not isinstance(value, str) or len(value) > 100 or "@" in value:
-            sanitized[key] = "unknown"
-    value = sanitized.get("limit_id")
-    if value is not None and (not isinstance(value, str) or len(value) > 100 or any(ord(char) < 32 for char in value)):
-        sanitized.pop("limit_id", None)
-    for key in ("five_h_reset_at", "weekly_reset_at"):
-        value = sanitized.get(key)
-        if value is not None and (
-            not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0
-        ):
-            sanitized[key] = None
-    return sanitized
-
-
-new_entry = sanitize_entry(new_entry)
-if new_entry is None:
-    raise SystemExit("invalid usage snapshot")
-
-def atomic_write(path, content):
-    fd, temporary_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", text=True
-    )
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as temporary_file:
-            temporary_file.write(content)
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
-        os.replace(temporary_name, path)
-    finally:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-
-
-history = []
-if history_path.exists():
-    try:
-        history = json.loads(history_path.read_text(encoding="utf-8"))
-        if not isinstance(history, list):
-            raise ValueError("history root is not an array")
-    except Exception as error:
-        backup = history_path.with_name(f"{history_path.name}.corrupt.{int(time.time())}")
-        shutil.copy2(history_path, backup)
-        sys.stderr.write(f"[WARN] Corrupt history copied to {backup} before reconstruction: {error}\n")
-        history = []
-
-history = [entry for item in history if (entry := sanitize_entry(item)) is not None]
-new_timestamp = new_entry.get("scraped_at", "")
-existing_timestamps = {entry.get("scraped_at") for entry in history}
-if new_timestamp not in existing_timestamps:
-    history.append(new_entry)
-history.sort(key=lambda entry: entry.get("scraped_at", ""), reverse=True)
-history = history[:max_entries]
-
-current = None
-if data_path.exists():
-    try:
-        current = sanitize_entry(json.loads(data_path.read_text(encoding="utf-8")))
-    except Exception:
-        current = None
-
-atomic_write(history_path, json.dumps(history, indent=2) + "\n")
-if current is None or new_timestamp >= current.get("scraped_at", ""):
-    atomic_write(data_path, json.dumps(new_entry, indent=2) + "\n")
-else:
-    sys.stderr.write("[WARN] Older snapshot retained in history but did not replace data.json.\n")
-PYEOF
+  printf '%s\n' "$json" | python3 "$SCRIPT_DIR/history.py" \
+    --history "$HISTORY_FILE" \
+    --data "$DATA_FILE" \
+    --retention-hours "$HISTORY_RETENTION_HOURS"
 
   echo "[OK] Snapshot storage processed at ${DATA_FILE}"
 }
 
 load_thresholds() {
-  python3 - "$ALERT_THRESHOLDS" <<'PYEOF'
-import sys
-
-values = []
-for part in sys.argv[1].split(","):
-    part = part.strip()
-    if not part:
-        continue
-    try:
-        value = int(part)
-    except ValueError:
-        continue
-    if 0 <= value <= 100:
-        values.append(value)
-
-for value in sorted(set(values), reverse=True):
-    print(value)
-PYEOF
+  python3 "$SCRIPT_DIR/monitor_utils.py" load-thresholds "$ALERT_THRESHOLDS"
 }
 
 # ============================================================================
@@ -809,79 +478,85 @@ PYEOF
 http_request() {
   local service="$1" expected_status="$2" curl_config="$3" method="$4" output_file="$5"
   shift 5
-  local attempt=1 max_attempts=$((CURL_RETRIES + 1)) status="000" curl_status=0 delay error_file
+  local attempt=1 max_attempts=$((CURL_RETRIES + 1)) status="000" curl_status=0 delay=0
+  local disposition error_file header_file telegram_confirmed=1 max_response_bytes=1048576
+  [[ "$service" == "GitHub Gist" ]] && max_response_bytes=67108864
   error_file="$(mktemp "${RUNTIME_DIR}/.curl-error.XXXXXX")"
+  header_file="$(mktemp "${RUNTIME_DIR}/.curl-headers.XXXXXX")"
+  HTTP_LAST_RETRYABLE=0
 
   while (( attempt <= max_attempts )); do
     echo "[INFO] ${service}: delivery attempt ${attempt}/${max_attempts}."
     : > "$output_file"
     : > "$error_file"
+    : > "$header_file"
     curl_status=0
-    status="$(printf '%s\n' "$curl_config" | curl --config - --silent --show-error \
+    status="$(printf '%s\n' "$curl_config" | curl -q --config - --silent --show-error \
       --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" --max-time "$CURL_MAX_TIME_SECONDS" \
-      --request "$method" --output "$output_file" --write-out '%{http_code}' "$@" 2>"$error_file")" || curl_status=$?
-    if (( curl_status == 0 )) && [[ "$status" == "$expected_status" ]]; then
-      if [[ "$service" != Telegram ]] || python3 - "$output_file" <<'PYEOF'
-import json
-import pathlib
-import sys
-try:
-    response = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-except (OSError, ValueError):
-    raise SystemExit(1)
-raise SystemExit(0 if isinstance(response, dict) and response.get("ok") is True else 1)
-PYEOF
-      then
-        echo "[OK] ${service}: delivered (HTTP ${status})."
-        rm -f "$error_file"
-        return 0
-      fi
+      --max-filesize "$max_response_bytes" \
+      --request "$method" --output "$output_file" --dump-header "$header_file" \
+      --write-out '%{http_code}' "$@" 2>"$error_file")" || curl_status=$?
+    [[ "$status" =~ ^[0-9]{3}$ ]] || status=000
+    telegram_confirmed=1
+    if (( curl_status == 0 )) && [[ "$status" == "$expected_status" && "$service" == Telegram ]] \
+      && ! python3 "$SCRIPT_DIR/alerts.py" telegram-delivered "$output_file"; then
+      telegram_confirmed=0
     fi
-    if [[ "${MONITOR_DEBUG:-0}" == 1 && -s "$error_file" ]]; then
-      python3 - "$service" "$error_file" <<'PYEOF'
-import pathlib
-import sys
-
-text = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace")[:2048]
-text = "".join(char if char in "\n\t" or ord(char) >= 32 else "?" for char in text).strip()
-if text:
-    sys.stderr.write(f"[DEBUG] {sys.argv[1]} curl: {text}\n")
-PYEOF
+    if (( curl_status == 0 && telegram_confirmed == 1 )) && [[ "$status" == "$expected_status" ]]; then
+      echo "[OK] ${service}: delivered (HTTP ${status})."
+      rm -f "$error_file" "$header_file"
+      return 0
     fi
-    echo "[WARN] ${service}: attempt failed (curl=${curl_status}, HTTP ${status})." >&2
-    if (( attempt < max_attempts )); then
-      delay=$((CURL_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))))
+    read -r disposition delay < <(
+      python3 "$SCRIPT_DIR/alerts.py" retry "$curl_status" "$((10#$status))" "$attempt" \
+        "$CURL_RETRY_DELAY_SECONDS" 60 "$header_file"
+    )
+    if (( telegram_confirmed == 0 )); then
+      disposition=permanent
+      delay=0
+    fi
+    HTTP_LAST_RETRYABLE=0
+    [[ "$disposition" == transient ]] && HTTP_LAST_RETRYABLE=1
+    if [[ "$disposition" == transient ]] && (( attempt < max_attempts )); then
+      echo "[WARN] ${service}: curl=${curl_status}, HTTP=${status}, attempt=${attempt}/${max_attempts}, retry_delay=${delay}s." >&2
       (( delay > 0 )) && sleep "$delay"
+    else
+      echo "[WARN] ${service}: curl=${curl_status}, HTTP=${status}, attempt=${attempt}/${max_attempts}, retry_delay=0s." >&2
+      break
     fi
     ((attempt += 1))
   done
-  rm -f "$error_file"
+  rm -f "$error_file" "$header_file"
   return 1
 }
 
 sync_gist() {
-  local json="$1"
-  local history_json="$2"
-
   if [[ -z "${GITHUB_PAT:-}" || -z "${GITHUB_GIST_ID:-}" ]]; then
     return 0  # silently skip if not configured
   fi
 
-  local payload response_file
-  payload="$(python3 - "$json" "$history_json" <<'PYEOF'
-import json
-import sys
-print(json.dumps({"files": {"data.json": {"content": sys.argv[1]}, "history.json": {"content": sys.argv[2]}}}))
-PYEOF
-)"
-  response_file="$(mktemp "${RUNTIME_DIR}/.gist-response.XXXXXX")"
+  local payload_file
+  payload_file="$(mktemp "${RUNTIME_DIR}/.gist-payload.XXXXXX")" || {
+    echo "[ERROR] Could not create private Gist payload file." >&2
+    return 1
+  }
+  if ! chmod 600 "$payload_file"; then
+    rm -f "$payload_file"
+    echo "[ERROR] Could not secure private Gist payload file." >&2
+    return 1
+  fi
+  if ! python3 "$SCRIPT_DIR/monitor_utils.py" gist-payload-files \
+    "$DATA_FILE" "$HISTORY_FILE" "$payload_file"; then
+    rm -f "$payload_file"
+    return 1
+  fi
   if http_request "GitHub Gist" 200 \
     "url = \"${GITHUB_API_URL}/gists/${GITHUB_GIST_ID}\""$'\n'"header = \"Authorization: token ${GITHUB_PAT}\"" \
-    PATCH "$response_file" -H "Content-Type: application/json" --data "$payload"; then
-    rm -f "$response_file"
+    PATCH /dev/null -H "Content-Type: application/json" --data-binary "@${payload_file}"; then
+    rm -f "$payload_file"
     return 0
   fi
-  rm -f "$response_file"
+  rm -f "$payload_file"
   return 1
 }
 
@@ -893,13 +568,7 @@ send_discord() {
   local payload
   if [[ -z "${DISCORD_WEBHOOK:-}" ]]; then return; fi
 
-  payload="$(python3 - "$message" <<'PYEOF'
-import json
-import sys
-
-print(json.dumps({"content": sys.argv[1]}))
-PYEOF
-)"
+  payload="$(python3 "$SCRIPT_DIR/monitor_utils.py" discord-payload "$message")"
 
   local response_file
   response_file="$(mktemp "${RUNTIME_DIR}/.discord-response.XXXXXX")"
@@ -930,17 +599,41 @@ send_telegram() {
 
 send_alert() {
   local message="$1"
-  local configured=0 delivered=0
+  local alert_prefix="${2:-}" configured=0 delivered=0 channel_status channel_retryable
   echo "[ALERT] Detected: $message"
   if [[ -n "${DISCORD_WEBHOOK:-}" ]]; then
     ((configured += 1))
-    if send_discord "$message"; then
+    if [[ -n "$alert_prefix" ]]; then
+      channel_status="${alert_prefix}_discord_status"
+      channel_retryable="${alert_prefix}_discord_retryable"
+    fi
+    if [[ -z "$alert_prefix" || "${!channel_status}" == pending \
+      || ( "${!channel_status}" == failed && "${!channel_retryable}" == 1 ) ]]; then
+      if send_discord "$message"; then
+        ((delivered += 1))
+        [[ -z "$alert_prefix" ]] || record_alert_channel "$alert_prefix" discord delivered 0 || return 1
+      else
+        [[ -z "$alert_prefix" ]] || record_alert_channel "$alert_prefix" discord failed "$HTTP_LAST_RETRYABLE" || return 1
+      fi
+    elif [[ "${!channel_status}" == delivered ]]; then
       ((delivered += 1))
     fi
   fi
   if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
     ((configured += 1))
-    if send_telegram "$message"; then
+    if [[ -n "$alert_prefix" ]]; then
+      channel_status="${alert_prefix}_telegram_status"
+      channel_retryable="${alert_prefix}_telegram_retryable"
+    fi
+    if [[ -z "$alert_prefix" || "${!channel_status}" == pending \
+      || ( "${!channel_status}" == failed && "${!channel_retryable}" == 1 ) ]]; then
+      if send_telegram "$message"; then
+        ((delivered += 1))
+        [[ -z "$alert_prefix" ]] || record_alert_channel "$alert_prefix" telegram delivered 0 || return 1
+      else
+        [[ -z "$alert_prefix" ]] || record_alert_channel "$alert_prefix" telegram failed "$HTTP_LAST_RETRYABLE" || return 1
+      fi
+    elif [[ "${!channel_status}" == delivered ]]; then
       ((delivered += 1))
     fi
   fi
@@ -948,53 +641,18 @@ send_alert() {
     echo "[INFO] No alert channel configured; alert acknowledged locally."
     return 0
   fi
-  (( delivered > 0 ))
+  (( delivered == configured ))
 }
 
 weekly_pace_vs_ideal() {
   local weekly_pct="$1"
   local weekly_reset_at="$2"
   local scraped_at_epoch="$3"
-
-  python3 - "$weekly_pct" "$weekly_reset_at" "$scraped_at_epoch" <<'PYEOF'
-import sys
-
-try:
-    actual = float(sys.argv[1])
-    reset_at = int(sys.argv[2])
-    sampled_at = int(sys.argv[3])
-except (TypeError, ValueError):
-    raise SystemExit(0)
-
-weekly_window = 7 * 24 * 60 * 60
-remaining = reset_at - sampled_at
-if not 0 <= actual <= 100 or not 0 <= remaining <= weekly_window:
-    raise SystemExit(0)
-
-ideal = round(100 * remaining / weekly_window, 1)
-difference = round(actual - ideal, 1)
-direction = "on pace" if difference == 0 else "above" if difference > 0 else "below"
-sign = "+" if difference > 0 else ""
-
-if ideal > 0:
-    relative = round(abs(actual - ideal) / ideal * 100, 1)
-    print(f"{sign}{difference:.1f} pts · {relative:.1f}% {direction}")
-else:
-    print(f"{sign}{difference:.1f} pts")
-PYEOF
+  python3 "$SCRIPT_DIR/monitor_utils.py" weekly-pace "$weekly_pct" "$weekly_reset_at" "$scraped_at_epoch"
 }
 
 percentage_below_full() {
-  python3 - "$1" <<'PYEOF'
-import math
-import sys
-
-try:
-    value = float(sys.argv[1])
-except ValueError:
-    raise SystemExit(1)
-raise SystemExit(0 if math.isfinite(value) and 0 <= value < 100 else 1)
-PYEOF
+  python3 "$SCRIPT_DIR/monitor_utils.py" percentage-below-full "$1"
 }
 
 csv_contains() {
@@ -1003,10 +661,8 @@ csv_contains() {
 }
 
 persist_alert_state() {
-  local state_tmp
-  state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || return 1
   if ! printf '%s\n' \
-    'state_version=3' \
+    'state_version=4' \
     "prev_5h_pct=${prev_5h_pct}" \
     "prev_weekly_pct=${prev_weekly_pct}" \
     "five_h_armed_reset_at=${five_h_armed_reset_at}" \
@@ -1017,6 +673,44 @@ persist_alert_state() {
     "notified_weekly_thresholds=${notified_weekly_thresholds}" \
     "pending_5h_threshold=${pending_5h_threshold}" \
     "pending_weekly_threshold=${pending_weekly_threshold}" \
+    "five_h_threshold_alert_id=${five_h_threshold_alert_id}" \
+    "five_h_threshold_status=${five_h_threshold_status}" \
+    "five_h_threshold_discord_status=${five_h_threshold_discord_status}" \
+    "five_h_threshold_discord_retryable=${five_h_threshold_discord_retryable}" \
+    "five_h_threshold_telegram_status=${five_h_threshold_telegram_status}" \
+    "five_h_threshold_telegram_retryable=${five_h_threshold_telegram_retryable}" \
+    "five_h_threshold_remaining_pct=${five_h_threshold_remaining_pct}" \
+    "five_h_threshold_reset_label=${five_h_threshold_reset_label}" \
+    "five_h_threshold_pace=${five_h_threshold_pace}" \
+    "five_h_threshold_last_terminal_alert_id=${five_h_threshold_last_terminal_alert_id}" \
+    "five_h_threshold_last_terminal_status=${five_h_threshold_last_terminal_status}" \
+    "five_h_threshold_last_terminal_discord_status=${five_h_threshold_last_terminal_discord_status}" \
+    "five_h_threshold_last_terminal_telegram_status=${five_h_threshold_last_terminal_telegram_status}" \
+    "weekly_threshold_alert_id=${weekly_threshold_alert_id}" \
+    "weekly_threshold_status=${weekly_threshold_status}" \
+    "weekly_threshold_discord_status=${weekly_threshold_discord_status}" \
+    "weekly_threshold_discord_retryable=${weekly_threshold_discord_retryable}" \
+    "weekly_threshold_telegram_status=${weekly_threshold_telegram_status}" \
+    "weekly_threshold_telegram_retryable=${weekly_threshold_telegram_retryable}" \
+    "weekly_threshold_remaining_pct=${weekly_threshold_remaining_pct}" \
+    "weekly_threshold_reset_label=${weekly_threshold_reset_label}" \
+    "weekly_threshold_pace=${weekly_threshold_pace}" \
+    "weekly_threshold_last_terminal_alert_id=${weekly_threshold_last_terminal_alert_id}" \
+    "weekly_threshold_last_terminal_status=${weekly_threshold_last_terminal_status}" \
+    "weekly_threshold_last_terminal_discord_status=${weekly_threshold_last_terminal_discord_status}" \
+    "weekly_threshold_last_terminal_telegram_status=${weekly_threshold_last_terminal_telegram_status}" \
+    "five_h_reset_alert_id=${five_h_reset_alert_id}" \
+    "five_h_reset_status=${five_h_reset_status}" \
+    "five_h_reset_discord_status=${five_h_reset_discord_status}" \
+    "five_h_reset_discord_retryable=${five_h_reset_discord_retryable}" \
+    "five_h_reset_telegram_status=${five_h_reset_telegram_status}" \
+    "five_h_reset_telegram_retryable=${five_h_reset_telegram_retryable}" \
+    "weekly_reset_alert_id=${weekly_reset_alert_id}" \
+    "weekly_reset_status=${weekly_reset_status}" \
+    "weekly_reset_discord_status=${weekly_reset_discord_status}" \
+    "weekly_reset_discord_retryable=${weekly_reset_discord_retryable}" \
+    "weekly_reset_telegram_status=${weekly_reset_telegram_status}" \
+    "weekly_reset_telegram_retryable=${weekly_reset_telegram_retryable}" \
     "script_tracking_initialized=${script_tracking_initialized}" \
     "script_prev_5h_pct=${script_prev_5h_pct}" \
     "script_prev_weekly_pct=${script_prev_weekly_pct}" \
@@ -1025,13 +719,238 @@ persist_alert_state() {
     "script_5h_reset_attempted_at=${script_5h_reset_attempted_at}" \
     "script_weekly_reset_attempted_at=${script_weekly_reset_attempted_at}" \
     "attempted_script_5h_reset_actions=${attempted_script_5h_reset_actions}" \
-    "attempted_script_weekly_reset_actions=${attempted_script_weekly_reset_actions}" > "$state_tmp"; then
-    rm -f "$state_tmp"
+    "attempted_script_weekly_reset_actions=${attempted_script_weekly_reset_actions}" \
+    | python3 "$SCRIPT_DIR/monitor_utils.py" atomic-write "$STATE_FILE"; then
+    echo "[ERROR] Could not durably persist alert state at ${STATE_FILE}." >&2
     return 1
   fi
-  if ! mv -f "$state_tmp" "$STATE_FILE"; then
-    rm -f "$state_tmp"
+}
+
+refresh_alert_status() {
+  local prefix="$1" discord_name="${1}_discord_status" telegram_name="${1}_telegram_status"
+  local status_name="${1}_status" next_status=pending
+  if [[ "${!discord_name}" == delivered && "${!telegram_name}" == delivered ]]; then
+    next_status=delivered
+  elif [[ "${!discord_name}" == failed || "${!telegram_name}" == failed ]]; then
+    next_status=failed
+  fi
+  printf -v "$status_name" '%s' "$next_status"
+}
+
+record_alert_channel() {
+  local prefix="$1" channel="$2" result="$3" retryable="$4"
+  printf -v "${prefix}_${channel}_status" '%s' "$result"
+  printf -v "${prefix}_${channel}_retryable" '%s' "$retryable"
+  refresh_alert_status "$prefix"
+  if ! persist_alert_state; then
+    echo "[ERROR] Could not persist ${channel} alert delivery state." >&2
+    ALERT_PROCESSING_ERROR="alert state persistence failed"
     return 1
+  fi
+}
+
+prepare_alert_delivery() {
+  local prefix="$1" alert_id="$2" id_name="${1}_alert_id"
+  if [[ "${!id_name}" == "$alert_id" ]]; then
+    return 0
+  fi
+  printf -v "$id_name" '%s' "$alert_id"
+  if [[ -n "${DISCORD_WEBHOOK:-}" ]]; then
+    printf -v "${prefix}_discord_status" '%s' pending
+  else
+    printf -v "${prefix}_discord_status" '%s' delivered
+  fi
+  printf -v "${prefix}_discord_retryable" '%s' 1
+  if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+    printf -v "${prefix}_telegram_status" '%s' pending
+  else
+    printf -v "${prefix}_telegram_status" '%s' delivered
+  fi
+  printf -v "${prefix}_telegram_retryable" '%s' 1
+  refresh_alert_status "$prefix"
+  persist_alert_state
+}
+
+attempt_alert_notification() {
+  local prefix="$1" alert_id="$2" message="$3" status_name="${1}_status"
+  prepare_alert_delivery "$prefix" "$alert_id" || return 1
+  if send_alert "$message" "$prefix"; then
+    # Test and integration overrides of send_alert retain their historical API.
+    if [[ "${!status_name}" != delivered ]]; then
+      [[ -z "${DISCORD_WEBHOOK:-}" ]] || record_alert_channel "$prefix" discord delivered 0 || return 1
+      if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+        record_alert_channel "$prefix" telegram delivered 0 || return 1
+      fi
+      refresh_alert_status "$prefix"
+      persist_alert_state || return 1
+    fi
+    return 0
+  fi
+  local discord_status_name="${prefix}_discord_status" discord_retryable_name="${prefix}_discord_retryable"
+  local telegram_status_name="${prefix}_telegram_status" telegram_retryable_name="${prefix}_telegram_retryable"
+  if [[ ( "${!discord_status_name}" == delivered \
+      || ( "${!discord_status_name}" == failed && "${!discord_retryable_name}" == 0 ) ) \
+    && ( "${!telegram_status_name}" == delivered \
+      || ( "${!telegram_status_name}" == failed && "${!telegram_retryable_name}" == 0 ) ) ]]; then
+    # Permanent failures terminate this occurrence without claiming delivery.
+    # A later threshold or cycle receives a new ID and fresh channel state.
+    refresh_alert_status "$prefix"
+    persist_alert_state || return 1
+    return 2
+  fi
+  return 1
+}
+
+close_active_threshold_alert() {
+  local prefix="$1" reason="$2" id_name="${1}_alert_id" status_name="${1}_status"
+  local discord_name="${1}_discord_status" telegram_name="${1}_telegram_status"
+  [[ -n "${!id_name}" ]] || return 0
+  printf -v "$status_name" '%s' failed
+  printf -v "${prefix}_last_terminal_alert_id" '%s' "${!id_name}"
+  printf -v "${prefix}_last_terminal_status" '%s' failed
+  printf -v "${prefix}_last_terminal_discord_status" '%s' "${!discord_name}"
+  printf -v "${prefix}_last_terminal_telegram_status" '%s' "${!telegram_name}"
+  echo "[WARN] Alert ${!id_name} closed as failed: ${reason}." >&2
+  persist_alert_state
+}
+
+threshold_alert_message() {
+  local prefix="$1" window="$2" threshold="$3"
+  local remaining_name="${1}_remaining_pct" reset_name="${1}_reset_label" pace_name="${1}_pace"
+  local pace_suffix=""
+  [[ -z "${!pace_name}" ]] || pace_suffix=$'\n'"*Pace vs ideal:* ${!pace_name}"
+  if [[ "$window" == 5h ]]; then
+    printf '*Codex 5h limit at %s%% remaining* (crossed %s%% threshold). Resets at %s%s' \
+      "${!remaining_name}" "$threshold" "${!reset_name}" "$pace_suffix"
+  else
+    printf '*Codex weekly limit at %s%% remaining* (crossed %s%% threshold). Resets %s%s' \
+      "${!remaining_name}" "$threshold" "${!reset_name}" "$pace_suffix"
+  fi
+}
+
+alert_id() {
+  python3 "$SCRIPT_DIR/alerts.py" id "$@"
+}
+
+migrate_legacy_alert_delivery() {
+  local legacy_version="$1" window state_window pending_name notified_name armed_name last_reset_name prefix occurrence migrated_id
+  for window in 5h weekly; do
+    [[ "$window" == 5h ]] && state_window=five_h || state_window=weekly
+    pending_name="pending_${window}_threshold"
+    notified_name="notified_${window}_thresholds"
+    armed_name="${state_window}_armed_reset_at"
+    prefix="${state_window}_threshold"
+    if [[ -n "${!pending_name}" ]]; then
+      occurrence="legacy-v${legacy_version}:${!armed_name}"
+      migrated_id="$(alert_id threshold "$window" "${!pending_name}" "$occurrence")" || return 1
+      printf -v "${prefix}_alert_id" '%s' "$migrated_id"
+      printf -v "${prefix}_discord_status" '%s' "$([[ -n "${DISCORD_WEBHOOK:-}" ]] && printf pending || printf delivered)"
+      printf -v "${prefix}_telegram_status" '%s' "$([[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] && printf pending || printf delivered)"
+      printf -v "${prefix}_discord_retryable" '%s' 1
+      printf -v "${prefix}_telegram_retryable" '%s' 1
+      refresh_alert_status "$prefix"
+    elif [[ -n "${!notified_name}" ]]; then
+      migrated_id="$(alert_id legacy-threshold "$window" "${!notified_name}" "${!armed_name}")" || return 1
+      printf -v "${prefix}_alert_id" '%s' "$migrated_id"
+      printf -v "${prefix}_status" '%s' delivered
+      printf -v "${prefix}_discord_status" '%s' delivered
+      printf -v "${prefix}_telegram_status" '%s' delivered
+      printf -v "${prefix}_discord_retryable" '%s' 0
+      printf -v "${prefix}_telegram_retryable" '%s' 0
+    fi
+
+    last_reset_name="last_notified_${window}_reset_at"
+    prefix="${state_window}_reset"
+    if (( ${!last_reset_name} > 0 )); then
+      migrated_id="$(alert_id reset "$window" reset "${!last_reset_name}")" || return 1
+      printf -v "${prefix}_alert_id" '%s' "$migrated_id"
+      printf -v "${prefix}_status" '%s' delivered
+      printf -v "${prefix}_discord_status" '%s' delivered
+      printf -v "${prefix}_telegram_status" '%s' delivered
+      printf -v "${prefix}_discord_retryable" '%s' 0
+      printf -v "${prefix}_telegram_retryable" '%s' 0
+    fi
+  done
+}
+
+migrate_alert_state_v1() { migrate_legacy_alert_delivery 1; }
+migrate_alert_state_v2() { migrate_legacy_alert_delivery 2; }
+migrate_alert_state_v3() { migrate_legacy_alert_delivery 3; }
+
+repair_v4_pending_threshold() {
+  local window="$1" state_window pending_name prefix id_name status_name
+  local discord_name telegram_name discord_retryable_name telegram_retryable_name
+  local id_seen_name status_seen_name discord_seen_name telegram_seen_name
+  local discord_retryable_seen_name telegram_retryable_seen_name
+  local discord_configured=0 telegram_configured=0 needs_repair=0 occurrence migrated_id armed_name
+
+  [[ "$window" == 5h ]] && state_window=five_h || state_window=weekly
+  pending_name="pending_${window}_threshold"
+  prefix="${state_window}_threshold"
+  id_name="${prefix}_alert_id"
+  status_name="${prefix}_status"
+  discord_name="${prefix}_discord_status"
+  telegram_name="${prefix}_telegram_status"
+  discord_retryable_name="${prefix}_discord_retryable"
+  telegram_retryable_name="${prefix}_telegram_retryable"
+  id_seen_name="${id_name}_seen"
+  status_seen_name="${status_name}_seen"
+  discord_seen_name="${discord_name}_seen"
+  telegram_seen_name="${telegram_name}_seen"
+  discord_retryable_seen_name="${discord_retryable_name}_seen"
+  telegram_retryable_seen_name="${telegram_retryable_name}_seen"
+  armed_name="${state_window}_armed_reset_at"
+
+  [[ -n "${DISCORD_WEBHOOK:-}" ]] && discord_configured=1
+  [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] && telegram_configured=1
+
+  [[ "${!pending_name}" =~ ^[0-9]+$ ]] || return 0
+  if [[ "${!id_name}" != "" && "${!id_name}" =~ ^[a-f0-9]{24}$ ]] \
+    && (( ${!id_seen_name} == 1 )); then
+    :
+  else
+    needs_repair=1
+    occurrence="v4-recovery:${!armed_name}:${!pending_name}"
+    migrated_id="$(alert_id threshold "$window" "${!pending_name}" "$occurrence")" \
+      || return 1
+    printf -v "$id_name" '%s' "$migrated_id"
+  fi
+
+  if (( discord_configured == 1 )) \
+    && (( ${!discord_seen_name} != 1 || ${!discord_retryable_seen_name} != 1 )); then
+    needs_repair=1
+  fi
+  if (( telegram_configured == 1 )) \
+    && (( ${!telegram_seen_name} != 1 || ${!telegram_retryable_seen_name} != 1 )); then
+    needs_repair=1
+  fi
+  if (( discord_configured == 0 )) \
+    && [[ "${!discord_name}" != delivered || "${!discord_retryable_name}" != 0 ]]; then
+    needs_repair=1
+  fi
+  if (( telegram_configured == 0 )) \
+    && [[ "${!telegram_name}" != delivered || "${!telegram_retryable_name}" != 0 ]]; then
+    needs_repair=1
+  fi
+  (( ${!status_seen_name} != 1 )) && needs_repair=1
+
+  if (( needs_repair == 1 )); then
+    if (( discord_configured == 1 )); then
+      printf -v "$discord_name" '%s' pending
+      printf -v "$discord_retryable_name" '%s' 1
+    else
+      printf -v "$discord_name" '%s' delivered
+      printf -v "$discord_retryable_name" '%s' 0
+    fi
+    if (( telegram_configured == 1 )); then
+      printf -v "$telegram_name" '%s' pending
+      printf -v "$telegram_retryable_name" '%s' 1
+    else
+      printf -v "$telegram_name" '%s' delivered
+      printf -v "$telegram_retryable_name" '%s' 0
+    fi
+    refresh_alert_status "$prefix"
+    persist_alert_state || return 1
   fi
 }
 
@@ -1104,6 +1023,31 @@ check_thresholds() {
   local notified_weekly_thresholds=""
   local pending_5h_threshold=""
   local pending_weekly_threshold=""
+  local state_version=1
+  local five_h_threshold_alert_id="" five_h_threshold_status=delivered
+  local five_h_threshold_discord_status=delivered five_h_threshold_discord_retryable=0
+  local five_h_threshold_telegram_status=delivered five_h_threshold_telegram_retryable=0
+  local five_h_threshold_alert_id_seen=0 five_h_threshold_status_seen=0
+  local five_h_threshold_discord_status_seen=0 five_h_threshold_telegram_status_seen=0
+  local five_h_threshold_discord_retryable_seen=0 five_h_threshold_telegram_retryable_seen=0
+  local five_h_threshold_remaining_pct="" five_h_threshold_reset_label="" five_h_threshold_pace=""
+  local five_h_threshold_last_terminal_alert_id="" five_h_threshold_last_terminal_status=""
+  local five_h_threshold_last_terminal_discord_status="" five_h_threshold_last_terminal_telegram_status=""
+  local weekly_threshold_alert_id="" weekly_threshold_status=delivered
+  local weekly_threshold_discord_status=delivered weekly_threshold_discord_retryable=0
+  local weekly_threshold_telegram_status=delivered weekly_threshold_telegram_retryable=0
+  local weekly_threshold_alert_id_seen=0 weekly_threshold_status_seen=0
+  local weekly_threshold_discord_status_seen=0 weekly_threshold_telegram_status_seen=0
+  local weekly_threshold_discord_retryable_seen=0 weekly_threshold_telegram_retryable_seen=0
+  local weekly_threshold_remaining_pct="" weekly_threshold_reset_label="" weekly_threshold_pace=""
+  local weekly_threshold_last_terminal_alert_id="" weekly_threshold_last_terminal_status=""
+  local weekly_threshold_last_terminal_discord_status="" weekly_threshold_last_terminal_telegram_status=""
+  local five_h_reset_alert_id="" five_h_reset_status=delivered
+  local five_h_reset_discord_status=delivered five_h_reset_discord_retryable=0
+  local five_h_reset_telegram_status=delivered five_h_reset_telegram_retryable=0
+  local weekly_reset_alert_id="" weekly_reset_status=delivered
+  local weekly_reset_discord_status=delivered weekly_reset_discord_retryable=0
+  local weekly_reset_telegram_status=delivered weekly_reset_telegram_retryable=0
   local script_tracking_initialized=0
   local script_prev_5h_pct=100
   local script_prev_weekly_pct=100
@@ -1113,13 +1057,17 @@ check_thresholds() {
   local script_weekly_reset_attempted_at=0
   local attempted_script_5h_reset_actions=""
   local attempted_script_weekly_reset_actions=""
-  local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold
+  local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold current_alert_id
+  local alert_result pending_before new_threshold message
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 initialize_script_baseline=0
   local -a script_thresholds=()
   ALERT_PROCESSING_ERROR=""
   if [[ -f "$STATE_FILE" ]]; then
     while IFS='=' read -r state_key state_value; do
       case "$state_key" in
+        state_version)
+          [[ "$state_value" =~ ^[1-4]$ ]] && state_version="$state_value"
+          ;;
         prev_5h_pct|prev_weekly_pct|script_prev_5h_pct|script_prev_weekly_pct)
           if [[ "$state_value" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
@@ -1136,6 +1084,49 @@ check_thresholds() {
         pending_5h_threshold|pending_weekly_threshold)
           [[ -z "$state_value" || "$state_value" =~ ^[0-9]+$ ]] && printf -v "$state_key" '%s' "$state_value"
           ;;
+        five_h_threshold_alert_id|weekly_threshold_alert_id|five_h_reset_alert_id|weekly_reset_alert_id)
+          if [[ -z "$state_value" || "$state_value" =~ ^[a-f0-9]{24}$ ]]; then
+            printf -v "$state_key" '%s' "$state_value"
+            case "$state_key" in
+              five_h_threshold_alert_id|weekly_threshold_alert_id)
+                printf -v "${state_key}_seen" '%s' 1
+                ;;
+            esac
+          fi
+          ;;
+        five_h_threshold_last_terminal_alert_id|weekly_threshold_last_terminal_alert_id)
+          [[ -z "$state_value" || "$state_value" =~ ^[a-f0-9]{24}$ ]] && printf -v "$state_key" '%s' "$state_value"
+          ;;
+        five_h_threshold_status|weekly_threshold_status|five_h_reset_status|weekly_reset_status|five_h_threshold_discord_status|five_h_threshold_telegram_status|weekly_threshold_discord_status|weekly_threshold_telegram_status|five_h_reset_discord_status|five_h_reset_telegram_status|weekly_reset_discord_status|weekly_reset_telegram_status)
+          if [[ "$state_value" == pending || "$state_value" == delivered || "$state_value" == failed ]]; then
+            printf -v "$state_key" '%s' "$state_value"
+            case "$state_key" in
+              five_h_threshold_status|weekly_threshold_status|five_h_threshold_discord_status|five_h_threshold_telegram_status|weekly_threshold_discord_status|weekly_threshold_telegram_status)
+                printf -v "${state_key}_seen" '%s' 1
+                ;;
+            esac
+          fi
+          ;;
+        five_h_threshold_last_terminal_status|weekly_threshold_last_terminal_status|five_h_threshold_last_terminal_discord_status|five_h_threshold_last_terminal_telegram_status|weekly_threshold_last_terminal_discord_status|weekly_threshold_last_terminal_telegram_status)
+          [[ -z "$state_value" || "$state_value" == pending || "$state_value" == delivered || "$state_value" == failed ]] \
+            && printf -v "$state_key" '%s' "$state_value"
+          ;;
+        five_h_threshold_remaining_pct|weekly_threshold_remaining_pct)
+          [[ -z "$state_value" || "$state_value" =~ ^([0-9]+([.][0-9]+)?)$ ]] && printf -v "$state_key" '%s' "$state_value"
+          ;;
+        five_h_threshold_reset_label|weekly_threshold_reset_label|five_h_threshold_pace|weekly_threshold_pace)
+          printf -v "$state_key" '%s' "$state_value"
+          ;;
+        five_h_threshold_discord_retryable|five_h_threshold_telegram_retryable|weekly_threshold_discord_retryable|weekly_threshold_telegram_retryable|five_h_reset_discord_retryable|five_h_reset_telegram_retryable|weekly_reset_discord_retryable|weekly_reset_telegram_retryable)
+          if [[ "$state_value" == 0 || "$state_value" == 1 ]]; then
+            printf -v "$state_key" '%s' "$state_value"
+            case "$state_key" in
+              five_h_threshold_discord_retryable|five_h_threshold_telegram_retryable|weekly_threshold_discord_retryable|weekly_threshold_telegram_retryable)
+                printf -v "${state_key}_seen" '%s' 1
+                ;;
+            esac
+          fi
+          ;;
         script_tracking_initialized)
           [[ "$state_value" == 0 || "$state_value" == 1 ]] && script_tracking_initialized="$state_value"
           ;;
@@ -1147,6 +1138,17 @@ check_thresholds() {
           ;;
       esac
     done < "$STATE_FILE"
+  fi
+
+  case "$state_version" in
+    1) migrate_alert_state_v1 || return 1 ;;
+    2) migrate_alert_state_v2 || return 1 ;;
+    3) migrate_alert_state_v3 || return 1 ;;
+  esac
+
+  if (( state_version == 4 )); then
+    repair_v4_pending_threshold 5h || return 1
+    repair_v4_pending_threshold weekly || return 1
   fi
 
   mapfile -t thresholds < <(load_thresholds)
@@ -1170,8 +1172,19 @@ check_thresholds() {
     due_5h_reset_at="$five_h_armed_reset_at"
     reset_age=$(( scraped_at_epoch - five_h_armed_reset_at ))
     if (( reset_age <= 5 * 60 * 60 && last_notified_5h_reset_at != five_h_armed_reset_at )); then
-      if send_alert "*Codex 5h limit reset.* A new usage cycle is available."; then
+      current_alert_id="$(alert_id reset 5h reset "$five_h_armed_reset_at")"
+      if attempt_alert_notification five_h_reset "$current_alert_id" \
+        "*Codex 5h limit reset.* A new usage cycle is available."; then
+        alert_result=0
+      else
+        alert_result=$?
+      fi
+      if (( alert_result == 0 )); then
         last_notified_5h_reset_at="$five_h_armed_reset_at"
+      elif (( alert_result == 2 )); then
+        last_notified_5h_reset_at="$five_h_armed_reset_at"
+        status=1
+        ALERT_PROCESSING_ERROR="alert delivery failed permanently"
       else
         status=1
         ALERT_PROCESSING_ERROR="alert delivery pending"
@@ -1195,8 +1208,19 @@ check_thresholds() {
     due_weekly_reset_at="$weekly_armed_reset_at"
     reset_age=$(( scraped_at_epoch - weekly_armed_reset_at ))
     if (( reset_age <= 7 * 24 * 60 * 60 && last_notified_weekly_reset_at != weekly_armed_reset_at )); then
-      if send_alert "*Codex weekly limit reset.* A new usage cycle is available."; then
+      current_alert_id="$(alert_id reset weekly reset "$weekly_armed_reset_at")"
+      if attempt_alert_notification weekly_reset "$current_alert_id" \
+        "*Codex weekly limit reset.* A new usage cycle is available."; then
+        alert_result=0
+      else
+        alert_result=$?
+      fi
+      if (( alert_result == 0 )); then
         last_notified_weekly_reset_at="$weekly_armed_reset_at"
+      elif (( alert_result == 2 )); then
+        last_notified_weekly_reset_at="$weekly_armed_reset_at"
+        status=1
+        ALERT_PROCESSING_ERROR="alert delivery failed permanently"
       else
         status=1
         ALERT_PROCESSING_ERROR="alert delivery pending"
@@ -1235,27 +1259,49 @@ check_thresholds() {
   # The first observation uses 100% as its baseline. A multi-threshold drop emits
   # one alert for the most critical crossed threshold and marks all crossed levels.
   if [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+    pending_before="$pending_5h_threshold"
     critical="$pending_5h_threshold"
+    new_threshold=""
     for t in "${thresholds[@]}"; do
-      if python3 - "$five_h_pct" "$prev_5h_pct" "$t" "$notified_5h_thresholds" <<'PYEOF'
-import sys
-current, previous, threshold = map(float, sys.argv[1:4])
-notified = {item for item in sys.argv[4].split(",") if item}
-raise SystemExit(0 if current <= threshold < previous and str(int(threshold)) not in notified else 1)
-PYEOF
+      if python3 "$SCRIPT_DIR/monitor_utils.py" threshold-crossed \
+        "$five_h_pct" "$prev_5h_pct" "$t" "$notified_5h_thresholds"
       then
-        [[ -z "$critical" || t -lt critical ]] && critical="$t"
+        if [[ -z "$critical" || t -lt critical ]]; then
+          critical="$t"
+          [[ -z "$pending_before" || t -lt pending_before ]] && new_threshold=1
+        elif [[ -z "$pending_before" ]]; then
+          new_threshold=1
+        fi
       fi
     done
     if [[ -n "$critical" ]]; then
+      if [[ -n "$new_threshold" ]]; then
+        if [[ -n "$five_h_threshold_alert_id" && "$five_h_threshold_status" != delivered ]]; then
+          close_active_threshold_alert five_h_threshold "superseded by ${critical}% threshold" || return 1
+        fi
+        five_h_threshold_remaining_pct="$five_h_pct"
+        five_h_threshold_reset_label="$five_h_reset"
+        five_h_threshold_pace="$pace"
+        current_alert_id="$(alert_id threshold 5h "$critical" "${five_h_armed_reset_at}:${scraped_at_epoch}")"
+      else
+        current_alert_id="$five_h_threshold_alert_id"
+        if [[ -z "$five_h_threshold_remaining_pct" ]]; then
+          five_h_threshold_remaining_pct="$five_h_pct"
+          five_h_threshold_reset_label="$five_h_reset"
+          five_h_threshold_pace="$pace"
+        fi
+      fi
       pending_5h_threshold="$critical"
-      if send_alert "*Codex 5h limit at ${five_h_pct}% remaining* (crossed ${critical}% threshold). Resets at ${five_h_reset}${pace_suffix}"; then
+      message="$(threshold_alert_message five_h_threshold 5h "$critical")"
+      if attempt_alert_notification five_h_threshold "$current_alert_id" "$message"; then
+        alert_result=0
+      else
+        alert_result=$?
+      fi
+      if (( alert_result == 0 || alert_result == 2 )); then
         local notified="${notified_5h_thresholds}"
         for t in "${thresholds[@]}"; do
-          if python3 - "$prev_5h_pct" "$critical" "$t" <<'PYEOF'
-import sys
-raise SystemExit(0 if float(sys.argv[2]) <= float(sys.argv[3]) < float(sys.argv[1]) else 1)
-PYEOF
+          if python3 "$SCRIPT_DIR/monitor_utils.py" threshold-between "$prev_5h_pct" "$critical" "$t"
           then
             [[ ",${notified}," == *",${t},"* ]] || notified="${notified:+${notified},}${t}"
           fi
@@ -1263,6 +1309,10 @@ PYEOF
         notified_5h_thresholds="$notified"
         pending_5h_threshold=""
         prev_5h_pct="$five_h_pct"
+        if (( alert_result == 2 )); then
+          status=1
+          ALERT_PROCESSING_ERROR="alert delivery failed permanently"
+        fi
       else
         status=1
         ALERT_PROCESSING_ERROR="alert delivery pending"
@@ -1273,27 +1323,49 @@ PYEOF
   fi
 
   if [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+    pending_before="$pending_weekly_threshold"
     critical="$pending_weekly_threshold"
+    new_threshold=""
     for t in "${thresholds[@]}"; do
-      if python3 - "$weekly_pct" "$prev_weekly_pct" "$t" "$notified_weekly_thresholds" <<'PYEOF'
-import sys
-current, previous, threshold = map(float, sys.argv[1:4])
-notified = {item for item in sys.argv[4].split(",") if item}
-raise SystemExit(0 if current <= threshold < previous and str(int(threshold)) not in notified else 1)
-PYEOF
+      if python3 "$SCRIPT_DIR/monitor_utils.py" threshold-crossed \
+        "$weekly_pct" "$prev_weekly_pct" "$t" "$notified_weekly_thresholds"
       then
-        [[ -z "$critical" || t -lt critical ]] && critical="$t"
+        if [[ -z "$critical" || t -lt critical ]]; then
+          critical="$t"
+          [[ -z "$pending_before" || t -lt pending_before ]] && new_threshold=1
+        elif [[ -z "$pending_before" ]]; then
+          new_threshold=1
+        fi
       fi
     done
     if [[ -n "$critical" ]]; then
+      if [[ -n "$new_threshold" ]]; then
+        if [[ -n "$weekly_threshold_alert_id" && "$weekly_threshold_status" != delivered ]]; then
+          close_active_threshold_alert weekly_threshold "superseded by ${critical}% threshold" || return 1
+        fi
+        weekly_threshold_remaining_pct="$weekly_pct"
+        weekly_threshold_reset_label="$weekly_reset"
+        weekly_threshold_pace="$pace"
+        current_alert_id="$(alert_id threshold weekly "$critical" "${weekly_armed_reset_at}:${scraped_at_epoch}")"
+      else
+        current_alert_id="$weekly_threshold_alert_id"
+        if [[ -z "$weekly_threshold_remaining_pct" ]]; then
+          weekly_threshold_remaining_pct="$weekly_pct"
+          weekly_threshold_reset_label="$weekly_reset"
+          weekly_threshold_pace="$pace"
+        fi
+      fi
       pending_weekly_threshold="$critical"
-      if send_alert "*Codex weekly limit at ${weekly_pct}% remaining* (crossed ${critical}% threshold). Resets ${weekly_reset}${pace_suffix}"; then
+      message="$(threshold_alert_message weekly_threshold weekly "$critical")"
+      if attempt_alert_notification weekly_threshold "$current_alert_id" "$message"; then
+        alert_result=0
+      else
+        alert_result=$?
+      fi
+      if (( alert_result == 0 || alert_result == 2 )); then
         local notified="${notified_weekly_thresholds}"
         for t in "${thresholds[@]}"; do
-          if python3 - "$prev_weekly_pct" "$critical" "$t" <<'PYEOF'
-import sys
-raise SystemExit(0 if float(sys.argv[2]) <= float(sys.argv[3]) < float(sys.argv[1]) else 1)
-PYEOF
+          if python3 "$SCRIPT_DIR/monitor_utils.py" threshold-between "$prev_weekly_pct" "$critical" "$t"
           then
             [[ ",${notified}," == *",${t},"* ]] || notified="${notified:+${notified},}${t}"
           fi
@@ -1301,6 +1373,10 @@ PYEOF
         notified_weekly_thresholds="$notified"
         pending_weekly_threshold=""
         prev_weekly_pct="$weekly_pct"
+        if (( alert_result == 2 )); then
+          status=1
+          ALERT_PROCESSING_ERROR="alert delivery failed permanently"
+        fi
       else
         status=1
         ALERT_PROCESSING_ERROR="alert delivery pending"
@@ -1348,11 +1424,8 @@ PYEOF
           | sort -nr -u
       )
       for script_threshold in "${script_thresholds[@]}"; do
-        if python3 - "$five_h_pct" "$script_prev_5h_pct" "$script_threshold" <<'PYEOF'
-import sys
-current, previous, threshold = map(float, sys.argv[1:])
-raise SystemExit(0 if current <= threshold < previous else 1)
-PYEOF
+        if python3 "$SCRIPT_DIR/monitor_utils.py" threshold-crossed \
+          "$five_h_pct" "$script_prev_5h_pct" "$script_threshold"
         then
           for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_INDICES[@]}; rule_position++ )); do
             if [[ "${ALERT_SCRIPT_RULE_EVENTS[$rule_position]}" == "5h:${script_threshold}" ]]; then
@@ -1375,11 +1448,8 @@ PYEOF
           | sort -nr -u
       )
       for script_threshold in "${script_thresholds[@]}"; do
-        if python3 - "$weekly_pct" "$script_prev_weekly_pct" "$script_threshold" <<'PYEOF'
-import sys
-current, previous, threshold = map(float, sys.argv[1:])
-raise SystemExit(0 if current <= threshold < previous else 1)
-PYEOF
+        if python3 "$SCRIPT_DIR/monitor_utils.py" threshold-crossed \
+          "$weekly_pct" "$script_prev_weekly_pct" "$script_threshold"
         then
           for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_INDICES[@]}; rule_position++ )); do
             if [[ "${ALERT_SCRIPT_RULE_EVENTS[$rule_position]}" == "weekly:${script_threshold}" ]]; then
@@ -1408,46 +1478,7 @@ PYEOF
 # ============================================================================
 update_health() {
   local result="$1" detail="$2" duration_ms="$3"
-  python3 - "$HEALTH_FILE" "$result" "$detail" "$duration_ms" <<'PYEOF'
-import datetime
-import json
-import os
-import pathlib
-import sys
-import tempfile
-
-path = pathlib.Path(sys.argv[1])
-result, detail, duration = sys.argv[2], sys.argv[3], int(sys.argv[4])
-try:
-    health = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-except (OSError, ValueError):
-    health = {}
-now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-health["last_cycle"] = now
-health["last_cycle_duration_ms"] = duration
-health["last_cycle_result"] = result
-if result == "success":
-    health["last_success"] = now
-    health["consecutive_failures"] = 0
-else:
-    health["last_error"] = {"at": now, "message": detail[:500]}
-    health["consecutive_failures"] = int(health.get("consecutive_failures", 0)) + 1
-
-fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", text=True)
-try:
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as output:
-        json.dump(health, output, indent=2)
-        output.write("\n")
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(temporary, path)
-finally:
-    try:
-        os.unlink(temporary)
-    except FileNotFoundError:
-        pass
-PYEOF
+  python3 "$SCRIPT_DIR/monitor_utils.py" update-health "$HEALTH_FILE" "$result" "$detail" "$duration_ms"
 }
 
 append_cycle_error() {
@@ -1493,7 +1524,7 @@ run_cycle() {
   local interval_seconds="$1"
   echo "[$(format_paris_now)] Scraping codex status..."
 
-  local json status=0 history_json="[]"
+  local json status=0
   CYCLE_ERROR=""
   if json=$(fetch_status_json "$interval_seconds"); then
     echo "$json" | python3 -m json.tool 2>/dev/null || echo "$json"
@@ -1502,12 +1533,11 @@ run_cycle() {
       append_cycle_error "Long-term archive update failed"
     fi
     if write_local_snapshot "$json" "$interval_seconds"; then
-      [[ -f "$HISTORY_FILE" ]] && history_json="$(<"$HISTORY_FILE")"
+      sync_gist || { status=1; append_cycle_error "GitHub Gist sync failed"; }
     else
       status=1
       append_cycle_error "Local snapshot write failed"
     fi
-    sync_gist "$json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
 
     local five_h weekly five_h_reset weekly_reset five_h_reset_at weekly_reset_at scraped_at scraped_at_epoch
     five_h=$(json_get_field "$json" "five_h_pct")
@@ -1567,6 +1597,30 @@ validate_interval() {
   fi
 }
 
+usage() {
+  cat <<'EOF'
+Usage: ./monitor.sh [MODE] [OPTIONS]
+
+Collect Codex limits and local token usage.
+
+Modes:
+  --once                 Run one collection cycle (default)
+  --loop [SECONDS]       Run now, then on aligned intervals
+  --check                Validate configuration, runtime and Codex access
+  --status-json          Print the Codex limit response as JSON
+
+Options:
+  --fail-fast            In loop mode, exit after the first failed cycle
+  --config FILE          Read configuration from FILE
+  --state-dir DIRECTORY  Store runtime state in DIRECTORY
+  -h, --help             Show this help without contacting Codex
+
+Configuration priority is CLI, environment, .env, then defaults. Source
+checkouts default to local/.env and local/runtime; installed commands use
+XDG_CONFIG_HOME and XDG_STATE_HOME (or their standard user defaults).
+EOF
+}
+
 seconds_until_next_interval() {
   local now_epoch="$1"
   local interval="$2"
@@ -1575,15 +1629,16 @@ seconds_until_next_interval() {
 
 main() {
   local interval mode=once fail_fast=0 now_epoch delay next_epoch next_check
-  initialize || return 1
-  interval="$LOOP_INTERVAL"
+  local config_path="" config_required=0 state_override="" interval_override=""
+  [[ "$ENV_FILE" == "$SOURCE_ENV_FILE" ]] || config_path="$ENV_FILE"
+  [[ "$RUNTIME_DIR" == "$SOURCE_RUNTIME_DIR" ]] || state_override="$RUNTIME_DIR"
 
   while (( $# > 0 )); do
     case "$1" in
       --loop)
         mode=loop
         if [[ -n "${2:-}" && "${2:-}" != --* ]]; then
-          interval="$2"
+          interval_override="$2"
           shift
         fi
         ;;
@@ -1591,11 +1646,33 @@ main() {
       --check) mode=check ;;
       --fail-fast) fail_fast=1 ;;
       --once) mode=once ;;
+      --config)
+        (( $# >= 2 )) || { config_error "--config requires a value."; return 1; }
+        config_path="$2"
+        config_required=1
+        shift
+        ;;
+      --state-dir)
+        (( $# >= 2 )) || { config_error "--state-dir requires a value."; return 1; }
+        state_override="$2"
+        shift
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
       *) config_error "Unknown argument: $1"; return 1 ;;
     esac
     shift
   done
 
+  [[ -z "$interval_override" ]] || validate_interval "$interval_override" || return 1
+  if [[ "$mode" == status_json ]]; then
+    initialize_status "$config_path" "$config_required" "$interval_override" || return 1
+  else
+    initialize "$config_path" "$config_required" "$state_override" "$interval_override" || return 1
+  fi
+  interval="$LOOP_INTERVAL"
   validate_interval "$interval" || return 1
   if [[ "$mode" == status_json ]]; then
     fetch_status_json "$interval"

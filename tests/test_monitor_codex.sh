@@ -26,6 +26,8 @@ assert_eq None "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["weekl
 assert_contains "$(<"$diagnostic")" 'partial limit group' "partial response did not produce an explicit warning"
 
 export FAKE_CODEX_FIXTURE="${ROOT_DIR}/tests/fixtures/codex/unknown.json"
-fetch_status_json 900 >/dev/null 2>&1 && fail "unknown windows were accepted"
+status=0
+fetch_status_json 900 >/dev/null 2>&1 || status=$?
+assert_eq 1 "$status" "Codex parser error code changed"
 
 printf 'PASS: Codex parsing tests\n'

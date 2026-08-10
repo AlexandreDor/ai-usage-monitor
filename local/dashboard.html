@@ -13,9 +13,16 @@
 </head>
 <body>
   <header>
-    <span class="live-dot"></span>
     <h1 data-i18n="dashboard.heading">Codex Limits</h1>
-    <span class="badge" id="mode-badge">-</span>
+    <div class="status-strip">
+      <div class="freshness-status" id="dashboard-status" role="status" aria-live="polite" aria-atomic="true">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span class="badge" id="freshness-badge">-</span>
+        <span id="freshness-detail">Waiting for data</span>
+      </div>
+      <span class="origin-status"><span id="origin-label">Source</span> <span class="badge" id="mode-badge">-</span></span>
+    </div>
+    <span id="sample-age">Sample age: unavailable</span>
     <span id="last-updated">-</span>
     <a class="nav-link" href="analytics.html"><span data-i18n="dashboard.analyticsLink">Advanced analytics</span> <span aria-hidden="true">→</span></a>
     <div class="preference-controls" data-i18n-aria-label="preferences.ariaLabel" aria-label="Display preferences">
@@ -39,26 +46,52 @@
   <div id="error-banner" role="alert" hidden></div>
 
   <main class="grid">
-    <section class="card limit-card">
-      <div class="card-label" data-i18n="dashboard.fiveHourLimit">5-Hour Limit</div>
+    <section class="card limit-card" aria-labelledby="five-h-label">
+      <div class="card-label" id="five-h-label" data-i18n="dashboard.fiveHourLimit">5-Hour Limit</div>
       <div class="pct-value unavailable" id="five-h-pct">--</div>
-      <progress class="bar" id="five-h-bar" max="100" value="0"></progress>
+      <progress class="bar" id="five-h-bar" max="100" aria-labelledby="five-h-label"></progress>
+      <div class="criticality unavailable" id="five-h-criticality">Quota status: unavailable</div>
       <div class="reset-info"><span data-i18n="dashboard.resetsAt">Resets at</span> <span id="five-h-reset">-</span></div>
     </section>
-    <section class="card limit-card">
-      <div class="card-label" data-i18n="dashboard.weeklyLimit">Weekly Limit</div>
+    <section class="card limit-card" aria-labelledby="weekly-label">
+      <div class="card-label" id="weekly-label" data-i18n="dashboard.weeklyLimit">Weekly Limit</div>
       <div class="pct-value unavailable" id="weekly-pct">--</div>
-      <progress class="bar" id="weekly-bar" max="100" value="0"></progress>
+      <progress class="bar" id="weekly-bar" max="100" aria-labelledby="weekly-label"></progress>
+      <div class="criticality unavailable" id="weekly-criticality">Quota status: unavailable</div>
       <div class="reset-info"><span data-i18n="dashboard.resets">Resets</span> <span id="weekly-reset">-</span></div>
       <div class="pace-indicator">
         <div class="pace-label" data-i18n="dashboard.paceVsIdeal">Pace vs ideal</div>
+        <div class="pace-comparison">
+          <span id="weekly-actual">Actual: --</span>
+          <span id="weekly-ideal">Ideal: --</span>
+        </div>
         <div class="pace-value" id="weekly-pace-delta">--</div>
       </div>
     </section>
-    <section class="card full history-card">
+    <section class="card full history-card" aria-labelledby="history-label">
       <div class="card-label history-label" id="history-label" data-i18n="dashboard.history">History</div>
       <div id="history-error" class="history-error" role="alert" hidden></div>
-      <canvas id="history-chart"></canvas>
+      <p class="history-summary" id="history-summary" aria-live="polite">No history samples available.</p>
+      <canvas id="history-chart" aria-hidden="true"></canvas>
+      <details class="history-data">
+        <summary id="history-table-toggle">View history data table</summary>
+        <div class="history-table-wrap">
+          <table>
+            <caption class="sr-only" id="history-table-caption">Quota history samples</caption>
+            <thead>
+              <tr>
+                <th scope="col" id="history-time-heading">Sample</th>
+                <th scope="col" id="history-five-heading">5-hour remaining</th>
+                <th scope="col" id="history-weekly-heading">Weekly remaining</th>
+                <th scope="col" id="history-ideal-heading">Weekly ideal</th>
+              </tr>
+            </thead>
+            <tbody id="history-table-body">
+              <tr><td colspan="4">No history samples available.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
     </section>
   </main>
 

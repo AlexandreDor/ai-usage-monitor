@@ -38,10 +38,19 @@ from storage import ArchiveSchemaError, connect_database
 
 with connect_database(Path(sys.argv[2])) as connection:
     assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
     assert connection.execute("SELECT limit_id FROM snapshots").fetchone()[0] == "v1"
     assert connection.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()[0] == "2"
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"reset_events", "token_usage_events", "collector_state", "collector_runs"} <= tables
+
+backup = Path(str(sys.argv[2]) + ".v1.bak")
+assert backup.is_file()
+with sqlite3.connect(backup) as connection:
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    assert connection.execute("SELECT limit_id FROM snapshots").fetchone()[0] == "v1"
 
 unknown = Path(sys.argv[2]).with_name("unknown.sqlite3")
 with sqlite3.connect(unknown) as connection:
@@ -233,6 +242,9 @@ writer_thread.join()
 reader_thread.join()
 if errors:
     raise errors[0][1]
+with connect_database(database) as connection:
+    assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
 PYEOF
 
 printf 'PASS: backend migration, collector cursor and analytics API tests\n'

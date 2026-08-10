@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -14,7 +15,7 @@ from typing import Any, Iterable, Sequence
 from zoneinfo import ZoneInfo
 
 from storage import ArchiveCorruptionError, ArchiveSchemaError, connect_database
-from token_usage import CollectorError, load_pricing
+from token_usage import CollectorError, parse_pricing
 
 
 PARIS = ZoneInfo("Europe/Paris")
@@ -25,8 +26,13 @@ WEEKLY_WINDOW_SECONDS = 7 * 86400
 MAX_SERIES_POINTS = 10_000
 MAX_RESET_MARKERS = 2_000
 DEFAULT_RESET_PAGE_SIZE = 50
+MAX_PAGINATION_OFFSET = min(1_000_000, (1 << 63) - 1)
 MAX_BREAKDOWN_ROWS = 2_000
 MAX_AVAILABLE_MODELS = 500
+MAX_UNKNOWN_PRICE_NAMES = 20
+MAX_ANALYTICS_LABEL_LENGTH = 200
+MAX_HERMES_BASELINES = 500
+MAX_HERMES_BASELINE_JSON_BYTES = 64 * 1024
 _LOCAL_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])(?:~|/(?:[^\s'\"`,;:)\]}]+/)*[^\s'\"`,;:)\]}]+)")
 
 
@@ -78,7 +84,10 @@ def ideal_weekly_pace(connection: sqlite3.Connection, reset_at: int) -> float | 
             LIMIT 1""",
         (reset_at,),
     ).fetchone()
-    deadline = row[0] if row else None
+    return ideal_weekly_pace_from_deadline(row[0] if row else None, reset_at)
+
+
+def ideal_weekly_pace_from_deadline(deadline: Any, reset_at: int) -> float | None:
     if not isinstance(deadline, int):
         return None
     remaining = deadline - reset_at
@@ -198,6 +207,18 @@ def normalize_token_counts(item: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def bounded_analytics_label(value: Any) -> str:
+    """Keep archive labels from making bounded diagnostics unbounded by bytes."""
+    return str(value)[:MAX_ANALYTICS_LABEL_LENGTH]
+
+
+def bounded_token_count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def token_analytics(
     connection: sqlite3.Connection,
     catalog: dict[str, Any],
@@ -206,6 +227,7 @@ def token_analytics(
     granularity: int,
     sources: Sequence[str],
     models: Sequence[str],
+    breakdown_page: tuple[int, int] | None,
 ) -> tuple[dict[str, Any], list[str]]:
     conditions, values = token_conditions(start, end, sources, models)
     sums = ", ".join(f"SUM({field}) AS {field}" for field in TOKEN_FIELDS)
@@ -214,44 +236,66 @@ def token_analytics(
         f"SELECT COUNT(*) FROM (SELECT 1 FROM token_usage_events WHERE {conditions} GROUP BY source, provider, model)",
         values,
     ) or 0)
-    if breakdown_count > MAX_BREAKDOWN_ROWS:
+    if breakdown_page is None and breakdown_count > MAX_BREAKDOWN_ROWS:
         raise AnalyticsError(f"token breakdown exceeds the {MAX_BREAKDOWN_ROWS}-group response limit")
+    pagination = ""
+    breakdown_values = list(values)
+    if breakdown_page is not None:
+        offset, limit = breakdown_page
+        pagination = " LIMIT ? OFFSET ?"
+        breakdown_values.extend((limit, offset))
     breakdown_rows = connection.execute(
-        f"SELECT source, provider, model, {sums}, COUNT(*) AS events FROM token_usage_events WHERE {conditions} GROUP BY source, provider, model ORDER BY source, model",
-        values,
-    ).fetchall()
+        f"SELECT source, provider, model, {sums}, COUNT(*) AS events FROM token_usage_events WHERE {conditions} "
+        f"GROUP BY source, provider, model ORDER BY source, model, provider{pagination}",
+        breakdown_values,
+    )
     prices = price_index(catalog)
     breakdown: list[dict[str, Any]] = []
-    summary = {field: 0 for field in TOKEN_FIELDS}
-    summary.update({
-        "events": 0,
-        "estimated_cost_usd": 0.0,
-        "assumed_zero_tokens": 0,
-        "total_tokens": 0,
-        "total": 0,
-    })
-    unknown: list[str] = []
     for raw in breakdown_rows:
+        if breakdown_page is None and len(breakdown) >= MAX_BREAKDOWN_ROWS:
+            raise AnalyticsError(f"token breakdown exceeds the {MAX_BREAKDOWN_ROWS}-group response limit")
         item = token_row(raw)
         normalize_token_counts(item)
-        for field in TOKEN_FIELDS:
-            summary[field] += item[field]
         item["events"] = int(item["events"])
-        summary["events"] += item["events"]
         cost, assumed_zero = cost_row(item, prices)
         item["estimated_cost_usd"] = round(cost, 8)
         item["cost_usd"] = item["estimated_cost_usd"]
         item["pricing_status"] = "assumed-zero" if assumed_zero else "priced"
-        summary["estimated_cost_usd"] += cost
-        summary["total_tokens"] += item["total_tokens"]
-        if assumed_zero:
-            summary["assumed_zero_tokens"] += item["total_tokens"]
-            unknown.append(f"{item['provider']}/{item['model']}")
         item["application"] = item["source"]
         breakdown.append(item)
+    summary_raw = connection.execute(
+        f"SELECT {sums}, COUNT(*) AS events FROM token_usage_events WHERE {conditions}",
+        values,
+    ).fetchone()
+    summary = normalize_token_counts(token_row(summary_raw))
+    summary["events"] = int(summary.get("events", 0) or 0)
+    summary.update({
+        "estimated_cost_usd": 0.0,
+        "assumed_zero_tokens": 0,
+    })
+    unknown_count = 0
+    unknown_examples: list[str] = []
+    cost_rows = connection.execute(
+        f"SELECT provider, model, {sums} FROM token_usage_events WHERE {conditions} "
+        "GROUP BY provider, model ORDER BY provider, model",
+        values,
+    )
+    for raw in cost_rows:
+        item = normalize_token_counts(token_row(raw))
+        cost, assumed_zero = cost_row(item, prices)
+        summary["estimated_cost_usd"] += cost
+        if assumed_zero:
+            summary["assumed_zero_tokens"] += item["total_tokens"]
+            unknown_count += 1
+            if len(unknown_examples) < MAX_UNKNOWN_PRICE_NAMES:
+                unknown_examples.append(
+                    f"{bounded_analytics_label(item['provider'])}/"
+                    f"{bounded_analytics_label(item['model'])}"
+                )
     summary["estimated_cost_usd"] = round(summary["estimated_cost_usd"], 8)
     summary["cost_usd"] = summary["estimated_cost_usd"]
     summary["total"] = summary["total_tokens"]
+    summary["unknown_pricing_groups"] = unknown_count
 
     # Compute cost at model granularity before folding into time buckets. A
     # single bucket can contain multiple providers/models with different
@@ -261,7 +305,7 @@ def token_analytics(
         f"FROM token_usage_events WHERE {conditions} GROUP BY bucket_epoch, source, provider, model "
         "ORDER BY bucket_epoch, source, provider, model",
         [granularity, granularity, *values],
-    ).fetchall()
+    )
     buckets: dict[int, dict[str, Any]] = {}
     by_source: dict[str, dict[int, dict[str, Any]]] = {}
     for raw in series_rows:
@@ -299,17 +343,29 @@ def token_analytics(
             item["application"] = source
             item["at"] = iso_utc(bucket_epoch)
             series_by_source.append(item)
-    warnings = [f"No catalog price; assumed zero: {name}" for name in sorted(set(unknown))]
-    return {
+    warnings = []
+    if unknown_count:
+        shown = ", ".join(unknown_examples)
+        omitted = unknown_count - len(unknown_examples)
+        suffix = f", +{omitted} more" if omitted > 0 else ""
+        group_label = "model group" if unknown_count == 1 else "model groups"
+        warnings.append(f"No catalog price; assumed zero: {unknown_count} {group_label} ({shown}{suffix})")
+    result = {
         "summary": summary,
         "series": series,
         "series_by_source": series_by_source,
         "breakdown": breakdown,
-    }, warnings
+    }
+    if breakdown_page is not None:
+        offset, limit = breakdown_page
+        result["breakdown_pagination"] = {"offset": offset, "limit": limit, "total": breakdown_count}
+    return result, warnings
 
 
 def limit_series(connection: sqlite3.Connection, start: int, end: int, granularity: int) -> dict[str, Any]:
-    rows = connection.execute(
+    series = []
+    samples = 0
+    for row in connection.execute(
         """WITH bucketed AS (
                  SELECT scraped_at_epoch, five_h_pct, weekly_pct,
                         (scraped_at_epoch / ?) * ? AS bucket_epoch
@@ -326,8 +382,17 @@ def limit_series(connection: sqlite3.Connection, start: int, end: int, granulari
                FROM latest
                JOIN snapshots ON snapshots.scraped_at_epoch = latest.latest_epoch
               ORDER BY latest.bucket_epoch""",
-        (granularity, granularity, start, end),
-    ).fetchall()
+         (granularity, granularity, start, end),
+    ):
+        samples += int(row["samples"])
+        series.append(
+            {
+                "at": iso_utc(row["bucket_epoch"]),
+                "five_h_pct": round(row["five_h_pct"], 3) if row["five_h_pct"] is not None else None,
+                "weekly_pct": round(row["weekly_pct"], 3) if row["weekly_pct"] is not None else None,
+                "samples": row["samples"],
+            }
+        )
     reset_markers = connection.execute(
         """
         SELECT window, reset_at_epoch, observed_at_epoch, before_pct, after_pct,
@@ -338,18 +403,10 @@ def limit_series(connection: sqlite3.Connection, start: int, end: int, granulari
          LIMIT ?
         """,
         (start, end, MAX_RESET_MARKERS),
-    ).fetchall()
+    )
     return {
-        "samples": int(sum(row["samples"] for row in rows)),
-        "series": [
-            {
-                "at": iso_utc(row["bucket_epoch"]),
-                "five_h_pct": round(row["five_h_pct"], 3) if row["five_h_pct"] is not None else None,
-                "weekly_pct": round(row["weekly_pct"], 3) if row["weekly_pct"] is not None else None,
-                "samples": row["samples"],
-            }
-            for row in rows
-        ],
+        "samples": samples,
+        "series": series,
         "reset_markers": [
             {
                 "window": row["window"],
@@ -371,54 +428,73 @@ def reset_history(connection: sqlite3.Connection, start: int, end: int, kind: st
         values.append(kind)
     where = " AND ".join(clauses)
     total = int(scalar(connection, f"SELECT COUNT(*) FROM reset_events WHERE {where}", values) or 0)
-    weekly_rows = connection.execute(
-        """SELECT reset_at_epoch, before_pct, after_pct, detection_method
-             FROM reset_events
-            WHERE reset_at_epoch >= ? AND reset_at_epoch < ? AND window = 'weekly'""",
-        (start, end),
-    ).fetchall()
-    random_impacts = {
-        row["reset_at_epoch"]: random_reset_impact(connection, row["reset_at_epoch"], row["before_pct"])
-        for row in weekly_rows
-        if row["detection_method"] == "random_observed"
-    }
+    weekly_summary_row = connection.execute(
+        """
+        WITH weekly AS (
+            SELECT reset_at_epoch, before_pct, detection_method,
+                   (SELECT weekly_reset_at
+                      FROM snapshots
+                     WHERE scraped_at_epoch < reset_events.reset_at_epoch
+                       AND weekly_reset_at IS NOT NULL
+                     ORDER BY scraped_at_epoch DESC
+                     LIMIT 1) AS deadline
+              FROM reset_events
+             WHERE reset_at_epoch >= ? AND reset_at_epoch < ? AND window = 'weekly'
+        ), scored AS (
+            SELECT *,
+                   CASE WHEN deadline - reset_at_epoch BETWEEN 0 AND ?
+                        THEN ROUND(100.0 * (deadline - reset_at_epoch) / ?, 3)
+                   END AS ideal
+              FROM weekly
+        ), impacts AS (
+            SELECT *, CASE WHEN before_pct IS NOT NULL AND ideal IS NOT NULL
+                           THEN ROUND(ideal - before_pct, 3) END AS delta
+              FROM scored
+        )
+        SELECT COUNT(*) AS weekly_total,
+               COALESCE(SUM(detection_method = 'random_observed'), 0) AS random_count,
+               COALESCE(SUM(CASE WHEN detection_method = 'random_observed' AND delta >= 0 THEN delta ELSE 0 END), 0) AS gained,
+               COALESCE(SUM(CASE WHEN detection_method = 'random_observed' AND delta < 0 THEN -delta ELSE 0 END), 0) AS lost,
+               COALESCE(SUM(CASE WHEN detection_method = 'random_observed' THEN COALESCE(delta, 0) ELSE 0 END), 0) AS net,
+               COALESCE(SUM(detection_method != 'random_observed'), 0) AS regular_count,
+               COALESCE(SUM(CASE WHEN detection_method != 'random_observed' AND before_pct > 0 THEN before_pct ELSE 0 END), 0) AS unused
+          FROM impacts
+        """,
+        (start, end, WEEKLY_WINDOW_SECONDS, WEEKLY_WINDOW_SECONDS),
+    ).fetchone()
     random_summary = {
-        "count": 0,
-        "gained_vs_ideal_pct_points": 0.0,
-        "lost_vs_ideal_pct_points": 0.0,
-        "net_vs_ideal_pct_points": 0.0,
+        "count": int(weekly_summary_row["random_count"]),
+        "gained_vs_ideal_pct_points": round(float(weekly_summary_row["gained"]), 3),
+        "lost_vs_ideal_pct_points": round(float(weekly_summary_row["lost"]), 3),
+        "net_vs_ideal_pct_points": round(float(weekly_summary_row["net"]), 3),
     }
-    end_of_week_summary = {"count": 0, "unused_pct_points": 0.0}
-    for weekly_row in weekly_rows:
-        before = weekly_row["before_pct"]
-        if weekly_row["detection_method"] == "random_observed":
-            random_summary["count"] += 1
-            _ideal, change = random_impacts[weekly_row["reset_at_epoch"]]
-            if change is not None:
-                random_summary["net_vs_ideal_pct_points"] += change
-                if change >= 0:
-                    random_summary["gained_vs_ideal_pct_points"] += change
-                else:
-                    random_summary["lost_vs_ideal_pct_points"] -= change
-        else:
-            end_of_week_summary["count"] += 1
-            if isinstance(before, (int, float)) and before > 0:
-                end_of_week_summary["unused_pct_points"] += float(before)
-    for summary in (random_summary, end_of_week_summary):
-        for key, value in tuple(summary.items()):
-            if isinstance(value, float):
-                summary[key] = round(value, 3)
+    end_of_week_summary = {
+        "count": int(weekly_summary_row["regular_count"]),
+        "unused_pct_points": round(float(weekly_summary_row["unused"]), 3),
+    }
     rows = connection.execute(
-        f"SELECT * FROM reset_events WHERE {where} ORDER BY reset_at_epoch DESC LIMIT ? OFFSET ?",
+        f"""SELECT reset_events.*,
+                    (SELECT weekly_reset_at
+                       FROM snapshots
+                      WHERE scraped_at_epoch < reset_events.reset_at_epoch
+                        AND weekly_reset_at IS NOT NULL
+                      ORDER BY scraped_at_epoch DESC
+                      LIMIT 1) AS prior_weekly_deadline
+               FROM reset_events
+              WHERE {where}
+              ORDER BY reset_at_epoch DESC LIMIT ? OFFSET ?""",
         [*values, limit, offset],
-    ).fetchall()
-    return {
-        "total": total,
-        "weekly_total": len(weekly_rows),
-        "weekly_summary": {"random": random_summary, "end_of_week": end_of_week_summary},
-        "offset": offset,
-        "limit": limit,
-        "items": [
+    )
+    items = []
+    for row in rows:
+        random_impact = (
+            random_reset_impact_from_deadline(
+                row["reset_at_epoch"], row["before_pct"], row["prior_weekly_deadline"]
+            )
+            if row["window"] == "weekly" and row["detection_method"] == "random_observed"
+            else (None, None)
+        )
+        items.append(
             {
                 "window": row["window"],
                 "category": "random" if row["detection_method"] == "random_observed" else "end_of_week" if row["window"] == "weekly" else "scheduled",
@@ -428,15 +504,28 @@ def reset_history(connection: sqlite3.Connection, start: int, end: int, kind: st
                 "before_pct": row["before_pct"],
                 "after_pct": row["after_pct"],
                 "detection_method": row["detection_method"],
-                "ideal_weekly_pace_pct": random_impacts.get(row["reset_at_epoch"], (None, None))[0],
-                "pace_delta_pct_points": random_impacts.get(row["reset_at_epoch"], (None, None))[1],
+                "ideal_weekly_pace_pct": random_impact[0],
+                "pace_delta_pct_points": random_impact[1],
                 "unused_pct_points": round(float(row["before_pct"]), 3)
                 if row["window"] == "weekly" and row["detection_method"] != "random_observed" and isinstance(row["before_pct"], (int, float)) and row["before_pct"] > 0
                 else 0,
             }
-            for row in rows
-        ],
+        )
+    return {
+        "total": total,
+        "weekly_total": int(weekly_summary_row["weekly_total"]),
+        "weekly_summary": {"random": random_summary, "end_of_week": end_of_week_summary},
+        "offset": offset,
+        "limit": limit,
+        "items": items,
     }
+
+
+def random_reset_impact_from_deadline(reset_at: int, before: Any, deadline: Any) -> tuple[float | None, float | None]:
+    ideal = ideal_weekly_pace_from_deadline(deadline, reset_at)
+    if not isinstance(before, (int, float)) or ideal is None:
+        return ideal, None
+    return ideal, round(ideal - float(before), 3)
 
 
 def _freshness_state(timestamp: int | None, now: int, interval: int) -> tuple[int | None, str]:
@@ -490,17 +579,42 @@ def collector_freshness(connection: sqlite3.Connection, now: int) -> dict[str, A
 
 def hermes_baselines(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     results = []
-    for row in connection.execute("SELECT state_key, state_json FROM collector_state WHERE source = 'hermes' AND state_key NOT IN ('initialized', 'tracking')"):
+    overflow_count = 0
+    overflow_counters = {field: 0 for field in TOKEN_FIELDS}
+    for row in connection.execute(
+        """SELECT state_key,
+                    CASE WHEN length(CAST(state_json AS BLOB)) <= ? THEN state_json END AS bounded_state_json
+              FROM collector_state
+             WHERE source = 'hermes' AND state_key NOT IN ('initialized', 'tracking')
+              ORDER BY state_key""",
+        (MAX_HERMES_BASELINE_JSON_BYTES,),
+    ):
         try:
-            value = json.loads(row["state_json"])
-        except json.JSONDecodeError:
+            value = json.loads(row["bounded_state_json"])
+        except (TypeError, json.JSONDecodeError):
             continue
         baseline = value.get("baseline") if isinstance(value, dict) else None
         if not isinstance(baseline, dict):
             continue
-        tokens = billable_total(baseline)
+        counters = {
+            field: bounded_token_count(baseline.get(field, 0))
+            for field in TOKEN_FIELDS
+        }
+        tokens = billable_total(counters)
         if tokens:
-            results.append({"key": row["state_key"], "tokens": tokens, "counters": baseline})
+            if len(results) < MAX_HERMES_BASELINES - 1:
+                results.append({"key": bounded_analytics_label(row["state_key"]), "tokens": tokens, "counters": counters})
+            else:
+                overflow_count += 1
+                for field in TOKEN_FIELDS:
+                    overflow_counters[field] += counters[field]
+    if overflow_count:
+        results.append({
+            "key": "__aggregated__",
+            "tokens": billable_total(overflow_counters),
+            "counters": overflow_counters,
+            "aggregated_entries": overflow_count,
+        })
     return results
 
 
@@ -508,7 +622,9 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
     if not database.is_file():
         raise AnalyticsUnavailableError("analytics archive is not available yet")
     try:
-        catalog = load_pricing(pricing)
+        pricing_bytes = pricing.read_bytes()
+        pricing_sha256 = hashlib.sha256(pricing_bytes).hexdigest()
+        catalog = parse_pricing(pricing_bytes)
     except (CollectorError, OSError, UnicodeError, ValueError) as exc:
         raise AnalyticsUnavailableError("pricing catalog cannot be read") from exc
     try:
@@ -529,17 +645,49 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
         try:
             reset_offset = int(params.get("reset_offset", "0"))
             reset_limit = int(params.get("reset_limit", str(DEFAULT_RESET_PAGE_SIZE)))
-        except ValueError as exc:
+        except (ValueError, OverflowError) as exc:
             raise AnalyticsError("reset pagination must use integers") from exc
-        if reset_offset < 0 or not 1 <= reset_limit <= 100:
-            raise AnalyticsError("reset_offset must be positive and reset_limit must be 1..100")
+        if not 0 <= reset_offset <= MAX_PAGINATION_OFFSET or not 1 <= reset_limit <= 100:
+            raise AnalyticsError(
+                f"reset_offset must be 0..{MAX_PAGINATION_OFFSET} and reset_limit must be 1..100"
+            )
 
-        tokens, warnings = token_analytics(connection, catalog, start, end, granularity, sources, models)
-        available_sources = [row[0] for row in connection.execute("SELECT DISTINCT source FROM token_usage_events ORDER BY source")]
-        available_models_count = int(scalar(connection, "SELECT COUNT(DISTINCT model) FROM token_usage_events") or 0)
-        if available_models_count > MAX_AVAILABLE_MODELS:
+        has_breakdown_offset = "breakdown_offset" in params
+        has_breakdown_limit = "breakdown_limit" in params
+        if has_breakdown_offset != has_breakdown_limit:
+            raise AnalyticsError("breakdown_offset and breakdown_limit must be provided together")
+        breakdown_page = None
+        if has_breakdown_offset:
+            try:
+                breakdown_offset = int(params["breakdown_offset"])
+                breakdown_limit = int(params["breakdown_limit"])
+            except (ValueError, OverflowError) as exc:
+                raise AnalyticsError("breakdown pagination must use integers") from exc
+            if not 0 <= breakdown_offset <= MAX_PAGINATION_OFFSET or not 1 <= breakdown_limit <= 100:
+                raise AnalyticsError(
+                    f"breakdown_offset must be 0..{MAX_PAGINATION_OFFSET} and breakdown_limit must be 1..100"
+                )
+            breakdown_page = (breakdown_offset, breakdown_limit)
+
+        tokens, warnings = token_analytics(connection, catalog, start, end, granularity, sources, models, breakdown_page)
+        available_sources = [
+            row[0]
+            for row in connection.execute(
+                "SELECT DISTINCT source FROM token_usage_events ORDER BY source LIMIT ?",
+                (len(SOURCES) + 1,),
+            )
+        ]
+        if len(available_sources) > len(SOURCES):
+            raise AnalyticsError(f"available source list exceeds the {len(SOURCES)}-source response limit")
+        available_models = [
+            row[0]
+            for row in connection.execute(
+                "SELECT DISTINCT model FROM token_usage_events ORDER BY model LIMIT ?",
+                (MAX_AVAILABLE_MODELS + 1,),
+            )
+        ]
+        if len(available_models) > MAX_AVAILABLE_MODELS:
             raise AnalyticsError(f"available model list exceeds the {MAX_AVAILABLE_MODELS}-model response limit")
-        available_models = [row[0] for row in connection.execute("SELECT DISTINCT model FROM token_usage_events ORDER BY model")]
         freshness = collector_freshness(connection, current)
         warnings.extend(
             f"{name} collector: {value['last_error']}"
@@ -563,11 +711,18 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
             "tokens": tokens,
             "resets": reset_history(connection, start, end, reset_type, reset_offset, reset_limit),
             "baselines": {"hermes": hermes_baselines(connection)},
-            "pricing": {"currency": catalog["currency"], "as_of": catalog.get("as_of", "unknown"), "valuation_mode": catalog.get("valuation_mode", "current_catalog")},
+            "pricing": {
+                "currency": catalog["currency"],
+                "as_of": catalog.get("as_of", "unknown"),
+                "valuation_mode": catalog.get("valuation_mode", "current_catalog"),
+                "sha256": pricing_sha256,
+            },
             "warnings": warnings,
         }
     except AnalyticsError:
         raise
+    except OverflowError as exc:
+        raise AnalyticsError("numeric query value is out of range") from exc
     except (ArchiveCorruptionError, ArchiveSchemaError, OSError, sqlite3.DatabaseError) as exc:
         raise AnalyticsUnavailableError("analytics archive query failed") from exc
     finally:
@@ -579,12 +734,18 @@ def main() -> int:
     parser.add_argument("--database", required=True)
     parser.add_argument("--pricing", required=True)
     parser.add_argument("--params", default="{}", help=argparse.SUPPRESS)
+    parser.add_argument("--breakdown-offset", type=int, help="first token breakdown row to return")
+    parser.add_argument("--breakdown-limit", type=int, help="number of token breakdown rows to return (1..100)")
     parser.add_argument("--now", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
         params = json.loads(args.params)
         if not isinstance(params, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in params.items()):
             raise AnalyticsError("params must be a string map")
+        if args.breakdown_offset is not None:
+            params["breakdown_offset"] = str(args.breakdown_offset)
+        if args.breakdown_limit is not None:
+            params["breakdown_limit"] = str(args.breakdown_limit)
         print(json.dumps(build_payload(Path(args.database), Path(args.pricing), params, now=args.now), separators=(",", ":")))
     except (AnalyticsError, json.JSONDecodeError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)

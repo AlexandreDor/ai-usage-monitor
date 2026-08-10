@@ -88,6 +88,36 @@ assert_contains "$headers" 'X-Content-Type-Options: nosniff' "nosniff header mis
 assert_contains "$headers" 'X-Frame-Options: DENY' "frame protection missing"
 assert_contains "$headers" 'Cache-Control: no-store' "cache header missing"
 
+for hostile_host in "attacker.example:${port}" "127.0.0.1:1" ''; do
+  hostile_code="$(curl --silent -H "Host: ${hostile_host}" --output "${TEST_ROOT}/host-error" \
+    --write-out '%{http_code}' "http://127.0.0.1:${port}/dashboard.html")"
+  assert_eq 400 "$hostile_code" "hostile or incomplete Host accepted: ${hostile_host:-<empty>}"
+  [[ "$(wc -c < "${TEST_ROOT}/host-error")" -le 64 ]] || fail "Host error response was not bounded"
+done
+
+python3 - "$port" <<'PY' || fail "saturated HTTP server did not reject immediately"
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+slow_clients = []
+try:
+    for _ in range(16):
+        client = socket.create_connection(("127.0.0.1", port), timeout=2)
+        client.sendall(f"GET /dashboard.html HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n".encode())
+        slow_clients.append(client)
+    time.sleep(0.2)
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as rejected:
+        rejected.sendall(f"GET /dashboard.html HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode())
+        response = rejected.recv(128)
+    if not response.startswith(b"HTTP/1.1 503 "):
+        raise AssertionError(response)
+finally:
+    for client in slow_clients:
+        client.close()
+PY
+
 for path in /monitor.sh /runtime/.alert_state /runtime/usage-history.sqlite3 '/%2e%2e%2fmonitor.sh' '/%252e%252e%252fmonitor.sh'; do
   code="$(curl --path-as-is --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:${port}${path}")"
   assert_eq 404 "$code" "non-allowlisted path exposed: $path"
@@ -103,6 +133,30 @@ if grep -Fq '/tmp/private' "${TEST_ROOT}/analytics-error"; then
 fi
 bad_query_code="$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:${port}/api/analytics?range=bad")"
 assert_eq 400 "$bad_query_code" "invalid analytics query response"
+repeated_breakdown_offset_code="$(curl --silent --output "${TEST_ROOT}/repeated-breakdown-offset-error" --write-out '%{http_code}' \
+  "http://127.0.0.1:${port}/api/analytics?range=24h&breakdown_offset=0&breakdown_offset=1&breakdown_limit=50")"
+assert_eq 400 "$repeated_breakdown_offset_code" "repeated breakdown_offset accepted"
+assert_eq 'query parameters must not be repeated' "$(json_field "${TEST_ROOT}/repeated-breakdown-offset-error" error)" "repeated breakdown_offset error"
+for bad_pagination_query in \
+  'reset_offset=1&reset_offset=2' \
+  'breakdown_offset=0' \
+  'reset_limit=101' \
+  'breakdown_offset=0&breakdown_limit=101' \
+  'reset_offset=1000001' \
+  'breakdown_offset=1000001&breakdown_limit=1' \
+  'reset_offset=999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999'; do
+  pagination_code="$(curl --silent --output "${TEST_ROOT}/pagination-error" --write-out '%{http_code}' \
+    "http://127.0.0.1:${port}/api/analytics?range=24h&${bad_pagination_query}")"
+  assert_eq 400 "$pagination_code" "invalid analytics pagination accepted: $bad_pagination_query"
+  [[ "$(wc -c < "${TEST_ROOT}/pagination-error")" -le 256 ]] || fail "pagination error response was not bounded"
+done
+for boundary_pagination_query in \
+  'reset_offset=1000000&reset_limit=1' \
+  'breakdown_offset=1000000&breakdown_limit=1'; do
+  pagination_code="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    "http://127.0.0.1:${port}/api/analytics?range=24h&${boundary_pagination_query}")"
+  assert_eq 200 "$pagination_code" "analytics pagination boundary rejected: $boundary_pagination_query"
+done
 extreme_date_code="$(curl --silent --output "${TEST_ROOT}/extreme-date-error" --write-out '%{http_code}' "http://127.0.0.1:${port}/api/analytics?from_date=9999-12-31&to_date=9999-12-31")"
 assert_eq 400 "$extreme_date_code" "out-of-range analytics date response"
 assert_eq 'dates must use YYYY-MM-DD' "$(json_field "${TEST_ROOT}/extreme-date-error" error)" "out-of-range analytics date body"
@@ -122,9 +176,13 @@ kill "$server_pid"
 wait "$server_pid" 2>/dev/null || true
 server_pid=""
 serve_fixture="${TEST_ROOT}/serve-fixture"
+serve_state="${TEST_ROOT}/serve state with spaces"
 mkdir -p "$serve_fixture"
-cp "$SERVE" "$ROOT_DIR/local/analytics.py" "$ROOT_DIR/local/storage.py" "$ROOT_DIR/local/token_usage.py" "$serve_fixture/"
+mkdir -p "$serve_state"
+cp "$SERVE" "$ROOT_DIR/local/config.py" "$ROOT_DIR/local/analytics.py" "$ROOT_DIR/local/storage.py" "$ROOT_DIR/local/token_usage.py" "$serve_fixture/"
 printf "TOKEN_PRICING_FILE='%s'\n" "$custom_pricing" > "${serve_fixture}/.env"
+chmod 600 "${serve_fixture}/.env"
+printf '{"state":"explicit"}\n' > "${serve_state}/data.json"
 env_port="$(python3 - <<'PY'
 import socket
 with socket.socket() as sock:
@@ -133,7 +191,7 @@ with socket.socket() as sock:
 PY
 )"
 DASHBOARD_ANALYTICS_DATABASE="$analytics_database" \
-  bash "${serve_fixture}/serve.sh" --port "$env_port" >"${TEST_ROOT}/env-server.log" 2>&1 &
+  bash "${serve_fixture}/serve.sh" --config "${serve_fixture}/.env" --state-dir "$serve_state" --port "$env_port" >"${TEST_ROOT}/env-server.log" 2>&1 &
 server_pid=$!
 for _ in {1..50}; do
   curl --silent --fail "http://127.0.0.1:${env_port}/api/analytics?range=24h" -o "${TEST_ROOT}/env-analytics" && break
@@ -141,5 +199,24 @@ for _ in {1..50}; do
 done
 kill -0 "$server_pid" 2>/dev/null || fail "HTTP server using .env pricing did not start"
 assert_eq 123.0 "$(json_field "${TEST_ROOT}/env-analytics" tokens.summary.estimated_cost_usd)" "pricing catalog from .env was ignored"
+curl --silent --fail "http://127.0.0.1:${env_port}/data.json" -o "${TEST_ROOT}/env-data"
+assert_eq explicit "$(json_field "${TEST_ROOT}/env-data" state)" "explicit server state directory was ignored"
+
+secret_file="${TEST_ROOT}/server-secret"
+printf 'must-not-be-served\n' > "$secret_file"
+for public_name in data.json history.json; do
+  rm -f "${serve_state}/${public_name}"
+  ln -s "$secret_file" "${serve_state}/${public_name}"
+  symlink_code="$(curl --silent --output "${TEST_ROOT}/symlink-response" --write-out '%{http_code}' \
+    "http://127.0.0.1:${env_port}/${public_name}")"
+  assert_eq 404 "$symlink_code" "symlink ${public_name} was served"
+  if grep -Fq 'must-not-be-served' "${TEST_ROOT}/symlink-response"; then
+    fail "symlink ${public_name} disclosed its target"
+  fi
+done
+
+if grep -Fq 'Traceback' "${TEST_ROOT}/server.log" "${TEST_ROOT}/env-server.log"; then
+  fail "HTTP errors emitted a traceback"
+fi
 
 printf 'PASS: local HTTP server tests\n'

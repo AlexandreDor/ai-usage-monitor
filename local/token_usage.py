@@ -62,10 +62,10 @@ def stable_id(*parts: Any) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def load_pricing(path: Path) -> dict[str, Any]:
+def parse_pricing(raw: bytes) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise CollectorError(f"invalid pricing catalog: {exc}") from exc
     if not isinstance(value, dict) or value.get("schema_version") != 1:
         raise CollectorError("pricing catalog schema_version must be 1")
@@ -104,6 +104,14 @@ def load_pricing(path: Path) -> dict[str, Any]:
         ):
             raise CollectorError("pricing identifiers must be provider/model strings")
     return value
+
+
+def load_pricing(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise CollectorError(f"invalid pricing catalog: {exc}") from exc
+    return parse_pricing(raw)
 
 
 def read_state(connection: sqlite3.Connection, source: str, key: str) -> dict[str, Any] | None:

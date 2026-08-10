@@ -112,7 +112,12 @@ reset_case
 ALERT_SCRIPT_1="$HOOK_ONE"
 ALERT_SCRIPT_1_EVENTS='5h:reset'
 validate_config
-send_alert() { printf '%s\n' "$1" >> "$NOTIFICATION_LOG"; return 1; }
+DISCORD_WEBHOOK='configured-for-transient-test'
+send_alert() {
+  printf '%s\n' "$1" >> "$NOTIFICATION_LOG"
+  record_alert_channel "$2" discord failed 1
+  return 1
+}
 check_thresholds 80 100 later unknown "$((now + 10))" '' "$now" >/dev/null || true
 check_thresholds 100 100 unknown unknown '' '' "$((now + 11))" >/dev/null || true
 check_thresholds 100 100 unknown unknown '' '' "$((now + 12))" >/dev/null || true
@@ -158,7 +163,25 @@ validate_config
 printf 'state_version=2\nprev_5h_pct=40\nprev_weekly_pct=100\n' > "$STATE_FILE"
 check_thresholds 40 100 later unknown '' '' "$now"
 [[ ! -e "$HOOK_LOG" ]] || fail "state migration replayed a historical threshold"
-assert_eq 3 "$(state_value state_version)" "alert state was not upgraded to version 3"
+assert_eq 4 "$(state_value state_version)" "alert state was not upgraded to version 4"
 assert_eq 1 "$(state_value script_tracking_initialized)" "script tracking was not initialized"
+
+# Version 3 script journals survive the transport-state migration unchanged.
+reset_case
+# Indexed variables are consumed indirectly by monitor.sh.
+# shellcheck disable=SC2034
+ALERT_SCRIPT_1="$HOOK_ONE"
+# shellcheck disable=SC2034
+ALERT_SCRIPT_1_EVENTS='5h:50'
+validate_config
+action_id="${ALERT_SCRIPT_RULE_IDS[0]}"
+printf '%s\n' \
+  'state_version=3' 'prev_5h_pct=40' 'prev_weekly_pct=100' \
+  'script_tracking_initialized=1' 'script_prev_5h_pct=40' 'script_prev_weekly_pct=100' \
+  "attempted_script_5h_actions=${action_id}" > "$STATE_FILE"
+check_thresholds 40 100 later unknown '' '' "$now"
+[[ ! -e "$HOOK_LOG" ]] || fail "version 3 script journal replayed an attempted action"
+assert_eq "$action_id" "$(state_value attempted_script_5h_actions)" "version 3 script journal was not preserved"
+assert_eq 4 "$(state_value state_version)" "version 3 script state was not upgraded"
 
 printf 'PASS: monitor alert script tests\n'

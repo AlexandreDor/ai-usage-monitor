@@ -1,7 +1,8 @@
-# Feuille de route active
+# Feuille de route clôturée
 
-Ce document ne recense que les travaux restant à réaliser. Les fonctionnalités
-terminées sont conservées dans l'historique Git et ne sont pas répétées ici.
+Les propositions P0, P1 et P2 de cette feuille de route sont implémentées dans
+la branche `agent/implement-roadmap-p0-p2-v2`. Ce document est conservé comme
+référence de périmètre et de validation; les évolutions P3 restent différées.
 
 Les choix structurants restent les suivants :
 
@@ -248,3 +249,12 @@ Un chantier est terminé lorsque :
 - la documentation utilisateur est à jour ;
 - aucune donnée privée, chemin local, identité de compte ou secret n'est ajouté
   aux fichiers ou API exposés.
+
+## Clôture
+
+Les contrôles de clôture ont été exécutés: tests shell, Python et Node,
+couverture bloquante, compilation Python, `bash -n`, ShellCheck, `git diff
+--check`, `npm audit`, Playwright avec axe-core, vérification systemd,
+installation/mise à jour/rollback, sauvegarde/restauration, désinstallation
+avec conservation des données, reproductibilité des archives et validation des
+checksums.

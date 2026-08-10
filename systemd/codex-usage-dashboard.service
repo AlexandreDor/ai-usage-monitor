@@ -1,0 +1,23 @@
+[Unit]
+Description=Codex Usage Monitor Dashboard
+Documentation=https://github.com/AlexandreDor/ai-usage-monitor
+After=network.target
+
+[Service]
+Type=simple
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/bin/env codex-usage-dashboard
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=default.target

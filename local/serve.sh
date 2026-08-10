@@ -4,16 +4,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ANALYTICS_DATABASE_PATH="${DASHBOARD_ANALYTICS_DATABASE:-${SCRIPT_DIR}/runtime/usage-history.sqlite3}"
-ANALYTICS_PRICING_PATH="${DASHBOARD_PRICING_FILE:-${TOKEN_PRICING_FILE:-}}"
 PORT=8080
 BIND_ADDRESS="127.0.0.1"
 POSITIONAL_PORT=""
 PORT_WAS_NAMED=false
+CONFIG_PATH=""
+CONFIG_REQUIRED=false
+STATE_OVERRIDE=""
 
 usage() {
   cat <<'EOF'
-Usage: ./serve.sh [--port PORT] [--bind ADDRESS]
+Usage: ./serve.sh [--port PORT] [--bind ADDRESS] [PATH OPTIONS]
        ./serve.sh [PORT]
 
 Serve the local Codex usage dashboard.
@@ -22,6 +23,8 @@ Options:
   --port PORT      TCP port (1-65535, default: 8080)
   --bind ADDRESS   IP address to listen on (default: 127.0.0.1)
                    Use --bind 0.0.0.0 explicitly to allow LAN access.
+  --config FILE    Read configuration from FILE
+  --state-dir DIR  Read dashboard state from DIR
   -h, --help       Show this help
 
 The server provides no authentication and no TLS. Do not expose it to an
@@ -43,6 +46,17 @@ while (($#)); do
     --bind)
       (($# >= 2)) || { echo "[ERROR] --bind requires a value." >&2; exit 2; }
       BIND_ADDRESS="$2"
+      shift 2
+      ;;
+    --config)
+      (($# >= 2)) || { echo "[ERROR] --config requires a value." >&2; exit 2; }
+      CONFIG_PATH="$2"
+      CONFIG_REQUIRED=true
+      shift 2
+      ;;
+    --state-dir)
+      (($# >= 2)) || { echo "[ERROR] --state-dir requires a value." >&2; exit 2; }
+      STATE_OVERRIDE="$2"
       shift 2
       ;;
     -h|--help)
@@ -67,32 +81,48 @@ while (($#)); do
   esac
 done
 
-# Reuse TOKEN_PRICING_FILE from the monitor's .env without sourcing arbitrary
-# shell code. An explicit environment override always wins.
-if [[ -e "${SCRIPT_DIR}/.env" && ( -L "${SCRIPT_DIR}/.env" || ! -O "${SCRIPT_DIR}/.env" ) ]]; then
-  echo "[ERROR] local/.env must be a regular file owned by the current user." >&2
-  exit 2
-fi
-if [[ -z "$ANALYTICS_PRICING_PATH" && -f "${SCRIPT_DIR}/.env" ]]; then
-  while IFS= read -r env_line || [[ -n "$env_line" ]]; do
-    env_line="${env_line%$'\r'}"
-    [[ "$env_line" =~ ^[[:space:]]*TOKEN_PRICING_FILE[[:space:]]*= ]] || continue
-    env_value="${env_line#*=}"
-    env_value="${env_value#"${env_value%%[![:space:]]*}"}"
-    env_value="${env_value%"${env_value##*[![:space:]]}"}"
-    if (( ${#env_value} >= 2 )) && { [[ "$env_value" == \"*\" ]] || [[ "$env_value" == \'*\' ]]; }; then
-      env_value="${env_value:1:${#env_value}-2}"
-    fi
-    ANALYTICS_PRICING_PATH="$env_value"
-    break
-  done < "${SCRIPT_DIR}/.env"
-fi
-ANALYTICS_PRICING_PATH="${ANALYTICS_PRICING_PATH:-${SCRIPT_DIR}/pricing.json}"
-
 if ! command -v python3 &>/dev/null; then
   echo "[ERROR] python3 is required to serve the dashboard." >&2
   exit 1
 fi
+
+resolver_arguments=(--base-dir "$SCRIPT_DIR" --profile serve)
+if [[ -n "$CONFIG_PATH" ]]; then
+  resolver_arguments+=(--config "$CONFIG_PATH")
+  [[ "$CONFIG_REQUIRED" == false ]] || resolver_arguments+=(--config-required)
+fi
+[[ -z "$STATE_OVERRIDE" ]] || resolver_arguments+=(--set "STATE_DIR=${STATE_OVERRIDE}")
+config_output="$(mktemp)" || { echo "[ERROR] Could not create a temporary configuration buffer." >&2; exit 2; }
+chmod 600 "$config_output"
+status=0
+read_error=""
+python3 "$SCRIPT_DIR/config.py" "${resolver_arguments[@]}" > "$config_output" || status=$?
+if (( status != 0 )); then
+  rm -f "$config_output"
+  exit 2
+fi
+while IFS= read -r -d '' config_key; do
+  if ! IFS= read -r -d '' config_value; then
+    read_error="Configuration resolver returned an incomplete record."
+    break
+  fi
+  case "$config_key" in
+    STATE_DIR|DASHBOARD_ANALYTICS_DATABASE|TOKEN_PRICING_FILE)
+      printf -v "$config_key" '%s' "$config_value"
+      ;;
+    *)
+      read_error="Configuration resolver returned an unexpected key."
+      break
+      ;;
+  esac
+done < "$config_output"
+rm -f "$config_output"
+if [[ -n "$read_error" ]]; then
+  echo "[ERROR] $read_error" >&2
+  exit 2
+fi
+ANALYTICS_DATABASE_PATH="$DASHBOARD_ANALYTICS_DATABASE"
+ANALYTICS_PRICING_PATH="$TOKEN_PRICING_FILE"
 
 if [[ "$ANALYTICS_DATABASE_PATH" != /* ]] || [[ -e "$ANALYTICS_DATABASE_PATH" && -L "$ANALYTICS_DATABASE_PATH" ]]; then
   echo "[ERROR] DASHBOARD_ANALYTICS_DATABASE must be an absolute path and not a symbolic link." >&2
@@ -131,13 +161,17 @@ fi
 echo "Serving dashboard at http://${DISPLAY_ADDRESS}:${PORT}/dashboard.html"
 echo "Only allowlisted dashboard assets and usage JSON are exposed. Press Ctrl+C to stop."
 
-python3 - "$SCRIPT_DIR" "$PORT" "$BIND_ADDRESS" "$ANALYTICS_DATABASE_PATH" "$ANALYTICS_PRICING_PATH" <<'PYEOF'
+python3 - "$SCRIPT_DIR" "$PORT" "$BIND_ADDRESS" "$ANALYTICS_DATABASE_PATH" "$ANALYTICS_PRICING_PATH" "$STATE_DIR" <<'PYEOF'
 import functools
 import http.server
+import ipaddress
+import mimetypes
+import os
 import pathlib
 import socket
 import socketserver
 import sqlite3
+import stat
 import sys
 import threading
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -150,24 +184,79 @@ port = int(sys.argv[2])
 bind_address = sys.argv[3]
 analytics_database = pathlib.Path(sys.argv[4])
 analytics_pricing = pathlib.Path(sys.argv[5])
+state_root = pathlib.Path(sys.argv[6])
+max_public_file_size = 32 * 1024 * 1024
+socket_timeout_seconds = 5
 public_files = {
-    "/dashboard.html": "/dashboard.html",
-    "/analytics.html": "/analytics.html",
-    "/assets/dashboard.css": "/assets/dashboard.css",
-    "/assets/dashboard.js": "/assets/dashboard.js",
-    "/assets/preferences.js": "/assets/preferences.js",
-    "/assets/analytics.css": "/assets/analytics.css",
-    "/assets/analytics.js": "/assets/analytics.js",
-    "/assets/chart.umd.min.js": "/assets/chart.umd.min.js",
-    "/images/favicon.png": "/images/favicon.png",
-    "/data.json": "/runtime/data.json",
-    "/history.json": "/runtime/history.json",
+    "/dashboard.html": root / "dashboard.html",
+    "/analytics.html": root / "analytics.html",
+    "/assets/dashboard.css": root / "assets/dashboard.css",
+    "/assets/dashboard.js": root / "assets/dashboard.js",
+    "/assets/preferences.js": root / "assets/preferences.js",
+    "/assets/analytics.css": root / "assets/analytics.css",
+    "/assets/analytics.js": root / "assets/analytics.js",
+    "/assets/chart.umd.min.js": root / "assets/chart.umd.min.js",
+    "/images/favicon.png": root / "images/favicon.png",
+    "/data.json": state_root / "data.json",
+    "/history.json": state_root / "history.json",
 }
 
 
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     server_version = "CodexDashboard"
     sys_version = ""
+
+    def valid_host(self):
+        raw_host = self.headers.get("Host", "")
+        if not raw_host or any(character.isspace() for character in raw_host):
+            return False
+        try:
+            parsed = urlsplit(f"//{raw_host}")
+            hostname = parsed.hostname
+            request_port = parsed.port
+        except ValueError:
+            return False
+        if (
+            hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or request_port != port
+        ):
+            return False
+        if hostname.lower() == "localhost":
+            return True
+        try:
+            address = ipaddress.ip_address(hostname)
+            listening_address = ipaddress.ip_address(bind_address)
+            local_address = ipaddress.ip_address(self.connection.getsockname()[0])
+        except ValueError:
+            return False
+        return address.is_loopback or address in (listening_address, local_address)
+
+    def reject_invalid_host(self):
+        if self.valid_host():
+            return False
+        self.send_error(400)
+        return True
+
+    def send_error(self, code, message=None, explain=None):
+        del message, explain
+        phrase = self.responses.get(code, ("Error",))[0]
+        body = f"{code} {phrase}\n".encode("ascii", "replace")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                pass
+        self.close_connection = True
 
     def send_json(self, status, value, *, include_body=True):
         import json
@@ -186,24 +275,29 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             raw = parse_qs(split.query, keep_blank_values=True, max_num_fields=20)
             if any(len(values) != 1 for values in raw.values()):
                 raise AnalyticsError("query parameters must not be repeated")
-            allowed = {"range", "from_date", "to_date", "source", "sources", "model", "models", "reset_type", "reset_offset", "reset_limit"}
+            allowed = {"range", "from_date", "to_date", "source", "sources", "model", "models", "reset_type", "reset_offset", "reset_limit", "breakdown_offset", "breakdown_limit"}
             if set(raw) - allowed:
                 raise AnalyticsError("unknown query parameter")
             params = {key: values[0] for key, values in raw.items()}
             payload = build_payload(analytics_database, analytics_pricing, params)
-        except (AnalyticsError, ValueError, OSError, sqlite3.DatabaseError) as error:
+        except (AnalyticsError, ValueError, OverflowError, OSError, sqlite3.DatabaseError) as error:
             status = 503 if error.__class__.__name__.endswith("UnavailableError") or "not available" in str(error) or "cannot be read" in str(error) else 400
-            self.send_json(status, {"error": str(error)}, include_body=include_body)
+            message = str(error).strip()[:200] or "request failed"
+            self.send_json(status, {"error": message}, include_body=include_body)
             return
         self.send_json(200, payload, include_body=include_body)
 
     def do_GET(self):
+        if self.reject_invalid_host():
+            return
         if unquote(urlsplit(self.path).path) == "/api/analytics":
             self.serve_analytics()
             return
         super().do_GET()
 
     def do_HEAD(self):
+        if self.reject_invalid_host():
+            return
         if unquote(urlsplit(self.path).path) == "/api/analytics":
             self.serve_analytics(include_body=False)
             return
@@ -213,13 +307,54 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         request_path = unquote(urlsplit(self.path).path)
         if request_path == "/":
             request_path = "/dashboard.html"
-        mapped_path = public_files.get(request_path)
-        if mapped_path is None:
-            self.send_error(404, "Not found")
+        if request_path not in public_files:
+            self.send_error(404)
             return None
+        path = public_files[request_path]
+        descriptor = -1
+        directory_descriptor = -1
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            if request_path in ("/data.json", "/history.json"):
+                directory_flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                directory_descriptor = os.open(state_root, directory_flags)
+                descriptor = os.open(path.name, flags, dir_fd=directory_descriptor)
+            else:
+                descriptor = os.open(path, flags)
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_public_file_size:
+                raise OSError("public file is not a bounded regular file")
+            stream = os.fdopen(descriptor, "rb")
+            descriptor = -1
+        except OSError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            self.send_error(404)
+            return None
+        finally:
+            if directory_descriptor >= 0:
+                os.close(directory_descriptor)
+        content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(metadata.st_size))
+        self.end_headers()
+        self._response_bytes_remaining = metadata.st_size
+        return stream
 
-        self.path = mapped_path
-        return super().send_head()
+    def copyfile(self, source, outputfile):
+        remaining = getattr(self, "_response_bytes_remaining", 0)
+        while remaining > 0:
+            chunk = source.read(min(64 * 1024, remaining))
+            if not chunk:
+                break
+            outputfile.write(chunk)
+            remaining -= len(chunk)
 
     def end_headers(self):
         self.send_header("Cache-Control", "no-store")
@@ -246,7 +381,24 @@ class BoundedThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPSe
         super().__init__(*args, **kwargs)
 
     def process_request(self, request, client_address):
-        self._worker_slots.acquire()
+        try:
+            request.settimeout(socket_timeout_seconds)
+        except OSError:
+            self.shutdown_request(request)
+            return
+        if not self._worker_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: text/plain; charset=utf-8\r\n"
+                    b"Content-Length: 24\r\n"
+                    b"Connection: close\r\n\r\n"
+                    b"503 Service Unavailable\n"
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
         try:
             super().process_request(request, client_address)
         except Exception:
@@ -258,6 +410,10 @@ class BoundedThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPSe
             super().process_request_thread(request, client_address)
         finally:
             self._worker_slots.release()
+
+    def handle_error(self, request, client_address):
+        del request
+        print(f"[WARN] Request from {client_address[0]} failed.", file=sys.stderr)
 
 
 handler = functools.partial(DashboardHandler, directory=str(root))

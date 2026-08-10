@@ -3,26 +3,78 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  workflow_call: {}
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install Python validation tools
+        run: python -m pip install coverage==7.13.5
+
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install --yes shellcheck
-      - name: Check Bash syntax
-        run: bash -n local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
-      - name: Run tests
-        run: tests/run.sh
-      - name: Install browser test dependencies
+
+      - name: Install Node.js dependencies
         run: npm ci
-      - name: Install Chromium
+
+      - name: Audit Node.js dependencies
+        run: npm audit --audit-level=low
+
+      - name: Compile Python sources and tests
+        run: python -m compileall -q local/ tests/
+
+      - name: Validate shell syntax and lint shell scripts
+        run: |
+          shopt -s globstar nullglob
+          shell_files=(local/**/*.sh scripts/**/*.sh tests/**/*.sh)
+          for file in "${shell_files[@]}"; do
+            bash -n "$file"
+          done
+          shellcheck "${shell_files[@]}"
+
+      - name: Run complete suite with Python coverage gate
+        run: |
+          python -m coverage erase
+          set +e
+          COVERAGE_RUN=1 COVERAGE_FILE="$PWD/.coverage" bash tests/run.sh
+          test_status=$?
+          set -e
+          python -m coverage combine -q
+          python -m coverage report
+          exit "$test_status"
+
+      - name: Run distribution tests outside instrumentation
+        run: bash tests/test_distribution.sh
+
+      - name: Install Playwright browser
         run: npx playwright install --with-deps chromium
-      - name: Run browser tests
-        run: npm run test:browser
-      - name: Run ShellCheck
-        run: shellcheck -x local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
+
+      - name: Run Playwright and axe tests with isolated state
+        env:
+          CODEX_USAGE_MONITOR_CONFIG: ${{ runner.temp }}/codex-usage-monitor-ci/.env
+          CODEX_USAGE_MONITOR_STATE_DIR: ${{ runner.temp }}/codex-usage-monitor-ci/runtime
+        run: |
+          mkdir -p "$RUNNER_TEMP/codex-usage-monitor-ci/runtime"
+          install -m 600 /dev/null "$CODEX_USAGE_MONITOR_CONFIG"
+          npm run test:browser

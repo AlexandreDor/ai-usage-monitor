@@ -1,0 +1,27 @@
+[Unit]
+Description=Codex Usage Monitor
+Documentation=https://github.com/AlexandreDor/ai-usage-monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/bin/env codex-usage-monitor --loop --fail-fast
+Restart=on-failure
+RestartSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+# The generated launcher exports the authoritative XDG paths. Keep the user's
+# home accessible: the monitor writes XDG state/configuration and reads the
+# authenticated Codex data under the user's home directory.
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=default.target

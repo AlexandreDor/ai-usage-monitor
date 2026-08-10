@@ -4,21 +4,26 @@
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import json
 import math
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import sys
-import time
+import tempfile
 from typing import Any
+
+try:
+    from . import history as history_storage
+except ImportError:
+    import history as history_storage
 
 from storage import (
     ArchiveCorruptionError,
     SCHEMA_VERSION,
     connect_database,
-    is_corruption_error,
+    publish_rebuilt_database,
 )
 
 RECENT_SECONDS = 24 * 60 * 60
@@ -61,71 +66,31 @@ def optional_positive_epoch(value: Any) -> int | None:
     return int(value)
 
 
-def parse_timestamp(value: Any) -> tuple[str, int] | None:
-    if not isinstance(value, str) or not value or len(value) > 64:
-        return None
-    try:
-        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
-    epoch = int(parsed.timestamp())
-    if epoch <= 0:
-        return None
-    return value, epoch
-
-
 def normalize_snapshot(value: Any, *, strict: bool) -> dict[str, Any] | None:
-    if not isinstance(value, dict) or isinstance(value, list):
+    try:
+        parsed = history_storage.parse_snapshot(value)
+    except history_storage.SnapshotValidationError as exc:
         if strict:
-            raise ArchiveInputError("snapshot must be a JSON object")
+            raise ArchiveInputError(str(exc)) from exc
         return None
+    return normalized_snapshot(parsed)
 
-    timestamp = parse_timestamp(value.get("scraped_at"))
-    if timestamp is None:
-        if strict:
-            raise ArchiveInputError("snapshot has an invalid scraped_at timestamp")
-        return None
 
-    normalized: dict[str, Any] = {
-        "scraped_at": timestamp[0],
-        "scraped_at_epoch": timestamp[1],
-        "five_h_pct": optional_number(value.get("five_h_pct")),
-        "five_h_reset": None,
-        "five_h_reset_at": optional_positive_epoch(value.get("five_h_reset_at")),
-        "weekly_pct": optional_number(value.get("weekly_pct")),
-        "weekly_reset": None,
-        "weekly_reset_at": optional_positive_epoch(value.get("weekly_reset_at")),
-        "sample_interval_seconds": None,
-        "history_window_hours": None,
-        "limit_id": None,
+def normalized_snapshot(parsed: history_storage.ParsedSnapshot) -> dict[str, Any]:
+    public = parsed.public
+    return {
+        "scraped_at": public["scraped_at"],
+        "scraped_at_epoch": int(parsed.epoch),
+        "five_h_pct": optional_number(public["five_h_pct"]),
+        "five_h_reset": public["five_h_reset"],
+        "five_h_reset_at": optional_positive_epoch(public["five_h_reset_at"]),
+        "weekly_pct": optional_number(public["weekly_pct"]),
+        "weekly_reset": public["weekly_reset"],
+        "weekly_reset_at": optional_positive_epoch(public["weekly_reset_at"]),
+        "sample_interval_seconds": optional_positive_epoch(public["sample_interval_seconds"]),
+        "history_window_hours": optional_number(public["history_window_hours"]),
+        "limit_id": public["limit_id"],
     }
-
-    for key in ("five_h_reset", "weekly_reset"):
-        reset = value.get(key)
-        if isinstance(reset, str) and len(reset) <= 100 and "@" not in reset:
-            normalized[key] = reset
-        elif reset is not None:
-            normalized[key] = "unknown"
-
-    interval = value.get("sample_interval_seconds")
-    if finite_number(interval) and interval > 0:
-        normalized["sample_interval_seconds"] = int(interval)
-
-    window = value.get("history_window_hours")
-    if finite_number(window) and window >= 0:
-        normalized["history_window_hours"] = float(window)
-
-    limit_id = value.get("limit_id")
-    if isinstance(limit_id, str) and len(limit_id) <= 100 and not any(ord(char) < 32 for char in limit_id):
-        normalized["limit_id"] = limit_id
-
-    if normalized["five_h_pct"] is None and normalized["weekly_pct"] is None:
-        if strict:
-            raise ArchiveInputError("snapshot has no valid usage percentage")
-        return None
-    return normalized
 
 
 def row_values(snapshot: dict[str, Any]) -> tuple[Any, ...]:
@@ -144,23 +109,30 @@ def row_values(snapshot: dict[str, Any]) -> tuple[Any, ...]:
     ))
 
 
-def read_history(history_path: Path) -> list[dict[str, Any]]:
-    if not history_path.exists():
-        return []
+def read_history(history_path: Path, current_epoch: int):
     try:
-        value = json.loads(history_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        warn(f"Could not read rolling history for archive migration: {exc}")
-        return []
-    if not isinstance(value, list):
-        warn("Rolling history is not an array; archive migration will keep only the current snapshot.")
-        return []
-    normalized: list[dict[str, Any]] = []
-    for item in value:
-        entry = normalize_snapshot(item, strict=False)
-        if entry is not None:
-            normalized.append(entry)
-    return normalized
+        for entry in history_storage.iter_validated_history(
+            history_path, future_anchor=current_epoch
+        ):
+            yield normalized_snapshot(entry)
+    except (history_storage.HistoryError, OSError) as exc:
+        raise ArchiveInputError(
+            f"rolling history migration failed validation: {exc}"
+        ) from exc
+
+
+def history_file_present(history_path: Path) -> bool:
+    """Return whether the expected history file exists as a regular file."""
+
+    try:
+        file_stat = os.lstat(history_path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ArchiveInputError(f"cannot inspect rolling history: {exc}") from exc
+    if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
+        raise ArchiveInputError("rolling history must be a regular file")
+    return True
 
 
 def insert_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any]) -> None:
@@ -185,6 +157,19 @@ def insert_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any]) ->
         """,
         row_values(snapshot),
     )
+
+
+def reject_future_snapshots(connection: sqlite3.Connection, current_epoch: int) -> None:
+    future = connection.execute(
+        "SELECT scraped_at_epoch FROM snapshots WHERE scraped_at_epoch > ? "
+        "ORDER BY scraped_at_epoch LIMIT 1",
+        (current_epoch + history_storage.FUTURE_TIMESTAMP_TOLERANCE_SECONDS,),
+    ).fetchone()
+    if future:
+        raise ArchiveInputError(
+            "archive contains a snapshot beyond the future timestamp tolerance; "
+            "refusing compaction after a possible clock rollback"
+        )
 
 
 def compact(connection: sqlite3.Connection, retention_days: int) -> None:
@@ -320,18 +305,31 @@ def ingest(
     connection = connect_database(database_path)
     try:
         with connection:
+            reject_future_snapshots(connection, snapshot["scraped_at_epoch"])
             migrated = connection.execute(
                 "SELECT value FROM metadata WHERE key = 'history_json_migrated'"
             ).fetchone()
             if not migrated or migrated[0] != "1":
-                for entry in read_history(history_path):
-                    insert_snapshot(connection, entry)
-                connection.execute(
-                    """
-                    INSERT INTO metadata(key, value) VALUES('history_json_migrated', '1')
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                    """
-                )
+                if history_file_present(history_path):
+                    for entry in read_history(history_path, snapshot["scraped_at_epoch"]):
+                        insert_snapshot(connection, entry)
+                    # Do not acknowledge a file that disappeared during the
+                    # migration window; the next cycle must retry it.
+                    if not history_file_present(history_path):
+                        raise ArchiveInputError(
+                            "rolling history disappeared during migration"
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO metadata(key, value) VALUES('history_json_migrated', '1')
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """
+                    )
+                else:
+                    warn(
+                        "Rolling history is temporarily unavailable; "
+                        "history_json_migrated remains unset."
+                    )
             connection.execute(
                 """
                 INSERT INTO metadata(key, value) VALUES('schema_version', ?)
@@ -347,15 +345,29 @@ def ingest(
     os.chmod(database_path, 0o600)
 
 
-def backup_corrupt_database(database_path: Path) -> Path:
-    timestamp = int(time.time())
-    backup = database_path.with_name(f"{database_path.name}.corrupt.{timestamp}")
-    suffix = 1
-    while backup.exists():
-        backup = database_path.with_name(f"{database_path.name}.corrupt.{timestamp}.{suffix}")
-        suffix += 1
-    os.replace(database_path, backup)
-    return backup
+def rebuild_corrupt_database(
+    database_path: Path,
+    history_path: Path,
+    snapshot: dict[str, Any],
+    retention_days: int,
+) -> Path:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{database_path.name}.rebuild.",
+        suffix=".sqlite3",
+        dir=database_path.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    temporary_path.unlink()
+    try:
+        ingest(temporary_path, history_path, snapshot, retention_days)
+        return publish_rebuilt_database(database_path, temporary_path)
+    finally:
+        for suffix in ("", "-wal", "-shm", ".storage.lock"):
+            try:
+                Path(str(temporary_path) + suffix).unlink()
+            except FileNotFoundError:
+                pass
 
 
 def parse_retention(value: str) -> int:
@@ -384,17 +396,22 @@ def run(args: argparse.Namespace) -> int:
         return 0
     except ArchiveCorruptionError as exc:
         try:
-            backup = backup_corrupt_database(database_path)
-        except OSError as backup_error:
-            error(f"Archive database is corrupt ({exc}); recovery backup failed: {backup_error}")
-            return 1
-        warn(f"Corrupt archive copied to {backup}; rebuilding it from rolling history.")
-        try:
-            ingest(database_path, history_path, snapshot, retention_days)
+            backup = rebuild_corrupt_database(
+                database_path, history_path, snapshot, retention_days
+            )
+            warn(f"Corrupt archive moved to {backup}; rebuilt it from rolling history.")
             return 0
-        except (ArchiveCorruptionError, OSError, sqlite3.DatabaseError) as rebuild_error:
+        except (
+            ArchiveCorruptionError,
+            ArchiveInputError,
+            OSError,
+            sqlite3.DatabaseError,
+        ) as rebuild_error:
             error(f"Could not rebuild archive after corruption: {rebuild_error}")
             return 1
+    except ArchiveInputError as exc:
+        error(f"Archive history migration failed: {exc}")
+        return 1
     except (OSError, sqlite3.DatabaseError) as exc:
         error(f"Archive update failed: {exc}")
         return 1

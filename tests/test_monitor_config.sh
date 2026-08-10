@@ -82,6 +82,21 @@ TELEGRAM_BOT_TOKEN='123:abc'
 TELEGRAM_CHAT_ID=-123
 validate_config
 
+for valid_api_url in \
+  'https://api.example.com/v1' 'http://localhost:8080' \
+  'http://127.0.0.1:8080' 'http://[::1]:8080'; do
+  monitor_defaults
+  GITHUB_API_URL="$valid_api_url"
+  validate_config
+done
+for invalid_api_url in \
+  'http://api.example.com' 'https://user@api.example.com' \
+  'https://api.example.com/path#fragment' 'https://api.example.com/path?query=1'; do
+  monitor_defaults
+  GITHUB_API_URL="$invalid_api_url"
+  validate_config >/dev/null 2>&1 && fail "invalid API URL accepted: $invalid_api_url"
+done
+
 monitor_defaults
 GITHUB_PAT=$'token\nheader'
 GITHUB_GIST_ID=abc123
@@ -103,7 +118,21 @@ assert_eq 3 "${#ALERT_SCRIPT_RULE_INDICES[@]}" "script actions were not normaliz
 assert_eq '5h:50' "${ALERT_SCRIPT_RULE_EVENTS[0]}" "leading-zero threshold was not normalized"
 
 monitor_defaults
+SCRIPT_LINK="${TEST_ROOT}/alert-hook-link.sh"
+ln -s "$SCRIPT_FIXTURE" "$SCRIPT_LINK"
+ALERT_SCRIPT_1="$SCRIPT_LINK"
+ALERT_SCRIPT_1_EVENTS=5h:50
+validate_config >/dev/null 2>&1 && fail "symlink alert script accepted"
+monitor_defaults
+chmod 720 "$SCRIPT_FIXTURE"
+ALERT_SCRIPT_1="$SCRIPT_FIXTURE"
+ALERT_SCRIPT_1_EVENTS=5h:50
+validate_config >/dev/null 2>&1 && fail "group-writable alert script accepted"
+chmod 700 "$SCRIPT_FIXTURE"
+
+monitor_defaults
 printf 'ALERT_SCRIPT_99="%s"\nALERT_SCRIPT_99_EVENTS="5h:75, weekly:reset"\n' "$SCRIPT_FIXTURE" > "$ENV_FILE"
+chmod 600 "$ENV_FILE"
 load_config
 loaded_path_name=ALERT_SCRIPT_99
 loaded_events_name=ALERT_SCRIPT_99_EVENTS
@@ -114,6 +143,7 @@ validate_config
 monitor_defaults
 INVALID_ALERT_SCRIPT_CONFIG=0
 printf 'ALERT_SCRIPT_100=%s\nALERT_SCRIPT_100_EVENTS=5h:50\n' "$SCRIPT_FIXTURE" > "$ENV_FILE"
+chmod 600 "$ENV_FILE"
 load_config >/dev/null 2>&1
 validate_config >/dev/null 2>&1 && fail "invalid .env script index accepted"
 INVALID_ALERT_SCRIPT_CONFIG=0
@@ -171,5 +201,74 @@ ALERT_SCRIPT_1="$METACHAR_SCRIPT"
 ALERT_SCRIPT_1_EVENTS=5h:50
 validate_config
 [[ ! -e "$INJECTION_MARKER" ]] || fail "script path was evaluated as shell code"
+
+help_output="$(CODEX_USAGE_MONITOR_CONFIG="${TEST_ROOT}/missing.env" CODEX_BIN="definitely-missing-codex" bash "$MONITOR_PATH" --help)"
+for documented_option in '--once' '--loop [SECONDS]' '--check' '--status-json' '--fail-fast' '--config FILE' '--state-dir DIRECTORY'; do
+  assert_contains "$help_output" "$documented_option" "monitor help omitted $documented_option"
+done
+
+cli_root="${TEST_ROOT}/CLI paths with spaces"
+cli_config="${cli_root}/monitor config.env"
+cli_state="${cli_root}/selected state"
+environment_state="${cli_root}/environment state"
+file_state="${cli_root}/file state"
+fake_codex="${cli_root}/fake codex"
+malicious_marker="${cli_root}/malicious command ran"
+mkdir -p "$cli_root"
+cp "${ROOT_DIR}/tests/fixtures/fake-codex.sh" "$fake_codex"
+chmod 700 "$fake_codex"
+printf '%s\n' \
+  "CODEX_BIN='${fake_codex}'" \
+  'TOKEN_USAGE_SOURCES=none' \
+  "TOKEN_PRICING_FILE='${ROOT_DIR}/local/pricing.json'" \
+  "STATE_DIR='${file_state}'" \
+  "IGNORED_VALUE=\$(touch '${malicious_marker}')" > "$cli_config"
+chmod 600 "$cli_config"
+CODEX_USAGE_MONITOR_STATE_DIR="$environment_state" \
+FAKE_CODEX_FIXTURE="${ROOT_DIR}/tests/fixtures/codex/multi-id.json" \
+  bash "$MONITOR_PATH" --config "$cli_config" --state-dir "$cli_state" --check >/dev/null
+[[ -d "$cli_state" ]] || fail "explicit monitor state directory was not created"
+[[ ! -e "$environment_state" && ! -e "$file_state" ]] || fail "CLI state directory did not take priority"
+[[ ! -e "$malicious_marker" ]] || fail "malicious .env text was executed"
+
+curl_arguments="${TEST_ROOT}/curl-arguments"
+curl() {
+  local output_file="" argument
+  : > "$curl_arguments"
+  for argument in "$@"; do
+    printf '%s\n' "$argument" >> "$curl_arguments"
+  done
+  while (($#)); do
+    case "$1" in
+      --output) output_file="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  cat >/dev/null
+  [[ -z "$output_file" ]] || printf '{}\n' > "$output_file"
+  printf '204'
+}
+monitor_defaults
+http_response="${TEST_ROOT}/http-response"
+http_request Test 204 'url = "https://example.invalid"' POST "$http_response" >/dev/null
+assert_eq '-q' "$(sed -n '1p' "$curl_arguments")" "curl -q was not the first argument"
+assert_contains "$({ sed -n '/--max-filesize/{N;p;}' "$curl_arguments"; } 2>/dev/null)" $'--max-filesize\n1048576' \
+  "curl response body limit is missing"
+unset -f curl
+
+status_config="${cli_root}/status-only.env"
+status_state="${cli_root}/status state must stay absent"
+printf '%s\n' \
+  "CODEX_BIN='${fake_codex}'" \
+  'LOOP_INTERVAL=60' \
+  'ALERT_THRESHOLDS=invalid' \
+  'TOKEN_USAGE_SOURCES=invalid' \
+  'TOKEN_PRICING_FILE=/missing/catalog.json' \
+  'GITHUB_API_URL=http://example.com' > "$status_config"
+chmod 600 "$status_config"
+status_output="$(FAKE_CODEX_FIXTURE="${ROOT_DIR}/tests/fixtures/codex/multi-id.json" \
+  bash "$MONITOR_PATH" --config "$status_config" --state-dir "$status_state" --status-json)"
+assert_contains "$status_output" '"five_h_pct"' "status-json did not return Codex JSON"
+[[ ! -e "$status_state" ]] || fail "status-json created its state directory"
 
 printf 'PASS: monitor configuration tests\n'

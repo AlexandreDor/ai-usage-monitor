@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+jobs:
+  ci:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  validate:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Renovate updates pinned GitHub Action SHAs.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify tag and main ancestry
+        run: |
+          source scripts/semver.sh
+          version="$(cat VERSION)"
+          semver_valid "$version"
+          test "${GITHUB_REF_NAME}" = "v${version}"
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: Check Bash syntax and ShellCheck
+        run: |
+          bash -n scripts/*.sh tests/test_distribution*.sh
+          shellcheck scripts/*.sh tests/test_distribution*.sh
+      - name: Run distribution and Codex status tests
+        run: |
+          tests/test_distribution.sh
+          python3 -m unittest tests.test_codex_status
+      - name: Build twice reproducibly
+        run: |
+          epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          assets="$RUNNER_TEMP/release-assets"
+          SOURCE_DATE_EPOCH="$epoch" scripts/build-release.sh --require-clean --output "$assets/build-one"
+          SOURCE_DATE_EPOCH="$epoch" scripts/build-release.sh --require-clean --output "$assets/build-two"
+          cmp "$assets/build-one/codex-usage-monitor-$(cat VERSION).tar.gz" "$assets/build-two/codex-usage-monitor-$(cat VERSION).tar.gz"
+          cmp "$assets/build-one/SHA256SUMS" "$assets/build-two/SHA256SUMS"
+          cd "$assets/build-one"
+          sha256sum --check SHA256SUMS
+      - name: Transfer the exact validated assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: validated-release-assets
+          path: |
+            ${{ runner.temp }}/release-assets/build-one/codex-usage-monitor-*.tar.gz
+            ${{ runner.temp }}/release-assets/build-one/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Renovate updates pinned GitHub Action SHAs.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download the validated release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: validated-release-assets
+          path: dist
+      - name: Verify transferred release assets
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS
+      - name: Create verified draft, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="codex-usage-monitor-$(cat VERSION).tar.gz"
+          gh release create "$GITHUB_REF_NAME" --draft \
+            --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" "dist/$archive" dist/SHA256SUMS
+          mkdir downloaded
+          gh release download "$GITHUB_REF_NAME" --dir downloaded
+          cmp "dist/$archive" "downloaded/$archive"
+          cmp dist/SHA256SUMS downloaded/SHA256SUMS
+          (cd downloaded && sha256sum --check SHA256SUMS)
+          gh release edit "$GITHUB_REF_NAME" --draft=false

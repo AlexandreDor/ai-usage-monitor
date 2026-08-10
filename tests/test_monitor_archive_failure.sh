@@ -39,4 +39,13 @@ assert_eq 'archive local gist alerts tokens' "${CALLS[*]}" "archive failure stop
 assert_eq failure "$(json_field "$HEALTH_FILE" last_cycle_result)" "archive failure was not recorded in health"
 assert_contains "$(json_field "$HEALTH_FILE" last_error.message)" 'Long-term archive update failed' "archive failure detail missing"
 
+# Gist publication is skipped entirely when the local public files were not updated.
+CALLS=()
+write_local_snapshot() {
+  CALLS+=(local)
+  return 1
+}
+run_once 900 >/dev/null 2>&1 && fail "local snapshot failure was not propagated"
+assert_eq 'archive local alerts tokens' "${CALLS[*]}" "local write failure still published a Gist"
+
 printf 'PASS: archive failure handling tests\n'

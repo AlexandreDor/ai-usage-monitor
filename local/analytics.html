@@ -174,7 +174,12 @@
             <tbody id="breakdown-body"></tbody>
           </table>
         </div>
-        <p class="empty-state" id="breakdown-empty" data-i18n="analytics.noModelConsumption" hidden>No model consumption to display.</p>
+        <p class="empty-state" id="breakdown-empty" role="status" aria-live="polite" data-i18n="analytics.noModelConsumption" hidden>No model consumption to display.</p>
+        <div class="pagination" id="breakdown-pagination" aria-label="Cost allocation pages" hidden>
+          <button type="button" id="breakdown-previous" aria-controls="breakdown-body" data-i18n="analytics.previous">Previous</button>
+          <span id="breakdown-page-label" role="status" aria-live="polite" aria-atomic="true"></span>
+          <button type="button" id="breakdown-next" aria-controls="breakdown-body" data-i18n="analytics.next">Next</button>
+        </div>
       </article>
 
       <article class="card analytics-card wide table-card" id="reset-history-card">

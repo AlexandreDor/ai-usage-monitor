@@ -2,6 +2,8 @@
 
 const ANALYTICS_REFRESH_MS = 900_000;
 const RESET_PAGE_SIZE = 50;
+const BREAKDOWN_PAGE_SIZE = 50;
+const MAX_MODEL_FILTERS = 50;
 const PARIS_ZONE = 'Europe/Paris';
 const PRICE_WARNING_PATTERN = /^No catalog price; assumed zero: (.+)$/u;
 const state = {
@@ -11,6 +13,7 @@ const state = {
   availableModels: [],
   resetType: 'all',
   resetOffset: 0,
+  breakdownOffset: 0,
   fromDate: '',
   toDate: '',
   tokenOverlay: true,
@@ -26,6 +29,8 @@ let limitDatasets = [];
 let tokenDatasets = [];
 let lastPayload = null;
 let currentPeriod = {};
+let refreshController = null;
+let refreshGeneration = 0;
 
 function byId(id) { return document.getElementById(id); }
 function safeNumber(value) {
@@ -158,9 +163,11 @@ function queryString() {
     reset_type: state.resetType,
     reset_offset: String(state.resetOffset),
     reset_limit: String(RESET_PAGE_SIZE),
+    breakdown_offset: String(state.breakdownOffset),
+    breakdown_limit: String(BREAKDOWN_PAGE_SIZE),
   });
   if (state.sources.length) query.set('sources', state.sources.join(','));
-  if (state.models.length) query.set('models', state.models.join(','));
+  if (state.models.length && state.models.length <= MAX_MODEL_FILTERS) query.set('models', state.models.join(','));
   if (state.range === 'custom') {
     query.set('from_date', state.fromDate);
     query.set('to_date', state.toDate);
@@ -446,9 +453,10 @@ function renderTokens(data = {}) {
   updateTokenOverlay();
 }
 
-function renderBreakdown(items) {
+function renderBreakdown(data = {}) {
   const body = byId('breakdown-body');
   clearRows(body);
+  const items = data.breakdown;
   const values = Array.isArray(items) ? items : [];
   byId('breakdown-empty').hidden = values.length > 0;
   for (const item of values) {
@@ -468,6 +476,21 @@ function renderBreakdown(items) {
     cell(row, item.pricing_status || '—', item.pricing_status === 'assumed-zero' ? 'pricing-unknown' : '');
     body.appendChild(row);
   }
+  const page = data.breakdown_pagination;
+  const pagination = byId('breakdown-pagination');
+  if (!page || typeof page !== 'object') {
+    pagination.hidden = true;
+    return;
+  }
+  const total = safeNumber(page.total);
+  const limit = Math.max(1, safeNumber(page.limit) || BREAKDOWN_PAGE_SIZE);
+  const offset = safeNumber(page.offset);
+  pagination.hidden = offset === 0 && total <= limit;
+  byId('breakdown-previous').disabled = offset === 0;
+  byId('breakdown-next').disabled = offset + limit >= total;
+  const first = values.length ? offset + 1 : 0;
+  const last = values.length ? Math.min(offset + values.length, total) : 0;
+  byId('breakdown-page-label').textContent = t('pageOf', { from: first, to: last, total });
 }
 
 function renderResets(data = {}) {
@@ -558,7 +581,7 @@ function pressedValues(container) {
     .map(button => button.dataset.filterValue);
 }
 function setPressedValues(container, values) {
-  const selected = new Set(values);
+  const selected = new Set(values.length ? values : state.availableModels);
   for (const button of container.querySelectorAll('[data-filter-value]')) {
     button.setAttribute('aria-pressed', String(selected.has(button.dataset.filterValue)));
   }
@@ -568,7 +591,7 @@ function addFilterOption(container, value) {
   button.type = 'button';
   button.className = 'filter-option';
   button.dataset.filterValue = value;
-  button.setAttribute('aria-pressed', String(state.models.includes(value)));
+  button.setAttribute('aria-pressed', String(!state.models.length || state.models.includes(value)));
   button.textContent = value;
   container.appendChild(button);
 }
@@ -579,7 +602,6 @@ function updateModelOptions(models) {
   state.availableModels = normalized;
   if (changed) {
     state.models = state.models.filter(model => normalized.includes(model));
-    if (!state.models.length) state.models = [...normalized];
     clearRows(container);
     for (const model of normalized) addFilterOption(container, model);
   } else setPressedValues(container, state.models);
@@ -626,7 +648,7 @@ function render(payload) {
   currentPeriod = period;
   renderLimits(payload.limits || {});
   renderTokens(payload.tokens || {});
-  renderBreakdown(payload.tokens?.breakdown || []);
+  renderBreakdown(payload.tokens || {});
   renderResets(payload.resets || {});
   renderFreshness(payload.freshness || {}, period);
   updateModelOptions(payload.available?.models || []);
@@ -645,12 +667,20 @@ function refreshSchedule(payload = lastPayload) {
 }
 async function refresh() {
   clearTimeout(refreshTimer);
+  const generation = ++refreshGeneration;
+  if (refreshController) refreshController.abort();
+  const controller = new AbortController();
+  refreshController = controller;
   const loading = byId('analytics-loading');
   if (loading) loading.hidden = false;
   try {
-    const response = await fetch(`/api/analytics?${queryString()}`, { headers: { Accept: 'application/json' } });
+    const response = await fetch(`/api/analytics?${queryString()}`, {
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
     let payload;
     try { payload = await response.json(); } catch (_error) { payload = {}; }
+    if (generation !== refreshGeneration) return;
     if (!response.ok) {
       const error = new Error(payload.error || `HTTP ${response.status}`);
       error.status = response.status;
@@ -658,11 +688,14 @@ async function refresh() {
     }
     render(payload);
   } catch (error) {
+    if (generation !== refreshGeneration || error?.name === 'AbortError') return;
     const message = error instanceof Error ? error.message : t('unableToLoadAnalytics');
     const localOnly = !lastPayload || error?.status === 503 || /not available|cannot be read|local mode/i.test(message);
     setMessage('analytics-local-only', localOnly ? t('localOnly') : '');
     setMessage('analytics-error', lastPayload ? `${message} · ${t('showingLastData')}` : message);
   } finally {
+    if (generation !== refreshGeneration) return;
+    refreshController = null;
     if (loading) loading.hidden = true;
     refreshSchedule();
   }
@@ -673,6 +706,7 @@ for (const button of document.querySelectorAll('[data-range]')) {
     document.querySelectorAll('[data-range]').forEach(item => item.classList.toggle('active', item === button));
     state.range = button.dataset.range;
     state.resetOffset = 0;
+    state.breakdownOffset = 0;
     byId('custom-dates').hidden = state.range !== 'custom';
     if (state.range !== 'custom') refresh();
   });
@@ -687,24 +721,32 @@ byId('source-filter').addEventListener('click', event => {
     state.sources = [button.dataset.filterValue];
   }
   state.resetOffset = 0;
+  state.breakdownOffset = 0;
   refresh();
 });
 byId('model-filter').addEventListener('click', event => {
   const button = event.target.closest('[data-filter-value]');
   if (!button) return;
   button.setAttribute('aria-pressed', String(button.getAttribute('aria-pressed') !== 'true'));
-  state.models = pressedValues(byId('model-filter'));
-  if (!state.models.length) {
+  const selected = pressedValues(byId('model-filter'));
+  if (!selected.length) {
     button.setAttribute('aria-pressed', 'true');
-    state.models = [button.dataset.filterValue];
+    return;
   }
+  if (selected.length > MAX_MODEL_FILTERS && selected.length !== state.availableModels.length) {
+    button.setAttribute('aria-pressed', String(button.getAttribute('aria-pressed') !== 'true'));
+    return;
+  }
+  state.models = selected.length === state.availableModels.length ? [] : selected;
   state.resetOffset = 0;
+  state.breakdownOffset = 0;
   refresh();
 });
 byId('select-all-models').addEventListener('click', () => {
-  state.models = [...state.availableModels];
+  state.models = [];
   setPressedValues(byId('model-filter'), state.models);
   state.resetOffset = 0;
+  state.breakdownOffset = 0;
   refresh();
 });
 byId('select-gpt-5-6').addEventListener('click', () => {
@@ -713,16 +755,19 @@ byId('select-gpt-5-6').addEventListener('click', () => {
   state.models = gpt56;
   setPressedValues(byId('model-filter'), state.models);
   state.resetOffset = 0;
+  state.breakdownOffset = 0;
   refresh();
 });
 byId('reset-filter').addEventListener('change', event => { state.resetType = event.target.value; state.resetOffset = 0; refresh(); });
 byId('apply-dates').addEventListener('click', () => {
-  state.fromDate = byId('from-date').value; state.toDate = byId('to-date').value; state.resetOffset = 0;
+  state.fromDate = byId('from-date').value; state.toDate = byId('to-date').value; state.resetOffset = 0; state.breakdownOffset = 0;
   if (!state.fromDate || !state.toDate) { setMessage('analytics-error', t('chooseBothDates')); return; }
   refresh();
 });
 byId('resets-previous').addEventListener('click', () => { state.resetOffset = Math.max(0, state.resetOffset - RESET_PAGE_SIZE); refresh(); });
 byId('resets-next').addEventListener('click', () => { state.resetOffset += RESET_PAGE_SIZE; refresh(); });
+byId('breakdown-previous').addEventListener('click', () => { state.breakdownOffset = Math.max(0, state.breakdownOffset - BREAKDOWN_PAGE_SIZE); refresh(); });
+byId('breakdown-next').addEventListener('click', () => { state.breakdownOffset += BREAKDOWN_PAGE_SIZE; refresh(); });
 byId('toggle-token-overlay').addEventListener('click', () => {
   if (!limitPoints.length || !tokenPoints.length) return;
   state.tokenOverlay = !state.tokenOverlay;
