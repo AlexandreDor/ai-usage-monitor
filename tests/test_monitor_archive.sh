@@ -30,7 +30,8 @@ archive_at() {
   snapshot_at "$epoch" | python3 "$ARCHIVE_SCRIPT" \
     --database "$ARCHIVE_FILE" \
     --history "$HISTORY_FILE" \
-    --retention-days "$retention"
+    --retention-days "$retention" \
+    --now "$BASE"
 }
 
 count_rows() {
@@ -54,6 +55,13 @@ with sqlite3.connect(sys.argv[1]) as connection:
 print("yes" if found else "no")
 PYEOF
 }
+
+# The CLI rejects an incoming snapshot beyond the current-clock tolerance,
+# independent of whatever rows may already exist in SQLite.
+if snapshot_at "$((BASE + 301))" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 0 --now "$BASE"; then
+  fail "future incoming snapshot was accepted"
+fi
 
 # Migration is automatic and idempotent.
 printf '[%s]\n' "$(snapshot_at "$((BASE - 100))")" > "$HISTORY_FILE"
@@ -139,9 +147,9 @@ before=$((BASE - 100))
 reset_at=$((BASE - 50))
 printf '{"five_h_pct":5,"weekly_pct":7,"five_h_reset_at":%s,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
   "$reset_at" "$reset_at" "$(iso_at "$before")" | python3 "$ARCHIVE_SCRIPT" \
-  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365 --now "$BASE"
 snapshot_at "$BASE" 100 100 | python3 "$ARCHIVE_SCRIPT" \
-  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365 --now "$BASE"
 assert_eq '2' "$(python3 - "$ARCHIVE_FILE" "$reset_at" <<'PYEOF'
 import sqlite3
 import sys
@@ -171,9 +179,9 @@ long_gap_before=$((BASE - 3 * 3600))
 long_gap_reset=$((BASE - 2 * 3600))
 printf '{"five_h_pct":5,"five_h_reset_at":%s,"scraped_at":"%s"}\n' \
   "$long_gap_reset" "$(iso_at "$long_gap_before")" | python3 "$ARCHIVE_SCRIPT" \
-  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365 --now "$BASE"
 snapshot_at "$BASE" 100 100 | python3 "$ARCHIVE_SCRIPT" \
-  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365 --now "$BASE"
 assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
 import sqlite3
 import sys
@@ -190,10 +198,10 @@ random_previous_deadline=$((BASE + 4 * 86400))
 random_current_deadline=$((random_previous_deadline + 3 * 86400))
 printf '{"weekly_pct":28,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
   "$random_previous_deadline" "$(iso_at "$random_before")" | python3 "$ARCHIVE_SCRIPT" \
-  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365 --now "$BASE"
 printf '{"weekly_pct":100,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
   "$random_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
-  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365 --now "$BASE"
 assert_eq '1' "$(python3 - "$ARCHIVE_FILE" "$BASE" <<'PYEOF'
 import sqlite3
 import sys
@@ -215,10 +223,10 @@ small_refill_previous_deadline=$((BASE + 4 * 86400))
 small_refill_current_deadline=$((small_refill_previous_deadline + 2 * 3600))
 printf '{"weekly_pct":92,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
   "$small_refill_previous_deadline" "$(iso_at "$small_refill_before")" | python3 "$ARCHIVE_SCRIPT" \
-  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365 --now "$BASE"
 printf '{"weekly_pct":100,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
   "$small_refill_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
-  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365 --now "$BASE"
 assert_eq '1' "$(python3 - "$ARCHIVE_FILE" "$BASE" <<'PYEOF'
 import sqlite3
 import sys
@@ -236,10 +244,10 @@ PYEOF
 rm -f "$ARCHIVE_FILE"
 printf '{"weekly_pct":92,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
   "$small_refill_previous_deadline" "$(iso_at "$small_refill_before")" | python3 "$ARCHIVE_SCRIPT" \
-  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365 --now "$BASE"
 printf '{"weekly_pct":92,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
   "$small_refill_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
-  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365 --now "$BASE"
 assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
 import sqlite3
 import sys

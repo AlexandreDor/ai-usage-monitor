@@ -22,6 +22,7 @@ jobs:
       # Renovate updates pinned GitHub Action SHAs.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Verify tag and main ancestry
@@ -70,8 +71,29 @@ jobs:
       # Renovate updates pinned GitHub Action SHAs.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Verify publish checkout and release tag target
+        shell: bash
+        run: |
+          set -euo pipefail
+          checkout_sha="$(git rev-parse HEAD)"
+          if ! tag_sha="$(git rev-parse --verify "${GITHUB_REF}^{commit}" 2>/dev/null)"; then
+            printf 'ERROR: release ref %s could not be dereferenced as a commit\n' "$GITHUB_REF" >&2
+            exit 1
+          fi
+          if [[ "$checkout_sha" != "$GITHUB_SHA" ]]; then
+            printf 'ERROR: publish checkout is %s, expected GITHUB_SHA %s\n' \
+              "$checkout_sha" "$GITHUB_SHA" >&2
+            exit 1
+          fi
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            printf 'ERROR: tag %s resolves to %s, expected GITHUB_SHA %s\n' \
+              "$GITHUB_REF_NAME" "$tag_sha" "$GITHUB_SHA" >&2
+            exit 1
+          fi
+          printf 'Verified %s resolves to GITHUB_SHA %s\n' "$GITHUB_REF_NAME" "$GITHUB_SHA"
       - name: Download the validated release assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:

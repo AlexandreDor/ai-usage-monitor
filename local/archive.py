@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import time
 from typing import Any
 
 try:
@@ -46,6 +47,15 @@ def warn(message: str) -> None:
 
 def error(message: str) -> None:
     print(f"[ERROR] {message}", file=sys.stderr)
+
+
+def coerce_now(value: Any = None) -> float:
+    """Return one finite wall-clock anchor for the whole archive operation."""
+
+    current = time.time() if value is None else value
+    if not finite_number(current):
+        raise ArchiveInputError("archive clock anchor must be a finite epoch")
+    return float(current)
 
 
 def finite_number(value: Any) -> bool:
@@ -299,19 +309,33 @@ def ingest(
     history_path: Path,
     snapshot: dict[str, Any],
     retention_days: int,
+    *,
+    now: float | int | None = None,
 ) -> None:
+    clock_epoch = coerce_now(now)
+    if (
+        snapshot["scraped_at_epoch"]
+        > clock_epoch + history_storage.FUTURE_TIMESTAMP_TOLERANCE_SECONDS
+    ):
+        raise ArchiveInputError(
+            "snapshot scraped_at exceeds the future timestamp tolerance"
+        )
+    # Keep the old relative guard as well: an old incoming snapshot must not
+    # make a future database row look historical after a clock rollback.
+    history_anchor = min(float(snapshot["scraped_at_epoch"]), clock_epoch)
     database_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(database_path.parent, 0o700)
     connection = connect_database(database_path)
     try:
         with connection:
             reject_future_snapshots(connection, snapshot["scraped_at_epoch"])
+            reject_future_snapshots(connection, clock_epoch)
             migrated = connection.execute(
                 "SELECT value FROM metadata WHERE key = 'history_json_migrated'"
             ).fetchone()
             if not migrated or migrated[0] != "1":
                 if history_file_present(history_path):
-                    for entry in read_history(history_path, snapshot["scraped_at_epoch"]):
+                    for entry in read_history(history_path, history_anchor):
                         insert_snapshot(connection, entry)
                     # Do not acknowledge a file that disappeared during the
                     # migration window; the next cycle must retry it.
@@ -350,6 +374,8 @@ def rebuild_corrupt_database(
     history_path: Path,
     snapshot: dict[str, Any],
     retention_days: int,
+    *,
+    now: float | int | None = None,
 ) -> Path:
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{database_path.name}.rebuild.",
@@ -360,7 +386,7 @@ def rebuild_corrupt_database(
     temporary_path = Path(temporary_name)
     temporary_path.unlink()
     try:
-        ingest(temporary_path, history_path, snapshot, retention_days)
+        ingest(temporary_path, history_path, snapshot, retention_days, now=now)
         return publish_rebuilt_database(database_path, temporary_path)
     finally:
         for suffix in ("", "-wal", "-shm", ".storage.lock"):
@@ -385,6 +411,7 @@ def run(args: argparse.Namespace) -> int:
         value = json.load(sys.stdin)
         snapshot = normalize_snapshot(value, strict=True)
         assert snapshot is not None
+        now = coerce_now(getattr(args, "now", None))
     except (ArchiveInputError, json.JSONDecodeError, OSError) as exc:
         error(f"Archive input failed: {exc}")
         return 1
@@ -392,12 +419,12 @@ def run(args: argparse.Namespace) -> int:
     database_path = Path(args.database)
     history_path = Path(args.history)
     try:
-        ingest(database_path, history_path, snapshot, retention_days)
+        ingest(database_path, history_path, snapshot, retention_days, now=now)
         return 0
     except ArchiveCorruptionError as exc:
         try:
             backup = rebuild_corrupt_database(
-                database_path, history_path, snapshot, retention_days
+                database_path, history_path, snapshot, retention_days, now=now
             )
             warn(f"Corrupt archive moved to {backup}; rebuilt it from rolling history.")
             return 0
@@ -422,6 +449,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--database", required=True, help="SQLite archive path")
     parser.add_argument("--history", required=True, help="Rolling history JSON path")
     parser.add_argument("--retention-days", required=True, help="0 for unlimited, otherwise 1..36500")
+    parser.add_argument(
+        "--now",
+        type=float,
+        default=None,
+        help="wall-clock epoch used for future timestamp validation (default: current time)",
+    )
     return parser
 
 

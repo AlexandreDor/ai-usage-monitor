@@ -148,4 +148,33 @@ check_thresholds 70 100 later unknown '' '' "$((now + 1))" >/dev/null 2>&1 || tr
 assert_alert_count 2
 assert_eq "$v4_alert_id" "$(state_value five_h_threshold_alert_id)" "v4 recovery ID was not deterministic"
 
+# Reset occurrences apply the same v4 repair rule independently to Discord
+# and Telegram. Missing or invalid channel fields never acknowledge delivery.
+reset_case
+DISCORD_WEBHOOK='configured-for-test'
+TELEGRAM_BOT_TOKEN='123:token'
+TELEGRAM_CHAT_ID='456'
+reset_at=$((now + 300))
+printf '%s\n' \
+  'state_version=4' 'prev_5h_pct=80' 'prev_weekly_pct=100' \
+  "five_h_armed_reset_at=${reset_at}" > "$STATE_FILE"
+send_alert() { printf '1\n' >> "$ALERT_COUNT_LOG"; return 1; }
+check_thresholds 80 100 unknown unknown '' '' "$((reset_at + 1))" >/dev/null 2>&1 || true
+reset_alert_id="$(state_value five_h_reset_alert_id)"
+[[ "$reset_alert_id" =~ ^[a-f0-9]{24}$ ]] || fail "incomplete v4 reset state did not get an alert ID"
+assert_eq pending "$(state_value five_h_reset_discord_status)" "v4 reset Discord was acknowledged"
+assert_eq pending "$(state_value five_h_reset_telegram_status)" "v4 reset Telegram was acknowledged"
+assert_eq pending "$(state_value five_h_reset_status)" "v4 reset global status was acknowledged"
+
+reset_case
+printf '%s\n' \
+  'state_version=4' 'prev_5h_pct=80' 'prev_weekly_pct=100' \
+  "five_h_armed_reset_at=${reset_at}" 'five_h_reset_alert_id=invalid' \
+  'five_h_reset_discord_status=delivered' 'five_h_reset_discord_retryable=0' \
+  'five_h_reset_telegram_status=delivered' 'five_h_reset_telegram_retryable=0' > "$STATE_FILE"
+check_thresholds 80 100 unknown unknown '' '' "$((reset_at + 2))" >/dev/null 2>&1 || true
+assert_eq pending "$(state_value five_h_reset_discord_status)" "invalid v4 reset Discord was acknowledged"
+assert_eq pending "$(state_value five_h_reset_telegram_status)" "invalid v4 reset Telegram was acknowledged"
+assert_eq "$reset_alert_id" "$(state_value five_h_reset_alert_id)" "v4 reset repair ID was not deterministic"
+
 printf 'PASS: monitor reset alert tests\n'

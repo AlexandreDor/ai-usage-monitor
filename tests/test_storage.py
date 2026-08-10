@@ -291,6 +291,40 @@ class StorageTests(unittest.TestCase):
         finally:
             holder.close()
 
+    def test_interrupted_triplet_publish_recovers_from_durable_journal(self):
+        connection = storage.connect_database(self.database)
+        connection.close()
+        rebuilt = self.root / "rebuilt-interrupted.sqlite3"
+        connection = storage.connect_database(rebuilt)
+        connection.close()
+
+        real_replace = storage.os.replace
+        replace_count = 0
+
+        def fail_between_replaces(source, destination):
+            nonlocal replace_count
+            replace_count += 1
+            if replace_count >= 3:
+                raise OSError("injected interruption between SQLite replaces")
+            return real_replace(source, destination)
+
+        with mock.patch.object(storage.os, "replace", side_effect=fail_between_replaces):
+            with self.assertRaisesRegex(OSError, "injected interruption"):
+                storage.publish_rebuilt_database(self.database, rebuilt)
+
+        journal = self.database.with_name(
+            self.database.name + storage.REBUILD_JOURNAL_SUFFIX
+        )
+        self.assertTrue(journal.exists())
+        self.assertFalse(self.database.exists())
+
+        connection = storage.connect_database(self.database)
+        try:
+            self.assertEqual("ok", connection.execute("PRAGMA quick_check").fetchone()[0])
+        finally:
+            connection.close()
+        self.assertFalse(journal.exists())
+
     def test_concurrent_reader_and_writer_finish_with_valid_database(self):
         connection = storage.connect_database(self.database)
         connection.close()

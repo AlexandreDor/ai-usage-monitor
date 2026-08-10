@@ -147,6 +147,72 @@ test('clears a previous chart when history becomes empty', async ({ page }) => {
   await expect(page.locator('#history-table-body')).toContainText('No history samples available.');
 });
 
+test('loads complete history from an allowed raw URL when the Gist response is truncated', async ({ page }) => {
+  const rawRequests = [];
+  const fullHistory = [{ ...snapshot, five_h_pct: 68, scraped_at: '2026-08-03T00:00:00Z' }];
+  await mockUsage(page);
+  await page.route('https://api.github.com/gists/?*', route => route.fulfill({
+    json: {
+      files: {
+        'data.json': { content: JSON.stringify(snapshot) },
+        'history.json': {
+          truncated: true,
+          content: '[{"scraped_at":"partial',
+          raw_url: 'https://gist.githubusercontent.com/example/123/raw/history.json',
+        },
+      },
+    },
+  }));
+  await page.route('https://gist.githubusercontent.com/**', route => {
+    rawRequests.push(route.request().url());
+    return route.fulfill({
+      json: fullHistory,
+      headers: { 'access-control-allow-origin': '*' },
+    });
+  });
+  await page.goto('/dashboard.html');
+
+  await page.evaluate(() => fetchGist());
+  await expect(page.locator('#mode-badge')).toHaveText('EXTERNAL');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await expect(page.locator('#history-error')).toBeHidden();
+  await expect(page.locator('#history-table-body tr')).toHaveCount(1);
+  await expect(page.locator('#history-summary')).toContainText('1 sample');
+  expect(rawRequests).toEqual(['https://gist.githubusercontent.com/example/123/raw/history.json']);
+});
+
+test('rejects an unsafe truncated Gist URL and keeps the degraded state accessible', async ({ page }) => {
+  const externalRequests = [];
+  page.on('request', request => {
+    if (new URL(request.url()).hostname !== '127.0.0.1') externalRequests.push(request.url());
+  });
+  await mockUsage(page);
+  await page.route('https://api.github.com/gists/?*', route => route.fulfill({
+    json: {
+      files: {
+        'data.json': { content: JSON.stringify(snapshot) },
+        'history.json': {
+          truncated: true,
+          content: '[{"scraped_at":"partial',
+          raw_url: 'https://evil.example/history.json',
+        },
+      },
+    },
+  }));
+  await page.goto('/dashboard.html');
+
+  await page.evaluate(() => fetchGist());
+  await expect(page.locator('#mode-badge')).toHaveText('EXTERNAL');
+  await expect(page.locator('#history-error')).toContainText('raw URL was not allowed');
+  await expect(page.locator('#history-summary')).toHaveText('No history samples available.');
+  await expect(page.locator('#history-table-body')).not.toContainText('partial');
+  expect(externalRequests).toHaveLength(1);
+  expect(externalRequests[0]).toMatch(/^https:\/\/api\.github\.com\/gists\/\?_=/);
+
+  const results = await new AxeBuilder({ page }).analyze();
+  expect(results.violations.filter(violation => ['critical', 'serious'].includes(violation.impact))).toEqual([]);
+});
+
 test('has no critical or serious accessibility violations on mobile', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await mockUsage(page);

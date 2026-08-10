@@ -71,6 +71,23 @@ class ArchiveMigrationTests(unittest.TestCase):
                 archive.ingest(self.database, self.history, self.current, 365)
             self.assertIsNone(self.marker())
 
+    def test_incoming_snapshot_is_checked_against_injected_clock(self):
+        with self.assertRaisesRegex(archive.ArchiveInputError, "future timestamp"):
+            archive.ingest(
+                self.database,
+                self.history,
+                archive.normalize_snapshot(snapshot(2000), strict=True),
+                365,
+                now=1000,
+            )
+        self.assertFalse(self.database.exists())
+
+    def test_legacy_history_is_checked_against_clock_and_snapshot_anchor(self):
+        self.history.write_text(json.dumps([snapshot(2401)]), encoding="utf-8")
+        with self.assertRaises(archive.ArchiveInputError):
+            archive.ingest(self.database, self.history, self.current, 365, now=2000)
+        self.assertIsNone(self.marker())
+
     def test_missing_history_is_not_marked_until_restored(self):
         archive.ingest(self.database, self.history, self.current, 365)
         self.assertIsNone(self.marker())

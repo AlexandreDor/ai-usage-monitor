@@ -278,11 +278,13 @@ The `.github/workflows/release.yml` workflow runs only for pushed `v*` tags. It:
 2. Requires the tagged commit to be contained in remote `main`.
 3. Requires the complete reusable CI, including audit, compilation, coverage,
    shell, distribution, Node, Playwright, and axe validation.
-4. Builds twice from a clean checkout using the tagged commit timestamp.
+4. Checks out `GITHUB_SHA` explicitly and builds twice from that clean checkout
+   using the tagged commit timestamp.
 5. Compares both archives and checksum files, then transfers exactly that
    validated archive/checksum pair to the publication job.
-6. Creates a draft, uploads and downloads the transferred assets,
-   byte/checksum-verifies them, and only then publishes.
+6. The publication job checks that the checkout and tag both resolve exactly to
+   `GITHUB_SHA`, then creates a draft, uploads and downloads the transferred
+   assets, byte/checksum-verifies them, and only then publishes.
 
 The workflow does not create or push Git tags. A maintainer must intentionally
 create and push the correctly named tag; documentation must not infer publication

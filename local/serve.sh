@@ -361,7 +361,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header(
             "Content-Security-Policy",
             "default-src 'none'; script-src 'self'; style-src 'self'; "
-            "connect-src 'self' https://api.github.com; img-src 'self'; "
+            "connect-src 'self' https://api.github.com https://gist.githubusercontent.com "
+            "https://raw.githubusercontent.com; img-src 'self'; "
             "font-src 'none'; object-src 'none'; base-uri 'none'; "
             "form-action 'none'; frame-ancestors 'none'",
         )

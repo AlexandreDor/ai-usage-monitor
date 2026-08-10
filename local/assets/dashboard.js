@@ -6,6 +6,8 @@ const REFRESH_INTERVAL_MS = 900_000;
 const DECIMATION_THRESHOLD = 1000;
 const DECIMATION_SAMPLES = 600;
 const PARIS_TIME_ZONE = 'Europe/Paris';
+const SAFE_GITHUB_RAW_HOSTS = new Set(['gist.githubusercontent.com', 'raw.githubusercontent.com']);
+const MAX_RAW_URL_LENGTH = 2048;
 
 let chart = null;
 let refreshTimer = null;
@@ -29,6 +31,9 @@ const DASHBOARD_COPY = {
     historySummary: '{count} samples from {start} to {end}. Latest weekly: {actual}; ideal: {ideal}.',
     historySummarySingle: '1 sample at {start}. Weekly: {actual}; ideal: {ideal}.', noHistory: 'No history samples available.',
     historyTableToggle: 'View history data table', historyTableCaption: 'Quota history samples', sample: 'Sample', fiveRemaining: '5-hour remaining', weeklyRemaining: 'Weekly remaining', weeklyIdeal: 'Weekly ideal',
+    gistRawUrlUnsafe: 'External {file} degraded: GitHub returned truncated content, but its raw URL was not allowed.',
+    gistRawFetchFailed: 'External {file} degraded: GitHub returned truncated content; the full file could not be loaded.',
+    gistRawInvalid: 'External {file} degraded: GitHub returned truncated content; the full file was not valid JSON.',
   },
   fr: {
     source: 'Origine', waiting: 'En attente de données', fresh: 'FRESH', stale: 'STALE', error: 'ERROR',
@@ -39,6 +44,9 @@ const DASHBOARD_COPY = {
     historySummary: '{count} collectes du {start} au {end}. Dernier quota hebdomadaire : {actual} ; idéal : {ideal}.',
     historySummarySingle: '1 collecte à {start}. Quota hebdomadaire : {actual} ; idéal : {ideal}.', noHistory: 'Aucune collecte disponible.',
     historyTableToggle: 'Afficher le tableau des collectes', historyTableCaption: 'Historique des quotas', sample: 'Collecte', fiveRemaining: 'Reste sur 5 heures', weeklyRemaining: 'Reste hebdomadaire', weeklyIdeal: 'Ideal hebdomadaire',
+    gistRawUrlUnsafe: '{file} externe dégradé : GitHub a renvoyé un contenu tronqué, mais son URL raw n’est pas autorisée.',
+    gistRawFetchFailed: '{file} externe dégradé : le contenu tronqué de GitHub n’a pas permis de charger le fichier complet.',
+    gistRawInvalid: '{file} externe dégradé : le fichier complet renvoyé n’est pas un JSON valide.',
   },
 };
 
@@ -482,6 +490,57 @@ async function fetchJson(url, missingMessage) {
   return response.json();
 }
 
+function safeRawUrl(rawUrl) {
+  if (typeof rawUrl !== 'string' || rawUrl.length === 0 || rawUrl.length > MAX_RAW_URL_LENGTH) return null;
+  if (typeof URL !== 'function') return null;
+
+  const pageLocation = typeof location === 'object' && location !== null ? location : null;
+  let candidate;
+  try {
+    candidate = new URL(rawUrl, pageLocation?.href);
+  } catch (_error) {
+    return null;
+  }
+
+  if (candidate.username || candidate.password || candidate.port) return null;
+  if (pageLocation?.origin && candidate.origin === pageLocation.origin) return candidate.href;
+  if (candidate.protocol === 'https:' && SAFE_GITHUB_RAW_HOSTS.has(candidate.hostname.toLowerCase())) {
+    return candidate.href;
+  }
+  return null;
+}
+
+function gistFileLabel(filename) {
+  return filename === 'history.json' ? 'history' : 'dashboard data';
+}
+
+async function fetchGistRawJson(rawUrl, filename) {
+  const label = gistFileLabel(filename);
+  let response;
+  try {
+    response = await fetch(rawUrl, { redirect: 'error' });
+  } catch (_error) {
+    throw new Error(copy('gistRawFetchFailed', { file: label }));
+  }
+  if (!response.ok) throw new Error(copy('gistRawFetchFailed', { file: label }));
+  try {
+    return await response.json();
+  } catch (_error) {
+    throw new Error(copy('gistRawInvalid', { file: label }));
+  }
+}
+
+async function fetchGistFile(file, filename, missingMessage) {
+  if (!file || typeof file !== 'object' || Array.isArray(file)) throw new Error(missingMessage);
+  if (file.truncated === true) {
+    const rawUrl = safeRawUrl(file.raw_url);
+    if (!rawUrl) throw new Error(copy('gistRawUrlUnsafe', { file: gistFileLabel(filename) }));
+    return fetchGistRawJson(rawUrl, filename);
+  }
+  if (typeof file.content !== 'string' || file.content.length === 0) throw new Error(missingMessage);
+  return JSON.parse(file.content);
+}
+
 async function fetchLocal() {
   setOrigin('local');
   const data = await fetchJson('data.json', t('dataNotFound'));
@@ -499,14 +558,10 @@ async function fetchGist() {
   const response = await fetch(`https://api.github.com/gists/${encodeURIComponent(GIST_ID)}?_=${Date.now()}`);
   if (!response.ok) throw new Error(t('githubApiError', { status: response.status }));
   const gist = await response.json();
-  const dataContent = gist?.files?.['data.json']?.content;
-  if (!dataContent) throw new Error(t('gistDataNotFound'));
-  renderData(JSON.parse(dataContent));
+  renderData(await fetchGistFile(gist?.files?.['data.json'], 'data.json', t('gistDataNotFound')));
 
   try {
-    const historyContent = gist?.files?.['history.json']?.content;
-    if (!historyContent) throw new Error(t('gistHistoryNotFound'));
-    renderHistory(JSON.parse(historyContent));
+    renderHistory(await fetchGistFile(gist?.files?.['history.json'], 'history.json', t('gistHistoryNotFound')));
   } catch (error) {
     renderHistoryFailure(error instanceof Error ? error.message : t('unableToLoadHistory'));
   }

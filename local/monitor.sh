@@ -954,6 +954,105 @@ repair_v4_pending_threshold() {
   fi
 }
 
+repair_v4_reset() {
+  local window="$1" scraped_at_epoch="$2" state_window prefix id_name status_name
+  local discord_name telegram_name discord_retryable_name telegram_retryable_name
+  local id_seen_name status_seen_name discord_seen_name telegram_seen_name
+  local discord_retryable_seen_name telegram_retryable_seen_name armed_name last_notified_name
+  local state_seen_name
+  local discord_configured=0 telegram_configured=0 needs_repair=0 occurrence_epoch="" max_age
+  local migrated_id
+
+  [[ "$window" == 5h ]] && state_window=five_h || state_window=weekly
+  prefix="${state_window}_reset"
+  id_name="${prefix}_alert_id"
+  status_name="${prefix}_status"
+  discord_name="${prefix}_discord_status"
+  telegram_name="${prefix}_telegram_status"
+  discord_retryable_name="${prefix}_discord_retryable"
+  telegram_retryable_name="${prefix}_telegram_retryable"
+  id_seen_name="${id_name}_seen"
+  status_seen_name="${status_name}_seen"
+  discord_seen_name="${discord_name}_seen"
+  telegram_seen_name="${telegram_name}_seen"
+  discord_retryable_seen_name="${discord_retryable_name}_seen"
+  telegram_retryable_seen_name="${telegram_retryable_name}_seen"
+  armed_name="${state_window}_armed_reset_at"
+  last_notified_name="last_notified_${window}_reset_at"
+  state_seen_name="${state_window}_reset_state_seen"
+
+  [[ -n "${DISCORD_WEBHOOK:-}" ]] && discord_configured=1
+  [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] && telegram_configured=1
+  [[ "$window" == 5h ]] && max_age=$((5 * 60 * 60)) || max_age=$((7 * 24 * 60 * 60))
+
+  # A reset occurrence is recoverable from its stable deadline, its durable
+  # last-notified marker, or an existing v4 alert ID.  A blank fresh state is
+  # intentionally left alone so it cannot invent a reset notification.
+  if [[ "${!armed_name}" =~ ^[0-9]+$ ]] && (( ${!armed_name} > 0 )) \
+    && (( scraped_at_epoch >= ${!armed_name} )) \
+    && (( scraped_at_epoch - ${!armed_name} <= max_age )) \
+    && [[ "${!last_notified_name}" != "${!armed_name}" ]]; then
+    occurrence_epoch="${!armed_name}"
+  elif [[ "${!last_notified_name}" =~ ^[0-9]+$ ]] && (( ${!last_notified_name} > 0 )); then
+    occurrence_epoch="${!last_notified_name}"
+  elif (( ${!id_seen_name} == 1 )) && [[ -n "${!id_name}" ]]; then
+    needs_repair=1
+  elif (( ${!state_seen_name} == 1 )) \
+    && (( ${!id_seen_name} != 1 || ${!status_seen_name} != 1 \
+      || ${!discord_seen_name} != 1 || ${!telegram_seen_name} != 1 \
+      || ${!discord_retryable_seen_name} != 1 || ${!telegram_retryable_seen_name} != 1 )); then
+    # There is damaged reset state but no recoverable deadline. Keep the
+    # occurrence pending and make its fallback ID stable across retries.
+    occurrence_epoch="$scraped_at_epoch"
+  else
+    return 0
+  fi
+
+  if [[ -n "$occurrence_epoch" ]] \
+    && ! { (( ${!id_seen_name} == 1 )) && [[ "${!id_name}" =~ ^[a-f0-9]{24}$ ]]; }; then
+    migrated_id="$(alert_id reset "$window" reset "$occurrence_epoch")" || return 1
+    printf -v "$id_name" '%s' "$migrated_id"
+    needs_repair=1
+  fi
+
+  if (( discord_configured == 1 )) \
+    && (( ${!discord_seen_name} != 1 || ${!discord_retryable_seen_name} != 1 )); then
+    needs_repair=1
+  fi
+  if (( telegram_configured == 1 )) \
+    && (( ${!telegram_seen_name} != 1 || ${!telegram_retryable_seen_name} != 1 )); then
+    needs_repair=1
+  fi
+  if (( discord_configured == 0 )) \
+    && [[ "${!discord_name}" != delivered || "${!discord_retryable_name}" != 0 ]]; then
+    needs_repair=1
+  fi
+  if (( telegram_configured == 0 )) \
+    && [[ "${!telegram_name}" != delivered || "${!telegram_retryable_name}" != 0 ]]; then
+    needs_repair=1
+  fi
+  (( ${!status_seen_name} != 1 )) && needs_repair=1
+
+  if (( needs_repair == 1 )); then
+    if (( discord_configured == 1 )); then
+      printf -v "$discord_name" '%s' pending
+      printf -v "$discord_retryable_name" '%s' 1
+    else
+      printf -v "$discord_name" '%s' delivered
+      printf -v "$discord_retryable_name" '%s' 0
+    fi
+    if (( telegram_configured == 1 )); then
+      printf -v "$telegram_name" '%s' pending
+      printf -v "$telegram_retryable_name" '%s' 1
+    else
+      printf -v "$telegram_name" '%s' delivered
+      printf -v "$telegram_retryable_name" '%s' 0
+    fi
+    refresh_alert_status "$prefix"
+    persist_alert_state || return 1
+  fi
+}
+
 run_alert_script() {
   local rule_position="$1" event_kind="$2" window="$3" threshold="$4" remaining_pct="$5"
   local reset_at="$6" reset_label="$7" scraped_at="$8" message="$9"
@@ -1027,8 +1126,13 @@ check_thresholds() {
   local five_h_threshold_alert_id="" five_h_threshold_status=delivered
   local five_h_threshold_discord_status=delivered five_h_threshold_discord_retryable=0
   local five_h_threshold_telegram_status=delivered five_h_threshold_telegram_retryable=0
+  # These state-presence flags are read through dynamically built variable names
+  # by the v4 repair helpers below.
+  # shellcheck disable=SC2034
   local five_h_threshold_alert_id_seen=0 five_h_threshold_status_seen=0
+  # shellcheck disable=SC2034
   local five_h_threshold_discord_status_seen=0 five_h_threshold_telegram_status_seen=0
+  # shellcheck disable=SC2034
   local five_h_threshold_discord_retryable_seen=0 five_h_threshold_telegram_retryable_seen=0
   local five_h_threshold_remaining_pct="" five_h_threshold_reset_label="" five_h_threshold_pace=""
   local five_h_threshold_last_terminal_alert_id="" five_h_threshold_last_terminal_status=""
@@ -1036,8 +1140,11 @@ check_thresholds() {
   local weekly_threshold_alert_id="" weekly_threshold_status=delivered
   local weekly_threshold_discord_status=delivered weekly_threshold_discord_retryable=0
   local weekly_threshold_telegram_status=delivered weekly_threshold_telegram_retryable=0
+  # shellcheck disable=SC2034
   local weekly_threshold_alert_id_seen=0 weekly_threshold_status_seen=0
+  # shellcheck disable=SC2034
   local weekly_threshold_discord_status_seen=0 weekly_threshold_telegram_status_seen=0
+  # shellcheck disable=SC2034
   local weekly_threshold_discord_retryable_seen=0 weekly_threshold_telegram_retryable_seen=0
   local weekly_threshold_remaining_pct="" weekly_threshold_reset_label="" weekly_threshold_pace=""
   local weekly_threshold_last_terminal_alert_id="" weekly_threshold_last_terminal_status=""
@@ -1045,9 +1152,25 @@ check_thresholds() {
   local five_h_reset_alert_id="" five_h_reset_status=delivered
   local five_h_reset_discord_status=delivered five_h_reset_discord_retryable=0
   local five_h_reset_telegram_status=delivered five_h_reset_telegram_retryable=0
+  # shellcheck disable=SC2034
+  local five_h_reset_alert_id_seen=0 five_h_reset_status_seen=0
+  # shellcheck disable=SC2034
+  local five_h_reset_discord_status_seen=0 five_h_reset_telegram_status_seen=0
+  # shellcheck disable=SC2034
+  local five_h_reset_discord_retryable_seen=0 five_h_reset_telegram_retryable_seen=0
+  # shellcheck disable=SC2034
+  local five_h_reset_state_seen=0
   local weekly_reset_alert_id="" weekly_reset_status=delivered
   local weekly_reset_discord_status=delivered weekly_reset_discord_retryable=0
   local weekly_reset_telegram_status=delivered weekly_reset_telegram_retryable=0
+  # shellcheck disable=SC2034
+  local weekly_reset_alert_id_seen=0 weekly_reset_status_seen=0
+  # shellcheck disable=SC2034
+  local weekly_reset_discord_status_seen=0 weekly_reset_telegram_status_seen=0
+  # shellcheck disable=SC2034
+  local weekly_reset_discord_retryable_seen=0 weekly_reset_telegram_retryable_seen=0
+  # shellcheck disable=SC2034
+  local weekly_reset_state_seen=0
   local script_tracking_initialized=0
   local script_prev_5h_pct=100
   local script_prev_weekly_pct=100
@@ -1064,6 +1187,16 @@ check_thresholds() {
   ALERT_PROCESSING_ERROR=""
   if [[ -f "$STATE_FILE" ]]; then
     while IFS='=' read -r state_key state_value; do
+      case "$state_key" in
+        five_h_reset_alert_id|five_h_reset_status|five_h_reset_discord_status|five_h_reset_discord_retryable|five_h_reset_telegram_status|five_h_reset_telegram_retryable)
+          # shellcheck disable=SC2034
+          five_h_reset_state_seen=1
+          ;;
+        weekly_reset_alert_id|weekly_reset_status|weekly_reset_discord_status|weekly_reset_discord_retryable|weekly_reset_telegram_status|weekly_reset_telegram_retryable)
+          # shellcheck disable=SC2034
+          weekly_reset_state_seen=1
+          ;;
+      esac
       case "$state_key" in
         state_version)
           [[ "$state_value" =~ ^[1-4]$ ]] && state_version="$state_value"
@@ -1091,6 +1224,9 @@ check_thresholds() {
               five_h_threshold_alert_id|weekly_threshold_alert_id)
                 printf -v "${state_key}_seen" '%s' 1
                 ;;
+              five_h_reset_alert_id|weekly_reset_alert_id)
+                printf -v "${state_key}_seen" '%s' 1
+                ;;
             esac
           fi
           ;;
@@ -1102,6 +1238,9 @@ check_thresholds() {
             printf -v "$state_key" '%s' "$state_value"
             case "$state_key" in
               five_h_threshold_status|weekly_threshold_status|five_h_threshold_discord_status|five_h_threshold_telegram_status|weekly_threshold_discord_status|weekly_threshold_telegram_status)
+                printf -v "${state_key}_seen" '%s' 1
+                ;;
+              five_h_reset_status|weekly_reset_status|five_h_reset_discord_status|five_h_reset_telegram_status|weekly_reset_discord_status|weekly_reset_telegram_status)
                 printf -v "${state_key}_seen" '%s' 1
                 ;;
             esac
@@ -1122,6 +1261,9 @@ check_thresholds() {
             printf -v "$state_key" '%s' "$state_value"
             case "$state_key" in
               five_h_threshold_discord_retryable|five_h_threshold_telegram_retryable|weekly_threshold_discord_retryable|weekly_threshold_telegram_retryable)
+                printf -v "${state_key}_seen" '%s' 1
+                ;;
+              five_h_reset_discord_retryable|five_h_reset_telegram_retryable|weekly_reset_discord_retryable|weekly_reset_telegram_retryable)
                 printf -v "${state_key}_seen" '%s' 1
                 ;;
             esac
@@ -1149,6 +1291,8 @@ check_thresholds() {
   if (( state_version == 4 )); then
     repair_v4_pending_threshold 5h || return 1
     repair_v4_pending_threshold weekly || return 1
+    repair_v4_reset 5h "$scraped_at_epoch" || return 1
+    repair_v4_reset weekly "$scraped_at_epoch" || return 1
   fi
 
   mapfile -t thresholds < <(load_thresholds)

@@ -47,6 +47,7 @@ function element(id) {
 }
 
 let fetchQueue = [];
+let fetchCalls = [];
 let destroyed = 0;
 const timerDelays = [];
 function FakeChart(_context, config) {
@@ -64,9 +65,12 @@ const context = vm.createContext({
   Intl,
   Map,
   Number,
+  URL,
+  location: { origin: 'http://127.0.0.1:4173', href: 'http://127.0.0.1:4173/dashboard.html' },
   Chart: FakeChart,
   document: { getElementById: element, createElement: tagName => domNode(tagName) },
-  fetch: async () => {
+  fetch: async (url, options = {}) => {
+    fetchCalls.push({ url, options });
     if (!fetchQueue.length) return new Promise(() => {});
     const value = fetchQueue.shift();
     return { ok: true, status: 200, json: async () => value };
@@ -206,6 +210,47 @@ function evaluate(expression) {
   if (element('history-error').hidden) fail('chart failure was not isolated and reported');
   if (!element('error-banner').hidden) fail('chart failure polluted the main error state');
   if (element('history-table-body').children.length !== 1) fail('chart failure prevented the history table rendering');
+
+  context.Chart = FakeChart;
+  evaluate('chart = null');
+  fetchCalls = [];
+  const gistSnapshot = { five_h_pct: 77, weekly_pct: 66, scraped_at: '2026-08-03T00:00:00Z' };
+  const gistHistory = [{ scraped_at: '2026-08-03T00:00:00Z', five_h_pct: 77 }];
+  fetchQueue = [
+    {
+      files: {
+        'data.json': { content: JSON.stringify(gistSnapshot) },
+        'history.json': {
+          truncated: true,
+          content: '[{"scraped_at":"partial',
+          raw_url: 'https://gist.githubusercontent.com/example/123/raw/history.json',
+        },
+      },
+    },
+    gistHistory,
+  ];
+  await evaluate('fetchGist()');
+  if (element('five-h-pct').textContent !== '77%') fail('Gist data did not render');
+  if (element('history-table-body').children.length !== 1) fail('truncated Gist history did not load from raw_url');
+  if (element('history-error').hidden !== true) fail('successful raw history load left an error visible');
+  if (fetchCalls.length !== 2 || fetchCalls[1].url !== 'https://gist.githubusercontent.com/example/123/raw/history.json') {
+    fail('truncated Gist history did not use its safe raw_url');
+  }
+  if (fetchCalls[1].options.redirect !== 'error') fail('raw Gist fetch did not reject redirects');
+
+  fetchCalls = [];
+  fetchQueue = [{
+    files: {
+      'data.json': { content: JSON.stringify(gistSnapshot) },
+      'history.json': { truncated: true, content: '[{"scraped_at":"partial', raw_url: 'https://evil.example/history.json' },
+    },
+  }];
+  await evaluate('fetchGist()');
+  if (fetchCalls.length !== 1) fail('unsafe raw_url was fetched');
+  if (!element('history-error').textContent.includes('raw URL was not allowed')) fail('unsafe truncated Gist state was not explicit');
+  if (element('history-table-body').children.length !== 1 || element('history-table-body').children[0].textContent.includes('partial')) {
+    fail('partial truncated Gist content was rendered');
+  }
 
   console.log('PASS: dashboard JavaScript tests');
 })().catch(error => {

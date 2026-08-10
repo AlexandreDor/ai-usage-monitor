@@ -6,6 +6,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -21,6 +22,7 @@ SCHEMA_VERSION_NUMBER = 2
 SQLITE_BUSY_TIMEOUT_MS = 50
 SQLITE_LOCK_RETRY_DELAYS = (0.02, 0.04, 0.08, 0.16)
 V1_BACKUP_SUFFIX = ".v1.bak"
+REBUILD_JOURNAL_SUFFIX = ".storage-recovery"
 READ_ONLY_INTEGRITY_CACHE_SECONDS = 30.0
 MAX_INTEGRITY_CACHE_ENTRIES = 32
 
@@ -309,6 +311,174 @@ def _database_lock_path(path: Path) -> Path:
     return path.with_name(path.name + ".storage.lock")
 
 
+def _rebuild_journal_path(path: Path) -> Path:
+    return path.with_name(path.name + REBUILD_JOURNAL_SUFFIX)
+
+
+def _write_rebuild_journal(path: Path, payload: dict[str, Any]) -> None:
+    """Publish a recovery journal before any active SQLite file is moved."""
+
+    journal_path = _rebuild_journal_path(path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{journal_path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path: Path | None = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as journal:
+            descriptor = -1
+            json.dump(payload, journal, ensure_ascii=True, sort_keys=True)
+            journal.write("\n")
+            journal.flush()
+            os.fchmod(journal.fileno(), 0o600)
+            os.fsync(journal.fileno())
+        os.replace(temporary_path, journal_path)
+        temporary_path = None
+        _fsync_directory(path.parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _remove_rebuild_journal(path: Path) -> None:
+    journal_path = _rebuild_journal_path(path)
+    try:
+        journal_path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_directory(path.parent)
+
+
+def _read_rebuild_journal(path: Path) -> dict[str, Any] | None:
+    journal_path = _rebuild_journal_path(path)
+    if journal_path.is_symlink():
+        raise ArchiveCorruptionError(
+            f"archive recovery journal must not be a symbolic link: {journal_path}"
+        )
+    try:
+        raw = journal_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ArchiveCorruptionError(f"cannot read archive recovery journal: {exc}") from exc
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ArchiveCorruptionError("archive recovery journal is invalid") from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ArchiveCorruptionError("archive recovery journal has an unsupported version")
+
+    expected_database = Path(os.path.abspath(os.fspath(path)))
+    try:
+        journal_database = Path(os.path.abspath(str(payload["database"])))
+        backup = Path(os.path.abspath(str(payload["backup"])))
+        rebuilt = Path(os.path.abspath(str(payload["rebuilt"])))
+        sources = [Path(os.path.abspath(str(value))) for value in payload["sources"]]
+        destinations = [
+            Path(os.path.abspath(str(value))) for value in payload["destinations"]
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ArchiveCorruptionError("archive recovery journal has invalid paths") from exc
+    if (
+        journal_database != expected_database
+        or not sources
+        or len(sources) != len(destinations)
+        or sources[-1] != expected_database
+        or len(set(sources)) != len(sources)
+        or any(source not in {
+            expected_database,
+            Path(str(expected_database) + "-wal"),
+            Path(str(expected_database) + "-shm"),
+        } for source in sources)
+        or backup.parent != expected_database.parent
+        or rebuilt.parent != expected_database.parent
+        or any(
+            destination
+            != (
+                backup
+                if source == expected_database
+                else Path(str(backup) + str(source)[len(str(expected_database)):])
+            )
+            for source, destination in zip(sources, destinations)
+        )
+    ):
+        raise ArchiveCorruptionError("archive recovery journal does not match the active database")
+    return {
+        "database": expected_database,
+        "backup": backup,
+        "rebuilt": rebuilt,
+        "sources": sources,
+        "destinations": destinations,
+    }
+
+
+def _path_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _recover_rebuild_journal_locked(path: Path) -> None:
+    """Finish a published replacement or roll back a partial triplet move."""
+
+    journal = _read_rebuild_journal(path)
+    if journal is None:
+        return
+
+    database = journal["database"]
+    rebuilt = journal["rebuilt"]
+    sources = journal["sources"]
+    destinations = journal["destinations"]
+    if database.exists() and not rebuilt.exists():
+        # The standalone replacement is active.  Sidecars must already have
+        # been moved before its main file was published.
+        if any(_path_exists(source) for source in sources[:-1]):
+            raise ArchiveCorruptionError(
+                "archive recovery found sidecars beside a published replacement"
+            )
+        _remove_rebuild_journal(path)
+        return
+
+    # The main replacement was not published.  Restore the old set in reverse
+    # order, making every rename idempotent so a second recovery is harmless.
+    for source, destination in reversed(list(zip(sources, destinations))):
+        if _path_exists(source) and _path_exists(destination):
+            raise ArchiveCorruptionError(
+                f"archive recovery found both active and backup files for {source}"
+            )
+        if not _path_exists(source) and _path_exists(destination):
+            if destination.is_symlink() or not destination.is_file():
+                raise ArchiveCorruptionError(
+                    f"archive recovery backup is not a regular file: {destination}"
+                )
+            os.replace(destination, source)
+            _fsync_directory(path.parent)
+
+    if _path_exists(rebuilt):
+        if rebuilt.is_symlink() or not rebuilt.is_file():
+            raise ArchiveCorruptionError(
+                f"archive recovery replacement is not a regular file: {rebuilt}"
+            )
+        rebuilt.unlink()
+        _fsync_directory(path.parent)
+    if not database.exists():
+        raise ArchiveCorruptionError("archive recovery could not restore the active database")
+    _remove_rebuild_journal(path)
+
+
+def _recover_rebuild_journal(path: Path) -> None:
+    """Recover a journal left by a process interrupted between renames."""
+
+    descriptor = _acquire_database_lock(path, exclusive=True)
+    try:
+        _recover_rebuild_journal_locked(path)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _acquire_database_lock(path: Path, *, exclusive: bool) -> int:
     lock_path = _database_lock_path(path)
     descriptor = os.open(
@@ -486,20 +656,29 @@ def publish_rebuilt_database(database_path: Path, rebuilt_path: Path) -> Path:
 
     prepare_rebuilt_database(rebuilt_path)
     with exclusive_database_recovery(database_path):
-        backup = database_path.with_name(
-            f"{database_path.name}.corrupt.{time.time_ns()}"
-        )
-        while backup.exists() or Path(str(backup) + "-wal").exists():
-            backup = database_path.with_name(
-                f"{database_path.name}.corrupt.{time.time_ns()}"
+        _recover_rebuild_journal_locked(database_path)
+        backup_stem = f"{database_path.name}.corrupt.{time.time_ns()}"
+        backup = database_path.with_name(backup_stem)
+        backup_index = 0
+        while any(
+            _path_exists(candidate)
+            for candidate in (
+                backup,
+                Path(str(backup) + "-wal"),
+                Path(str(backup) + "-shm"),
             )
+        ):
+            backup_index += 1
+            backup = database_path.with_name(f"{backup_stem}.{backup_index}")
 
-        sources = [database_path]
-        sources.extend(
+        sidecars = [
             path
             for path in (Path(str(database_path) + "-wal"), Path(str(database_path) + "-shm"))
-            if path.exists()
-        )
+            if _path_exists(path)
+        ]
+        # Move sidecars first so a process interrupted before the main rename
+        # still leaves a valid, checkpointed main file to open on recovery.
+        sources = [*sidecars, database_path]
         destinations = [
             backup if source == database_path else Path(str(backup) + str(source)[len(str(database_path)):])
             for source in sources
@@ -508,22 +687,33 @@ def publish_rebuilt_database(database_path: Path, rebuilt_path: Path) -> Path:
             if source.is_symlink() or not source.is_file():
                 raise OSError(f"archive recovery source is not a regular file: {source}")
 
-        moved: list[tuple[Path, Path]] = []
-        published = False
+        journal_payload = {
+            "version": 1,
+            "database": str(Path(os.path.abspath(database_path))),
+            "backup": str(Path(os.path.abspath(backup))),
+            "rebuilt": str(Path(os.path.abspath(rebuilt_path))),
+            "sources": [str(Path(os.path.abspath(source))) for source in sources],
+            "destinations": [
+                str(Path(os.path.abspath(destination))) for destination in destinations
+            ],
+        }
+        _write_rebuild_journal(database_path, journal_payload)
         try:
             for source, destination in zip(sources, destinations):
                 os.replace(source, destination)
-                moved.append((source, destination))
+                _fsync_directory(database_path.parent)
             os.replace(rebuilt_path, database_path)
-            published = True
             _fsync_directory(database_path.parent)
         except Exception:
-            if not published:
-                for source, destination in reversed(moved):
-                    if destination.exists() and not source.exists():
-                        os.replace(destination, source)
-                _fsync_directory(database_path.parent)
+            # Best-effort immediate rollback.  If the injected failure also
+            # affects rollback, the durable journal lets the next connection
+            # complete recovery before SQLite opens any file.
+            try:
+                _recover_rebuild_journal_locked(database_path)
+            except Exception:
+                pass
             raise
+        _remove_rebuild_journal(database_path)
         return backup
 
 
@@ -668,6 +858,11 @@ def check_read_only_integrity(
 def connect_database(database_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     if database_path.is_symlink():
         raise OSError(f"archive database must not be a symbolic link: {database_path}")
+    journal_path = _rebuild_journal_path(database_path)
+    if journal_path.is_symlink():
+        raise OSError(f"archive recovery journal must not be a symbolic link: {journal_path}")
+    if journal_path.exists():
+        _recover_rebuild_journal(database_path)
     lock_descriptor = _acquire_database_lock(database_path, exclusive=False)
     if read_only:
         connection: RetryingConnection | None = None
