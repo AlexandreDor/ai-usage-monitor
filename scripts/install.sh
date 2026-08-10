@@ -4,6 +4,8 @@ set -euo pipefail
 umask 077
 
 PROGRAM="codex-usage-monitor"
+LAUNCHER_MARKER="# ${PROGRAM} generated launcher; managed by install.sh"
+UNIT_MARKER="# ${PROGRAM} generated user unit; managed by install.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_SOURCE="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # shellcheck source=scripts/semver.sh
@@ -127,10 +129,33 @@ assert_owned_lib_root() {
 
 atomic_symlink() {
   local target="$1" link="$2" temporary
+  if [[ "${CUM_TEST_FAIL_LINK:-}" == "previous" && "$link" == "$PREVIOUS_LINK" ]]; then
+    return 1
+  fi
   temporary="${link}.tmp.$$"
   rm -f -- "$temporary"
   ln -s -- "$target" "$temporary"
   mv -Tf -- "$temporary" "$link"
+}
+
+restore_symlink_state() {
+  local link="$1" present="$2" target="${3:-}" temporary
+  temporary="${link}.rollback.$$"
+  rm -f -- "$temporary"
+  if [[ "$present" == 1 ]]; then
+    ln -s -- "$target" "$temporary"
+    mv -Tf -- "$temporary" "$link"
+  else
+    rm -f -- "$link"
+  fi
+}
+
+assert_generated_target() {
+  local path="$1" marker="$2"
+  if [[ -e "$path" || -L "$path" ]]; then
+    [[ -f "$path" && ! -L "$path" ]] || fail "refusing to replace unsafe existing target: ${path}"
+    grep -Fqx -- "$marker" "$path" || fail "refusing to replace unowned existing target: ${path}"
+  fi
 }
 
 systemd_available() {
@@ -157,6 +182,8 @@ service_is_active() {
 
 SERVICES_STOPPED=0
 ACTIVE_SERVICES=()
+SERVICES_MASKED=0
+MASKED_SERVICES=()
 
 stop_active_services() {
   local service
@@ -177,8 +204,15 @@ stop_active_services() {
 resume_active_services() {
   local service status=0
   [[ "$SERVICES_STOPPED" == 1 ]] || return 0
+  if ! unmask_maintenance_services; then
+    return 1
+  fi
   for service in "${ACTIVE_SERVICES[@]}"; do
-    systemctl --user start "$service" || status=1
+    if ! systemctl --user start "$service"; then
+      status=1
+    elif ! service_is_active "$service"; then
+      status=1
+    fi
   done
   ((status == 0)) || return 1
   SERVICES_STOPPED=0
@@ -194,6 +228,9 @@ restart_recorded_services() {
   for service in "${RESTART_SERVICES[@]}"; do
     if ! systemctl --user restart "$service"; then
       RESTART_ERRORS+=("$service")
+      status=1
+    elif ! service_is_active "$service"; then
+      RESTART_ERRORS+=("${service} (not active after restart)")
       status=1
     fi
   done
@@ -218,13 +255,14 @@ restart_running_services() {
 write_application_launcher() {
   local path="$1" executable="$2" temporary
   local quoted_config quoted_state quoted_config_root quoted_state_root
+  assert_generated_target "$path" "$LAUNCHER_MARKER"
   temporary="${path}.tmp.$$"
   printf -v quoted_config '%q' "${CONFIG_DIR}/.env"
   printf -v quoted_state '%q' "$STATE_DIR"
   printf -v quoted_config_root '%q' "$XDG_CONFIG_ROOT"
   printf -v quoted_state_root '%q' "$XDG_STATE_ROOT"
   {
-    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'umask 077'
+    printf '%s\n' '#!/usr/bin/env bash' "$LAUNCHER_MARKER" 'set -euo pipefail' 'umask 077'
     printf 'export CODEX_USAGE_MONITOR_CONFIG=%s\n' "$quoted_config"
     printf 'export CODEX_USAGE_MONITOR_STATE_DIR=%s\n' "$quoted_state"
     printf 'export XDG_CONFIG_HOME=%s\n' "$quoted_config_root"
@@ -238,9 +276,10 @@ write_application_launcher() {
 
 write_manager_launcher() {
   local path="$1" temporary
+  assert_generated_target "$path" "$LAUNCHER_MARKER"
   temporary="${path}.tmp.$$"
   {
-    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'umask 077'
+    printf '%s\n' '#!/usr/bin/env bash' "$LAUNCHER_MARKER" 'set -euo pipefail' 'umask 077'
     printf 'export CUM_HOME=%q\n' "$HOME_DIR"
     printf 'export XDG_CONFIG_HOME=%q\n' "$XDG_CONFIG_ROOT"
     printf 'export XDG_STATE_HOME=%q\n' "$XDG_STATE_ROOT"
@@ -286,6 +325,9 @@ install_units() {
   local release="$1" unit source_unit destination escaped_bin_dir line
   [[ "$NO_SYSTEMD" == 0 ]] || return 0
   mkdir -p -- "$SYSTEMD_DIR"
+  for unit in "${SERVICES[@]}"; do
+    assert_generated_target "${SYSTEMD_DIR}/${unit}" "$UNIT_MARKER"
+  done
   UNIT_TRANSACTION_DIR="$(mktemp -d "${SYSTEMD_DIR}/.${PROGRAM}.units.XXXXXX")"
   mkdir "${UNIT_TRANSACTION_DIR}/new" "${UNIT_TRANSACTION_DIR}/old"
   escaped_bin_dir="${BIN_DIR//\\/\\\\}"
@@ -294,22 +336,19 @@ install_units() {
   for unit in "${SERVICES[@]}"; do
     source_unit="${release}/systemd/${unit}"
     destination="${SYSTEMD_DIR}/${unit}"
-    [[ ! -e "$destination" || ( -f "$destination" && ! -L "$destination" ) ]] || {
-      rm -rf -- "$UNIT_TRANSACTION_DIR"
-      UNIT_TRANSACTION_DIR=""
-      fail "installed unit path is unsafe: ${destination}"
-    }
     if [[ -f "$destination" ]]; then
       cp -p -- "$destination" "${UNIT_TRANSACTION_DIR}/old/${unit}"
       : > "${UNIT_TRANSACTION_DIR}/old-present-${unit}"
     fi
+    printf '%s\n' "$UNIT_MARKER" > "${UNIT_TRANSACTION_DIR}/new/${unit}"
     while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" == "$UNIT_MARKER" ]] && continue
       if [[ "$line" == 'Environment="PATH=%h/.local/bin:'* ]]; then
         printf 'Environment="PATH=%s:/usr/local/bin:/usr/bin:/bin"\n' "$escaped_bin_dir"
       else
         printf '%s\n' "$line"
       fi
-    done < "$source_unit" > "${UNIT_TRANSACTION_DIR}/new/${unit}"
+    done < "$source_unit" >> "${UNIT_TRANSACTION_DIR}/new/${unit}"
     chmod 644 "${UNIT_TRANSACTION_DIR}/new/${unit}"
   done
   UNIT_TRANSACTION_ACTIVE=1
@@ -450,33 +489,71 @@ releases_equal() {
   done < "${left}/scripts/release-files.txt"
 }
 
+ACTIVATION_IN_PROGRESS=0
+ACTIVATION_OLD_CURRENT_PRESENT=0
+ACTIVATION_OLD_CURRENT_TARGET=""
+ACTIVATION_OLD_PREVIOUS_PRESENT=0
+ACTIVATION_OLD_PREVIOUS_TARGET=""
+
+rollback_activation() {
+  [[ "$ACTIVATION_IN_PROGRESS" == 1 ]] || return 0
+  restore_symlink_state "$CURRENT_LINK" "$ACTIVATION_OLD_CURRENT_PRESENT" \
+    "$ACTIVATION_OLD_CURRENT_TARGET" || true
+  restore_symlink_state "$PREVIOUS_LINK" "$ACTIVATION_OLD_PREVIOUS_PRESENT" \
+    "$ACTIVATION_OLD_PREVIOUS_TARGET" || true
+  rollback_unit_transaction || true
+  restart_recorded_services || true
+  ACTIVATION_IN_PROGRESS=0
+}
+
 activate_release() {
-  local version="$1" old_target=""
+  local version="$1" old_target="" old_previous_target=""
   [[ -d "${RELEASES_DIR}/${version}" ]] || fail "release is not installed: ${version}"
-  [[ ! -L "$CURRENT_LINK" ]] || old_target="$(readlink "$CURRENT_LINK")"
+  if [[ -e "$CURRENT_LINK" || -L "$CURRENT_LINK" ]]; then
+    [[ -L "$CURRENT_LINK" ]] || fail "current link is unsafe: ${CURRENT_LINK}"
+    old_target="$(readlink "$CURRENT_LINK")"
+    [[ "$old_target" == releases/* && "$old_target" != */*/* ]] || fail "current link is unsafe"
+    ACTIVATION_OLD_CURRENT_PRESENT=1
+  else
+    ACTIVATION_OLD_CURRENT_PRESENT=0
+  fi
+  if [[ -e "$PREVIOUS_LINK" || -L "$PREVIOUS_LINK" ]]; then
+    [[ -L "$PREVIOUS_LINK" ]] || fail "previous link is unsafe: ${PREVIOUS_LINK}"
+    old_previous_target="$(readlink "$PREVIOUS_LINK")"
+    [[ "$old_previous_target" == releases/* && "$old_previous_target" != */*/* ]] || fail "previous link is unsafe"
+    ACTIVATION_OLD_PREVIOUS_PRESENT=1
+  else
+    ACTIVATION_OLD_PREVIOUS_PRESENT=0
+  fi
+  ACTIVATION_OLD_CURRENT_TARGET="$old_target"
+  ACTIVATION_OLD_PREVIOUS_TARGET="$old_previous_target"
+  ACTIVATION_IN_PROGRESS=1
   install_units "${RELEASES_DIR}/${version}" || fail "could not install user units"
   if ! atomic_symlink "releases/${version}" "$CURRENT_LINK"; then
-    rollback_unit_transaction
+    rollback_activation
     fail "could not activate release ${version}"
   fi
-  if ! restart_running_services; then
-    if [[ -n "$old_target" ]]; then
-      atomic_symlink "$old_target" "$CURRENT_LINK"
-    else
-      rm -f -- "$CURRENT_LINK"
+  if [[ -n "$old_target" && "$old_target" != "releases/${version}" ]]; then
+    if ! restart_running_services; then
+      rollback_activation
+      fail "service restart failed; activation was rolled back"
     fi
-    rollback_unit_transaction
-    restart_recorded_services || true
-    fail "service restart failed; activation was rolled back"
+    if ! atomic_symlink "$old_target" "$PREVIOUS_LINK"; then
+      rollback_activation
+      fail "could not record previous release; activation was rolled back"
+    fi
+  else
+    restart_running_services || {
+      rollback_activation
+      fail "service restart failed; activation was rolled back"
+    }
   fi
   commit_unit_transaction
-  if [[ -n "$old_target" && "$old_target" != "releases/${version}" ]]; then
-    atomic_symlink "$old_target" "$PREVIOUS_LINK"
-  fi
+  ACTIVATION_IN_PROGRESS=0
 }
 
 install_release() {
-  local destination stage config_example
+  local destination stage config_example unit
   prepare_source
   # A fresh install has no state directory yet, so create it before opening
   # the shared maintenance lock.
@@ -486,6 +563,15 @@ install_release() {
   ensure_owned_lib_root
   mkdir -p -- "$RELEASES_DIR" "$BIN_DIR" "$CONFIG_DIR"
   chmod 700 "$CONFIG_DIR"
+  assert_generated_target "${BIN_DIR}/codex-usage-monitor" "$LAUNCHER_MARKER"
+  assert_generated_target "${BIN_DIR}/codex-usage-dashboard" "$LAUNCHER_MARKER"
+  assert_generated_target "${BIN_DIR}/codex-usage-monitor-manage" "$LAUNCHER_MARKER"
+  if [[ "$NO_SYSTEMD" == 0 ]]; then
+    mkdir -p -- "$SYSTEMD_DIR"
+    for unit in "${SERVICES[@]}"; do
+      assert_generated_target "${SYSTEMD_DIR}/${unit}" "$UNIT_MARKER"
+    done
+  fi
   stage="${RELEASES_DIR}/.${PROGRAM}.stage.$$"
   RELEASE_STAGE="$stage"
   rm -rf -- "$stage"
@@ -544,10 +630,14 @@ MONITOR_LOCK_FD=""
 MONITOR_LOCK_HELD=0
 
 acquire_monitor_lock() {
-  local lock_path="${STATE_DIR}/.monitor.lock"
+  acquire_monitor_lock_at "${STATE_DIR}/.monitor.lock"
+}
+
+acquire_monitor_lock_at() {
+  local lock_path="$1"
   command -v flock >/dev/null 2>&1 || fail "flock is required for this maintenance operation"
-  mkdir -p -- "$STATE_DIR"
-  chmod 700 "$STATE_DIR"
+  mkdir -p -- "$(dirname "$lock_path")"
+  chmod 700 "$(dirname "$lock_path")"
   [[ ! -e "$lock_path" || ( -f "$lock_path" && ! -L "$lock_path" ) ]] || \
     fail "monitor lock path is unsafe: ${lock_path}"
   exec {MONITOR_LOCK_FD}>>"$lock_path"
@@ -568,9 +658,60 @@ release_monitor_lock() {
   MONITOR_LOCK_HELD=0
 }
 
+mask_services_for_maintenance() {
+  local service enabled
+  systemd_available || return 0
+  MASKED_SERVICES=()
+  SERVICES_MASKED=1
+  for service in "${SERVICES[@]}"; do
+    enabled="$(systemctl --user is-enabled "$service" 2>/dev/null || true)"
+    [[ "$enabled" == masked ]] && continue
+    if ! systemctl --user mask --runtime "$service"; then
+      unmask_maintenance_services || true
+      return 1
+    fi
+    [[ "$(systemctl --user is-enabled "$service" 2>/dev/null || true)" == masked ]] || {
+      unmask_maintenance_services || true
+      return 1
+    }
+    MASKED_SERVICES+=("$service")
+  done
+}
+
+unmask_maintenance_services() {
+  local service status=0
+  [[ "$SERVICES_MASKED" == 1 ]] || return 0
+  for service in "${MASKED_SERVICES[@]}"; do
+    systemctl --user unmask "$service" || status=1
+  done
+  if ((status == 0)); then
+    MASKED_SERVICES=()
+    SERVICES_MASKED=0
+  fi
+  ((status == 0))
+}
+
+mask_services_for_recovery() {
+  local service preserved already
+  mask_services_for_maintenance || return 1
+  for preserved in "${JOURNAL_MASKED_SERVICES[@]}"; do
+    already=0
+    for service in "${MASKED_SERVICES[@]}"; do
+      [[ "$service" == "$preserved" ]] && already=1
+    done
+    ((already == 0)) && MASKED_SERVICES+=("$preserved")
+  done
+  ((${#MASKED_SERVICES[@]} == 0)) || SERVICES_MASKED=1
+}
+
 assert_services_stopped() {
   local service
   systemd_available || return 0
+  for service in "${SERVICES[@]}"; do
+    if service_is_active "$service"; then
+      systemctl --user stop "$service" || fail "could not stop service before maintenance: ${service}"
+    fi
+  done
   for service in "${SERVICES[@]}"; do
     service_is_active "$service" && fail "service must be stopped before maintenance: ${service}"
   done
@@ -578,9 +719,10 @@ assert_services_stopped() {
 }
 
 begin_maintenance() {
-  # Reserve the cycle inode before stopping services so a manual cycle cannot
-  # start in the gap between service discovery and lock acquisition.
+  # The runtime mask closes the gap that the application lock cannot close:
+  # systemctl start does not acquire the monitor's flock.
   acquire_monitor_lock
+  mask_services_for_maintenance || fail "could not prevent managed services from starting"
   stop_active_services
   assert_services_stopped
 }
@@ -608,7 +750,9 @@ backup_data() {
   PREPARE_TEMP="$(mktemp -d)"
   temporary="$PREPARE_TEMP"
   mkdir "${temporary}/config" "${temporary}/state"
+  assert_services_stopped
   [[ ! -d "$CONFIG_DIR" ]] || cp -a -- "${CONFIG_DIR}/." "${temporary}/config/"
+  assert_services_stopped
   [[ ! -d "$STATE_DIR" ]] || cp -a -- "${STATE_DIR}/." "${temporary}/state/"
   archive_temp="$(mktemp "${output_dir}/.${PROGRAM}.backup.XXXXXX")"
   OUTPUT_TEMP="$archive_temp"
@@ -630,25 +774,183 @@ validate_backup_archive() {
     "$BACKUP_ARCHIVE_MAX_MEMBER_BYTES" "$BACKUP_ARCHIVE_MAX_TOTAL_BYTES"
 }
 
+RESTORE_JOURNAL=""
 RESTORE_IN_PROGRESS=0
 CONFIG_HAD_OLD=0
 STATE_HAD_OLD=0
-CONFIG_ACTIVATED=0
-STATE_ACTIVATED=0
 CONFIG_STAGE=""
 STATE_STAGE=""
 CONFIG_OLD=""
 STATE_OLD=""
+JOURNAL_PHASE=""
+JOURNAL_CONFIG_DIR=""
+JOURNAL_STATE_DIR=""
+JOURNAL_CONFIG_STAGE=""
+JOURNAL_STATE_STAGE=""
+JOURNAL_CONFIG_OLD=""
+JOURNAL_STATE_OLD=""
+JOURNAL_CONFIG_HAD_OLD=0
+JOURNAL_STATE_HAD_OLD=0
+JOURNAL_MASKED_SERVICES=()
+
+write_restore_journal() {
+  local phase="$1" temporary="${RESTORE_JOURNAL}.tmp.$$" service
+  [[ -n "$RESTORE_JOURNAL" ]] || fail "restore journal path is not initialized"
+  [[ ! -e "$temporary" && ! -L "$temporary" ]] || fail "restore journal temporary path already exists"
+  {
+    printf 'phase=%s\n' "$phase"
+    printf 'config_dir=%s\n' "$CONFIG_DIR"
+    printf 'state_dir=%s\n' "$STATE_DIR"
+    printf 'config_stage=%s\n' "$CONFIG_STAGE"
+    printf 'state_stage=%s\n' "$STATE_STAGE"
+    printf 'config_old=%s\n' "$CONFIG_OLD"
+    printf 'state_old=%s\n' "$STATE_OLD"
+    printf 'config_had_old=%s\n' "$CONFIG_HAD_OLD"
+    printf 'state_had_old=%s\n' "$STATE_HAD_OLD"
+    for service in "${MASKED_SERVICES[@]}"; do
+      printf 'masked_service=%s\n' "$service"
+    done
+  } > "$temporary"
+  chmod 600 "$temporary"
+  mv -f -- "$temporary" "$RESTORE_JOURNAL"
+  sync
+}
+
+load_restore_journal() {
+  local key value service
+  [[ -f "$RESTORE_JOURNAL" && ! -L "$RESTORE_JOURNAL" ]] || \
+    fail "restore journal is not a regular non-symlink file: ${RESTORE_JOURNAL}"
+  JOURNAL_PHASE=""
+  JOURNAL_CONFIG_DIR=""
+  JOURNAL_STATE_DIR=""
+  JOURNAL_CONFIG_STAGE=""
+  JOURNAL_STATE_STAGE=""
+  JOURNAL_CONFIG_OLD=""
+  JOURNAL_STATE_OLD=""
+  JOURNAL_CONFIG_HAD_OLD=0
+  JOURNAL_STATE_HAD_OLD=0
+  JOURNAL_MASKED_SERVICES=()
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    case "$key" in
+      phase) JOURNAL_PHASE="$value" ;;
+      config_dir) JOURNAL_CONFIG_DIR="$value" ;;
+      state_dir) JOURNAL_STATE_DIR="$value" ;;
+      config_stage) JOURNAL_CONFIG_STAGE="$value" ;;
+      state_stage) JOURNAL_STATE_STAGE="$value" ;;
+      config_old) JOURNAL_CONFIG_OLD="$value" ;;
+      state_old) JOURNAL_STATE_OLD="$value" ;;
+      config_had_old) JOURNAL_CONFIG_HAD_OLD="$value" ;;
+      state_had_old) JOURNAL_STATE_HAD_OLD="$value" ;;
+      masked_service) JOURNAL_MASKED_SERVICES+=("$value") ;;
+      *) fail "restore journal contains an unknown field: ${key}" ;;
+    esac
+  done < "$RESTORE_JOURNAL"
+  [[ "$JOURNAL_PHASE" == prepared || "$JOURNAL_PHASE" == config-old-moved || \
+    "$JOURNAL_PHASE" == state-old-moved || "$JOURNAL_PHASE" == config-activated || \
+    "$JOURNAL_PHASE" == state-activated || "$JOURNAL_PHASE" == committed ]] || \
+    fail "restore journal phase is invalid"
+  [[ "$JOURNAL_CONFIG_DIR" == "$CONFIG_DIR" && "$JOURNAL_STATE_DIR" == "$STATE_DIR" ]] || \
+    fail "restore journal paths do not match this installation"
+  [[ "$JOURNAL_CONFIG_STAGE" == "${CONFIG_DIR}.restore-stage."* && \
+    "$JOURNAL_STATE_STAGE" == "${STATE_DIR}.restore-stage."* && \
+    "$JOURNAL_CONFIG_OLD" == "${CONFIG_DIR}.before-restore."* && \
+    "$JOURNAL_STATE_OLD" == "${STATE_DIR}.before-restore."* ]] || \
+    fail "restore journal staging paths are unsafe"
+  [[ "${JOURNAL_CONFIG_STAGE#"${CONFIG_DIR}".restore-stage.}" != */* && \
+    "${JOURNAL_STATE_STAGE#"${STATE_DIR}".restore-stage.}" != */* && \
+    "${JOURNAL_CONFIG_OLD#"${CONFIG_DIR}".before-restore.}" != */* && \
+    "${JOURNAL_STATE_OLD#"${STATE_DIR}".before-restore.}" != */* ]] || \
+    fail "restore journal staging paths are unsafe"
+  [[ "$JOURNAL_CONFIG_HAD_OLD" == 0 || "$JOURNAL_CONFIG_HAD_OLD" == 1 ]] || fail "invalid config journal flag"
+  [[ "$JOURNAL_STATE_HAD_OLD" == 0 || "$JOURNAL_STATE_HAD_OLD" == 1 ]] || fail "invalid state journal flag"
+  for service in "${JOURNAL_MASKED_SERVICES[@]}"; do
+    [[ "$service" == "${SERVICES[0]}" || "$service" == "${SERVICES[1]}" ]] || \
+      fail "restore journal contains an unknown service"
+  done
+}
+
+restore_journal_cleanup() {
+  rm -rf -- "$JOURNAL_CONFIG_STAGE" "$JOURNAL_STATE_STAGE" \
+    "$JOURNAL_CONFIG_OLD" "$JOURNAL_STATE_OLD"
+  rm -f -- "$RESTORE_JOURNAL"
+}
+
+restore_journal_rollback() {
+  local path old stage had_old status=0
+  for path in config state; do
+    if [[ "$path" == config ]]; then
+      local destination="$JOURNAL_CONFIG_DIR" old="$JOURNAL_CONFIG_OLD" \
+        stage="$JOURNAL_CONFIG_STAGE" had_old="$JOURNAL_CONFIG_HAD_OLD"
+    else
+      local destination="$JOURNAL_STATE_DIR" old="$JOURNAL_STATE_OLD" \
+        stage="$JOURNAL_STATE_STAGE" had_old="$JOURNAL_STATE_HAD_OLD"
+    fi
+    if [[ "$had_old" == 1 ]]; then
+      if [[ -e "$old" || -L "$old" ]]; then
+        [[ ! -e "$destination" && ! -L "$destination" ]] || rm -rf -- "$destination" || status=1
+        mv -- "$old" "$destination" || status=1
+      elif [[ ! -e "$destination" && ! -L "$destination" ]]; then
+        status=1
+      fi
+    else
+      [[ ! -e "$destination" && ! -L "$destination" ]] || rm -rf -- "$destination" || status=1
+    fi
+    rm -rf -- "$stage"
+  done
+  if ((status == 0)); then
+    rm -f -- "$RESTORE_JOURNAL"
+  fi
+  ((status == 0))
+}
 
 rollback_restore() {
   [[ "$RESTORE_IN_PROGRESS" == 1 ]] || return 0
-  if [[ "$STATE_ACTIVATED" == 1 ]]; then rm -rf -- "$STATE_DIR"; fi
-  if [[ "$CONFIG_ACTIVATED" == 1 ]]; then rm -rf -- "$CONFIG_DIR"; fi
-  if [[ "$STATE_HAD_OLD" == 1 && -e "$STATE_OLD" ]]; then mv -- "$STATE_OLD" "$STATE_DIR"; fi
-  if [[ "$CONFIG_HAD_OLD" == 1 && -e "$CONFIG_OLD" ]]; then mv -- "$CONFIG_OLD" "$CONFIG_DIR"; fi
-  [[ -z "$STATE_STAGE" ]] || rm -rf -- "$STATE_STAGE"
-  [[ -z "$CONFIG_STAGE" ]] || rm -rf -- "$CONFIG_STAGE"
+  load_restore_journal
+  if [[ "$JOURNAL_PHASE" == committed ]]; then
+    restore_journal_cleanup
+  else
+    restore_journal_rollback
+  fi
   RESTORE_IN_PROGRESS=0
+}
+
+restore_transaction_checkpoint() {
+  case "${CUM_TEST_KILL_AFTER_RESTORE_MV:-}" in
+    config-old|config-stage|state-old|state-stage)
+      [[ "$1" == "${CUM_TEST_KILL_AFTER_RESTORE_MV}" ]] && kill -KILL "$$"
+      ;;
+  esac
+}
+
+recovery_lock_path() {
+  local candidate
+  for candidate in "${STATE_DIR}/.monitor.lock" "$JOURNAL_STATE_OLD/.monitor.lock" \
+    "$JOURNAL_STATE_STAGE/.monitor.lock"; do
+    if [[ -f "$candidate" && ! -L "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  fail "restore journal has no usable monitor lock"
+}
+
+recover_restore_transaction() {
+  local lock_path
+  [[ ! -e "$RESTORE_JOURNAL" && ! -L "$RESTORE_JOURNAL" ]] && return 0
+  [[ ! -L "$RESTORE_JOURNAL" ]] || fail "restore journal must not be a symlink"
+  load_restore_journal
+  lock_path="$(recovery_lock_path)"
+  acquire_monitor_lock_at "$lock_path"
+  mask_services_for_recovery || fail "could not prevent managed services from starting during recovery"
+  stop_active_services
+  assert_services_stopped
+  if [[ "$JOURNAL_PHASE" == committed ]]; then
+    restore_journal_cleanup
+  else
+    restore_journal_rollback || fail "could not recover interrupted restore transaction"
+  fi
+  resume_active_services || fail "could not restart services after restore recovery"
+  release_monitor_lock
 }
 
 restore_data() {
@@ -666,6 +968,14 @@ restore_data() {
   tar --extract --gzip --file="$backup_copy" --directory="$extraction" --no-same-owner --no-same-permissions
   rm -f -- "$backup_copy"
 
+  for data_dir in "$CONFIG_DIR" "$STATE_DIR"; do
+    [[ ! -e "$data_dir" && ! -L "$data_dir" || -d "$data_dir" && ! -L "$data_dir" ]] || \
+      fail "persistent data path is unsafe: ${data_dir}"
+  done
+  CONFIG_HAD_OLD=0
+  STATE_HAD_OLD=0
+  [[ ! -e "$CONFIG_DIR" && ! -L "$CONFIG_DIR" ]] || CONFIG_HAD_OLD=1
+  [[ ! -e "$STATE_DIR" && ! -L "$STATE_DIR" ]] || STATE_HAD_OLD=1
   mkdir -p -- "$(dirname "$CONFIG_DIR")" "$(dirname "$STATE_DIR")"
   CONFIG_STAGE="${CONFIG_DIR}.restore-stage.$$"
   STATE_STAGE="${STATE_DIR}.restore-stage.$$"
@@ -683,22 +993,46 @@ restore_data() {
   rm -f -- "${STATE_STAGE}/.monitor.lock"
   ln -- "${STATE_DIR}/.monitor.lock" "${STATE_STAGE}/.monitor.lock"
   chmod 600 "${STATE_STAGE}/.monitor.lock"
+  write_restore_journal prepared
   RESTORE_IN_PROGRESS=1
-  if [[ -e "$CONFIG_DIR" ]]; then CONFIG_HAD_OLD=1; mv -- "$CONFIG_DIR" "$CONFIG_OLD"; fi
-  if [[ -e "$STATE_DIR" ]]; then STATE_HAD_OLD=1; mv -- "$STATE_DIR" "$STATE_OLD"; fi
-  CONFIG_ACTIVATED=1
+  if [[ "$CONFIG_HAD_OLD" == 1 ]]; then
+    assert_services_stopped
+    mv -- "$CONFIG_DIR" "$CONFIG_OLD"
+    write_restore_journal config-old-moved
+    restore_transaction_checkpoint config-old
+  fi
+  if [[ "$STATE_HAD_OLD" == 1 ]]; then
+    assert_services_stopped
+    mv -- "$STATE_DIR" "$STATE_OLD"
+    write_restore_journal state-old-moved
+    restore_transaction_checkpoint state-old
+  fi
+  assert_services_stopped
   mv -- "$CONFIG_STAGE" "$CONFIG_DIR"
-  STATE_ACTIVATED=1
+  write_restore_journal config-activated
+  restore_transaction_checkpoint config-stage
+  assert_services_stopped
+  if [[ "$STATE_HAD_OLD" == 0 ]]; then
+    # begin_maintenance created a lock-only state directory; remove that
+    # transaction artifact before replacing it with the staged state tree.
+    rm -rf -- "$STATE_DIR"
+  fi
   mv -- "$STATE_STAGE" "$STATE_DIR"
+  write_restore_journal state-activated
+  restore_transaction_checkpoint state-stage
   if ! resume_active_services; then
-    systemd_available && systemctl --user stop "${ACTIVE_SERVICES[@]}" || true
+    if systemd_available && ((${#ACTIVE_SERVICES[@]})); then
+      systemctl --user stop "${ACTIVE_SERVICES[@]}" || true
+    fi
     SERVICES_STOPPED=1
-    rollback_restore
+    rollback_restore || true
     resume_active_services || true
     fail "restored services failed to start; data was rolled back"
   fi
+  write_restore_journal committed
+  rm -rf -- "$CONFIG_OLD" "$STATE_OLD" "$CONFIG_STAGE" "$STATE_STAGE"
+  rm -f -- "$RESTORE_JOURNAL"
   RESTORE_IN_PROGRESS=0
-  rm -rf -- "$CONFIG_OLD" "$STATE_OLD"
   release_monitor_lock
   printf 'Configuration and state restored\n'
 }
@@ -710,15 +1044,28 @@ uninstall_release() {
       fail "refusing uninstall path that is HOME or an ancestor of HOME: ${path}"
   done
   assert_owned_lib_root
+  assert_generated_target "${BIN_DIR}/codex-usage-monitor" "$LAUNCHER_MARKER"
+  assert_generated_target "${BIN_DIR}/codex-usage-dashboard" "$LAUNCHER_MARKER"
+  assert_generated_target "${BIN_DIR}/codex-usage-monitor-manage" "$LAUNCHER_MARKER"
+  if [[ "$NO_SYSTEMD" == 0 ]]; then
+    for path in "${SERVICES[@]}"; do
+      assert_generated_target "${SYSTEMD_DIR}/${path}" "$UNIT_MARKER"
+    done
+  fi
   begin_maintenance
+  assert_services_stopped
   if systemd_available; then
     systemctl --user disable "${SERVICES[@]}"
   fi
+  assert_services_stopped
   rm -f -- "${SYSTEMD_DIR}/${SERVICES[0]}" "${SYSTEMD_DIR}/${SERVICES[1]}"
   rm -f -- "${BIN_DIR}/codex-usage-monitor" "${BIN_DIR}/codex-usage-dashboard" "${BIN_DIR}/codex-usage-monitor-manage"
+  assert_services_stopped
   rm -rf -- "$LIB_ROOT"
   systemctl_user daemon-reload
+  unmask_maintenance_services || fail "could not remove maintenance service masks"
   if [[ "$PURGE" == 1 ]]; then
+    assert_services_stopped
     rm -rf -- "$CONFIG_DIR" "$STATE_DIR"
     printf 'Uninstalled %s and purged configuration and state\n' "$PROGRAM"
   else
@@ -763,9 +1110,13 @@ ROLLBACK_VERSION=""
 
 cleanup() {
   local status=$?
+  rollback_activation || true
   rollback_restore || true
   rollback_unit_transaction || true
   [[ -z "${UNIT_TRANSACTION_DIR:-}" ]] || rm -rf -- "$UNIT_TRANSACTION_DIR"
+  if [[ "$SERVICES_MASKED" == 1 && "$SERVICES_STOPPED" != 1 ]]; then
+    unmask_maintenance_services || printf 'ERROR: failed to remove maintenance service masks\n' >&2
+  fi
   if [[ "$SERVICES_STOPPED" == 1 ]]; then
     resume_active_services || printf 'ERROR: failed to restart one or more previously active services\n' >&2
   fi
@@ -832,6 +1183,11 @@ RELEASES_DIR="${LIB_ROOT}/releases"
 CURRENT_LINK="${LIB_ROOT}/current"
 PREVIOUS_LINK="${LIB_ROOT}/previous"
 validate_layout
+RESTORE_JOURNAL="${STATE_DIR}.restore-journal"
+
+case "$COMMAND" in
+  install|restore|uninstall|backup) recover_restore_transaction ;;
+esac
 
 for input_label in archive checksum backup; do
   case "$input_label" in

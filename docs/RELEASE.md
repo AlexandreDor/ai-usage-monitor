@@ -91,6 +91,11 @@ uninstall when that marker is absent or invalid. Uninstall also rejects any
 release/configuration/state path that is HOME or an ancestor of HOME, and first
 requires all managed services to be stopped.
 
+Generated launchers and user units carry an explicit ownership marker. Existing
+targets without that marker are never replaced or removed; a manually owned
+launcher or unit is therefore a hard installation error, while repeating an
+installation of the application's own targets remains idempotent.
+
 ## Update and rollback
 
 Update from another extracted release:
@@ -110,9 +115,11 @@ Update from a release archive:
 
 The release is validated and copied to a version-specific staging directory
 before `current` changes atomically. The prior target is recorded as `previous`.
-Configuration and state are outside releases and survive updates. Repeating the
-same update is safe when installed files are identical; a same-version content
-collision is rejected.
+`current`, `previous`, generated units, and previously running services form one
+activation transaction; a failure while recording `previous` or validating a
+restart restores all of them. Configuration and state are outside releases and
+survive updates. Repeating the same update is safe when installed files are
+identical; a same-version content collision is rejected.
 
 Rollback by swapping current and previous, or name an already installed SemVer:
 
@@ -140,8 +147,9 @@ cycles before stopping the active user services. This prevents a manual cycle
 from starting in the stop/discovery gap and gives a coherent copy of SQLite and
 its WAL files before those same services are required to start again. A held
 manual lock makes backup fail explicitly rather than race, including under
-`--no-systemd`. The atomically replaced archive is mode `0600` and contains
-`config/` and `state/`.
+`--no-systemd`. Managed units are also runtime-masked during maintenance because
+`systemctl start` does not take the monitor flock. The atomically replaced
+archive is mode `0600` and contains `config/` and `state/`.
 
 Restore a backup:
 
@@ -153,9 +161,12 @@ Restore a backup:
 Restore copies and validates the archive before stopping services. Only regular
 files and directories below exactly `config/` and `state/` are accepted;
 absolute/traversal paths, links, devices, and FIFOs are rejected. It stages both
-trees on their destination filesystems and rolls both back if activation or
-service restart fails. Treat backups as secrets because they can contain
-notification and Gist credentials.
+trees on their destination filesystems and records every rename in a durable
+journal outside the state tree. If the process is killed between the config and
+state renames, the next `install`, `restore`, `uninstall`, or `backup` command
+automatically rolls both trees back to the last coherent pair. It also rolls
+both back if activation or service restart fails. Treat backups as secrets
+because they can contain notification and Gist credentials.
 
 Restore also acquires `.monitor.lock` after staging but before stopping services,
 and keeps the same locked inode in the replacement state tree. Existing manual

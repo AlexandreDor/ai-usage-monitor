@@ -131,6 +131,42 @@ class ArchiveMigrationTests(unittest.TestCase):
             self.assertEqual("ok", connection.execute("PRAGMA quick_check").fetchone()[0])
         self.assertEqual(before, after)
 
+    def test_reset_events_survive_rebuild_without_retention_and_purge_with_retention(self):
+        self.history.write_text("[]", encoding="utf-8")
+        current = archive.normalize_snapshot(snapshot(200000), strict=True)
+        archive.ingest(self.database, self.history, current, 0, now=200000)
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """
+                INSERT INTO reset_events (
+                    window, reset_at_epoch, observed_at_epoch,
+                    before_pct, after_pct, detection_method
+                ) VALUES ('5h', 100, 200, 20, 90, 'scheduled_crossing')
+                """
+            )
+            connection.commit()
+
+        # compact() and rebuild_reset_events() must not erase an observed event
+        # that is no longer derivable from the retained snapshot adjacency.
+        archive.ingest(self.database, self.history, current, 0, now=200000)
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(
+                (1,),
+                connection.execute(
+                    "SELECT COUNT(*) FROM reset_events WHERE window = '5h' AND reset_at_epoch = 100"
+                ).fetchone(),
+            )
+
+        archive.ingest(self.database, self.history, current, 1, now=200000)
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(
+                (0,),
+                connection.execute(
+                    "SELECT COUNT(*) FROM reset_events WHERE window = '5h' AND reset_at_epoch = 100"
+                ).fetchone(),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

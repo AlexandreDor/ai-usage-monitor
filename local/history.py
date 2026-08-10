@@ -816,6 +816,14 @@ def update_history(
             "data after a possible clock rollback"
         )
 
+    # A missing or invalid data file can still be repaired from the newest
+    # validated history entry.  Do this before comparing the incoming sample,
+    # otherwise an older sample would regress the current snapshot.
+    data_baseline = current_data
+    if data_baseline is None and loaded_history.entries:
+        data_baseline = max(loaded_history.entries, key=lambda entry: entry.epoch)
+        warnings.append("data file was repaired from the latest valid history snapshot")
+
     # data.json is the durable current-snapshot side of the update.  Include it
     # when rebuilding history so a successful data write followed by a failed
     # history write is recovered on the next cycle instead of being lost.
@@ -831,10 +839,15 @@ def update_history(
     )
     retained, history_bytes = _apply_defensive_limits(retained, warnings)
 
-    data_updated = current_data is None or new_entry.epoch >= current_data.epoch
+    if data_baseline is None or new_entry.epoch >= data_baseline.epoch:
+        data_to_publish = new_entry
+        data_updated = current_data is None or new_entry.epoch >= current_data.epoch
+    else:
+        data_to_publish = data_baseline
+        data_updated = current_data is None
     if data_updated:
-        _atomic_write(data, _serialize_snapshot(new_entry))
-        current_public = dict(new_entry.public)
+        _atomic_write(data, _serialize_snapshot(data_to_publish))
+        current_public = dict(data_to_publish.public)
     else:
         # Keep an older collection in history without allowing it to regress
         # the current data object.

@@ -222,6 +222,39 @@ def compact(connection: sqlite3.Connection, retention_days: int) -> None:
     if retention_days > 0:
         cutoff = anchor - retention_days * 24 * 60 * 60
         connection.execute("DELETE FROM snapshots WHERE scraped_at_epoch < ?", (cutoff,))
+        connection.execute("DELETE FROM reset_events WHERE reset_at_epoch < ?", (cutoff,))
+
+
+def upsert_reset_event(
+    connection: sqlite3.Connection,
+    window: str,
+    reset_at_epoch: int,
+    observed_at_epoch: int,
+    before_pct: Any,
+    after_pct: Any,
+    detection_method: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO reset_events (
+            window, reset_at_epoch, observed_at_epoch,
+            before_pct, after_pct, detection_method
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(window, reset_at_epoch) DO UPDATE SET
+            observed_at_epoch = excluded.observed_at_epoch,
+            before_pct = excluded.before_pct,
+            after_pct = excluded.after_pct,
+            detection_method = excluded.detection_method
+        """,
+        (
+            window,
+            reset_at_epoch,
+            observed_at_epoch,
+            before_pct,
+            after_pct,
+            detection_method,
+        ),
+    )
 
 
 def rebuild_reset_events(connection: sqlite3.Connection) -> None:
@@ -234,7 +267,6 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
         ORDER BY scraped_at_epoch
         """
     ).fetchall()
-    connection.execute("DELETE FROM reset_events")
     windows = (("5h", 1, 2), ("weekly", 3, 4))
     for previous, current in zip(rows, rows[1:]):
         gap = current[0] - previous[0]
@@ -253,20 +285,14 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             if not isinstance(reset_at, int) or reset_at <= 0:
                 continue
             if previous[0] < reset_at <= current[0]:
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO reset_events (
-                        window, reset_at_epoch, observed_at_epoch,
-                        before_pct, after_pct, detection_method
-                    ) VALUES (?, ?, ?, ?, ?, 'scheduled_crossing')
-                    """,
-                    (
-                        window,
-                        reset_at,
-                        current[0],
-                        previous[pct_index],
-                        current[pct_index],
-                    ),
+                upsert_reset_event(
+                    connection,
+                    window,
+                    reset_at,
+                    current[0],
+                    previous[pct_index],
+                    current[pct_index],
+                    "scheduled_crossing",
                 )
 
         # Codex can refill the weekly window before its previously announced
@@ -293,14 +319,14 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
                 or current_pct >= RANDOM_WEEKLY_RESET_FULL_REFILL_PCT
             )
         ):
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO reset_events (
-                    window, reset_at_epoch, observed_at_epoch,
-                    before_pct, after_pct, detection_method
-                ) VALUES ('weekly', ?, ?, ?, ?, 'random_observed')
-                """,
-                (current[0], current[0], previous_pct, current_pct),
+            upsert_reset_event(
+                connection,
+                "weekly",
+                current[0],
+                current[0],
+                previous_pct,
+                current_pct,
+                "random_observed",
             )
 
 

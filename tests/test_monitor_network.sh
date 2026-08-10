@@ -140,6 +140,64 @@ reset_fake_curl
 check_thresholds 69 100 later unknown '' '' 2000000002 >/dev/null
 assert_eq 0 "$(request_count)" "completed alert was called again"
 
+# A reset closes a partially delivered threshold occurrence before clearing the
+# cycle markers. Delivered channels remain delivered, and the next cycle gets a
+# fresh alert ID on both transports.
+reset_fake_curl
+rm -f "$STATE_FILE"
+ALERT_THRESHOLDS=75
+export DISCORD_WEBHOOK='https://discord.com/api/webhooks/123/token'
+export TELEGRAM_BOT_TOKEN='123:token' TELEGRAM_CHAT_ID=-456
+export FAKE_CURL_DISCORD_STATUS=500 FAKE_CURL_TELEGRAM_STATUS=200
+export FAKE_CURL_TELEGRAM_BODY='{"ok":true}'
+cycle_reset_at=2000000300
+check_thresholds 70 100 later unknown "$cycle_reset_at" '' 2000000200 >/dev/null 2>&1 || true
+old_cycle_alert_id="$(state_value five_h_threshold_alert_id)"
+assert_eq 75 "$(state_value pending_5h_threshold)" "partial threshold was not pending before reset"
+assert_eq failed "$(state_value five_h_threshold_discord_status)" "partial Discord state was lost before reset"
+assert_eq delivered "$(state_value five_h_threshold_telegram_status)" "partial Telegram state was lost before reset"
+
+reset_fake_curl
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_TELEGRAM_STATUS=200
+export FAKE_CURL_TELEGRAM_BODY='{"ok":true}'
+check_thresholds 70 100 unknown unknown '' '' "$((cycle_reset_at + 1))" >/dev/null
+new_cycle_alert_id="$(state_value five_h_threshold_alert_id)"
+[[ "$new_cycle_alert_id" != "$old_cycle_alert_id" ]] || fail "new cycle reused the partial threshold alert ID"
+assert_eq "$old_cycle_alert_id" "$(state_value five_h_threshold_last_terminal_alert_id)" "partial threshold was not closed on reset"
+assert_eq failed "$(state_value five_h_threshold_last_terminal_status)" "reset did not supersede partial threshold as failed"
+assert_eq failed "$(state_value five_h_threshold_last_terminal_discord_status)" "Discord channel state was lost on reset"
+assert_eq delivered "$(state_value five_h_threshold_last_terminal_telegram_status)" "Telegram channel state was lost on reset"
+assert_eq delivered "$(state_value five_h_threshold_discord_status)" "new cycle Discord delivery failed"
+assert_eq delivered "$(state_value five_h_threshold_telegram_status)" "new cycle Telegram delivery failed"
+assert_eq 4 "$(request_count)" "reset and new-cycle notifications did not use both channels"
+reset_fake_curl
+check_thresholds 70 100 unknown unknown '' '' "$((cycle_reset_at + 2))" >/dev/null
+assert_eq 0 "$(request_count)" "new-cycle alert was emitted again"
+
+# A fully delivered threshold is retained across reset and is not recorded as
+# failed; the following cycle still receives a distinct threshold ID.
+reset_fake_curl
+rm -f "$STATE_FILE"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_TELEGRAM_STATUS=200
+export FAKE_CURL_TELEGRAM_BODY='{"ok":true}'
+delivered_cycle_reset_at=2000000600
+check_thresholds 70 100 later unknown "$delivered_cycle_reset_at" '' 2000000500 >/dev/null
+delivered_cycle_alert_id="$(state_value five_h_threshold_alert_id)"
+assert_eq delivered "$(state_value five_h_threshold_status)" "fully delivered threshold was not delivered"
+check_thresholds 100 100 unknown unknown '' '' "$((delivered_cycle_reset_at + 1))" >/dev/null
+assert_eq "$delivered_cycle_alert_id" "$(state_value five_h_threshold_alert_id)" "delivered threshold ID was discarded on reset"
+assert_eq delivered "$(state_value five_h_threshold_status)" "delivered threshold was closed on reset"
+assert_eq delivered "$(state_value five_h_threshold_discord_status)" "delivered Discord state was lost on reset"
+assert_eq delivered "$(state_value five_h_threshold_telegram_status)" "delivered Telegram state was lost on reset"
+assert_eq '' "$(state_value five_h_threshold_last_terminal_alert_id)" "delivered threshold was recorded as terminal failure"
+reset_fake_curl
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_TELEGRAM_STATUS=200
+export FAKE_CURL_TELEGRAM_BODY='{"ok":true}'
+check_thresholds 70 100 unknown unknown '' '' "$((delivered_cycle_reset_at + 2))" >/dev/null
+assert_eq 2 "$(request_count)" "new cycle did not notify both channels after delivered threshold"
+[[ "$(state_value five_h_threshold_alert_id)" != "$delivered_cycle_alert_id" ]] \
+  || fail "new cycle reused a fully delivered threshold alert ID"
+
 # A permanent channel failure terminates only that occurrence. It is not
 # retried, while a reset and a threshold in the next cycle get fresh IDs.
 reset_fake_curl

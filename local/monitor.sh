@@ -806,7 +806,20 @@ close_active_threshold_alert() {
   printf -v "${prefix}_last_terminal_discord_status" '%s' "${!discord_name}"
   printf -v "${prefix}_last_terminal_telegram_status" '%s' "${!telegram_name}"
   echo "[WARN] Alert ${!id_name} closed as failed: ${reason}." >&2
-  persist_alert_state
+  persist_alert_state || return 1
+}
+
+close_threshold_alert_before_reset() {
+  local prefix="$1" pending_name status_name
+  if [[ "$prefix" == five_h_threshold ]]; then
+    pending_name=pending_5h_threshold
+  else
+    pending_name=pending_weekly_threshold
+  fi
+  status_name="${prefix}_status"
+  if [[ -n "${!pending_name}" && "${!status_name}" != delivered ]]; then
+    close_active_threshold_alert "$prefix" "superseded by reset" || return 1
+  fi
 }
 
 threshold_alert_message() {
@@ -1326,6 +1339,7 @@ check_thresholds() {
       fi
     fi
     if (( reset_age > 5 * 60 * 60 || last_notified_5h_reset_at == five_h_armed_reset_at )); then
+      close_threshold_alert_before_reset five_h_threshold || return 1
       five_h_armed_reset_at=0
       notified_5h_thresholds=""
       pending_5h_threshold=""
@@ -1362,6 +1376,7 @@ check_thresholds() {
       fi
     fi
     if (( reset_age > 7 * 24 * 60 * 60 || last_notified_weekly_reset_at == weekly_armed_reset_at )); then
+      close_threshold_alert_before_reset weekly_threshold || return 1
       weekly_armed_reset_at=0
       notified_weekly_thresholds=""
       pending_weekly_threshold=""
@@ -1411,7 +1426,8 @@ check_thresholds() {
     done
     if [[ -n "$critical" ]]; then
       if [[ -n "$new_threshold" ]]; then
-        if [[ -n "$five_h_threshold_alert_id" && "$five_h_threshold_status" != delivered ]]; then
+        if [[ -n "$five_h_threshold_alert_id" && -n "$pending_before" \
+          && "$five_h_threshold_status" != delivered ]]; then
           close_active_threshold_alert five_h_threshold "superseded by ${critical}% threshold" || return 1
         fi
         five_h_threshold_remaining_pct="$five_h_pct"
@@ -1475,7 +1491,8 @@ check_thresholds() {
     done
     if [[ -n "$critical" ]]; then
       if [[ -n "$new_threshold" ]]; then
-        if [[ -n "$weekly_threshold_alert_id" && "$weekly_threshold_status" != delivered ]]; then
+        if [[ -n "$weekly_threshold_alert_id" && -n "$pending_before" \
+          && "$weekly_threshold_status" != delivered ]]; then
           close_active_threshold_alert weekly_threshold "superseded by ${critical}% threshold" || return 1
         fi
         weekly_threshold_remaining_pct="$weekly_pct"

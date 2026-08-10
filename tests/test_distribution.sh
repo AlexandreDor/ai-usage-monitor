@@ -74,6 +74,14 @@ assert_file "$LIB_ROOT/.codex-usage-monitor.owned"
 assert_file "$LIB_ROOT/releases/0.1.0/local/images/favicon.png"
 [[ ! -e "$LIB_ROOT/releases/0.1.0/local/.env" ]] || fail "configuration leaked into a release"
 [[ ! -e "$LIB_ROOT/releases/0.1.0/local/runtime" ]] || fail "state link leaked into a release"
+PROTECTED_HOME="$TEST_ROOT/protected launcher home"
+PROTECTED_BIN="$TEST_ROOT/protected launcher bin"
+mkdir -p "$PROTECTED_BIN"
+printf '%s\n' user-owned-launcher > "$PROTECTED_BIN/codex-usage-monitor"
+PROTECTED_COMMON=(--home "$PROTECTED_HOME" --xdg-config-home "$TEST_ROOT/protected config" --xdg-state-home "$TEST_ROOT/protected state" --lib-root "$TEST_ROOT/protected lib" --bin-dir "$PROTECTED_BIN" --systemd-dir "$TEST_ROOT/protected units" --no-systemd)
+assert_fails "install overwrote an unowned launcher" \
+  "$INSTALLER" install --source "$RELEASE_ONE" "${PROTECTED_COMMON[@]}"
+assert_eq user-owned-launcher "$(<"$PROTECTED_BIN/codex-usage-monitor")"
 expected="monitor 0.1.0 config=$CONFIG_HOME/codex-usage-monitor/.env state=$STATE_HOME/codex-usage-monitor"
 assert_eq "$expected" "$("$BIN_DIR/codex-usage-monitor")"
 
@@ -88,6 +96,10 @@ assert_eq 'secret=config' "$(<"$CONFIG_HOME/codex-usage-monitor/.env")"
 assert_eq 'persistent-state' "$(<"$STATE_HOME/codex-usage-monitor/data.txt")"
 expected="monitor 0.2.0 config=$CONFIG_HOME/codex-usage-monitor/.env state=$STATE_HOME/codex-usage-monitor"
 assert_eq "$expected" "$("$BIN_DIR/codex-usage-monitor")"
+assert_fails "previous-link failure did not roll back activation" env CUM_TEST_FAIL_LINK=previous \
+  "$BIN_DIR/codex-usage-monitor-manage" update --source "$RELEASE_ONE"
+assert_eq releases/0.2.0 "$(readlink "$LIB_ROOT/current")"
+assert_eq releases/0.1.0 "$(readlink "$LIB_ROOT/previous")"
 "$BIN_DIR/codex-usage-monitor-manage" update --source "$RELEASE_TWO" >/dev/null
 assert_eq releases/0.2.0 "$(readlink "$LIB_ROOT/current")"
 
@@ -223,13 +235,32 @@ case "$command" in
     [[ "$1" == --quiet ]]
     [[ -e "$FAKE_SYSTEM_STATE/$2" ]] || exit 3
     ;;
+  is-enabled)
+    if [[ -e "$FAKE_SYSTEM_STATE/.masked.$1" ]]; then
+      printf '%s\n' masked
+      exit 1
+    fi
+    exit 1
+    ;;
   stop)
     if [[ -n "${FAKE_FAIL_STOP:-}" && -e "$FAKE_FAIL_STOP" ]]; then
       exit 1
     fi
-    for service in "$@"; do rm -f "$FAKE_SYSTEM_STATE/$service"; done
+    for service in "$@"; do
+      rm -f "$FAKE_SYSTEM_STATE/$service"
+      if [[ -n "${FAKE_START_DURING_STOP:-}" && "$FAKE_START_DURING_STOP" == "$service" ]]; then
+        "$0" --user start "$service" &
+        wait "$!" || true
+      fi
+    done
     ;;
   start|restart)
+    for service in "$@"; do
+      if [[ -e "$FAKE_SYSTEM_STATE/.masked.$service" ]]; then
+        printf 'start-blocked %s\n' "$*" >> "$FAKE_SYSTEM_LOG"
+        exit 1
+      fi
+    done
     if [[ -n "${FAKE_FAIL_START:-}" && -e "$FAKE_FAIL_START" ]]; then
       exit 1
     fi
@@ -238,7 +269,18 @@ case "$command" in
         exit 1
       fi
       touch "$FAKE_SYSTEM_STATE/$service"
+      if [[ "$command" == restart && "${FAKE_DROP_AFTER_RESTART_SERVICE:-}" == "$service" ]]; then
+        rm -f "$FAKE_SYSTEM_STATE/$service"
+      fi
     done
+    ;;
+  mask)
+    [[ "$1" == --runtime ]]
+    shift
+    for service in "$@"; do touch "$FAKE_SYSTEM_STATE/.masked.$service"; done
+    ;;
+  unmask)
+    for service in "$@"; do rm -f "$FAKE_SYSTEM_STATE/.masked.$service"; done
     ;;
   daemon-reload)
     [[ -z "${FAKE_FAIL_DAEMON_RELOAD:-}" || ! -e "$FAKE_FAIL_DAEMON_RELOAD" ]]
@@ -251,17 +293,42 @@ esac
 EOF
 chmod 755 "$FAKE_SYSTEM_BIN/systemctl"
 SYSTEM_COMMON=(--home "$SYSTEM_HOME" --xdg-config-home "$SYSTEM_CONFIG" --xdg-state-home "$SYSTEM_STATE" --lib-root "$SYSTEM_LIB" --bin-dir "$SYSTEM_BIN" --systemd-dir "$SYSTEM_UNITS")
+UNIT_PROTECTED_HOME="$TEST_ROOT/unit protected home"
+UNIT_PROTECTED_CONFIG="$TEST_ROOT/unit protected config"
+UNIT_PROTECTED_STATE="$TEST_ROOT/unit protected state"
+UNIT_PROTECTED_LIB="$TEST_ROOT/unit protected lib"
+UNIT_PROTECTED_BIN="$TEST_ROOT/unit protected bin"
+UNIT_PROTECTED_DIR="$TEST_ROOT/unit protected units"
+mkdir -p "$UNIT_PROTECTED_DIR"
+printf '%s\n' user-owned-unit > "$UNIT_PROTECTED_DIR/codex-usage-monitor.service"
+UNIT_PROTECTED=(--home "$UNIT_PROTECTED_HOME" --xdg-config-home "$UNIT_PROTECTED_CONFIG" --xdg-state-home "$UNIT_PROTECTED_STATE" --lib-root "$UNIT_PROTECTED_LIB" --bin-dir "$UNIT_PROTECTED_BIN" --systemd-dir "$UNIT_PROTECTED_DIR")
+assert_fails "install overwrote an unowned systemd unit" env PATH="$FAKE_SYSTEM_BIN:$PATH" \
+  FAKE_SYSTEM_STATE="$FAKE_SYSTEM_STATE" FAKE_SYSTEM_LOG="$FAKE_SYSTEM_LOG" \
+  "$INSTALLER" install --source "$RELEASE_ONE" "${UNIT_PROTECTED[@]}"
+assert_eq user-owned-unit "$(<"$UNIT_PROTECTED_DIR/codex-usage-monitor.service")"
 PATH="$FAKE_SYSTEM_BIN:$PATH" FAKE_SYSTEM_STATE="$FAKE_SYSTEM_STATE" FAKE_SYSTEM_LOG="$FAKE_SYSTEM_LOG" \
   "$INSTALLER" install --source "$RELEASE_ONE" "${SYSTEM_COMMON[@]}"
 grep -Fq "Environment=\"PATH=$SYSTEM_BIN:" "$SYSTEM_UNITS/codex-usage-monitor.service" || fail "installed unit lost custom launcher path"
 grep -Fq 'ExecStart=/usr/bin/env codex-usage-monitor --loop --fail-fast' "$SYSTEM_UNITS/codex-usage-monitor.service" || fail "monitor unit is not fail-fast"
 expected="monitor 0.1.0 config=$SYSTEM_CONFIG/codex-usage-monitor/.env state=$SYSTEM_STATE/codex-usage-monitor"
 assert_eq "$expected" "$(PATH="$SYSTEM_BIN:/usr/local/bin:/usr/bin:/bin" codex-usage-monitor --loop --fail-fast)"
+grep -Fqx '# codex-usage-monitor generated launcher; managed by install.sh' "$SYSTEM_BIN/codex-usage-monitor" || fail "launcher ownership marker is missing"
+grep -Fqx '# codex-usage-monitor generated user unit; managed by install.sh' "$SYSTEM_UNITS/codex-usage-monitor.service" || fail "unit ownership marker is missing"
 
 SYSTEM_RELEASE_TWO="$TEST_ROOT/system release two"
 make_release 0.2.0 "$SYSTEM_RELEASE_TWO"
 printf '%s\n' '# release two monitor unit' >> "$SYSTEM_RELEASE_TWO/systemd/codex-usage-monitor.service"
 printf '%s\n' '# release two dashboard unit' >> "$SYSTEM_RELEASE_TWO/systemd/codex-usage-dashboard.service"
+
+# A previous-link failure after current/restart must restore every activation
+# component, including the services that were already running.
+touch "$FAKE_SYSTEM_STATE/codex-usage-monitor.service" "$FAKE_SYSTEM_STATE/codex-usage-dashboard.service"
+assert_fails "previous-link failure left a partial activation" env PATH="$FAKE_SYSTEM_BIN:$PATH" \
+  FAKE_SYSTEM_STATE="$FAKE_SYSTEM_STATE" FAKE_SYSTEM_LOG="$FAKE_SYSTEM_LOG" CUM_TEST_FAIL_LINK=previous \
+  "$INSTALLER" update --source "$SYSTEM_RELEASE_TWO" "${SYSTEM_COMMON[@]}"
+assert_eq releases/0.1.0 "$(readlink "$SYSTEM_LIB/current")"
+[[ ! -e "$SYSTEM_LIB/previous" ]] || fail "failed activation created a previous link"
+! grep -Fq 'release two monitor unit' "$SYSTEM_UNITS/codex-usage-monitor.service" || fail "failed activation left monitor units"
 
 # Unit replacement and current activation roll back together.
 FAIL_RELOAD="$TEST_ROOT/fail daemon reload"
@@ -273,6 +340,17 @@ assert_eq releases/0.1.0 "$(readlink "$SYSTEM_LIB/current")"
 ! grep -Fq 'release two monitor unit' "$SYSTEM_UNITS/codex-usage-monitor.service" || fail "monitor unit was not rolled back"
 ! grep -Fq 'release two dashboard unit' "$SYSTEM_UNITS/codex-usage-dashboard.service" || fail "dashboard unit was not rolled back"
 rm "$FAIL_RELOAD"
+
+# A process that exits immediately after a successful restart is also a failed
+# activation and must roll back.
+touch "$FAKE_SYSTEM_STATE/codex-usage-monitor.service" "$FAKE_SYSTEM_STATE/codex-usage-dashboard.service"
+assert_fails "immediately dead service restart was accepted" env PATH="$FAKE_SYSTEM_BIN:$PATH" \
+  FAKE_SYSTEM_STATE="$FAKE_SYSTEM_STATE" FAKE_SYSTEM_LOG="$FAKE_SYSTEM_LOG" \
+  FAKE_DROP_AFTER_RESTART_SERVICE=codex-usage-monitor.service \
+  "$INSTALLER" update --source "$SYSTEM_RELEASE_TWO" "${SYSTEM_COMMON[@]}"
+assert_eq releases/0.1.0 "$(readlink "$SYSTEM_LIB/current")"
+[[ ! -e "$SYSTEM_LIB/previous" ]] || fail "dead-service rollback created a previous link"
+! grep -Fq 'release two monitor unit' "$SYSTEM_UNITS/codex-usage-monitor.service" || fail "dead-service rollback left units"
 
 # Either service restart failing must reject and roll back activation.
 touch "$FAKE_SYSTEM_STATE/codex-usage-monitor.service" "$FAKE_SYSTEM_STATE/codex-usage-dashboard.service"
@@ -299,6 +377,16 @@ if grep -Fq 'start codex-usage-dashboard.service' "$FAKE_SYSTEM_LOG"; then
   fail "backup started a service that was inactive"
 fi
 
+# A manager start attempted concurrently with stop is rejected by the runtime
+# mask and cannot race the copy.
+: > "$FAKE_SYSTEM_LOG"
+touch "$FAKE_SYSTEM_STATE/codex-usage-monitor.service"
+PATH="$FAKE_SYSTEM_BIN:$PATH" FAKE_SYSTEM_STATE="$FAKE_SYSTEM_STATE" FAKE_SYSTEM_LOG="$FAKE_SYSTEM_LOG" \
+  FAKE_START_DURING_STOP=codex-usage-monitor.service \
+  "$INSTALLER" backup --output "$TEST_ROOT/concurrent start backup.tar.gz" "${SYSTEM_COMMON[@]}"
+grep -Fq 'start-blocked codex-usage-monitor.service' "$FAKE_SYSTEM_LOG" || fail "concurrent systemctl start was not blocked"
+[[ -e "$FAKE_SYSTEM_STATE/codex-usage-monitor.service" ]] || fail "previously active service was not resumed"
+
 # A backup failure after quiescing must still restart the recorded service.
 ln -s "$TEST_ROOT/nonexistent" "$SYSTEM_STATE/codex-usage-monitor/rejected-link"
 assert_fails "backup accepted a state symlink" env PATH="$FAKE_SYSTEM_BIN:$PATH" \
@@ -318,6 +406,20 @@ assert_fails "restore succeeded despite service start failure" env PATH="$FAKE_S
 assert_eq before-failed-restore "$(<"$SYSTEM_CONFIG/codex-usage-monitor/.env")"
 assert_eq before-failed-restore "$(<"$SYSTEM_STATE/codex-usage-monitor/data.txt")"
 rm "$FAIL_START"
+
+# SIGKILL after the first tree move leaves a journal; the next maintenance
+# command must recover both trees before doing its own work.
+if env PATH="$FAKE_SYSTEM_BIN:$PATH" FAKE_SYSTEM_STATE="$FAKE_SYSTEM_STATE" FAKE_SYSTEM_LOG="$FAKE_SYSTEM_LOG" \
+  CUM_TEST_KILL_AFTER_RESTORE_MV=config-old \
+  "$INSTALLER" restore --backup "$TEST_ROOT/system backup.tar.gz" "${SYSTEM_COMMON[@]}"; then
+  fail "restore injection did not terminate the process"
+fi
+assert_file "$SYSTEM_STATE/codex-usage-monitor.restore-journal"
+PATH="$FAKE_SYSTEM_BIN:$PATH" FAKE_SYSTEM_STATE="$FAKE_SYSTEM_STATE" FAKE_SYSTEM_LOG="$FAKE_SYSTEM_LOG" \
+  "$INSTALLER" backup --output "$TEST_ROOT/recovered backup.tar.gz" "${SYSTEM_COMMON[@]}"
+assert_eq before-failed-restore "$(<"$SYSTEM_CONFIG/codex-usage-monitor/.env")"
+assert_eq before-failed-restore "$(<"$SYSTEM_STATE/codex-usage-monitor/data.txt")"
+[[ ! -e "$SYSTEM_STATE/codex-usage-monitor.restore-journal" ]] || fail "restore journal was not recovered"
 systemd-analyze verify "$SYSTEM_UNITS/codex-usage-monitor.service" "$SYSTEM_UNITS/codex-usage-dashboard.service"
 ! grep -Fq 'ProtectSystem=strict' "$SYSTEM_UNITS/codex-usage-monitor.service" || fail "monitor state was made read-only"
 ! grep -Eq '^(ProtectSystem|ProtectHome)=' "$SYSTEM_UNITS/codex-usage-monitor.service" || fail "monitor paths were made inaccessible"
@@ -424,6 +526,13 @@ MARKER_HOME="$TEST_ROOT/marker home"
 rm "$MARKER_HOME/.local/lib/codex-usage-monitor/.codex-usage-monitor.owned"
 assert_fails "uninstall removed an unowned LIB_ROOT" "$INSTALLER" uninstall --home "$MARKER_HOME" --no-systemd
 [[ -d "$MARKER_HOME/.local/lib/codex-usage-monitor" ]] || fail "unowned LIB_ROOT was removed"
+
+UNOWNED_TARGET_HOME="$TEST_ROOT/unowned target home"
+"$INSTALLER" install --source "$RELEASE_ONE" --home "$UNOWNED_TARGET_HOME" --no-systemd
+printf '%s\n' user-owned-launcher > "$UNOWNED_TARGET_HOME/.local/bin/codex-usage-monitor"
+assert_fails "uninstall removed an unowned launcher" "$INSTALLER" uninstall --home "$UNOWNED_TARGET_HOME" --no-systemd
+assert_eq user-owned-launcher "$(<"$UNOWNED_TARGET_HOME/.local/bin/codex-usage-monitor")"
+[[ -d "$UNOWNED_TARGET_HOME/.local/lib/codex-usage-monitor" ]] || fail "uninstall removed an unowned install"
 
 exec {uninstall_lock_fd}>>"$STATE_HOME/codex-usage-monitor/.monitor.lock"
 flock -n "$uninstall_lock_fd"

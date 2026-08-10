@@ -200,6 +200,29 @@ class HistoryTests(unittest.TestCase):
         self.assertTrue(any("older snapshot" in warning for warning in older.warnings))
         self.assertEqual("1970-01-01T00:10:00Z", self.read_json(self.data_path)["scraped_at"])
 
+    def test_missing_or_corrupt_data_is_repaired_from_newest_history(self):
+        self.history_path.write_text(
+            json.dumps([
+                snapshot("1970-01-01T00:10:00Z", weekly=80),
+                snapshot("1970-01-01T00:09:00Z", weekly=79),
+            ]),
+            encoding="utf-8",
+        )
+        older = self.update(
+            snapshot("1970-01-01T00:08:00Z", weekly=78), retention=24, now=10_000
+        )
+        self.assertTrue(older.data_updated)
+        self.assertEqual("1970-01-01T00:10:00Z", self.read_json(self.data_path)["scraped_at"])
+        self.assertEqual(80, self.read_json(self.data_path)["weekly_pct"])
+
+        self.data_path.write_text("{broken", encoding="utf-8")
+        older_again = self.update(
+            snapshot("1970-01-01T00:07:00Z", weekly=77), retention=24, now=10_000
+        )
+        self.assertTrue(older_again.data_updated)
+        self.assertEqual("1970-01-01T00:10:00Z", self.read_json(self.data_path)["scraped_at"])
+        self.assertEqual(80, self.read_json(self.data_path)["weekly_pct"])
+
     def test_data_write_before_history_failure_is_reconciled_next_cycle(self):
         self.update(snapshot("1970-01-01T00:16:40Z"), retention=24, now=2_000)
 
