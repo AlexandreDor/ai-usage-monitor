@@ -10,6 +10,9 @@ import json
 import math
 import os
 from pathlib import Path
+import re
+import stat
+import subprocess
 import sys
 import tempfile
 from typing import Any, BinaryIO, TextIO
@@ -64,6 +67,101 @@ def check_tzdata() -> bool:
     except Exception:
         return False
     return True
+
+
+_HOOK_SECRET_ENVIRONMENT = (
+    "DISCORD_WEBHOOK",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+    "GITHUB_PAT",
+    "GITHUB_GIST_ID",
+)
+_HOOK_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_HOOK_ERROR = "alert hook must be an executable, user-owned regular file that is not a symlink or group/world-writable"
+
+
+class HookValidationError(ValueError):
+    pass
+
+
+def _open_alert_hook(path: Path) -> tuple[int, int]:
+    if not path.is_absolute() or len(path.parts) < 2:
+        raise HookValidationError(_HOOK_ERROR)
+
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_descriptor = os.open(path.anchor, directory_flags)
+    hook_descriptor = -1
+    try:
+        for component in path.parts[1:-1]:
+            next_descriptor = os.open(component, directory_flags, dir_fd=parent_descriptor)
+            try:
+                metadata = os.fstat(next_descriptor)
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise HookValidationError(_HOOK_ERROR)
+            except BaseException:
+                os.close(next_descriptor)
+                raise
+            os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+
+        hook_descriptor = os.open(path.parts[-1], file_flags, dir_fd=parent_descriptor)
+        metadata = os.fstat(hook_descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or not metadata.st_mode & 0o111
+            or metadata.st_mode & 0o022
+        ):
+            raise HookValidationError(_HOOK_ERROR)
+        return hook_descriptor, parent_descriptor
+    except BaseException:
+        if hook_descriptor >= 0:
+            os.close(hook_descriptor)
+        os.close(parent_descriptor)
+        raise
+
+
+def _hook_environment(overrides: list[str]) -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in _HOOK_SECRET_ENVIRONMENT:
+        environment.pop(name, None)
+    for assignment in overrides:
+        name, separator, value = assignment.partition("=")
+        if not separator or not _HOOK_ENVIRONMENT_NAME.fullmatch(name) or "\0" in value:
+            raise HookValidationError("alert hook environment contains an invalid entry")
+        environment[name] = value
+    return environment
+
+
+def run_alert_hook(path: Path, timeout_seconds: int, overrides: list[str]) -> int:
+    if not 1 <= timeout_seconds <= 1800:
+        raise HookValidationError("alert hook timeout must be between 1 and 1800 seconds")
+    environment = _hook_environment(overrides)
+    hook_descriptor, parent_descriptor = _open_alert_hook(path)
+    try:
+        try:
+            result = subprocess.run(
+                [f"/proc/self/fd/{hook_descriptor}"],
+                cwd=f"/proc/self/fd/{parent_descriptor}",
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                timeout=timeout_seconds,
+                check=False,
+                pass_fds=(hook_descriptor, parent_descriptor),
+                start_new_session=True,
+            )
+        except subprocess.TimeoutExpired:
+            return 124
+        return result.returncode
+    finally:
+        os.close(hook_descriptor)
+        os.close(parent_descriptor)
 
 
 def json_get_field(raw: str, field: str) -> Any:
@@ -289,6 +387,10 @@ def _parser() -> argparse.ArgumentParser:
     gist_files.add_argument("snapshot", type=Path)
     gist_files.add_argument("history", type=Path)
     gist_files.add_argument("output", type=Path)
+    hook = commands.add_parser("run-alert-hook")
+    hook.add_argument("path", type=Path)
+    hook.add_argument("timeout_seconds", type=int)
+    hook.add_argument("--env", dest="environment", action="append", default=[])
     return parser
 
 
@@ -339,8 +441,13 @@ def main(argv: list[str] | None = None) -> int:
             atomic_write_from_stream(arguments.path, sys.stdin.buffer)
         elif arguments.command == "gist-payload-files":
             write_gist_payload(arguments.snapshot, arguments.history, arguments.output)
+        elif arguments.command == "run-alert-hook":
+            return run_alert_hook(arguments.path, arguments.timeout_seconds, arguments.environment)
         return 0
     except (OSError, OverflowError, TypeError, ValueError, json.JSONDecodeError) as error:
+        if arguments.command == "run-alert-hook":
+            sys.stderr.write(f"[ERROR] {error}\n")
+            return 125
         if arguments.command in ("validate-number", "validate-thresholds"):
             sys.stderr.write(f"[ERROR] {error}\n")
         return 1

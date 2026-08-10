@@ -164,6 +164,24 @@ for hostile in traversal absolute symlink hardlink fifo; do
   assert_eq 'secret=config' "$(<"$CONFIG_HOME/codex-usage-monitor/.env")"
 done
 
+# A tiny gzip can carry a large PAX record. The validator must bound the
+# decompressed stream before tarfile allocates that metadata.
+python3 - "$TEST_ROOT" <<'PY'
+import pathlib
+import tarfile
+import sys
+
+archive = pathlib.Path(sys.argv[1]) / "metadata-bomb.tar.gz"
+with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT) as stream:
+    for name in ("config", "state"):
+        info = tarfile.TarInfo(name)
+        info.type = tarfile.DIRTYPE
+        info.pax_headers = {"comment": "x" * (16 * 1024 * 1024)}
+        stream.addfile(info)
+PY
+assert_fails "PAX metadata decompression budget was ignored" python3 "$ROOT_DIR/scripts/validate-archive.py" \
+  backup "$TEST_ROOT/metadata-bomb.tar.gz" $((1024 * 1024)) 10 $((1024 * 1024)) 1
+
 assert_fails "relative home path was accepted" "$INSTALLER" install --source "$RELEASE_ONE" --home relative --no-systemd
 assert_fails "overlapping data and release paths were accepted" "$INSTALLER" install --source "$RELEASE_ONE" \
   --home "$HOME_DIR" --lib-root "$TEST_ROOT/overlap" --xdg-state-home "$TEST_ROOT/overlap" --no-systemd

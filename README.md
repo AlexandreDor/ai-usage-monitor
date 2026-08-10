@@ -39,7 +39,7 @@ shells are not supported.
 | OpenAI Codex CLI | limit source | `codex --version` |
 | curl | Discord, Telegram, and Gist | `curl --version` |
 | `flock` | single-cycle locking | `flock --version` |
-| GNU coreutils | alert-script timeout and distribution tools | `timeout --version` |
+| GNU coreutils | monitor and distribution tools | `date --version` |
 
 Install and authenticate Codex before running the monitor:
 

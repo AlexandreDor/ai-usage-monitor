@@ -3,6 +3,7 @@
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -111,6 +112,70 @@ class MonitorUtilsTests(unittest.TestCase):
             invalid.stderr,
         )
         self.assertNotIn("Traceback", invalid.stderr)
+
+    def test_alert_hook_open_rejects_invalid_final_file_permissions_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hook = root / "hook.sh"
+            hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            hook.chmod(0o700)
+
+            hook.chmod(0o600)
+            with self.assertRaises(monitor_utils.HookValidationError):
+                monitor_utils.run_alert_hook(hook, 1, [])
+            hook.chmod(0o720)
+            with self.assertRaises(monitor_utils.HookValidationError):
+                monitor_utils.run_alert_hook(hook, 1, [])
+            hook.chmod(0o700)
+
+            link = root / "hook-link.sh"
+            link.symlink_to(hook)
+            with self.assertRaises(OSError):
+                monitor_utils.run_alert_hook(link, 1, [])
+
+            with mock.patch.object(monitor_utils.os, "getuid", return_value=os.getuid() + 1):
+                with self.assertRaises(monitor_utils.HookValidationError):
+                    monitor_utils.run_alert_hook(hook, 1, [])
+
+    def test_alert_hook_executes_the_inode_opened_before_path_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hook = root / "hook.sh"
+            replacement = root / "replacement.sh"
+            hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            replacement.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+            hook.chmod(0o700)
+            replacement.chmod(0o700)
+            original_inode = hook.stat().st_ino
+            observed = {}
+
+            def fake_run(command, **kwargs):
+                observed["command"] = command
+                observed["inode"] = os.fstat(kwargs["pass_fds"][0]).st_ino
+                observed["environment"] = kwargs["env"]
+                os.replace(replacement, hook)
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.dict(
+                monitor_utils.os.environ,
+                {
+                    "DISCORD_WEBHOOK": "secret",
+                    "GITHUB_PAT": "secret",
+                },
+                clear=False,
+            ), mock.patch.object(monitor_utils.subprocess, "run", side_effect=fake_run):
+                self.assertEqual(
+                    0,
+                    monitor_utils.run_alert_hook(
+                        hook, 1, ["CODEX_ALERT_EVENT=threshold"]
+                    ),
+                )
+
+            self.assertEqual(original_inode, observed["inode"])
+            self.assertEqual([observed["command"][0]], observed["command"])
+            self.assertEqual("threshold", observed["environment"]["CODEX_ALERT_EVENT"])
+            self.assertNotIn("DISCORD_WEBHOOK", observed["environment"])
+            self.assertNotIn("GITHUB_PAT", observed["environment"])
 
 
 if __name__ == "__main__":

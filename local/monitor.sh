@@ -336,11 +336,6 @@ check_requirements() {
     missing=1
   fi
 
-  if alert_scripts_configured && ! command -v timeout &>/dev/null; then
-    echo "[ERROR] 'timeout' is required when alert scripts are configured." >&2
-    missing=1
-  fi
-
   (( missing == 0 ))
 }
 
@@ -1057,26 +1052,22 @@ run_alert_script() {
   local rule_position="$1" event_kind="$2" window="$3" threshold="$4" remaining_pct="$5"
   local reset_at="$6" reset_label="$7" scraped_at="$8" message="$9"
   local rule_index="${ALERT_SCRIPT_RULE_INDICES[$rule_position]}"
-  local path="${ALERT_SCRIPT_RULE_PATHS[$rule_position]}" working_directory exit_code=0 event_label
-  working_directory="$(dirname "$path")"
+  local path="${ALERT_SCRIPT_RULE_PATHS[$rule_position]}" exit_code=0 event_label
   event_label="${window}:${threshold:-reset}"
   echo "[ACTION] Script rule ${rule_index} for ${event_label}: ${path}"
   (
-    cd "$working_directory" || exit 125
-    timeout --signal=TERM --kill-after=5s "$ALERT_SCRIPT_TIMEOUT_SECONDS" \
-      env -u DISCORD_WEBHOOK -u TELEGRAM_BOT_TOKEN -u TELEGRAM_CHAT_ID \
-          -u GITHUB_PAT -u GITHUB_GIST_ID \
-          "CODEX_ALERT_EVENT=${event_kind}" \
-          "CODEX_ALERT_WINDOW=${window}" \
-          "CODEX_ALERT_THRESHOLD=${threshold}" \
-          "CODEX_ALERT_REMAINING_PCT=${remaining_pct}" \
-          "CODEX_ALERT_RESET_AT=${reset_at}" \
-          "CODEX_ALERT_RESET_LABEL=${reset_label}" \
-          "CODEX_ALERT_SCRAPED_AT=${scraped_at}" \
-          "CODEX_ALERT_MESSAGE=${message}" \
-          "CODEX_ALERT_CODEX_BIN=${CODEX_BIN:-codex}" \
-          "CODEX_ALERT_RULE_INDEX=${rule_index}" \
-          "$path" </dev/null
+    python3 "$SCRIPT_DIR/monitor_utils.py" run-alert-hook \
+      "$path" "$ALERT_SCRIPT_TIMEOUT_SECONDS" \
+      --env "CODEX_ALERT_EVENT=${event_kind}" \
+      --env "CODEX_ALERT_WINDOW=${window}" \
+      --env "CODEX_ALERT_THRESHOLD=${threshold}" \
+      --env "CODEX_ALERT_REMAINING_PCT=${remaining_pct}" \
+      --env "CODEX_ALERT_RESET_AT=${reset_at}" \
+      --env "CODEX_ALERT_RESET_LABEL=${reset_label}" \
+      --env "CODEX_ALERT_SCRAPED_AT=${scraped_at}" \
+      --env "CODEX_ALERT_MESSAGE=${message}" \
+      --env "CODEX_ALERT_CODEX_BIN=${CODEX_BIN:-codex}" \
+      --env "CODEX_ALERT_RULE_INDEX=${rule_index}"
   ) || exit_code=$?
 
   if (( exit_code == 0 )); then

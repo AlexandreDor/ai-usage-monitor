@@ -12,8 +12,8 @@ Installation and maintenance require Bash, GNU coreutils, GNU tar, gzip, and
 `git ls-files`.
 
 Runtime requirements are Bash, Python 3.9 or newer with `Europe/Paris` timezone
-data, curl, `flock`, and an installed/authenticated Codex CLI. GNU `timeout` is
-also required when local alert hooks are configured.
+data, curl, `flock`, and an installed/authenticated Codex CLI. Alert hook
+timeouts are enforced by the Python monitor runner.
 
 The Codex app-server `initialize.clientInfo.version` is read from the release's
 `VERSION` file; it is the application version, not an independent protocol
