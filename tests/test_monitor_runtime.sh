@@ -12,11 +12,13 @@ snapshot() {
   printf '{"five_h_pct":%s,"weekly_pct":%s,"five_h_reset":"later","weekly_reset":"later","scraped_at":"%s","sample_interval_seconds":900,"history_window_hours":192,"limit_id":"test"}' "$2" "$3" "$1"
 }
 
-new_json="$(snapshot '2026-08-03T12:00:00Z' 80 60)"
-old_json="$(snapshot '2026-08-03T11:00:00Z' 90 70)"
+new_scraped_at="$(date -u -d '30 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')"
+old_scraped_at="$(date -u -d '90 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')"
+new_json="$(snapshot "$new_scraped_at" 80 60)"
+old_json="$(snapshot "$old_scraped_at" 90 70)"
 write_local_snapshot "$new_json" 900 >/dev/null
 write_local_snapshot "$old_json" 900 >/dev/null 2>&1
-assert_eq '2026-08-03T12:00:00Z' "$(json_field "$DATA_FILE" scraped_at)" "older snapshot replaced data.json"
+assert_eq "$new_scraped_at" "$(json_field "$DATA_FILE" scraped_at)" "older snapshot replaced data.json"
 assert_eq 2 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1], encoding="utf-8"))))' "$HISTORY_FILE")" "older snapshot missing from history"
 
 printf '{broken' > "$HISTORY_FILE"
