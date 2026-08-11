@@ -20,6 +20,7 @@ let freshnessState = 'waiting';
 let freshnessFailure = null;
 let lastSampleAt = null;
 let sampleIntervalSeconds = REFRESH_INTERVAL_MS / 1000;
+let loadGeneration = 0;
 
 const DASHBOARD_COPY = {
   en: {
@@ -541,36 +542,48 @@ async function fetchGistFile(file, filename, missingMessage) {
   return JSON.parse(file.content);
 }
 
-async function fetchLocal() {
+async function fetchLocal(generation = ++loadGeneration) {
   setOrigin('local');
   const data = await fetchJson('data.json', t('dataNotFound'));
+  if (generation !== loadGeneration) return;
   renderData(data);
 
   try {
-    renderHistory(await fetchJson('history.json', t('historyNotFound')));
+    const history = await fetchJson('history.json', t('historyNotFound'));
+    if (generation !== loadGeneration) return;
+    renderHistory(history);
   } catch (error) {
+    if (generation !== loadGeneration) return;
     renderHistoryFailure(error instanceof Error ? error.message : t('unableToLoadHistory'));
   }
 }
 
-async function fetchGist() {
+async function fetchGist(generation = ++loadGeneration) {
   setOrigin('external');
   const response = await fetch(`https://api.github.com/gists/${encodeURIComponent(GIST_ID)}?_=${Date.now()}`);
   if (!response.ok) throw new Error(t('githubApiError', { status: response.status }));
   const gist = await response.json();
-  renderData(await fetchGistFile(gist?.files?.['data.json'], 'data.json', t('gistDataNotFound')));
+  if (generation !== loadGeneration) return;
+  const data = await fetchGistFile(gist?.files?.['data.json'], 'data.json', t('gistDataNotFound'));
+  if (generation !== loadGeneration) return;
+  renderData(data);
 
   try {
-    renderHistory(await fetchGistFile(gist?.files?.['history.json'], 'history.json', t('gistHistoryNotFound')));
+    const history = await fetchGistFile(gist?.files?.['history.json'], 'history.json', t('gistHistoryNotFound'));
+    if (generation !== loadGeneration) return;
+    renderHistory(history);
   } catch (error) {
+    if (generation !== loadGeneration) return;
     renderHistoryFailure(error instanceof Error ? error.message : t('unableToLoadHistory'));
   }
 }
 
 async function refresh() {
+  const generation = ++loadGeneration;
   try {
-    await (GIST_ID ? fetchGist() : fetchLocal());
+    await (GIST_ID ? fetchGist(generation) : fetchLocal(generation));
   } catch (error) {
+    if (generation !== loadGeneration) return;
     setMainError(error instanceof Error ? error.message : t('unableToLoadData'));
     freshnessFailure = 'network';
     setFreshness('error');
