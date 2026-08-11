@@ -89,22 +89,80 @@ assert_alert_count 1
 check_thresholds 100 100 "unknown" "later" "" "$new_weekly_deadline" "$((now + 1800))"
 assert_alert_count 1
 
-# A small refill to full is also valid, while a deadline jump without a refill
-# is not enough evidence to notify.
+# Reaching exactly 98% is valid even for a small refill when the deadline moves
+# by exactly 30 minutes. A deadline jump without a refill is not enough.
 reset_case
-check_thresholds 100 92 "unknown" "later" "" "$old_weekly_deadline" "$now"
-check_thresholds 100 100 "unknown" "later" "" "$((old_weekly_deadline + 2 * 60 * 60))" "$((now + 900))"
+check_thresholds 100 97 "unknown" "later" "" "$old_weekly_deadline" "$now"
+check_thresholds 100 98 "unknown" "later" "" "$((old_weekly_deadline + 30 * 60))" "$((now + 900))"
 assert_alert_count 1
 reset_case
 check_thresholds 100 92 "unknown" "later" "" "$old_weekly_deadline" "$now"
 check_thresholds 100 92 "unknown" "later" "" "$new_weekly_deadline" "$((now + 900))"
 assert_alert_count 0
 
-# A long observation gap is insufficient evidence for an early reset because
-# the refill may have occurred at an unknown point while collection was down.
+# A 20-point refill also qualifies below 98%, including after a long gap and
+# intervening partial observations.
 reset_case
-check_thresholds 100 28 "unknown" "later" "" "$old_weekly_deadline" "$now"
-check_thresholds 100 100 "unknown" "later" "" "$new_weekly_deadline" "$((now + 3601))"
+check_thresholds 100 40 "unknown" "later" "" "$old_weekly_deadline" "$now"
+check_thresholds 100 "" "unknown" "unknown" "" "" "$((now + 3600))"
+check_thresholds 100 60 "unknown" "later" "" "$((old_weekly_deadline + 30 * 60))" "$((now + 7200))"
+assert_alert_count 1
+
+# Values from different limit groups are never compared as one quota cycle.
+reset_case
+check_thresholds 100 40 "unknown" "later" "" "$old_weekly_deadline" "$now" "group-a"
+check_thresholds 100 100 "unknown" "later" "" "$new_weekly_deadline" "$((now + 900))" "group-b"
+assert_alert_count 0
+
+# Scheduled deadlines also stay bound to their original limit group.
+reset_case
+scheduled_deadline=$((now + 100))
+check_thresholds 100 40 "unknown" "later" "" "$scheduled_deadline" "$now" "group-a"
+check_thresholds 100 40 "unknown" "later" "" "$new_weekly_deadline" "$((now + 101))" "group-b"
+assert_alert_count 0
+
+# A partial observation from another group cannot cross notification thresholds.
+reset_case
+ALERT_THRESHOLDS=50
+check_thresholds 100 80 "unknown" "later" "" "$old_weekly_deadline" "$now" "group-a"
+check_thresholds 100 40 "unknown" "unknown" "" "" "$((now + 1))" "group-b"
+assert_alert_count 0
+ALERT_THRESHOLDS=0
+
+# A partial sample after the old deadline reports the scheduled reset once and
+# invalidates the old observation so the next complete sample cannot replay it.
+reset_case
+check_thresholds 100 40 "unknown" "later" "" "$scheduled_deadline" "$now"
+check_thresholds 100 "" "unknown" "unknown" "" "" "$((now + 101))"
+check_thresholds 100 100 "unknown" "later" "" "$new_weekly_deadline" "$((now + 200))"
+assert_alert_count 1
+
+# A failed threshold delivery does not replace the observation baseline used
+# to detect a later refill.
+reset_case
+ALERT_THRESHOLDS=50
+check_thresholds 100 100 "unknown" "later" "" "$old_weekly_deadline" "$now"
+send_alert() {
+  printf '%s\n' "$1" >> "$ALERT_LOG"
+  printf '1\n' >> "$ALERT_COUNT_LOG"
+  return 1
+}
+check_thresholds 100 40 "unknown" "later" "" "$old_weekly_deadline" "$((now + 1))" || true
+send_alert() {
+  printf '%s\n' "$1" >> "$ALERT_LOG"
+  printf '1\n' >> "$ALERT_COUNT_LOG"
+}
+check_thresholds 100 100 "unknown" "later" "" "$((old_weekly_deadline + 30 * 60))" "$((now + 2))"
+assert_alert_count 2
+assert_contains "$(tail -n 1 "$ALERT_LOG")" "weekly limit reset" "failed threshold delivery hid the reset"
+[[ -z "$(state_value pending_weekly_threshold)" ]] || fail "old threshold remained pending after reset"
+
+# Legacy threshold baselines have no limit owner and are reinitialized from the
+# first complete observation after upgrade.
+reset_case
+ALERT_THRESHOLDS=50
+printf 'state_version=3\nprev_5h_pct=100\nprev_weekly_pct=80\n' > "$STATE_FILE"
+check_thresholds 100 40 "unknown" "later" "" "$old_weekly_deadline" "$now" "group-b"
 assert_alert_count 0
 
 # Threshold alerts include the same weekly pace delta shown by the dashboard.

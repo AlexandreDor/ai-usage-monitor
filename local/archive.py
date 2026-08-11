@@ -26,8 +26,8 @@ MEDIUM_SECONDS = 7 * 24 * 60 * 60
 MEDIUM_BUCKET_SECONDS = 30 * 60
 OLD_BUCKET_SECONDS = 60 * 60
 RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT = 20
-RANDOM_WEEKLY_RESET_FULL_REFILL_PCT = 99
-RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS = 2 * 60 * 60
+RANDOM_WEEKLY_RESET_FULL_REFILL_PCT = 98
+RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS = 30 * 60
 MAX_RETENTION_DAYS = 36500
 
 
@@ -234,13 +234,14 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
     rows = connection.execute(
         """
         SELECT scraped_at_epoch, five_h_pct, five_h_reset_at,
-               weekly_pct, weekly_reset_at, sample_interval_seconds
+               weekly_pct, weekly_reset_at, sample_interval_seconds, limit_id
           FROM snapshots
         ORDER BY scraped_at_epoch
         """
     ).fetchall()
     connection.execute("DELETE FROM reset_events")
     windows = (("5h", 1, 2), ("weekly", 3, 4))
+    scheduled_weekly_cycles = set()
     for previous, current in zip(rows, rows[1:]):
         gap = current[0] - previous[0]
         intervals = [
@@ -248,10 +249,10 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             if isinstance(value, (int, float)) and value > 0
         ]
         expected_interval = int(max(intervals, default=900))
-        # A reset deadline crossing a long observation gap is not enough
-        # evidence that the reset was observed. Keep the event history
-        # conservative instead of inventing missed resets.
+        # A deadline crossing alone is not enough evidence across a long gap.
         if gap <= 0 or gap > max(3_600, expected_interval * 2):
+            continue
+        if previous[6] != current[6]:
             continue
         for window, pct_index, reset_index in windows:
             reset_at = previous[reset_index]
@@ -273,24 +274,31 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
                         current[pct_index],
                     ),
                 )
+                if window == "weekly":
+                    scheduled_weekly_cycles.add((reset_at, previous[6]))
 
-        # Codex can refill the weekly window before its previously announced
-        # deadline. Record this separately: the exact instant is unknown, so
-        # the event is anchored to the first post-reset observation.
+    # A refill plus a later deadline remains positive reset evidence after a
+    # long gap or partial samples. Compare coherent observations from the same
+    # limit group and anchor the event to the first complete post-reset sample.
+    previous_weekly = None
+    for current in rows:
+        current_pct, current_deadline = current[3], current[4]
+        if not isinstance(current_pct, (int, float)) or not isinstance(current_deadline, int):
+            continue
+        if previous_weekly is None:
+            previous_weekly = current
+            continue
+
+        previous = previous_weekly
         previous_pct, current_pct = previous[3], current[3]
         previous_deadline, current_deadline = previous[4], current[4]
-        refill_change = (
-            current_pct - previous_pct
-            if isinstance(previous_pct, (int, float))
-            and isinstance(current_pct, (int, float))
-            else None
-        )
+        refill_change = current_pct - previous_pct
+        scheduled_crossing = (previous_deadline, previous[6]) in scheduled_weekly_cycles
         if (
-            refill_change is not None
+            previous[6] == current[6]
+            and isinstance(previous_pct, (int, float))
             and isinstance(previous_deadline, int)
-            and isinstance(current_deadline, int)
-            and previous[0] < previous_deadline
-            and not previous[0] < previous_deadline <= current[0]
+            and not scheduled_crossing
             and current_deadline >= previous_deadline + RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS
             and refill_change > 0
             and (
@@ -307,6 +315,7 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
                 """,
                 (current[0], current[0], previous_pct, current_pct),
             )
+        previous_weekly = current
 
 
 def ingest(

@@ -17,6 +17,8 @@ HOOK_ONE="${TEST_ROOT}/hooks with spaces/record one.sh"
 HOOK_TWO="${TEST_ROOT}/hooks with spaces/record two.sh"
 FAIL_HOOK="${TEST_ROOT}/hooks with spaces/fail.sh"
 SLOW_HOOK="${TEST_ROOT}/hooks with spaces/slow.sh"
+CRASH_STATE_HOOK="${TEST_ROOT}/hooks with spaces/capture state.sh"
+CRASH_STATE="${TEST_ROOT}/hook-journal.state"
 mkdir -p "$(dirname "$HOOK_ONE")"
 
 # Generated fixture scripts intentionally use single-quoted source strings.
@@ -40,7 +42,10 @@ write_recording_hook "$HOOK_TWO"
 # shellcheck disable=SC2016
 printf '%s\n' '#!/usr/bin/env bash' 'printf "fail|%s|%s\n" "$CODEX_ALERT_THRESHOLD" "$CODEX_ALERT_RULE_INDEX" >> "$HOOK_LOG"' 'exit 7' > "$FAIL_HOOK"
 printf '%s\n' '#!/usr/bin/env bash' 'sleep 3' > "$SLOW_HOOK"
-chmod 700 "$FAIL_HOOK" "$SLOW_HOOK"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' 'cp "$STATE_FILE_FOR_HOOK" "$CRASH_STATE"' > "$CRASH_STATE_HOOK"
+chmod 700 "$FAIL_HOOK" "$SLOW_HOOK" "$CRASH_STATE_HOOK"
+export CRASH_STATE
 
 send_alert() {
   printf '%s\n' "$1" >> "$NOTIFICATION_LOG"
@@ -122,6 +127,29 @@ assert_contains "$(head -n 1 "$HOOK_LOG")" '|weekly|reset|1|' "observed weekly r
 assert_eq 1 "$(wc -l < "$NOTIFICATION_LOG")" "observed weekly reset notification was not sent"
 check_thresholds 100 100 unknown later '' "$new_weekly_deadline" "$((now + 1800))"
 assert_eq 1 "$(wc -l < "$HOOK_LOG")" "observed weekly reset script was replayed"
+
+# Partial data from another group cannot cross script thresholds.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='weekly:50'
+validate_config
+check_thresholds 100 80 unknown later '' "$old_weekly_deadline" "$now" group-a
+check_thresholds 100 40 unknown unknown '' '' "$((now + 1))" group-b
+[[ ! -e "$HOOK_LOG" ]] || fail "partial observation crossed limit groups"
+
+# The hook journal contains the current complete observation. Restoring that
+# crash point must still allow the following refill to be detected as a reset.
+reset_case
+ALERT_SCRIPT_1="$CRASH_STATE_HOOK"
+ALERT_SCRIPT_1_EVENTS='weekly:50'
+validate_config
+send_alert() { printf '%s\n' "$1" >> "$NOTIFICATION_LOG"; return 1; }
+check_thresholds 100 100 unknown later '' "$old_weekly_deadline" "$now" group-a
+check_thresholds 100 40 unknown later '' "$old_weekly_deadline" "$((now + 1))" group-a >/dev/null || true
+cp "$CRASH_STATE" "$STATE_FILE"
+send_alert() { printf '%s\n' "$1" >> "$NOTIFICATION_LOG"; return 0; }
+check_thresholds 100 100 unknown later '' "$((old_weekly_deadline + 30 * 60))" "$((now + 2))" group-a
+assert_contains "$(tail -n 1 "$NOTIFICATION_LOG")" "weekly limit reset" "hook journal missed the following reset"
 
 # Notification retries remain independent from the one-shot script journal.
 reset_case
