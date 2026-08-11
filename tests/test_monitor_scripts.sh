@@ -107,6 +107,22 @@ check_thresholds 40 100 later unknown "$((now + 500))" '' "$((now + 21))"
 assert_eq 2 "$(wc -l < "$HOOK_LOG")" "new cycle threshold did not execute"
 assert_contains "$(tail -n 1 "$HOOK_LOG")" '50|5h|threshold|1|' "new cycle threshold context"
 
+# An observed early weekly refill follows the same notification and one-shot
+# script path as a scheduled reset.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='weekly:reset'
+validate_config
+old_weekly_deadline=$((now + 4 * 24 * 60 * 60))
+new_weekly_deadline=$((old_weekly_deadline + 3 * 24 * 60 * 60))
+check_thresholds 100 28 unknown later '' "$old_weekly_deadline" "$now"
+check_thresholds 100 100 unknown later '' "$new_weekly_deadline" "$((now + 900))"
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" "observed weekly reset script did not execute"
+assert_contains "$(head -n 1 "$HOOK_LOG")" '|weekly|reset|1|' "observed weekly reset event contract"
+assert_eq 1 "$(wc -l < "$NOTIFICATION_LOG")" "observed weekly reset notification was not sent"
+check_thresholds 100 100 unknown later '' "$new_weekly_deadline" "$((now + 1800))"
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" "observed weekly reset script was replayed"
+
 # Notification retries remain independent from the one-shot script journal.
 reset_case
 ALERT_SCRIPT_1="$HOOK_ONE"
@@ -158,7 +174,7 @@ validate_config
 printf 'state_version=2\nprev_5h_pct=40\nprev_weekly_pct=100\n' > "$STATE_FILE"
 check_thresholds 40 100 later unknown '' '' "$now"
 [[ ! -e "$HOOK_LOG" ]] || fail "state migration replayed a historical threshold"
-assert_eq 3 "$(state_value state_version)" "alert state was not upgraded to version 3"
+assert_eq 4 "$(state_value state_version)" "alert state was not upgraded to version 4"
 assert_eq 1 "$(state_value script_tracking_initialized)" "script tracking was not initialized"
 
 printf 'PASS: monitor alert script tests\n'

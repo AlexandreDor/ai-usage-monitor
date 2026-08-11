@@ -67,7 +67,7 @@ reset_case
 printf 'prev_5h_pct=80\nprev_weekly_pct=70\n' > "$STATE_FILE"
 check_thresholds 80 70 "later" "later" "$((now + 300))" "$((now + 3600))" "$now"
 assert_alert_count 0
-[[ "$(state_value state_version)" == "3" ]] || fail "state was not migrated"
+[[ "$(state_value state_version)" == "4" ]] || fail "state was not migrated"
 
 # A reset older than its whole window is discarded rather than reported late.
 reset_case
@@ -75,6 +75,37 @@ check_thresholds 80 100 "later" "unknown" "$((now + 300))" "" "$now"
 check_thresholds 100 100 "later" "unknown" "" "" "$((now + 300 + 5 * 60 * 60 + 1))"
 assert_alert_count 0
 [[ "$(state_value five_h_armed_reset_at)" == "0" ]] || fail "stale 5h cycle was not cleared"
+
+# An early weekly refill with a materially advanced deadline is an observed
+# reset even though the old scheduled deadline has not arrived yet.
+reset_case
+old_weekly_deadline=$((now + 4 * 24 * 60 * 60))
+new_weekly_deadline=$((old_weekly_deadline + 3 * 24 * 60 * 60))
+check_thresholds 100 28 "unknown" "later" "" "$old_weekly_deadline" "$now"
+check_thresholds 100 100 "unknown" "later" "" "$new_weekly_deadline" "$((now + 900))"
+assert_alert_count 1
+[[ "$(state_value last_notified_weekly_reset_at)" == "$((now + 900))" ]] \
+  || fail "observed weekly reset was not persisted"
+check_thresholds 100 100 "unknown" "later" "" "$new_weekly_deadline" "$((now + 1800))"
+assert_alert_count 1
+
+# A small refill to full is also valid, while a deadline jump without a refill
+# is not enough evidence to notify.
+reset_case
+check_thresholds 100 92 "unknown" "later" "" "$old_weekly_deadline" "$now"
+check_thresholds 100 100 "unknown" "later" "" "$((old_weekly_deadline + 2 * 60 * 60))" "$((now + 900))"
+assert_alert_count 1
+reset_case
+check_thresholds 100 92 "unknown" "later" "" "$old_weekly_deadline" "$now"
+check_thresholds 100 92 "unknown" "later" "" "$new_weekly_deadline" "$((now + 900))"
+assert_alert_count 0
+
+# A long observation gap is insufficient evidence for an early reset because
+# the refill may have occurred at an unknown point while collection was down.
+reset_case
+check_thresholds 100 28 "unknown" "later" "" "$old_weekly_deadline" "$now"
+check_thresholds 100 100 "unknown" "later" "" "$new_weekly_deadline" "$((now + 3601))"
+assert_alert_count 0
 
 # Threshold alerts include the same weekly pace delta shown by the dashboard.
 reset_case

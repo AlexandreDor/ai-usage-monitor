@@ -38,6 +38,9 @@ HEALTH_FILE="${RUNTIME_DIR}/health.json"
 LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
 DEFAULT_INTERVAL_SECONDS=900
 INVALID_ALERT_SCRIPT_CONFIG=0
+RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT=20
+RANDOM_WEEKLY_RESET_FULL_REFILL_PCT=99
+RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS=$((2 * 60 * 60))
 
 load_config() {
   local line key value
@@ -997,6 +1000,49 @@ raise SystemExit(0 if math.isfinite(value) and 0 <= value < 100 else 1)
 PYEOF
 }
 
+is_random_weekly_reset() {
+  local previous_pct="$1"
+  local current_pct="$2"
+  local previous_reset_at="$3"
+  local current_reset_at="$4"
+  local scraped_at_epoch="$5"
+  local previous_scraped_at_epoch="$6"
+  local interval_seconds="$7"
+  local maximum_observation_gap=$(( interval_seconds * 2 ))
+  (( maximum_observation_gap < 3600 )) && maximum_observation_gap=3600
+
+  python3 - "$previous_pct" "$current_pct" "$previous_reset_at" "$current_reset_at" \
+    "$scraped_at_epoch" "$previous_scraped_at_epoch" "$maximum_observation_gap" \
+    "$RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT" \
+    "$RANDOM_WEEKLY_RESET_FULL_REFILL_PCT" \
+    "$RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS" <<'PYEOF'
+import math
+import sys
+
+try:
+    previous_pct, current_pct = map(float, sys.argv[1:3])
+    previous_reset_at, current_reset_at, scraped_at, previous_scraped_at = map(int, sys.argv[3:7])
+    maximum_observation_gap = int(sys.argv[7])
+    minimum_change, full_refill = map(float, sys.argv[8:10])
+    minimum_deadline_advance = int(sys.argv[10])
+except (TypeError, ValueError):
+    raise SystemExit(1)
+
+refill_change = current_pct - previous_pct
+observation_gap = scraped_at - previous_scraped_at
+detected = (
+    math.isfinite(previous_pct)
+    and math.isfinite(current_pct)
+    and 0 < observation_gap <= maximum_observation_gap
+    and previous_reset_at > scraped_at
+    and current_reset_at >= previous_reset_at + minimum_deadline_advance
+    and refill_change > 0
+    and (refill_change >= minimum_change or current_pct >= full_refill)
+)
+raise SystemExit(0 if detected else 1)
+PYEOF
+}
+
 csv_contains() {
   local list="$1" wanted="$2"
   [[ ",${list}," == *",${wanted},"* ]]
@@ -1006,9 +1052,11 @@ persist_alert_state() {
   local state_tmp
   state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || return 1
   if ! printf '%s\n' \
-    'state_version=3' \
+    'state_version=4' \
     "prev_5h_pct=${prev_5h_pct}" \
     "prev_weekly_pct=${prev_weekly_pct}" \
+    "prev_weekly_reset_at=${prev_weekly_reset_at}" \
+    "prev_scraped_at_epoch=${prev_scraped_at_epoch}" \
     "five_h_armed_reset_at=${five_h_armed_reset_at}" \
     "weekly_armed_reset_at=${weekly_armed_reset_at}" \
     "last_notified_5h_reset_at=${last_notified_5h_reset_at}" \
@@ -1093,9 +1141,12 @@ check_thresholds() {
   local five_h_reset_at="$5"
   local weekly_reset_at="$6"
   local scraped_at_epoch="$7"
+  local interval_seconds="${8:-$DEFAULT_INTERVAL_SECONDS}"
 
   local prev_5h_pct=100
   local prev_weekly_pct=100
+  local prev_weekly_reset_at=0
+  local prev_scraped_at_epoch=0
   local five_h_armed_reset_at=0
   local weekly_armed_reset_at=0
   local last_notified_5h_reset_at=0
@@ -1125,7 +1176,7 @@ check_thresholds() {
             printf -v "$state_key" '%s' "$state_value"
           fi
           ;;
-        five_h_armed_reset_at|weekly_armed_reset_at|last_notified_5h_reset_at|last_notified_weekly_reset_at)
+        prev_weekly_reset_at|prev_scraped_at_epoch|five_h_armed_reset_at|weekly_armed_reset_at|last_notified_5h_reset_at|last_notified_weekly_reset_at)
           if [[ "$state_value" =~ ^[0-9]+$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
           fi
@@ -1163,6 +1214,18 @@ check_thresholds() {
     [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && script_prev_5h_pct="$five_h_pct"
     [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && script_prev_weekly_pct="$weekly_pct"
     script_tracking_initialized=1
+  fi
+
+  # Codex can refill the weekly window before its previously announced
+  # deadline. Match the archive's conservative detection rule so alerts and
+  # reset history agree: require both a quota refill and a materially later
+  # deadline. Anchor the event to this first post-reset observation because the
+  # exact reset instant is unknown.
+  if (( prev_weekly_reset_at > 0 )) \
+    && is_random_weekly_reset "$prev_weekly_pct" "$weekly_pct" \
+      "$prev_weekly_reset_at" "$weekly_reset_at" "$scraped_at_epoch" \
+      "$prev_scraped_at_epoch" "$interval_seconds"; then
+    weekly_armed_reset_at="$scraped_at_epoch"
   fi
 
   # Reset delivery is retried while the reset still belongs to a plausible cycle.
@@ -1395,6 +1458,11 @@ PYEOF
     fi
   fi
 
+  if [[ "$weekly_reset_at" =~ ^[0-9]+$ ]]; then
+    prev_weekly_reset_at="$weekly_reset_at"
+  fi
+  prev_scraped_at_epoch="$scraped_at_epoch"
+
   if ! persist_alert_state; then
     echo "[ERROR] Could not persist alert state." >&2
     status=1
@@ -1519,7 +1587,7 @@ run_cycle() {
     scraped_at=$(json_get_field "$json" "scraped_at")
     scraped_at_epoch=$(timestamp_to_epoch "$scraped_at") || scraped_at_epoch=$(date -u +%s)
     check_thresholds "$five_h" "$weekly" "$five_h_reset" "$weekly_reset" \
-      "$five_h_reset_at" "$weekly_reset_at" "$scraped_at_epoch" \
+      "$five_h_reset_at" "$weekly_reset_at" "$scraped_at_epoch" "$interval_seconds" \
       || { status=1; append_cycle_error "${ALERT_PROCESSING_ERROR:-alert processing failed}"; }
   else
     status=1

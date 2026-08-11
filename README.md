@@ -480,9 +480,11 @@ ALERT_THRESHOLDS=90,75,50,25,10,5,1
 The monitor also alerts once when an active 5-hour or weekly limit resets. Reset
 deadlines are persisted locally, so a reset that happens while the monitor is
 stopped is reported on the next run when it is no more than one full limit
-window old. The first quota observation uses 100% as its baseline. A drop across
-several thresholds emits one alert for the most critical crossed threshold, and
-failed deliveries remain pending for a later cycle.
+window old. An early weekly refill is also reported when both the remaining
+quota and the announced reset deadline advance enough to distinguish it from a
+normal percentage fluctuation. The first quota observation uses 100% as its
+baseline. A drop across several thresholds emits one alert for the most critical
+crossed threshold, and failed deliveries remain pending for a later cycle.
 
 ### Local alert scripts
 
