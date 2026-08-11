@@ -38,6 +38,9 @@ HEALTH_FILE="${RUNTIME_DIR}/health.json"
 LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
 DEFAULT_INTERVAL_SECONDS=900
 INVALID_ALERT_SCRIPT_CONFIG=0
+RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT=20
+RANDOM_WEEKLY_RESET_FULL_REFILL_PCT=98
+RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS=$((30 * 60))
 
 load_config() {
   local line key value
@@ -997,6 +1000,39 @@ raise SystemExit(0 if math.isfinite(value) and 0 <= value < 100 else 1)
 PYEOF
 }
 
+is_random_weekly_reset() {
+  local previous_pct="$1"
+  local current_pct="$2"
+  local previous_reset_at="$3"
+  local current_reset_at="$4"
+
+  python3 - "$previous_pct" "$current_pct" "$previous_reset_at" "$current_reset_at" \
+    "$RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT" \
+    "$RANDOM_WEEKLY_RESET_FULL_REFILL_PCT" \
+    "$RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS" <<'PYEOF'
+import math
+import sys
+
+try:
+    previous_pct, current_pct = map(float, sys.argv[1:3])
+    previous_reset_at, current_reset_at = map(int, sys.argv[3:5])
+    minimum_change, full_refill = map(float, sys.argv[5:7])
+    minimum_deadline_advance = int(sys.argv[7])
+except (TypeError, ValueError):
+    raise SystemExit(1)
+
+refill_change = current_pct - previous_pct
+detected = (
+    math.isfinite(previous_pct)
+    and math.isfinite(current_pct)
+    and current_reset_at >= previous_reset_at + minimum_deadline_advance
+    and refill_change > 0
+    and (refill_change >= minimum_change or current_pct >= full_refill)
+)
+raise SystemExit(0 if detected else 1)
+PYEOF
+}
+
 csv_contains() {
   local list="$1" wanted="$2"
   [[ ",${list}," == *",${wanted},"* ]]
@@ -1006,11 +1042,15 @@ persist_alert_state() {
   local state_tmp
   state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || return 1
   if ! printf '%s\n' \
-    'state_version=3' \
+    'state_version=4' \
     "prev_5h_pct=${prev_5h_pct}" \
     "prev_weekly_pct=${prev_weekly_pct}" \
+    "observed_weekly_pct=${observed_weekly_pct}" \
+    "observed_weekly_reset_at=${observed_weekly_reset_at}" \
+    "observed_weekly_limit_id=${observed_weekly_limit_id}" \
     "five_h_armed_reset_at=${five_h_armed_reset_at}" \
     "weekly_armed_reset_at=${weekly_armed_reset_at}" \
+    "weekly_armed_limit_id=${weekly_armed_limit_id}" \
     "last_notified_5h_reset_at=${last_notified_5h_reset_at}" \
     "last_notified_weekly_reset_at=${last_notified_weekly_reset_at}" \
     "notified_5h_thresholds=${notified_5h_thresholds}" \
@@ -1093,11 +1133,16 @@ check_thresholds() {
   local five_h_reset_at="$5"
   local weekly_reset_at="$6"
   local scraped_at_epoch="$7"
+  local limit_id="${8:-default}"
 
   local prev_5h_pct=100
   local prev_weekly_pct=100
+  local observed_weekly_pct=""
+  local observed_weekly_reset_at=0
+  local observed_weekly_limit_id=""
   local five_h_armed_reset_at=0
   local weekly_armed_reset_at=0
+  local weekly_armed_limit_id=""
   local last_notified_5h_reset_at=0
   local last_notified_weekly_reset_at=0
   local notified_5h_thresholds=""
@@ -1115,17 +1160,19 @@ check_thresholds() {
   local attempted_script_weekly_reset_actions=""
   local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 initialize_script_baseline=0
+  local observed_weekly_reset=0 weekly_observation_valid=0 process_weekly_sample=1 state_loaded=0
   local -a script_thresholds=()
   ALERT_PROCESSING_ERROR=""
   if [[ -f "$STATE_FILE" ]]; then
+    state_loaded=1
     while IFS='=' read -r state_key state_value; do
       case "$state_key" in
-        prev_5h_pct|prev_weekly_pct|script_prev_5h_pct|script_prev_weekly_pct)
+        prev_5h_pct|prev_weekly_pct|observed_weekly_pct|script_prev_5h_pct|script_prev_weekly_pct)
           if [[ "$state_value" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
           fi
           ;;
-        five_h_armed_reset_at|weekly_armed_reset_at|last_notified_5h_reset_at|last_notified_weekly_reset_at)
+        observed_weekly_reset_at|five_h_armed_reset_at|weekly_armed_reset_at|last_notified_5h_reset_at|last_notified_weekly_reset_at)
           if [[ "$state_value" =~ ^[0-9]+$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
           fi
@@ -1135,6 +1182,9 @@ check_thresholds() {
           ;;
         pending_5h_threshold|pending_weekly_threshold)
           [[ -z "$state_value" || "$state_value" =~ ^[0-9]+$ ]] && printf -v "$state_key" '%s' "$state_value"
+          ;;
+        observed_weekly_limit_id|weekly_armed_limit_id)
+          printf -v "$state_key" '%s' "$state_value"
           ;;
         script_tracking_initialized)
           [[ "$state_value" == 0 || "$state_value" == 1 ]] && script_tracking_initialized="$state_value"
@@ -1153,6 +1203,9 @@ check_thresholds() {
   pace="$(weekly_pace_vs_ideal "$weekly_pct" "$weekly_reset_at" "$scraped_at_epoch")"
   pace_suffix=""
   [[ -n "$pace" ]] && pace_suffix=$'\n'"*Pace vs ideal:* ${pace}"
+  if [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ && "$weekly_reset_at" =~ ^[0-9]+$ ]]; then
+    weekly_observation_valid=1
+  fi
 
   if (( ${#ALERT_SCRIPT_RULE_INDICES[@]} == 0 )); then
     script_tracking_initialized=0
@@ -1163,6 +1216,66 @@ check_thresholds() {
     [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && script_prev_5h_pct="$five_h_pct"
     [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && script_prev_weekly_pct="$weekly_pct"
     script_tracking_initialized=1
+  fi
+
+  # Alert state belongs to one coherent limit group. A complete observation of
+  # another group starts a fresh baseline instead of crossing group boundaries.
+  if (( state_loaded == 1 )) && [[ -z "$observed_weekly_limit_id" ]]; then
+    if (( weekly_observation_valid == 1 )); then
+      prev_weekly_pct="$weekly_pct"
+      notified_weekly_thresholds=""
+      pending_weekly_threshold=""
+      script_prev_weekly_pct="$weekly_pct"
+      attempted_script_weekly_actions=""
+      observed_weekly_pct="$weekly_pct"
+      observed_weekly_reset_at="$weekly_reset_at"
+      observed_weekly_limit_id="$limit_id"
+    else
+      process_weekly_sample=0
+    fi
+  elif (( weekly_observation_valid == 1 )) \
+    && [[ -n "$observed_weekly_limit_id" && "$limit_id" != "$observed_weekly_limit_id" ]]; then
+    prev_weekly_pct="$weekly_pct"
+    notified_weekly_thresholds=""
+    pending_weekly_threshold=""
+    script_prev_weekly_pct="$weekly_pct"
+    attempted_script_weekly_actions=""
+    observed_weekly_pct="$weekly_pct"
+    observed_weekly_reset_at="$weekly_reset_at"
+    observed_weekly_limit_id="$limit_id"
+    if [[ "$weekly_armed_limit_id" != "$limit_id" ]]; then
+      weekly_armed_reset_at=0
+      weekly_armed_limit_id=""
+      script_weekly_reset_attempted_at=0
+      attempted_script_weekly_reset_actions=""
+    fi
+  elif [[ -n "$observed_weekly_limit_id" && "$limit_id" != "$observed_weekly_limit_id" ]]; then
+    process_weekly_sample=0
+  fi
+  if (( weekly_armed_reset_at > 0 )) && [[ -z "$weekly_armed_limit_id" ]]; then
+    weekly_armed_reset_at=0
+    script_weekly_reset_attempted_at=0
+    attempted_script_weekly_reset_actions=""
+  fi
+
+  # Codex can refill the weekly window before its previously announced
+  # deadline. Match the archive's conservative detection rule so alerts and
+  # reset history agree: require both a quota refill and a materially later
+  # deadline. Anchor the event to this first post-reset observation because the
+  # exact reset instant is unknown.
+  if (( observed_weekly_reset_at > 0 )) \
+    && [[ "$limit_id" == "$observed_weekly_limit_id" ]] \
+    && is_random_weekly_reset "$observed_weekly_pct" "$weekly_pct" \
+      "$observed_weekly_reset_at" "$weekly_reset_at"; then
+    weekly_armed_reset_at="$scraped_at_epoch"
+    weekly_armed_limit_id="$limit_id"
+    observed_weekly_reset=1
+    notified_weekly_thresholds=""
+    pending_weekly_threshold=""
+    prev_weekly_pct="$weekly_pct"
+    observed_weekly_pct="$weekly_pct"
+    observed_weekly_reset_at="$weekly_reset_at"
+    observed_weekly_limit_id="$limit_id"
   fi
 
   # Reset delivery is retried while the reset still belongs to a plausible cycle.
@@ -1191,8 +1304,19 @@ check_thresholds() {
     fi
   fi
 
-  if (( weekly_armed_reset_at > 0 && scraped_at_epoch >= weekly_armed_reset_at )); then
+  if (( weekly_armed_reset_at > 0 && scraped_at_epoch >= weekly_armed_reset_at )) \
+    && [[ "$weekly_armed_limit_id" == "$limit_id" ]]; then
     due_weekly_reset_at="$weekly_armed_reset_at"
+    if (( observed_weekly_reset == 0 )); then
+      if (( weekly_observation_valid == 1 )); then
+        observed_weekly_pct="$weekly_pct"
+        observed_weekly_reset_at="$weekly_reset_at"
+      else
+        observed_weekly_pct=""
+        observed_weekly_reset_at=0
+      fi
+      observed_weekly_limit_id="$limit_id"
+    fi
     reset_age=$(( scraped_at_epoch - weekly_armed_reset_at ))
     if (( reset_age <= 7 * 24 * 60 * 60 && last_notified_weekly_reset_at != weekly_armed_reset_at )); then
       if send_alert "*Codex weekly limit reset.* A new usage cycle is available."; then
@@ -1204,15 +1328,24 @@ check_thresholds() {
     fi
     if (( reset_age > 7 * 24 * 60 * 60 || last_notified_weekly_reset_at == weekly_armed_reset_at )); then
       weekly_armed_reset_at=0
+      weekly_armed_limit_id=""
       notified_weekly_thresholds=""
       pending_weekly_threshold=""
-      prev_weekly_pct=100
+      if (( observed_weekly_reset == 1 )); then
+        prev_weekly_pct="$weekly_pct"
+      else
+        prev_weekly_pct=100
+      fi
     fi
     if (( script_weekly_reset_attempted_at != due_weekly_reset_at )); then
       script_weekly_reset_attempted_at="$due_weekly_reset_at"
       attempted_script_weekly_reset_actions=""
       attempted_script_weekly_actions=""
-      script_prev_weekly_pct=100
+      if (( observed_weekly_reset == 1 )); then
+        script_prev_weekly_pct="$weekly_pct"
+      else
+        script_prev_weekly_pct=100
+      fi
     fi
   fi
 
@@ -1230,6 +1363,7 @@ check_thresholds() {
     && percentage_below_full "$weekly_pct" \
     && (( weekly_reset_at > scraped_at_epoch && weekly_reset_at <= scraped_at_epoch + 8 * 24 * 60 * 60 )); then
     weekly_armed_reset_at="$weekly_reset_at"
+    weekly_armed_limit_id="$limit_id"
   fi
 
   # The first observation uses 100% as its baseline. A multi-threshold drop emits
@@ -1272,7 +1406,7 @@ PYEOF
     fi
   fi
 
-  if [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+  if (( process_weekly_sample == 1 )) && [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
     critical="$pending_weekly_threshold"
     for t in "${thresholds[@]}"; do
       if python3 - "$weekly_pct" "$prev_weekly_pct" "$t" "$notified_weekly_thresholds" <<'PYEOF'
@@ -1308,6 +1442,14 @@ PYEOF
     else
       prev_weekly_pct="$weekly_pct"
     fi
+  fi
+
+  # Journal a complete observation before any hook can persist or act on this
+  # cycle. Notification retry state remains independent in prev_weekly_pct.
+  if (( weekly_observation_valid == 1 )); then
+    observed_weekly_pct="$weekly_pct"
+    observed_weekly_reset_at="$weekly_reset_at"
+    observed_weekly_limit_id="$limit_id"
   fi
 
   # Notifications above are always attempted before local scripts. Script actions
@@ -1367,7 +1509,7 @@ PYEOF
       (( script_state_error == 0 )) && script_prev_5h_pct="$five_h_pct"
     fi
 
-    if (( script_state_error == 0 && initialize_script_baseline == 0 )) \
+    if (( script_state_error == 0 && initialize_script_baseline == 0 && process_weekly_sample == 1 )) \
       && [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
       mapfile -t script_thresholds < <(
         printf '%s\n' "${ALERT_SCRIPT_RULE_EVENTS[@]}" \
@@ -1509,17 +1651,18 @@ run_cycle() {
     fi
     sync_gist "$json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
 
-    local five_h weekly five_h_reset weekly_reset five_h_reset_at weekly_reset_at scraped_at scraped_at_epoch
+    local five_h weekly five_h_reset weekly_reset five_h_reset_at weekly_reset_at limit_id scraped_at scraped_at_epoch
     five_h=$(json_get_field "$json" "five_h_pct")
     weekly=$(json_get_field "$json" "weekly_pct")
     five_h_reset=$(json_get_field "$json" "five_h_reset")
     weekly_reset=$(json_get_field "$json" "weekly_reset")
     five_h_reset_at=$(json_get_field "$json" "five_h_reset_at")
     weekly_reset_at=$(json_get_field "$json" "weekly_reset_at")
+    limit_id=$(json_get_field "$json" "limit_id")
     scraped_at=$(json_get_field "$json" "scraped_at")
     scraped_at_epoch=$(timestamp_to_epoch "$scraped_at") || scraped_at_epoch=$(date -u +%s)
     check_thresholds "$five_h" "$weekly" "$five_h_reset" "$weekly_reset" \
-      "$five_h_reset_at" "$weekly_reset_at" "$scraped_at_epoch" \
+      "$five_h_reset_at" "$weekly_reset_at" "$scraped_at_epoch" "$limit_id" \
       || { status=1; append_cycle_error "${ALERT_PROCESSING_ERROR:-alert processing failed}"; }
   else
     status=1
