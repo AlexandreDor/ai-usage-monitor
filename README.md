@@ -259,15 +259,17 @@ Scripts receive:
 | Variable | Default | Accepted values | Description |
 |---|---:|---|---|
 | `LOOP_INTERVAL` | `900` | Integer from `1` to `86400` seconds | Collection cadence used by `--loop`. |
-| `HISTORY_RETENTION_HOURS` | `192` | Number from `0.25` to `8760` | Rolling `history.json` target. It is currently converted to an entry limit using the active interval. |
+| `HISTORY_RETENTION_HOURS` | `192` | Number from `0.25` to `8760` | Age-based rolling window for `history.json`; defensive limits of 10,000 entries and 16 MiB also apply. |
 | `ARCHIVE_RETENTION_DAYS` | `365` | Integer from `0` to `36500` | SQLite retention; `0` keeps data indefinitely. |
 | `CODEX_STATUS_TIMEOUT_SECONDS` | `20` | Integer from `5` to `300` | Timeout for the Codex app-server status request. |
 | `CODEX_BIN` | `codex` | Executable name or path | Codex CLI command used by the monitor. |
 | `MONITOR_DEBUG` | `0` | `0` or `1` | Enables bounded sanitized Codex and HTTP diagnostics. |
 
 The SQLite archive retains detailed quota, reset, and token data for Analytics.
-The rolling JSON history is separate and currently uses an entry count derived
-from `HISTORY_RETENTION_HOURS` and the active collection interval.
+The rolling JSON history is separate and retains samples according to their
+actual timestamps. Changing the collection interval does not change the time
+span requested by `HISTORY_RETENTION_HOURS`; only the defensive entry and size
+limits can shorten it.
 
 ### Token Analytics
 

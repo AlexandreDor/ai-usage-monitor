@@ -124,33 +124,6 @@ correspondent pas à un reset identifiable.
 
 **Effort : M**
 
-### 5. Rendre l'historique JSON réellement temporel
-
-L'archive SQLite applique déjà une rétention temporelle et un compactage. Le
-fichier `history.json` du dashboard principal reste géré inline dans
-`monitor.sh` et tronqué selon un nombre d'entrées dérivé de l'intervalle courant.
-
-**Actions :**
-
-- Extraire la gestion de l'historique dans `local/history.py`.
-- Valider les snapshots et normaliser leurs timestamps en epoch.
-- Refuser les pourcentages hors de l'intervalle `0..100`.
-- Trier et dédupliquer selon le timestamp réel.
-- Appliquer `HISTORY_RETENTION_HOURS` selon l'âge des relevés.
-- Conserver l'écriture atomique et la sauvegarde existantes, en garantissant un
-  nom réellement unique pour chaque historique corrompu.
-- Conserver un plafond défensif de 10 000 entrées et 16 MiB.
-
-**Critères de validation :**
-
-- La durée conservée reste correcte après une interruption ou un changement
-  d'intervalle `900 -> 60 -> 900`.
-- Une corruption ne provoque pas la perte silencieuse de l'historique.
-- Les entrées invalides, dupliquées, trop anciennes ou trop nombreuses sont
-  traitées sans crash.
-
-**Effort : S à M**
-
 ### 6. Centraliser la configuration partagée
 
 La configuration est validée par le monitor et `serve.sh` sait déjà relire le
@@ -331,9 +304,9 @@ intégrée.
 
 ### 17. Réduire progressivement le script monolithique
 
-Le stockage, l'archivage et la collecte Analytics sont déjà séparés en modules
-Python. Le protocole Codex, la validation principale et l'orchestration restent
-concentrés dans `monitor.sh`.
+Le stockage, l'historique, l'archivage et la collecte Analytics sont déjà
+séparés en modules Python. Le protocole Codex, la validation principale et
+l'orchestration restent concentrés dans `monitor.sh`.
 
 **Objectif :** améliorer la testabilité sans lancer une réécriture prématurée.
 
@@ -342,8 +315,8 @@ concentrés dans `monitor.sh`.
 - Définir un schéma versionné pour les snapshots et l'historique JSON.
 - Déplacer progressivement le protocole Codex et la validation vers des modules
   Python testables.
-- Extraire en priorité `history.py`, `config.py` et un client du protocole Codex,
-  puis limiter Bash au parsing CLI et à l'orchestration.
+- Extraire en priorité `config.py` et un client du protocole Codex, puis limiter
+  Bash au parsing CLI et à l'orchestration.
 
 **Effort : L**
 
@@ -371,7 +344,7 @@ du monitor reste à ajouter dans l'objectif 14.
 1. Ajouter la détection des données périmées et le rafraîchissement adaptatif au
    dashboard principal.
 2. Détecter les anomalies de quota.
-3. Extraire l'historique JSON et centraliser la configuration.
+3. Centraliser la configuration partagée.
 4. Finaliser WAL, les sauvegardes SQLite et l'empreinte du catalogue.
 5. Terminer les éléments Analytics restants.
 6. Terminer l'accessibilité du dashboard.
@@ -397,7 +370,6 @@ Le programme restant est terminé lorsque :
 - le dashboard principal détecte et annonce les données périmées ;
 - un dashboard local actif actualise le relevé principal toutes les 5 minutes
   sans densifier les historiques ;
-- l'historique JSON applique une rétention temporelle robuste ;
 - les mouvements de quota anormaux sont détectés sans confondre les resets
   légitimes ;
 - le monitor et le serveur partagent une configuration non exécutable ;
