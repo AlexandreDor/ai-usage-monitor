@@ -32,6 +32,7 @@ if (defaults.CodexPreferences.formatRate() !== '0.86') fail('conversion rate for
 if (defaults.CodexPreferences.t('analytics.showCost') !== 'Show cost') fail('analytics cost toggle translation is missing');
 if (defaults.CodexPreferences.t('dashboard.globalResetForecast') !== 'Global reset forecast') fail('dashboard forecast translation is missing');
 if (defaults.CodexPreferences.t('analytics.randomResets') !== 'Random resets') fail('random reset translation is missing');
+if (!defaults.CodexPreferences.t('analytics.randomResetImpact', { gained: '1 pt', lost: '2 pts' }).includes('ideal pace')) fail('random reset impact does not mention ideal pace');
 if (defaults.CodexPreferences.t('analytics.uncachedInput') !== 'Uncached input') fail('analytics metric translation is missing');
 
 defaults.CodexPreferences.set({ language: 'fr', currency: 'USD' });
@@ -40,6 +41,7 @@ if (defaults.CodexPreferences.get().language !== 'fr') fail('language preference
 if (defaults.CodexPreferences.t('analytics.showCost') !== 'Afficher le coût') fail('French analytics cost toggle translation is missing');
 if (defaults.CodexPreferences.t('dashboard.forecastUnavailable') !== 'Prévision indisponible') fail('French dashboard forecast translation is missing');
 if (defaults.CodexPreferences.t('analytics.randomResets') !== 'Réinitialisations aléatoires') fail('French random reset translation is missing');
+if (!defaults.CodexPreferences.t('analytics.randomResetImpact', { gained: '1 pt', lost: '2 pts' }).includes('rythme idéal')) fail('French random reset impact does not mention ideal pace');
 if (defaults.CodexPreferences.t('analytics.freshness') !== 'Fraîcheur') fail('French analytics freshness translation is missing');
 
 const invalid = createContext('{not-json');

@@ -41,6 +41,8 @@ test('works offline and exposes no critical accessibility violations', async ({ 
   await expect(page.locator('.forecast-link')).toHaveAttribute('target', '_blank');
   await expect(page.locator('.forecast-link')).toHaveAttribute('rel', 'noopener noreferrer');
   await expect(page.locator('.dashboard-links .external-link')).toHaveAttribute('href', 'https://github.com/AlexandreDor/ai-usage-monitor');
+  await expect(page.locator('.dashboard-links a').first()).toHaveAttribute('href', 'https://github.com/AlexandreDor/ai-usage-monitor');
+  await expect(page.locator('.dashboard-links a').last()).toHaveAttribute('href', 'analytics.html');
   expect(externalRequests).toEqual([]);
 
   const results = await new AxeBuilder({ page }).analyze();
@@ -159,7 +161,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#weekly-reset-count')).toHaveText('2');
   await expect(page.locator('#weekly-reset-impact')).toHaveText('1 random · 1 end of week');
   await expect(page.locator('#random-reset-count')).toHaveText('1');
-  await expect(page.locator('#random-reset-impact')).toHaveText('30.004 pts gained · 0 pts lost');
+  await expect(page.locator('#random-reset-impact')).toHaveText('30.004 pts gained · 0 pts lost vs ideal pace');
   await expect(page.locator('#end-week-reset-count')).toHaveText('1');
   await expect(page.locator('.metric-card')).toHaveCount(10);
   await expect(page.locator('#toggle-token-overlay')).toHaveAttribute('aria-pressed', 'true');
@@ -195,7 +197,10 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await page.locator('#source-filter [data-filter-value="codex"]').click();
   await expect.poll(() => analyticsQueries.at(-1)?.get('sources')).toBe('opencode,hermes');
   await expect(page.locator('.page-nav')).toHaveCount(0);
-  await expect(page.locator('.back-link')).toHaveCount(1);
+  await expect(page.locator('.analytics-nav .back-link')).toHaveCount(2);
+  await expect(page.locator('.back-link[href="dashboard.html"]')).toHaveCount(1);
+  await expect(page.locator('.analytics-nav .external-link')).toHaveAttribute('href', 'https://github.com/AlexandreDor/ai-usage-monitor');
+  await expect(page.locator('.analytics-nav .external-link')).toHaveAttribute('rel', 'noopener noreferrer');
   await expect(page.locator('#assumed-zero-tokens, #period-label, #granularity-label')).toHaveCount(0);
   const chartBounds = await page.evaluate(() => ({
     limitsMin: limitsChart.options.scales.x.min,
