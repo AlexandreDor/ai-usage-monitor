@@ -45,4 +45,61 @@ export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_TELEGRAM_STATUS=200
 check_thresholds 70 100 later unknown '' '' 2000000001 >/dev/null
 assert_eq "" "$(awk -F= '$1 == "pending_5h_threshold" {print $2}' "$STATE_FILE")" "pending threshold not cleared after retry"
 
+# Delivery is tracked independently: Discord is not replayed after succeeding.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-partial"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+export FAKE_CURL_TELEGRAM_STATUS_SEQUENCE=503,200 FAKE_CURL_TELEGRAM_EXIT=0
+unset FAKE_CURL_TELEGRAM_STATUS FAKE_CURL_HEADERS
+check_thresholds 70 100 later unknown '' '' 2000000100 >/dev/null 2>&1 \
+  && fail "partial channel failure did not fail the cycle"
+assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.status)" "Discord state"
+assert_eq pending "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.telegram.status)" "Telegram pending state"
+check_thresholds 70 100 later unknown '' '' 2000000101 >/dev/null
+assert_eq 1 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" "Discord was replayed"
+assert_eq 2 "$(<"${FAKE_CURL_COUNT_DIR}/telegram")" "Telegram was not retried"
+assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.status)" "aggregate delivery state"
+
+# Permanent client errors are attempted once and never replayed.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-permanent"
+export FAKE_CURL_DISCORD_STATUS=400
+unset FAKE_CURL_TELEGRAM_STATUS_SEQUENCE
+TELEGRAM_BOT_TOKEN='' TELEGRAM_CHAT_ID=''
+check_thresholds 70 100 later unknown '' '' 2000000200 >/dev/null 2>&1 \
+  && fail "permanent failure did not fail its first cycle"
+check_thresholds 70 100 later unknown '' '' 2000000201 >/dev/null
+assert_eq 1 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" "permanent error was retried"
+assert_eq failed "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.status)" "permanent channel state"
+
+# A legacy pending threshold is migrated atomically and keeps a legacy cycle ID.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-migration"
+unset FAKE_CURL_DISCORD_STATUS_SEQUENCE FAKE_CURL_DISCORD_HEADERS
+export FAKE_CURL_DISCORD_STATUS=204
+legacy_reset=$((2000000250 + 300))
+printf '%s\n' \
+  'state_version=4' 'prev_5h_pct=80' 'prev_weekly_pct=100' \
+  "five_h_armed_reset_at=${legacy_reset}" 'weekly_armed_reset_at=0' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=75' 'pending_weekly_threshold=' > "$STATE_FILE"
+check_thresholds 70 100 later unknown "$legacy_reset" '' 2000000250 >/dev/null
+assert_eq 4 "$(json_field "$ALERT_DELIVERIES_FILE" legacy_migration.source_state_version)" "migration source version"
+assert_contains "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.cycle_key)" 'legacy-v4|' "legacy cycle key"
+assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.status)" "migrated delivery"
+
+# A long Retry-After is persisted without blocking and suppresses early cycles.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-rate-limit"
+export FAKE_CURL_DISCORD_STATUS_SEQUENCE=429,204
+export FAKE_CURL_DISCORD_HEADERS='Retry-After: 120'
+check_thresholds 70 100 later unknown '' '' 2000000300 >/dev/null 2>&1 \
+  && fail "rate limit did not fail its attempt cycle"
+assert_eq 2000000420 "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.next_attempt_at)" "Retry-After deadline"
+check_thresholds 70 100 later unknown '' '' 2000000301 >/dev/null
+assert_eq 1 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" "future retry ran too early"
+check_thresholds 70 100 later unknown '' '' 2000000420 >/dev/null
+assert_eq 2 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" "due retry did not run"
+
 printf 'PASS: monitor network tests\n'

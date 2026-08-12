@@ -169,7 +169,7 @@ chmod +x monitor.sh serve.sh
 # For trusted LAN access: ./serve.sh --bind 0.0.0.0 --port 8080
 ```
 
-Important: `serve.sh` only hosts an explicit allowlist containing the two dashboards, their local assets, the favicon, `data.json`, `history.json`, and the read-only `/api/analytics` response. The raw SQLite archive and files such as `.env`, `.alert_state`, `health.json`, locks, logs, and directory listings are never served. It does not refresh usage by itself; `monitor.sh` must also run on a loop or schedule.
+Important: `serve.sh` only hosts an explicit allowlist containing the two dashboards, their local assets, the favicon, `data.json`, `history.json`, and the read-only `/api/analytics` response. The raw SQLite archive and files such as `.env`, `.alert_state`, `alert-deliveries.json`, `health.json`, locks, logs, and directory listings are never served. It does not refresh usage by itself; `monitor.sh` must also run on a loop or schedule.
 
 ### LAN security
 
@@ -484,8 +484,25 @@ window old. An early weekly refill is also reported when the remaining quota
 reaches at least 98% or increases by at least 20 percentage points, and the
 announced reset deadline advances by at least 30 minutes. The first quota
 observation uses 100% as its baseline. A drop across several thresholds emits
-one alert for the most critical crossed threshold, and failed deliveries remain
-pending for a later cycle.
+one alert for the most critical crossed threshold, and temporary delivery
+failures remain pending for a later cycle.
+
+Network alerts are recorded in the private
+`local/runtime/alert-deliveries.json` journal before the first request. Discord
+and Telegram then advance independently: a successful channel is never replayed
+just because the other one failed. HTTP 408, 429 and 5xx responses, timeouts and
+transport failures remain pending; `Retry-After` is honored without blocking a
+monitor cycle for more than 60 seconds. Other 4xx responses, redirects,
+unexpected success responses and invalid Telegram confirmations are permanent
+failures. A more critical threshold in the same quota cycle atomically replaces
+the older pending threshold while preserving one immutable message per alert.
+
+The journal stores logical channel names and status codes, never webhook URLs,
+tokens, chat IDs, response bodies or raw headers. Adding a channel does not
+replay historical alerts. Removing a channel permanently closes its pending
+deliveries; rotating credentials for a configured channel lets its pending
+deliveries continue normally. Reconciled terminal entries are retained for 30
+days, with a defensive limit of 500 entries.
 
 ### Local alert scripts
 
@@ -526,7 +543,7 @@ by ascending index. A reset clears that window's script threshold journal.
 Each action is journaled before execution and attempted at most once. A non-zero
 exit or timeout is logged but does not fail the monitor cycle, retry the action,
 or prevent later scripts from running. Notification delivery remains independent
-and keeps its existing retry behavior. Scripts run synchronously under the cycle
+and uses its per-channel durable retry journal. Scripts run synchronously under the cycle
 lock, from their own directory, with no stdin. Their stdout and stderr go to the
 monitor log.
 

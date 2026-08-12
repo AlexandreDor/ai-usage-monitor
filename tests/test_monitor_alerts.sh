@@ -13,6 +13,8 @@ ALERT_LOG="${TEST_ROOT}/alerts.log"
 ALERT_COUNT_LOG="${TEST_ROOT}/alert-count.log"
 ALERT_THRESHOLDS=0
 
+# Invoked through register_network_alert's compatibility seam.
+# shellcheck disable=SC2329
 send_alert() {
   printf '%s\n' "$1" >> "$ALERT_LOG"
   printf '1\n' >> "$ALERT_COUNT_LOG"
@@ -37,7 +39,7 @@ state_value() {
 }
 
 reset_case() {
-  rm -f "$STATE_FILE" "$ALERT_LOG" "$ALERT_COUNT_LOG"
+  rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$ALERT_LOG" "$ALERT_COUNT_LOG"
 }
 
 now=2000000000
@@ -142,12 +144,14 @@ assert_alert_count 1
 reset_case
 ALERT_THRESHOLDS=50
 check_thresholds 100 100 "unknown" "later" "" "$old_weekly_deadline" "$now"
+# shellcheck disable=SC2329
 send_alert() {
   printf '%s\n' "$1" >> "$ALERT_LOG"
   printf '1\n' >> "$ALERT_COUNT_LOG"
   return 1
 }
 check_thresholds 100 40 "unknown" "later" "" "$old_weekly_deadline" "$((now + 1))" || true
+# shellcheck disable=SC2329
 send_alert() {
   printf '%s\n' "$1" >> "$ALERT_LOG"
   printf '1\n' >> "$ALERT_COUNT_LOG"

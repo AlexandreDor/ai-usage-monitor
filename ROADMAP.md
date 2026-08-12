@@ -52,33 +52,6 @@ que soit son âge.
 
 **Effort : S**
 
-### 2. Suivre la livraison des alertes séparément par canal
-
-L'état actuel sait rejouer une alerte en attente, mais considère la livraison
-réussie dès qu'un canal a fonctionné. Il ne mémorise pas le résultat de Discord
-et Telegram séparément pour une même alerte.
-
-**Actions :**
-
-- Donner un `alert_id` stable à chaque alerte.
-- Conserver, pour chaque canal configuré, un état `pending`, `delivered` ou
-  `failed`.
-- Considérer l'alerte entièrement livrée uniquement lorsque tous les canaux
-  configurés ont réussi.
-- Ne pas retenter les erreurs HTTP 4xx permanentes ; retenter les erreurs 429,
-  5xx et les timeouts en respectant `Retry-After`.
-- Migrer les anciens états sans rejouer une alerte déjà livrée.
-- Exclure les tokens et URL sensibles des diagnostics persistés.
-
-**Critères de validation :**
-
-- La réussite de Discord ne masque pas l'échec de Telegram, et inversement.
-- Seuls les canaux encore en attente sont rejoués au cycle suivant.
-- Les migrations depuis les formats d'état existants sont testées.
-- Les réponses 4xx, 429, 5xx et les timeouts sont couvertes.
-
-**Effort : M**
-
 ### 3. Accélérer les relevés pendant la consultation du dashboard
 
 Lorsqu'un utilisateur consulte le dashboard local, le relevé principal doit être
@@ -388,7 +361,7 @@ intégrée.
 - Remplacer les URL de clonage génériques par l'URL canonique du dépôt.
 - Vérifier les procédures LXC, systemd et GitHub Pages avec les noms et chemins
   actuels.
-- Expliquer les états de fraîcheur et le suivi par canal des alertes.
+- Expliquer les états de fraîcheur.
 - Documenter la sauvegarde et la restauration de SQLite, y compris le mode WAL.
 - Maintenir la référence de configuration avec les changements de `config.py`.
 
@@ -442,8 +415,7 @@ du monitor reste à ajouter dans l'objectif 14.
 
 1. Ajouter la détection des données périmées et le rafraîchissement adaptatif au
    dashboard principal.
-2. Fiabiliser le suivi des alertes par canal, puis détecter les anomalies de
-   quota.
+2. Détecter les anomalies de quota.
 3. Extraire l'historique JSON et centraliser la configuration.
 4. Finaliser WAL, les sauvegardes SQLite et l'empreinte du catalogue.
 5. Terminer les éléments Analytics restants, améliorer l'exploration des
@@ -472,7 +444,6 @@ Le programme restant est terminé lorsque :
 - un dashboard local actif actualise le relevé principal toutes les 5 minutes
   sans densifier les historiques ;
 - l'historique JSON applique une rétention temporelle robuste ;
-- les alertes sont suivies indépendamment pour chaque canal ;
 - les mouvements de quota anormaux sont détectés sans confondre les resets
   légitimes ;
 - le monitor et le serveur partagent une configuration non exécutable ;
