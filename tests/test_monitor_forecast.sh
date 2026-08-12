@@ -24,6 +24,9 @@ assert_eq '2026-08-12T17:17:44Z' "$(python3 -c 'import json,sys; print(json.load
 
 snapshot='{"five_h_pct":80,"weekly_pct":60,"five_h_reset":"later","weekly_reset":"later","scraped_at":"2026-08-12T17:15:00Z","sample_interval_seconds":900,"history_window_hours":192,"limit_id":"test"}'
 enriched="$(enrich_snapshot_with_codex_forecast "$snapshot")"
+# The real sourced implementation is exercised here before a cycle-specific
+# stub with the same name is declared below.
+# shellcheck disable=SC2218
 write_local_snapshot "$enriched" 900 >/dev/null
 assert_eq 76 "$(json_field "$DATA_FILE" codex_forecast.chance_24h_pct)" "forecast missing from data.json"
 assert_eq false "$(python3 -c 'import json,sys; print(str("codex_forecast" in json.load(open(sys.argv[1], encoding="utf-8"))[0]).lower())' "$HISTORY_FILE")" "forecast leaked into history.json"
