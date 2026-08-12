@@ -139,6 +139,17 @@ function evaluate(expression) {
   if (element('forecast-24h').textContent !== '--') fail('stale forecast remained visible');
   if (element('forecast-status').textContent !== 'Forecast unavailable') fail('stale forecast was not marked unavailable');
 
+  evaluate(`renderForecast({
+    sample_interval_seconds: 900,
+    codex_forecast: {
+      chance_24h_pct: 76,
+      chance_6h_pct: 10,
+      generated_at: '2999-01-01T00:00:00Z',
+    },
+  })`);
+  if (element('forecast-24h').textContent !== '--') fail('future forecast remained visible');
+  if (element('forecast-status').textContent !== 'Forecast unavailable') fail('future forecast was not marked unavailable');
+
   fetchQueue = [
     { five_h_pct: 80, weekly_pct: 70, scraped_at: '2026-08-03T00:00:00Z' },
     [],

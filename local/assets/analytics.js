@@ -585,7 +585,7 @@ function updateModelOptions(models) {
   const changed = normalized.join('\0') !== state.availableModels.join('\0');
   state.availableModels = normalized;
   let shouldRefresh = false;
-  if (!state.modelAvailabilityResolved) {
+  if (!state.modelAvailabilityResolved && normalized.length) {
     const availableGpt = normalized.filter(model => GPT_56_MODELS.includes(model));
     if (availableGpt.length) {
       state.models = availableGpt;

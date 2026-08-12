@@ -639,15 +639,21 @@ PYEOF
 }
 
 fetch_codex_forecast() {
-  local bucket response_file status curl_status=0
+  local bucket response_file response_bytes status curl_status=0
   bucket=$(( $(date -u +%s) / 300 ))
   response_file="$(mktemp "${RUNTIME_DIR}/.forecast-response.XXXXXX")"
-  status="$(curl --silent --show-error --connect-timeout 3 --max-time 8 \
+  status="$(curl --silent --show-error --connect-timeout 3 --max-time 8 --max-filesize 65536 \
     --output "$response_file" --write-out '%{http_code}' \
     "https://codex.lunarwerx.com/cnx/aireset/summary/t/${bucket}" 2>/dev/null)" || curl_status=$?
   if (( curl_status != 0 )) || [[ "$status" != 200 ]]; then
     rm -f "$response_file"
     echo "[WARN] Codex Forecast is unavailable; continuing without global reset probabilities." >&2
+    return 1
+  fi
+  response_bytes="$(wc -c < "$response_file")"
+  if [[ ! "$response_bytes" =~ ^[0-9]+$ ]] || (( response_bytes > 65536 )); then
+    rm -f "$response_file"
+    echo "[WARN] Codex Forecast returned an oversized response; continuing without global reset probabilities." >&2
     return 1
   fi
 
@@ -683,11 +689,14 @@ except (OverflowError, ValueError):
     raise SystemExit(1)
 if generated.tzinfo is None:
     raise SystemExit(1)
+generated = generated.astimezone(datetime.timezone.utc)
+if generated > datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5):
+    raise SystemExit(1)
 
 forecast = {
     "chance_24h_pct": probability("chanceToday"),
     "chance_6h_pct": probability("chanceSoon"),
-    "generated_at": generated.astimezone(datetime.timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "generated_at": generated.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }
 print(json.dumps(forecast, separators=(",", ":")))
 PYEOF

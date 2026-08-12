@@ -278,6 +278,31 @@ test('falls back once to all models when GPT 5.6 is unavailable', async ({ page 
   expect(queries).toHaveLength(2);
 });
 
+test('selects GPT 5.6 when models appear after an initially empty archive', async ({ page }) => {
+  const queries = [];
+  let availableModels = [];
+  await page.route('**/api/analytics?*', route => {
+    queries.push(new URL(route.request().url()).searchParams);
+    return route.fulfill({
+      json: {
+        ...analyticsPayload,
+        available: { ...analyticsPayload.available, models: availableModels },
+      },
+    });
+  });
+  await page.goto('/analytics.html');
+
+  await expect.poll(() => queries.length).toBe(1);
+  await expect(page.locator('#analytics-error')).toBeHidden();
+  availableModels = ['gpt-5.6-sol', 'legacy-model'];
+  await page.locator('[data-range="7d"]').click();
+
+  await expect.poll(() => queries.length).toBe(2);
+  await expect(page.locator('#model-filter [data-filter-value="gpt-5.6-sol"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#model-filter [data-filter-value="legacy-model"]')).toHaveAttribute('aria-pressed', 'false');
+  await expect(page.locator('#analytics-error')).toBeHidden();
+});
+
 test('keeps the complete dashboard above the fold at 1920x1080', async ({ page }) => {
   await page.setViewportSize({ width: 1920, height: 1080 });
   await mockUsage(page);

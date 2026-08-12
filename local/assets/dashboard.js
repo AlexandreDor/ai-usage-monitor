@@ -135,6 +135,7 @@ function renderForecast(data) {
   const available = chance24h !== null
     && chance6h !== null
     && Number.isFinite(generatedAt)
+    && ageMs >= -5 * 60 * 1000
     && ageMs <= staleAfterMs;
 
   document.getElementById('forecast-24h').textContent = available ? `${chance24h}%` : '--';

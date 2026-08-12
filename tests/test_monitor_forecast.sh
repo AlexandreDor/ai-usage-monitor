@@ -35,6 +35,12 @@ export FAKE_CURL_BODY='{invalid'
 fetch_codex_forecast >/dev/null 2>&1 && fail "invalid forecast JSON was accepted"
 export FAKE_CURL_BODY='{"chanceToday":1.01,"chanceSoon":0.1,"generatedAt":"2026-08-12T17:17:44Z"}'
 fetch_codex_forecast >/dev/null 2>&1 && fail "out-of-range forecast probability was accepted"
+export FAKE_CURL_BODY='{"chanceToday":0.5,"chanceSoon":0.1,"generatedAt":"2999-08-12T17:17:44Z"}'
+fetch_codex_forecast >/dev/null 2>&1 && fail "future forecast timestamp was accepted"
+printf -v oversized_body '%*s' 65537 ''
+export FAKE_CURL_BODY="$oversized_body"
+fetch_codex_forecast >/dev/null 2>&1 && fail "oversized forecast response was accepted"
+unset oversized_body
 export FAKE_CURL_STATUS=503 FAKE_CURL_BODY='{}'
 fetch_codex_forecast >/dev/null 2>&1 && fail "unavailable forecast endpoint was accepted"
 
