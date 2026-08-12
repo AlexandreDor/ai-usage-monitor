@@ -119,6 +119,32 @@ function setBar(barId, pctId, pct) {
   value.classList.toggle('unavailable', safePct === null);
 }
 
+function renderForecast(data) {
+  const strip = document.getElementById('forecast-strip');
+  const status = document.getElementById('forecast-status');
+  const forecast = data?.codex_forecast;
+  const chance24h = validPct(forecast?.chance_24h_pct);
+  const chance6h = validPct(forecast?.chance_6h_pct);
+  const generatedAt = Date.parse(displayText(forecast?.generated_at, ''));
+  const intervalSeconds = Number(data?.sample_interval_seconds);
+  const staleAfterMs = Math.max(
+    30 * 60 * 1000,
+    (Number.isFinite(intervalSeconds) && intervalSeconds > 0 ? intervalSeconds * 2 : 0) * 1000,
+  );
+  const ageMs = Date.now() - generatedAt;
+  const available = chance24h !== null
+    && chance6h !== null
+    && Number.isFinite(generatedAt)
+    && ageMs <= staleAfterMs;
+
+  document.getElementById('forecast-24h').textContent = available ? `${chance24h}%` : '--';
+  document.getElementById('forecast-6h').textContent = available ? `${chance6h}%` : '--';
+  strip.classList.toggle('unavailable', !available);
+  status.textContent = available
+    ? t('forecastUpdated', { value: formatParisDateTime(generatedAt) })
+    : t('forecastUnavailable');
+}
+
 function setMainError(message = '') {
   const element = document.getElementById('error-banner');
   mainFailure = message || null;
@@ -302,6 +328,7 @@ function renderData(data, { schedule = true } = {}) {
   dashboardData = data;
   setBar('five-h-bar', 'five-h-pct', data.five_h_pct);
   setBar('weekly-bar', 'weekly-pct', data.weekly_pct);
+  renderForecast(data);
   document.getElementById('five-h-reset').textContent = formatParisUnixTimestamp(data.five_h_reset_at);
   document.getElementById('weekly-reset').textContent = formatParisUnixTimestamp(data.weekly_reset_at);
   renderWeeklyPaceDelta(data);

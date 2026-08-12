@@ -119,6 +119,20 @@ header h1 {
   border-color: #fff;
 }
 
+.dashboard-links {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+}
+
+.external-link span[aria-hidden="true"] {
+  display: inline-block;
+  margin-left: 2px;
+  font-size: 0.82em;
+}
+
 .preference-controls {
   position: absolute;
   top: 24px;
@@ -317,6 +331,88 @@ header h1 {
   font-size: 0.9rem;
 }
 
+.forecast-strip {
+  max-width: 960px;
+  min-height: 58px;
+  margin: 0 auto 18px;
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(8, 20, 43, 0.72);
+  box-shadow: 0 12px 32px rgba(2, 8, 23, 0.32);
+  backdrop-filter: blur(12px);
+}
+
+.forecast-heading {
+  min-width: 190px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.forecast-link {
+  color: #bfdbfe;
+  font-size: 0.76rem;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+  text-decoration: none;
+  text-transform: uppercase;
+}
+
+.forecast-link:hover,
+.forecast-link:focus-visible {
+  color: #fff;
+}
+
+.third-party-badge {
+  padding: 2px 6px;
+  color: var(--muted);
+  border: 1px solid rgba(96, 165, 250, 0.22);
+  border-radius: 999px;
+  font-size: 0.58rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.forecast-metrics {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+.forecast-metric {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.forecast-metric strong {
+  color: #93c5fd;
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
+.forecast-metric span,
+.forecast-status {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.forecast-status {
+  margin-left: auto;
+  text-align: right;
+}
+
+.forecast-strip.unavailable .forecast-metric strong {
+  color: var(--muted);
+}
+
 .history-error {
   margin: -4px 0 16px;
   border: 1px solid rgba(240, 140, 70, 0.45);
@@ -379,6 +475,23 @@ canvas {
 
   .preference-label {
     display: none;
+  }
+
+  .forecast-strip {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 10px 16px;
+  }
+
+  .forecast-heading {
+    min-width: 0;
+    flex: 1 1 100%;
+  }
+
+  .forecast-status {
+    flex: 1 1 100%;
+    margin-left: 0;
+    text-align: left;
   }
 }
 

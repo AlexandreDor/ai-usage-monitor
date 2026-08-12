@@ -116,6 +116,29 @@ function evaluate(expression) {
   if (element('five-h-reset').textContent !== '03/08/2026 19:35') fail('five-hour reset is not formatted in Paris time');
   if (element('weekly-reset').textContent !== '03/01/2026 13:34') fail('weekly reset is not formatted in Paris time');
 
+  evaluate(`renderForecast({
+    sample_interval_seconds: 900,
+    codex_forecast: {
+      chance_24h_pct: 76,
+      chance_6h_pct: 10,
+      generated_at: new Date().toISOString(),
+    },
+  })`);
+  if (element('forecast-24h').textContent !== '76%') fail('24-hour forecast chance is not rendered');
+  if (element('forecast-6h').textContent !== '10%') fail('6-hour forecast chance is not rendered');
+  if (!element('forecast-status').textContent.startsWith('Forecast updated ')) fail('forecast freshness is not rendered');
+
+  evaluate(`renderForecast({
+    sample_interval_seconds: 900,
+    codex_forecast: {
+      chance_24h_pct: 76,
+      chance_6h_pct: 10,
+      generated_at: '2000-01-01T00:00:00Z',
+    },
+  })`);
+  if (element('forecast-24h').textContent !== '--') fail('stale forecast remained visible');
+  if (element('forecast-status').textContent !== 'Forecast unavailable') fail('stale forecast was not marked unavailable');
+
   fetchQueue = [
     { five_h_pct: 80, weekly_pct: 70, scraped_at: '2026-08-03T00:00:00Z' },
     [],

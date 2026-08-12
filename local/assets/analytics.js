@@ -4,11 +4,14 @@ const ANALYTICS_REFRESH_MS = 900_000;
 const RESET_PAGE_SIZE = 50;
 const PARIS_ZONE = 'Europe/Paris';
 const PRICE_WARNING_PATTERN = /^No catalog price; assumed zero: (.+)$/u;
+const GPT_56_MODELS = Object.freeze(['gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra']);
 const state = {
   range: '30d',
   sources: ['codex', 'opencode', 'hermes'],
-  models: [],
+  models: [...GPT_56_MODELS],
   availableModels: [],
+  modelAvailabilityResolved: false,
+  modelFallbackNotice: false,
   resetType: 'all',
   resetOffset: 0,
   fromDate: '',
@@ -577,12 +580,25 @@ function updateModelOptions(models) {
   const container = byId('model-filter');
   const changed = normalized.join('\0') !== state.availableModels.join('\0');
   state.availableModels = normalized;
+  let shouldRefresh = false;
+  if (!state.modelAvailabilityResolved) {
+    const availableGpt = normalized.filter(model => GPT_56_MODELS.includes(model));
+    if (availableGpt.length) {
+      state.models = availableGpt;
+    } else {
+      state.models = [...normalized];
+      state.modelFallbackNotice = true;
+      shouldRefresh = normalized.length > 0;
+    }
+    state.modelAvailabilityResolved = true;
+  }
   if (changed) {
     state.models = state.models.filter(model => normalized.includes(model));
-    if (!state.models.length) state.models = [...normalized];
+    if (!state.models.length && !state.modelFallbackNotice) state.models = [...normalized];
     clearRows(container);
     for (const model of normalized) addFilterOption(container, model);
   } else setPressedValues(container, state.models);
+  return shouldRefresh;
 }
 
 function render(payload) {
@@ -615,10 +631,15 @@ function render(payload) {
   const random = weeklySummary.random || {};
   const endOfWeek = weeklySummary.end_of_week || {};
   const weeklyTotal = safeNumber(payload.resets?.weekly_total ?? safeNumber(random.count) + safeNumber(endOfWeek.count));
-  byId('random-reset-count').textContent = formatFullTokens(weeklyTotal);
-  byId('random-reset-impact').textContent = t('weeklyResetBreakdown', {
+  byId('weekly-reset-count').textContent = formatFullTokens(weeklyTotal);
+  byId('weekly-reset-impact').textContent = t('weeklyResetBreakdown', {
     random: formatFullTokens(random.count),
     regular: formatFullTokens(endOfWeek.count),
+  });
+  byId('random-reset-count').textContent = formatFullTokens(random.count);
+  byId('random-reset-impact').textContent = t('randomResetImpact', {
+    gained: formatPoints(random.gained_vs_ideal_pct_points),
+    lost: formatPoints(random.lost_vs_ideal_pct_points),
   });
   byId('end-week-reset-count').textContent = formatFullTokens(endOfWeek.count);
   byId('end-week-reset-impact').textContent = t('ofUnusedQuotaExpired', { value: formatPercent(endOfWeek.unused_pct_points) });
@@ -629,10 +650,11 @@ function render(payload) {
   renderBreakdown(payload.tokens?.breakdown || []);
   renderResets(payload.resets || {});
   renderFreshness(payload.freshness || {}, period);
-  updateModelOptions(payload.available?.models || []);
+  const refreshForModelFallback = updateModelOptions(payload.available?.models || []);
   renderWarnings(payload.warnings || []);
-  setMessage('analytics-error', '');
+  setMessage('analytics-error', state.modelFallbackNotice ? t('gptModelsUnavailable') : '');
   setMessage('analytics-local-only', '');
+  if (refreshForModelFallback) setTimeout(refresh, 0);
 }
 
 function refreshSchedule(payload = lastPayload) {
@@ -708,7 +730,7 @@ byId('select-all-models').addEventListener('click', () => {
   refresh();
 });
 byId('select-gpt-5-6').addEventListener('click', () => {
-  const gpt56 = state.availableModels.filter(model => ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'].includes(model));
+  const gpt56 = state.availableModels.filter(model => GPT_56_MODELS.includes(model));
   if (!gpt56.length) { setMessage('analytics-error', t('gptModelsUnavailable')); return; }
   state.models = gpt56;
   setPressedValues(byId('model-filter'), state.models);

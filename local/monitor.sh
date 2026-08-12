@@ -63,7 +63,7 @@ load_config() {
     fi
 
     case "$key" in
-      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
+      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_FORECAST_ENABLED|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
         if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
           value="${value:1:${#value}-2}"
         fi
@@ -282,6 +282,7 @@ validate_config() {
   [[ -z "$TELEGRAM_BOT_TOKEN" || "$TELEGRAM_BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || { config_error "TELEGRAM_BOT_TOKEN has an invalid format." || true; invalid=1; }
   [[ -z "$TELEGRAM_CHAT_ID" || "$TELEGRAM_CHAT_ID" =~ ^-?[1-9][0-9]*$ ]] || { config_error "TELEGRAM_CHAT_ID must be a non-zero numeric chat ID." || true; invalid=1; }
   [[ "$MONITOR_DEBUG" == 0 || "$MONITOR_DEBUG" == 1 ]] || { config_error "MONITOR_DEBUG must be 0 or 1." || true; invalid=1; }
+  [[ "$CODEX_FORECAST_ENABLED" == 0 || "$CODEX_FORECAST_ENABLED" == 1 ]] || { config_error "CODEX_FORECAST_ENABLED must be 0 or 1." || true; invalid=1; }
   [[ "$GITHUB_API_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || { config_error "GITHUB_API_URL is not a valid HTTP(S) base URL." || true; invalid=1; }
   [[ "$TELEGRAM_API_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || { config_error "TELEGRAM_API_URL is not a valid HTTP(S) base URL." || true; invalid=1; }
   [[ "$TOKEN_USAGE_SOURCES" == auto || "$TOKEN_USAGE_SOURCES" == none || "$TOKEN_USAGE_SOURCES" =~ ^(codex|opencode|hermes)(,(codex|opencode|hermes))*$ ]] || { config_error "TOKEN_USAGE_SOURCES must be auto, none, or a comma-separated list of codex,opencode,hermes." || true; invalid=1; }
@@ -381,6 +382,7 @@ initialize() {
   CURL_RETRIES="${CURL_RETRIES:-2}"
   CURL_RETRY_DELAY_SECONDS="${CURL_RETRY_DELAY_SECONDS:-1}"
   MONITOR_DEBUG="${MONITOR_DEBUG:-0}"
+  CODEX_FORECAST_ENABLED="${CODEX_FORECAST_ENABLED:-1}"
   DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}"
   TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
   TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -636,6 +638,83 @@ print(value)
 PYEOF
 }
 
+fetch_codex_forecast() {
+  local bucket response_file status curl_status=0
+  bucket=$(( $(date -u +%s) / 300 ))
+  response_file="$(mktemp "${RUNTIME_DIR}/.forecast-response.XXXXXX")"
+  status="$(curl --silent --show-error --connect-timeout 3 --max-time 8 \
+    --output "$response_file" --write-out '%{http_code}' \
+    "https://codex.lunarwerx.com/cnx/aireset/summary/t/${bucket}" 2>/dev/null)" || curl_status=$?
+  if (( curl_status != 0 )) || [[ "$status" != 200 ]]; then
+    rm -f "$response_file"
+    echo "[WARN] Codex Forecast is unavailable; continuing without global reset probabilities." >&2
+    return 1
+  fi
+
+  if ! python3 - "$response_file" <<'PYEOF'
+import datetime
+import json
+import math
+import pathlib
+import sys
+
+try:
+    payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, ValueError):
+    raise SystemExit(1)
+
+if not isinstance(payload, dict):
+    raise SystemExit(1)
+
+
+def probability(name):
+    value = payload.get(name)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or not 0 <= value <= 1:
+        raise SystemExit(1)
+    return math.floor(value * 100 + 0.5)
+
+
+generated_at = payload.get("generatedAt")
+if not isinstance(generated_at, str) or not generated_at or len(generated_at) > 100:
+    raise SystemExit(1)
+try:
+    generated = datetime.datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+except (OverflowError, ValueError):
+    raise SystemExit(1)
+if generated.tzinfo is None:
+    raise SystemExit(1)
+
+forecast = {
+    "chance_24h_pct": probability("chanceToday"),
+    "chance_6h_pct": probability("chanceSoon"),
+    "generated_at": generated.astimezone(datetime.timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+print(json.dumps(forecast, separators=(",", ":")))
+PYEOF
+  then
+    rm -f "$response_file"
+    echo "[WARN] Codex Forecast returned invalid data; continuing without global reset probabilities." >&2
+    return 1
+  fi
+  rm -f "$response_file"
+}
+
+enrich_snapshot_with_codex_forecast() {
+  local json="$1" forecast
+  forecast="$(fetch_codex_forecast)" || return 1
+  python3 - "$json" "$forecast" <<'PYEOF'
+import json
+import sys
+
+snapshot = json.loads(sys.argv[1])
+forecast = json.loads(sys.argv[2])
+if not isinstance(snapshot, dict) or not isinstance(forecast, dict):
+    raise SystemExit(1)
+snapshot["codex_forecast"] = forecast
+print(json.dumps(snapshot, indent=2))
+PYEOF
+}
+
 timestamp_to_epoch() {
   local timestamp="$1"
 
@@ -692,7 +771,7 @@ import time
 
 history_path = pathlib.Path(sys.argv[1])
 data_path = pathlib.Path(sys.argv[2])
-new_entry = json.loads(sys.argv[3])
+new_snapshot = json.loads(sys.argv[3])
 max_entries = int(sys.argv[4])
 public_fields = {
     "five_h_pct",
@@ -708,7 +787,27 @@ public_fields = {
 }
 
 
-def sanitize_entry(entry):
+def sanitize_forecast(value):
+    if not isinstance(value, dict):
+        return None
+    chance_24h = value.get("chance_24h_pct")
+    chance_6h = value.get("chance_6h_pct")
+    generated_at = value.get("generated_at")
+    if any(
+        not isinstance(chance, int) or isinstance(chance, bool) or not 0 <= chance <= 100
+        for chance in (chance_24h, chance_6h)
+    ):
+        return None
+    if not isinstance(generated_at, str) or not generated_at or len(generated_at) > 100:
+        return None
+    return {
+        "chance_24h_pct": chance_24h,
+        "chance_6h_pct": chance_6h,
+        "generated_at": generated_at,
+    }
+
+
+def sanitize_entry(entry, *, include_forecast=False):
     if not isinstance(entry, dict):
         return None
     sanitized = {key: entry[key] for key in public_fields if key in entry}
@@ -725,11 +824,16 @@ def sanitize_entry(entry):
             not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0
         ):
             sanitized[key] = None
+    if include_forecast:
+        forecast = sanitize_forecast(entry.get("codex_forecast"))
+        if forecast is not None:
+            sanitized["codex_forecast"] = forecast
     return sanitized
 
 
-new_entry = sanitize_entry(new_entry)
-if new_entry is None:
+new_history_entry = sanitize_entry(new_snapshot)
+new_data_entry = sanitize_entry(new_snapshot, include_forecast=True)
+if new_history_entry is None or new_data_entry is None:
     raise SystemExit("invalid usage snapshot")
 
 def atomic_write(path, content):
@@ -763,23 +867,23 @@ if history_path.exists():
         history = []
 
 history = [entry for item in history if (entry := sanitize_entry(item)) is not None]
-new_timestamp = new_entry.get("scraped_at", "")
+new_timestamp = new_history_entry.get("scraped_at", "")
 existing_timestamps = {entry.get("scraped_at") for entry in history}
 if new_timestamp not in existing_timestamps:
-    history.append(new_entry)
+    history.append(new_history_entry)
 history.sort(key=lambda entry: entry.get("scraped_at", ""), reverse=True)
 history = history[:max_entries]
 
 current = None
 if data_path.exists():
     try:
-        current = sanitize_entry(json.loads(data_path.read_text(encoding="utf-8")))
+        current = sanitize_entry(json.loads(data_path.read_text(encoding="utf-8")), include_forecast=True)
     except Exception:
         current = None
 
 atomic_write(history_path, json.dumps(history, indent=2) + "\n")
 if current is None or new_timestamp >= current.get("scraped_at", ""):
-    atomic_write(data_path, json.dumps(new_entry, indent=2) + "\n")
+    atomic_write(data_path, json.dumps(new_data_entry, indent=2) + "\n")
 else:
     sys.stderr.write("[WARN] Older snapshot retained in history but did not replace data.json.\n")
 PYEOF
@@ -2162,21 +2266,27 @@ run_cycle() {
   local interval_seconds="$1"
   echo "[$(format_paris_now)] Scraping codex status..."
 
-  local json status=0 history_json="[]"
+  local json public_json status=0 history_json="[]"
   CYCLE_ERROR=""
   if json=$(fetch_status_json "$interval_seconds"); then
     echo "$json" | python3 -m json.tool 2>/dev/null || echo "$json"
+    public_json="$json"
+    if [[ "$CODEX_FORECAST_ENABLED" == 1 ]]; then
+      if ! public_json="$(enrich_snapshot_with_codex_forecast "$json")"; then
+        public_json="$json"
+      fi
+    fi
     if ! archive_snapshot "$json"; then
       status=1
       append_cycle_error "Long-term archive update failed"
     fi
-    if write_local_snapshot "$json" "$interval_seconds"; then
+    if write_local_snapshot "$public_json" "$interval_seconds"; then
       [[ -f "$HISTORY_FILE" ]] && history_json="$(<"$HISTORY_FILE")"
     else
       status=1
       append_cycle_error "Local snapshot write failed"
     fi
-    sync_gist "$json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
+    sync_gist "$public_json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
 
     local five_h weekly five_h_reset weekly_reset five_h_reset_at weekly_reset_at limit_id scraped_at scraped_at_epoch
     five_h=$(json_get_field "$json" "five_h_pct")

@@ -17,7 +17,10 @@
     <h1 data-i18n="dashboard.heading">Codex Limits</h1>
     <span class="badge" id="mode-badge">-</span>
     <span id="last-updated">-</span>
-    <a class="nav-link" href="analytics.html"><span data-i18n="dashboard.analyticsLink">Advanced analytics</span> <span aria-hidden="true">→</span></a>
+    <nav class="dashboard-links" data-i18n-aria-label="dashboard.navigationAria" aria-label="Dashboard navigation">
+      <a class="nav-link" href="analytics.html"><span data-i18n="dashboard.analyticsLink">Advanced analytics</span> <span aria-hidden="true">→</span></a>
+      <a class="nav-link external-link" href="https://github.com/AlexandreDor/ai-usage-monitor" target="_blank" rel="noopener noreferrer"><span data-i18n="dashboard.githubLink">GitHub repository</span> <span aria-hidden="true">↗</span></a>
+    </nav>
     <div class="preference-controls" data-i18n-aria-label="preferences.ariaLabel" aria-label="Display preferences">
       <div class="preference-setting">
         <span class="preference-label" data-i18n="preferences.language">Language</span>
@@ -37,6 +40,21 @@
   </header>
 
   <div id="error-banner" role="alert" hidden></div>
+
+  <aside class="forecast-strip" id="forecast-strip" data-i18n-aria-label="dashboard.forecastAria" aria-label="Global reset forecast">
+    <div class="forecast-heading">
+      <a class="forecast-link external-link" href="https://codex.lunarwerx.com/" target="_blank" rel="noopener noreferrer">
+        <span data-i18n="dashboard.globalResetForecast">Global reset forecast</span>
+        <span aria-hidden="true">↗</span>
+      </a>
+      <span class="third-party-badge" data-i18n="dashboard.thirdParty">Third-party</span>
+    </div>
+    <div class="forecast-metrics">
+      <div class="forecast-metric"><strong id="forecast-24h">--</strong><span data-i18n="dashboard.chance24h">24h chance</span></div>
+      <div class="forecast-metric"><strong id="forecast-6h">--</strong><span data-i18n="dashboard.chance6h">6h chance</span></div>
+    </div>
+    <span class="forecast-status" id="forecast-status" data-i18n="dashboard.forecastUnavailable">Forecast unavailable</span>
+  </aside>
 
   <main class="grid">
     <section class="card limit-card">

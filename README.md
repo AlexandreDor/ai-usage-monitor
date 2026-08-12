@@ -4,7 +4,7 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
 
 **Problem:** OpenAI already exposes Codex usage through its local app-server and in the ChatGPT Codex usage page, but those views do not give you rolling history or proactive notifications when you're running low.
 
-**Solution:** A local bash script that reads the Codex app-server on exact 15-minute boundaries, writes a `data.json` snapshot, serves a dashboard in your browser, and fires Discord or Telegram alerts directly all from your own machine, with zero cloud dependency.
+**Solution:** A local bash script that reads the Codex app-server on exact 15-minute boundaries, writes a `data.json` snapshot, serves a dashboard in your browser, and fires Discord or Telegram alerts directly. An optional, enabled-by-default request to the third-party Codex Forecast service adds global 24-hour and 6-hour reset probabilities; it can be disabled without affecting local quota monitoring.
 
 ![Codex Limits dashboard hero](local/images/hero.png)
 
@@ -170,6 +170,8 @@ chmod +x monitor.sh serve.sh
 ```
 
 Important: `serve.sh` only hosts an explicit allowlist containing the two dashboards, their local assets, the favicon, `data.json`, `history.json`, and the read-only `/api/analytics` response. The raw SQLite archive and files such as `.env`, `.alert_state`, `alert-deliveries.json`, `health.json`, locks, logs, and directory listings are never served. It does not refresh usage by itself; `monitor.sh` must also run on a loop or schedule.
+
+The compact global reset forecast on the live dashboard comes from [Codex Forecast](https://codex.lunarwerx.com/), an independent third-party service not affiliated with OpenAI. `monitor.sh` fetches its 24-hour and 6-hour probabilities once per collection cycle and adds only those percentages and their generation time to the current `data.json`. The browser never contacts Codex Forecast directly. Forecast failures are warnings only: quota snapshots, alerts and Analytics continue normally, and the dashboard shows the forecast as unavailable.
 
 ### LAN security
 
@@ -656,12 +658,15 @@ All variables go in `local/.env` (copy from `local/.env.example`).
 | `CURL_RETRIES` | No | `2` | HTTP retry count, from `0` to `5` |
 | `CURL_RETRY_DELAY_SECONDS` | No | `1` | Initial retry delay, from `0` to `60` seconds |
 | `MONITOR_DEBUG` | No | `0` | Set to `1` for bounded diagnostics without credentials |
+| `CODEX_FORECAST_ENABLED` | No | `1` | Fetch global 24h/6h reset probabilities from the third-party Codex Forecast service; `0` disables it |
 | `GITHUB_PAT` | No (Tier 2 only) | — | GitHub Personal Access Token (`gist` scope) |
 | `GITHUB_GIST_ID` | No (Tier 2 only) | — | ID of the Gist to update |
 | `GITHUB_API_URL` | No | `https://api.github.com` | GitHub API base URL; primarily injectable for tests |
 | `TELEGRAM_API_URL` | No | `https://api.telegram.org` | Telegram API base URL; primarily injectable for tests |
 
 `GITHUB_PAT`/`GITHUB_GIST_ID` and `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` must be configured as complete pairs. Python 3.9 or newer, `tzdata` with `Europe/Paris`, `curl`, and `flock` are required.
+
+When Gist synchronization is enabled, the optional `codex_forecast` object is included in the current `data.json` sent to the Gist. It is never written to `history.json` or the SQLite archive. This keeps Forecast data current-only and avoids presenting old global probabilities as historical account data.
 
 ---
 
