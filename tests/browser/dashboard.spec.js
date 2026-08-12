@@ -115,7 +115,7 @@ const analyticsPayload = {
   filters: { sources: [], models: [], reset_type: 'all' },
   available: { sources: ['codex', 'opencode'], models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'unknown-model'] },
   freshness: { limits_last_sample_at: '2026-08-04T09:45:00Z', collectors: { codex: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, opencode: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, hermes: { status: 'disabled', last_success_at: null } } },
-  limits: { samples: 2, series: [{ at: '2026-08-03T00:00:00Z', five_h_pct: 80, weekly_pct: 60 }, { at: '2026-08-04T00:00:00Z', five_h_pct: 55, weekly_pct: 52 }] },
+  limits: { samples: 2, series: [{ at: '2026-08-03T00:00:00Z', five_h_pct: 80, weekly_pct: 60, ideal_weekly_pct: 65.5 }, { at: '2026-08-04T00:00:00Z', five_h_pct: 55, weekly_pct: 52, ideal_weekly_pct: 51.2 }] },
   tokens: {
     summary: { input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 25000, output_tokens: 200000, reasoning_tokens: 50000, events: 2, estimated_cost_usd: 11.25, assumed_zero_tokens: 100 },
     series: [{ at: '2026-08-04T00:00:00Z', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 25000, output_tokens: 200000, reasoning_tokens: 50000, estimated_cost_usd: 11.25 }],
@@ -388,6 +388,7 @@ test('renders detailed analytics, reset markers and cost mode by default', async
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.filter(dataset => dataset.resetMarker).length)).toBe(2);
   await expect.poll(() => page.evaluate(() => tokensChart.data.datasets.length)).toBe(2);
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.label === 'codex')?.data[0]?.y)).toBe(11.25);
+  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.label === 'Ideal weekly pace')?.data[1]?.y)).toBe(51.2);
   await page.locator('#toggle-token-overlay').click();
   await expect(page.locator('#tokens-chart-card')).toBeVisible();
   await expect(page.locator('#tokens-chart-card #token-metric-toggle')).toHaveCount(1);
@@ -428,6 +429,7 @@ test('groups visible Analytics units and excludes missing values and reset marke
 
   await expect.poll(() => page.evaluate(() => limitsChart.tooltip.body?.map(item => item.lines[0]))).toEqual([
     '5-hour remaining: 55%',
+    'Ideal weekly pace: 51.2%',
     'codex: €9.68',
     'opencode: €0.0000',
   ]);
@@ -440,6 +442,7 @@ test('groups visible Analytics units and excludes missing values and reset marke
   });
   await moveToSlice();
   await expect.poll(() => page.evaluate(() => limitsChart.tooltip.body?.map(item => item.lines[0]))).toEqual([
+    'Ideal weekly pace: 51.2%',
     'codex: €9.68',
     'opencode: €0.0000',
   ]);
@@ -453,6 +456,7 @@ test('groups visible Analytics units and excludes missing values and reset marke
   await moveToSlice();
   await expect.poll(() => page.evaluate(() => limitsChart.tooltip.body?.map(item => item.lines[0]))).toEqual([
     '5-hour remaining: 55%',
+    'Ideal weekly pace: 51.2%',
     'codex: 1,200,000 tokens',
     'opencode: 100 tokens',
   ]);

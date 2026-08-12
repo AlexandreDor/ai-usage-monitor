@@ -309,6 +309,7 @@ function renderLimitTable(points) {
     cell(row, formatDate(point.at));
     cell(row, formatPercent(point.five_h_pct));
     cell(row, formatPercent(point.weekly_pct));
+    cell(row, formatPercent(point.ideal_weekly_pct));
     body?.appendChild(row);
   }
 }
@@ -343,6 +344,12 @@ function renderLimits(data = {}) {
       label: t('weeklyRemaining'),
       data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.weekly_pct) })),
       borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.07)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false,
+      valueKind: 'percent',
+    },
+    {
+      label: t('idealWeeklyPace'),
+      data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.ideal_weekly_pct) })),
+      borderColor: '#a7f3d0', backgroundColor: 'transparent', fill: false, borderWidth: 2, borderDash: [8, 6], pointRadius: 0, tension: 0, spanGaps: false,
       valueKind: 'percent',
     },
   ];

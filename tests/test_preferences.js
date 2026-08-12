@@ -35,6 +35,7 @@ if (defaults.CodexPreferences.t('analytics.randomResets') !== 'Random resets') f
 if (!defaults.CodexPreferences.t('analytics.randomResetImpact', { gained: '1 pt', lost: '2 pts' }).includes('ideal pace')) fail('random reset impact does not mention ideal pace');
 if (defaults.CodexPreferences.t('analytics.uncachedInput') !== 'Uncached input') fail('analytics metric translation is missing');
 if (defaults.CodexPreferences.t('analytics.tokenValue', { value: '1,000' }) !== '1,000 tokens') fail('analytics token tooltip translation is missing');
+if (defaults.CodexPreferences.t('analytics.idealWeeklyPace') !== 'Ideal weekly pace') fail('ideal weekly pace translation is missing');
 
 defaults.CodexPreferences.set({ language: 'fr', currency: 'USD' });
 if (defaults.CodexPreferences.formatCurrency(11.25) !== '11,25 $') fail('French USD formatting is incorrect');
@@ -45,6 +46,7 @@ if (defaults.CodexPreferences.t('analytics.randomResets') !== 'Réinitialisation
 if (!defaults.CodexPreferences.t('analytics.randomResetImpact', { gained: '1 pt', lost: '2 pts' }).includes('rythme idéal')) fail('French random reset impact does not mention ideal pace');
 if (defaults.CodexPreferences.t('analytics.freshness') !== 'Fraîcheur') fail('French analytics freshness translation is missing');
 if (defaults.CodexPreferences.t('analytics.tokenValue', { value: '1 000' }) !== '1 000 tokens') fail('French analytics token tooltip translation is missing');
+if (defaults.CodexPreferences.t('analytics.idealWeeklyPace') !== 'Rythme hebdomadaire idéal') fail('French ideal weekly pace translation is missing');
 
 const invalid = createContext('{not-json');
 if (JSON.stringify(invalid.CodexPreferences.get()) !== JSON.stringify({ language: 'en', currency: 'EUR' })) {

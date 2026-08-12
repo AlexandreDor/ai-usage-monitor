@@ -87,6 +87,15 @@ def ideal_weekly_pace(connection: sqlite3.Connection, reset_at: int) -> float | 
     return round(100 * remaining / WEEKLY_WINDOW_SECONDS, 3)
 
 
+def ideal_weekly_remaining(sampled_at: int, reset_at: Any) -> float | None:
+    if not isinstance(reset_at, int):
+        return None
+    remaining = reset_at - sampled_at
+    if not 0 <= remaining <= WEEKLY_WINDOW_SECONDS:
+        return None
+    return round(100 * remaining / WEEKLY_WINDOW_SECONDS, 3)
+
+
 def random_reset_impact(connection: sqlite3.Connection, reset_at: int, before: Any) -> tuple[float | None, float | None]:
     ideal = ideal_weekly_pace(connection, reset_at)
     if not isinstance(before, (int, float)) or ideal is None:
@@ -311,7 +320,7 @@ def token_analytics(
 def limit_series(connection: sqlite3.Connection, start: int, end: int, granularity: int) -> dict[str, Any]:
     rows = connection.execute(
         """WITH bucketed AS (
-                 SELECT scraped_at_epoch, five_h_pct, weekly_pct,
+                 SELECT scraped_at_epoch, five_h_pct, weekly_pct, weekly_reset_at,
                         (scraped_at_epoch / ?) * ? AS bucket_epoch
                    FROM snapshots
                   WHERE scraped_at_epoch >= ? AND scraped_at_epoch < ?
@@ -322,7 +331,7 @@ def limit_series(connection: sqlite3.Connection, start: int, end: int, granulari
                   GROUP BY bucket_epoch
              )
              SELECT latest.bucket_epoch, snapshots.five_h_pct,
-                    snapshots.weekly_pct, latest.samples
+                    snapshots.weekly_pct, snapshots.weekly_reset_at, latest.samples
                FROM latest
                JOIN snapshots ON snapshots.scraped_at_epoch = latest.latest_epoch
               ORDER BY latest.bucket_epoch""",
@@ -346,6 +355,7 @@ def limit_series(connection: sqlite3.Connection, start: int, end: int, granulari
                 "at": iso_utc(row["bucket_epoch"]),
                 "five_h_pct": round(row["five_h_pct"], 3) if row["five_h_pct"] is not None else None,
                 "weekly_pct": round(row["weekly_pct"], 3) if row["weekly_pct"] is not None else None,
+                "ideal_weekly_pct": ideal_weekly_remaining(row["bucket_epoch"], row["weekly_reset_at"]),
                 "samples": row["samples"],
             }
             for row in rows

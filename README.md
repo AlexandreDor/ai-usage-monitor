@@ -32,8 +32,8 @@ reset probabilities from the independent Codex Forecast service.
 
 The local Analytics page provides:
 
-- quota history for 24 hours, 7, 30, or 90 days, one year, all retained data,
-  or a custom date range;
+- quota history and ideal weekly pace for 24 hours, 7, 30, or 90 days, one year,
+  all retained data, or a custom date range;
 - detected 5-hour and weekly reset history, including scheduled and early
   weekly resets;
 - local token consumption from Codex, OpenCode, and Hermes;
