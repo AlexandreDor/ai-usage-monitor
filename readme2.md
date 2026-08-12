@@ -57,7 +57,7 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
    (JSON blob)       (static dashboard)
 ```
 
-**Tier 1 — Local only:** Everything runs on your machine. No external accounts beyond your existing OpenAI / ChatGPT subscription.  
+**Tier 1 — Local only:** Everything runs on your machine. No external accounts beyond your existing OpenAI / ChatGPT subscription.
 **Tier 2 — External dashboard (optional):** `monitor.sh` also PATCHes a GitHub Gist. A static GitHub Pages site reads from it. Requires a GitHub account and a Personal Access Token.
 
 ---
@@ -107,20 +107,20 @@ codex-usage-monitor/
 
 > [!NOTE]
 > **First-time Codex users — you must authenticate before using this tool.**
-> 
+>
 > The monitor uses the local Codex app-server, which only works after you have signed in. If you have never run Codex before:
-> 
+>
 > ```bash
 > # 1. Install the CLI
 > npm i -g @openai/codex
-> 
+>
 > # 2. Launch Codex — it will prompt you to sign in on first run
 > codex
 > ```
-> 
+>
 > Authenticate with your **ChatGPT account** (Plus, Pro, Business, Edu, or Enterprise) or an **API key**.
 > Once signed in, verify with `codex /status` — you should see your usage percentages.
-> 
+>
 > Full setup details: [developers.openai.com/codex/cli](https://developers.openai.com/codex/cli/)
 
 > **Windows users:** Run everything inside WSL. Native Windows bash is not supported. See the [Windows setup guide](https://developers.openai.com/codex/windows).
