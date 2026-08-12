@@ -164,9 +164,10 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#random-reset-impact')).toHaveText('30.004 pts gained · 0 pts lost vs ideal pace');
   await expect(page.locator('#end-week-reset-count')).toHaveText('1');
   await expect(page.locator('.metric-card')).toHaveCount(10);
+  await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#toggle-token-overlay')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#tokens-chart-card')).toBeHidden();
-  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.length)).toBe(5);
+  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.yAxisID === 'tokens')?.data[0]?.y)).toBe(11.25);
   await page.locator('#toggle-token-overlay').click();
   await expect(page.locator('#toggle-token-overlay')).toHaveAttribute('aria-pressed', 'false');
   await expect(page.locator('#tokens-chart-card')).toBeVisible();
@@ -298,7 +299,7 @@ test('keeps the complete dashboard above the fold at 1920x1080', async ({ page }
   expect(layout.navigationOverlap).toBe(false);
 });
 
-test('renders detailed analytics, reset markers, application series and cost mode', async ({ page }) => {
+test('renders detailed analytics, reset markers and cost mode by default', async ({ page }) => {
   await page.route('**/api/analytics?*', route => {
     const query = new URL(route.request().url()).searchParams;
     const offset = Number(query.get('reset_offset') || 0);
@@ -315,18 +316,19 @@ test('renders detailed analytics, reset markers, application series and cost mod
   await expect(page.locator('#reset-pagination')).toBeVisible();
   await expect(page.locator('#reset-page-label')).toHaveText('1–50 of 55');
   await expect(page.locator('#collector-grid')).toContainText('database unavailable');
-  await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'false');
+  await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#tokens-chart-card')).toBeHidden();
   await expect(page.locator('#resets-body tr').first().locator('td')).toHaveCount(5);
 
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.filter(dataset => dataset.resetMarker).length)).toBe(2);
   await expect.poll(() => page.evaluate(() => tokensChart.data.datasets.length)).toBe(2);
-  await page.locator('#token-metric-toggle').click();
-  await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.label === 'codex')?.data[0]?.y)).toBe(11.25);
+  await page.locator('#token-metric-toggle').click();
+  await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'false');
+  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.label === 'codex')?.data[0]?.y)).toBe(1200000);
   await page.locator('#toggle-token-overlay').click();
   await expect(page.locator('#tokens-chart-card')).toBeVisible();
-  await expect.poll(() => page.evaluate(() => tokensChart.data.datasets[0].data[0].y)).toBe(11.25);
+  await expect.poll(() => page.evaluate(() => tokensChart.data.datasets[0].data[0].y)).toBe(1200000);
 
   await page.locator('#resets-next').click();
   await expect(page.locator('#reset-page-label')).toContainText('51–55');

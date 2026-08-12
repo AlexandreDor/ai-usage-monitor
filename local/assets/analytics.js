@@ -17,7 +17,7 @@ const state = {
   fromDate: '',
   toDate: '',
   tokenOverlay: true,
-  tokenMetric: 'tokens',
+  tokenMetric: 'cost',
 };
 let limitsChart = null;
 let tokensChart = null;
