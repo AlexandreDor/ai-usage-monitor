@@ -10,8 +10,6 @@ No hosted backend is required. Optional integrations can send notifications,
 publish the current dashboard data through a GitHub Gist, or display global
 reset probabilities from the independent Codex Forecast service.
 
-![Codex Limits dashboard](local/images/hero.png)
-
 ## Features
 
 ### Live quota dashboard
