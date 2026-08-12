@@ -125,6 +125,8 @@ function renderForecast(data) {
   const forecast = data?.codex_forecast;
   const chance24h = validPct(forecast?.chance_24h_pct);
   const chance6h = validPct(forecast?.chance_6h_pct);
+  const threshold24h = validPct(forecast?.highlight_threshold_24h_pct) ?? 50;
+  const threshold6h = validPct(forecast?.highlight_threshold_6h_pct) ?? 25;
   const generatedAt = Date.parse(displayText(forecast?.generated_at, ''));
   const intervalSeconds = Number(data?.sample_interval_seconds);
   const staleAfterMs = Math.max(
@@ -138,8 +140,16 @@ function renderForecast(data) {
     && ageMs >= -5 * 60 * 1000
     && ageMs <= staleAfterMs;
 
-  document.getElementById('forecast-24h').textContent = available ? `${chance24h}%` : '--';
-  document.getElementById('forecast-6h').textContent = available ? `${chance6h}%` : '--';
+  const value24h = document.getElementById('forecast-24h');
+  const value6h = document.getElementById('forecast-6h');
+  value24h.textContent = available ? `${chance24h}%` : '--';
+  value6h.textContent = available ? `${chance6h}%` : '--';
+  const highlight24h = available && chance24h >= threshold24h;
+  const highlight6h = available && chance6h >= threshold6h;
+  value24h.classList.toggle('threshold-reached', highlight24h);
+  value6h.classList.toggle('threshold-reached', highlight6h);
+  value24h.title = highlight24h ? t('forecastThresholdReached', { value: threshold24h }) : '';
+  value6h.title = highlight6h ? t('forecastThresholdReached', { value: threshold6h }) : '';
   strip.classList.toggle('unavailable', !available);
   status.textContent = available
     ? t('forecastUpdated', { value: formatParisDateTime(generatedAt) })
@@ -179,11 +189,15 @@ function normalizeHistory(history) {
     const weekly = validPct(item.weekly_pct);
     if (!Number.isFinite(timestamp) || (fiveHour === null && weekly === null)) continue;
     const weeklyReset = Number(item.weekly_reset_at);
+    const forecast24h = validPct(item.codex_forecast?.chance_24h_pct);
+    const forecast6h = validPct(item.codex_forecast?.chance_6h_pct);
     byTimestamp.set(timestamp, {
       timestamp,
       fiveHour,
       weekly,
       weeklyReset: Number.isFinite(weeklyReset) && weeklyReset > 0 ? weeklyReset : null,
+      forecast24h,
+      forecast6h,
     });
   }
 
@@ -238,6 +252,30 @@ function chartDatasets(points) {
       borderDash: [8, 6],
       pointRadius: 0,
       tension: 0,
+      fill: false,
+      spanGaps: false,
+      valueKind: 'percent',
+    },
+    {
+      label: t('forecast24hDataset'),
+      data: points.map(point => ({ x: point.timestamp, y: point.forecast24h })),
+      borderColor: '#a78bfa',
+      backgroundColor: 'transparent',
+      borderWidth: 2,
+      pointRadius: points.length > 200 ? 0 : 2,
+      tension: 0.3,
+      fill: false,
+      spanGaps: false,
+      valueKind: 'percent',
+    },
+    {
+      label: t('forecast6hDataset'),
+      data: points.map(point => ({ x: point.timestamp, y: point.forecast6h })),
+      borderColor: '#fbbf24',
+      backgroundColor: 'transparent',
+      borderWidth: 2,
+      pointRadius: points.length > 200 ? 0 : 2,
+      tension: 0.3,
       fill: false,
       spanGaps: false,
       valueKind: 'percent',

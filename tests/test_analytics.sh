@@ -36,6 +36,14 @@ with connection:
         ("weekly", 1785863000, 1785863000, 30, 80, "random_observed"),
     )
     connection.execute(
+        "INSERT INTO forecast_samples VALUES (?, ?, ?, ?)",
+        (1785861001, 1785860990, 64, 22),
+    )
+    connection.execute(
+        "INSERT INTO forecast_samples VALUES (?, ?, ?, ?)",
+        (1785861900, 1785861890, 99, 88),
+    )
+    connection.execute(
         """INSERT INTO token_usage_events
            (occurred_at_epoch, source, provider, model, input_tokens, cache_read_tokens,
             cache_write_tokens, output_tokens, reasoning_tokens, external_id)
@@ -99,6 +107,8 @@ assert_eq 2 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]
 assert_eq 1 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["weekly_summary"]["random"]["count"])' <<<"$payload")" "random reset count"
 assert_eq 7.348 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["weekly_summary"]["random"]["lost_vs_ideal_pct_points"])' <<<"$payload")" "random reset loss versus ideal pace"
 assert_eq 35.0 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"]["weekly_summary"]["end_of_week"]["unused_pct_points"])' <<<"$payload")" "end-of-week unused quota"
+assert_eq '99:88' "$(python3 -c 'import json,sys; data=json.load(sys.stdin); item=next(item for item in data["resets"]["items"] if item["reset_at"] == "2026-08-04T17:00:00Z"); print("{}:{}".format(item["forecast_chance_24h_pct"], item["forecast_chance_6h_pct"]))' <<<"$payload")" "latest Forecast before 5-hour reset"
+assert_eq 'None:None:None' "$(python3 -c 'import json,sys; data=json.load(sys.stdin); item=next(item for item in data["resets"]["items"] if item["reset_at"] == "2026-08-04T17:30:00Z"); print("{}:{}:{}".format(item["forecast_chance_24h_pct"], item["forecast_chance_6h_pct"], item["forecast_sample_at"]))' <<<"$payload")" "Forecast exactly 45 minutes before reset was not treated as N/A"
 assert_eq 52 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["baselines"]["hermes"][0]["tokens"])' <<<"$payload")" "Hermes baseline excludes the reasoning sub-counter"
 assert_eq 2 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["limits"]["series"][0]["samples"])' <<<"$payload")" "limit bucket sample count"
 assert_eq 45.0 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["limits"]["series"][0]["five_h_pct"])' <<<"$payload")" "limit bucket keeps the latest sample"

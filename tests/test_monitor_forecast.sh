@@ -29,7 +29,10 @@ enriched="$(enrich_snapshot_with_codex_forecast "$snapshot")"
 # shellcheck disable=SC2218
 write_local_snapshot "$enriched" >/dev/null
 assert_eq 76 "$(json_field "$DATA_FILE" codex_forecast.chance_24h_pct)" "forecast missing from data.json"
-assert_eq false "$(python3 -c 'import json,sys; print(str("codex_forecast" in json.load(open(sys.argv[1], encoding="utf-8"))[0]).lower())' "$HISTORY_FILE")" "forecast leaked into history.json"
+assert_eq 50 "$(json_field "$DATA_FILE" codex_forecast.highlight_threshold_24h_pct)" "24-hour highlight threshold missing from data.json"
+assert_eq 25 "$(json_field "$DATA_FILE" codex_forecast.highlight_threshold_6h_pct)" "6-hour highlight threshold missing from data.json"
+assert_eq 76 "$(json_field "$HISTORY_FILE" 0.codex_forecast.chance_24h_pct)" "forecast missing from history.json"
+assert_eq false "$(python3 -c 'import json,sys; print(str("highlight_threshold_24h_pct" in json.load(open(sys.argv[1], encoding="utf-8"))[0]["codex_forecast"]).lower())' "$HISTORY_FILE")" "highlight threshold leaked into history.json"
 
 export FAKE_CURL_BODY='{invalid'
 fetch_codex_forecast >/dev/null 2>&1 && fail "invalid forecast JSON was accepted"
@@ -63,11 +66,12 @@ sync_gist() { printf '%s\n' "$1" > "$gist_argument"; }
 check_thresholds() { return 0; }
 collect_token_usage() { return 0; }
 run_cycle 900 >/dev/null || fail "valid forecast made the monitor cycle fail"
-assert_eq false "$(python3 -c 'import json,sys; print(str("codex_forecast" in json.load(open(sys.argv[1], encoding="utf-8"))).lower())' "$archive_argument")" "forecast leaked into SQLite input"
+assert_eq true "$(python3 -c 'import json,sys; print(str("codex_forecast" in json.load(open(sys.argv[1], encoding="utf-8"))).lower())' "$archive_argument")" "forecast missing from SQLite input"
 assert_eq true "$(python3 -c 'import json,sys; print(str("codex_forecast" in json.load(open(sys.argv[1], encoding="utf-8"))).lower())' "$local_argument")" "forecast missing from public snapshot input"
 assert_eq true "$(python3 -c 'import json,sys; print(str("codex_forecast" in json.load(open(sys.argv[1], encoding="utf-8"))).lower())' "$gist_argument")" "forecast missing from Gist snapshot input"
 
 enrich_snapshot_with_codex_forecast() { return 1; }
 run_cycle 900 >/dev/null || fail "forecast failure propagated to the monitor cycle"
+assert_eq false "$(python3 -c 'import json,sys; print(str("codex_forecast" in json.load(open(sys.argv[1], encoding="utf-8"))).lower())' "$archive_argument")" "failed forecast created a SQLite sample input"
 
 printf 'PASS: Codex Forecast collection tests\n'

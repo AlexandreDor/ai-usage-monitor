@@ -100,6 +100,7 @@ def normalize_snapshot(value: Any, *, strict: bool) -> dict[str, Any] | None:
         "sample_interval_seconds": None,
         "history_window_hours": None,
         "limit_id": None,
+        "forecast": None,
     }
 
     for key in ("five_h_reset", "weekly_reset"):
@@ -120,6 +121,26 @@ def normalize_snapshot(value: Any, *, strict: bool) -> dict[str, Any] | None:
     limit_id = value.get("limit_id")
     if isinstance(limit_id, str) and len(limit_id) <= 100 and not any(ord(char) < 32 for char in limit_id):
         normalized["limit_id"] = limit_id
+
+    forecast = value.get("codex_forecast")
+    if isinstance(forecast, dict):
+        chance_24h = forecast.get("chance_24h_pct")
+        chance_6h = forecast.get("chance_6h_pct")
+        generated = parse_timestamp(forecast.get("generated_at"))
+        if (
+            isinstance(chance_24h, int)
+            and not isinstance(chance_24h, bool)
+            and 0 <= chance_24h <= 100
+            and isinstance(chance_6h, int)
+            and not isinstance(chance_6h, bool)
+            and 0 <= chance_6h <= 100
+            and generated is not None
+        ):
+            normalized["forecast"] = {
+                "generated_at_epoch": generated[1],
+                "chance_24h_pct": chance_24h,
+                "chance_6h_pct": chance_6h,
+            }
 
     if normalized["five_h_pct"] is None and normalized["weekly_pct"] is None:
         if strict:
@@ -185,6 +206,26 @@ def insert_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any]) ->
         """,
         row_values(snapshot),
     )
+    forecast = snapshot.get("forecast")
+    if forecast is not None:
+        connection.execute(
+            """
+            INSERT INTO forecast_samples (
+                scraped_at_epoch, generated_at_epoch,
+                chance_24h_pct, chance_6h_pct
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(scraped_at_epoch) DO UPDATE SET
+                generated_at_epoch = excluded.generated_at_epoch,
+                chance_24h_pct = excluded.chance_24h_pct,
+                chance_6h_pct = excluded.chance_6h_pct
+            """,
+            (
+                snapshot["scraped_at_epoch"],
+                forecast["generated_at_epoch"],
+                forecast["chance_24h_pct"],
+                forecast["chance_6h_pct"],
+            ),
+        )
 
 
 def compact(connection: sqlite3.Connection, retention_days: int) -> None:
@@ -224,9 +265,40 @@ def compact(connection: sqlite3.Connection, retention_days: int) -> None:
         (medium_start, medium_start, OLD_BUCKET_SECONDS),
     )
 
+    connection.execute(
+        """
+        DELETE FROM forecast_samples
+        WHERE scraped_at_epoch >= ?
+          AND scraped_at_epoch < ?
+          AND scraped_at_epoch NOT IN (
+              SELECT MAX(scraped_at_epoch)
+              FROM forecast_samples
+              WHERE scraped_at_epoch >= ? AND scraped_at_epoch < ?
+              GROUP BY scraped_at_epoch / ?
+          )
+        """,
+        (medium_start, recent_start, medium_start, recent_start, MEDIUM_BUCKET_SECONDS),
+    )
+    connection.execute(
+        """
+        DELETE FROM forecast_samples
+        WHERE scraped_at_epoch < ?
+          AND scraped_at_epoch NOT IN (
+              SELECT MAX(scraped_at_epoch)
+              FROM forecast_samples
+              WHERE scraped_at_epoch < ?
+              GROUP BY scraped_at_epoch / ?
+          )
+        """,
+        (medium_start, medium_start, OLD_BUCKET_SECONDS),
+    )
+
     if retention_days > 0:
         cutoff = anchor - retention_days * 24 * 60 * 60
         connection.execute("DELETE FROM snapshots WHERE scraped_at_epoch < ?", (cutoff,))
+        connection.execute(
+            "DELETE FROM forecast_samples WHERE scraped_at_epoch < ?", (cutoff,)
+        )
 
 
 def rebuild_reset_events(connection: sqlite3.Connection) -> None:

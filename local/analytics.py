@@ -337,6 +337,29 @@ def limit_series(connection: sqlite3.Connection, start: int, end: int, granulari
               ORDER BY latest.bucket_epoch""",
         (granularity, granularity, start, end),
     ).fetchall()
+    forecast_rows = connection.execute(
+        """WITH bucketed AS (
+                 SELECT scraped_at_epoch, generated_at_epoch,
+                        chance_24h_pct, chance_6h_pct,
+                        (scraped_at_epoch / ?) * ? AS bucket_epoch
+                   FROM forecast_samples
+                  WHERE scraped_at_epoch >= ? AND scraped_at_epoch < ?
+             ), latest AS (
+                 SELECT bucket_epoch, MAX(scraped_at_epoch) AS latest_epoch,
+                        COUNT(*) AS samples
+                   FROM bucketed
+                  GROUP BY bucket_epoch
+             )
+             SELECT latest.bucket_epoch, forecast_samples.generated_at_epoch,
+                    forecast_samples.chance_24h_pct,
+                    forecast_samples.chance_6h_pct, latest.samples
+               FROM latest
+               JOIN forecast_samples
+                 ON forecast_samples.scraped_at_epoch = latest.latest_epoch
+              ORDER BY latest.bucket_epoch""",
+        (granularity, granularity, start, end),
+    ).fetchall()
+    forecasts_by_bucket = {int(row["bucket_epoch"]): row for row in forecast_rows}
     reset_markers = connection.execute(
         """
         SELECT window, reset_at_epoch, observed_at_epoch, before_pct, after_pct,
@@ -350,12 +373,29 @@ def limit_series(connection: sqlite3.Connection, start: int, end: int, granulari
     ).fetchall()
     return {
         "samples": int(sum(row["samples"] for row in rows)),
+        "forecast_samples": int(sum(row["samples"] for row in forecast_rows)),
         "series": [
             {
                 "at": iso_utc(row["bucket_epoch"]),
                 "five_h_pct": round(row["five_h_pct"], 3) if row["five_h_pct"] is not None else None,
                 "weekly_pct": round(row["weekly_pct"], 3) if row["weekly_pct"] is not None else None,
                 "ideal_weekly_pct": ideal_weekly_remaining(row["bucket_epoch"], row["weekly_reset_at"]),
+                "forecast_chance_24h_pct": (
+                    forecasts_by_bucket[int(row["bucket_epoch"])]["chance_24h_pct"]
+                    if int(row["bucket_epoch"]) in forecasts_by_bucket else None
+                ),
+                "forecast_chance_6h_pct": (
+                    forecasts_by_bucket[int(row["bucket_epoch"])]["chance_6h_pct"]
+                    if int(row["bucket_epoch"]) in forecasts_by_bucket else None
+                ),
+                "forecast_generated_at": (
+                    iso_utc(forecasts_by_bucket[int(row["bucket_epoch"])]["generated_at_epoch"])
+                    if int(row["bucket_epoch"]) in forecasts_by_bucket else None
+                ),
+                "forecast_samples": (
+                    forecasts_by_bucket[int(row["bucket_epoch"])]["samples"]
+                    if int(row["bucket_epoch"]) in forecasts_by_bucket else 0
+                ),
                 "samples": row["samples"],
             }
             for row in rows
@@ -372,6 +412,25 @@ def limit_series(connection: sqlite3.Connection, start: int, end: int, granulari
             for row in reset_markers
         ],
     }
+
+
+FORECAST_BEFORE_RESET_MAX_AGE_SECONDS = 45 * 60
+
+
+def forecast_before_reset(
+    connection: sqlite3.Connection, reset_at_epoch: int
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT scraped_at_epoch, chance_24h_pct, chance_6h_pct
+          FROM forecast_samples
+         WHERE scraped_at_epoch <= ?
+           AND scraped_at_epoch > ?
+         ORDER BY scraped_at_epoch DESC
+         LIMIT 1
+        """,
+        (reset_at_epoch, reset_at_epoch - FORECAST_BEFORE_RESET_MAX_AGE_SECONDS),
+    ).fetchone()
 
 
 def reset_history(connection: sqlite3.Connection, start: int, end: int, kind: str, offset: int, limit: int) -> dict[str, Any]:
@@ -422,6 +481,10 @@ def reset_history(connection: sqlite3.Connection, start: int, end: int, kind: st
         f"SELECT * FROM reset_events WHERE {where} ORDER BY reset_at_epoch DESC LIMIT ? OFFSET ?",
         [*values, limit, offset],
     ).fetchall()
+    forecast_by_reset = {
+        row["reset_at_epoch"]: forecast_before_reset(connection, row["reset_at_epoch"])
+        for row in rows
+    }
     return {
         "total": total,
         "weekly_total": len(weekly_rows),
@@ -437,6 +500,18 @@ def reset_history(connection: sqlite3.Connection, start: int, end: int, kind: st
                 "observation_delay_seconds": max(0, row["observed_at_epoch"] - row["reset_at_epoch"]),
                 "before_pct": row["before_pct"],
                 "after_pct": row["after_pct"],
+                "forecast_chance_24h_pct": (
+                    forecast_by_reset[row["reset_at_epoch"]]["chance_24h_pct"]
+                    if forecast_by_reset[row["reset_at_epoch"]] is not None else None
+                ),
+                "forecast_chance_6h_pct": (
+                    forecast_by_reset[row["reset_at_epoch"]]["chance_6h_pct"]
+                    if forecast_by_reset[row["reset_at_epoch"]] is not None else None
+                ),
+                "forecast_sample_at": (
+                    iso_utc(forecast_by_reset[row["reset_at_epoch"]]["scraped_at_epoch"])
+                    if forecast_by_reset[row["reset_at_epoch"]] is not None else None
+                ),
                 "detection_method": row["detection_method"],
                 "ideal_weekly_pace_pct": random_impacts.get(row["reset_at_epoch"], (None, None))[0],
                 "pace_delta_pct_points": random_impacts.get(row["reset_at_epoch"], (None, None))[1],

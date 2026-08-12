@@ -316,7 +316,7 @@ class HistoryTests(unittest.TestCase):
             self.assertFalse(path.exists())
             self.assertEqual([], list(root.glob(".history.json.*")))
 
-    def test_data_comparison_uses_real_time_and_forecast_is_current_only(self):
+    def test_data_comparison_uses_real_time_and_forecast_is_historized(self):
         now = 1_700_000_000
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -336,6 +336,8 @@ class HistoryTests(unittest.TestCase):
                 "chance_24h_pct": 20,
                 "chance_6h_pct": 10,
                 "generated_at": timestamp(now),
+                "highlight_threshold_24h_pct": 50,
+                "highlight_threshold_6h_pct": 25,
             }
             result = history.update_history(
                 history_path,
@@ -358,7 +360,11 @@ class HistoryTests(unittest.TestCase):
             current = json.loads(data_path.read_text(encoding="utf-8"))
             rolling = json.loads(history_path.read_text(encoding="utf-8"))
             self.assertEqual(forecast, current["codex_forecast"])
-            self.assertTrue(all("codex_forecast" not in item for item in rolling))
+            self.assertTrue(all("codex_forecast" in item for item in rolling))
+            self.assertEqual(20, rolling[0]["codex_forecast"]["chance_24h_pct"])
+            self.assertNotIn(
+                "highlight_threshold_24h_pct", rolling[0]["codex_forecast"]
+            )
             self.assertTrue(all("scraped_at_epoch" not in item for item in rolling))
 
     def test_cli_reads_stdin_and_reports_validation_errors_without_traceback(self):
