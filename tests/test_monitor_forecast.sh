@@ -27,7 +27,7 @@ enriched="$(enrich_snapshot_with_codex_forecast "$snapshot")"
 # The real sourced implementation is exercised here before a cycle-specific
 # stub with the same name is declared below.
 # shellcheck disable=SC2218
-write_local_snapshot "$enriched" 900 >/dev/null
+write_local_snapshot "$enriched" >/dev/null
 assert_eq 76 "$(json_field "$DATA_FILE" codex_forecast.chance_24h_pct)" "forecast missing from data.json"
 assert_eq false "$(python3 -c 'import json,sys; print(str("codex_forecast" in json.load(open(sys.argv[1], encoding="utf-8"))[0]).lower())' "$HISTORY_FILE")" "forecast leaked into history.json"
 

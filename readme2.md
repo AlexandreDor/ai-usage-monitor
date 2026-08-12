@@ -68,6 +68,7 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
 codex-usage-monitor/
 |-- local/
 |   |-- monitor.sh        # Codex usage collector, alerts, optional Gist sync
+|   |-- history.py        # Temporal history validation, retention and recovery
 |   |-- dashboard.html    # Local dashboard UI
 |   |-- analytics.html    # Local long-term limits/token analytics UI
 |   |-- analytics.py      # Read-only aggregation used by /api/analytics
@@ -643,7 +644,7 @@ All variables go in `local/.env` (copy from `local/.env.example`).
 | `ALERT_SCRIPT_<N>` | No | — | Absolute executable path for script rule 1..99 |
 | `ALERT_SCRIPT_<N>_EVENTS` | With matching script | — | Comma-separated threshold/reset selectors |
 | `ALERT_SCRIPT_TIMEOUT_SECONDS` | No | `30` | Per-script timeout, from `1` to `1800` seconds |
-| `HISTORY_RETENTION_HOURS` | No | `192` | Entry-count retention target, from `0.25` to `8760` hours |
+| `HISTORY_RETENTION_HOURS` | No | `192` | Age-based rolling window, from `0.25` to `8760` hours; 10,000-entry and 16 MiB defensive limits apply |
 | `ARCHIVE_RETENTION_DAYS` | No | `365` | Long-term SQLite archive retention; `0` means unlimited, maximum `36500` days |
 | `TOKEN_USAGE_SOURCES` | No | `auto` | `auto`, `none`, or a comma-separated list of `codex`, `opencode`, `hermes` |
 | `TOKEN_PRICING_FILE` | No | `local/pricing.json` | Absolute path to the validated versioned pricing catalog |
@@ -722,7 +723,7 @@ PRs welcome. Some ideas:
 
 - Run `tests/run.sh` for the dependency-free suite and `npm ci && npm run test:browser` for Playwright/axe-core checks.
 - CI runs Bash syntax checks, ShellCheck, the complete shell/Node suite, and Chromium browser tests.
-- History retention remains entry-count based so existing long-term data behavior is preserved. Changing the collection interval changes the effective time span represented by `HISTORY_RETENTION_HOURS`.
+- Rolling `history.json` retention uses the samples' actual timestamps, so changing the collection interval does not change the time span requested by `HISTORY_RETENTION_HOURS`. The 10,000-entry and 16 MiB defensive limits can shorten the available window and produce an explicit warning.
 - Long-term history is stored separately in `runtime/usage-history.sqlite3`: all limit points are kept for 24 hours, then the archive's retention compaction applies. Analytics uses 15-minute buckets through 48 hours, 30-minute buckets through 30 days, then hourly buckets. Token events and reconstructed resets use the same retention period without limit-series downsampling. The default retention is one year; `ARCHIVE_RETENTION_DAYS=0` keeps it indefinitely. SQLite is provided by Python's standard library; the raw archive is not served by `serve.sh` or synchronized to the Gist.
 - The SQLite archive is local state, not an off-machine backup. Back it up separately if the long-term history must survive disk loss.
 - Docker should only be used when the container can access an authenticated Codex CLI config. A common setup is mounting `~/.codex` into `/root/.codex`. If `codex /status` does not work on the host, it will not work inside Docker either — authenticate first.
