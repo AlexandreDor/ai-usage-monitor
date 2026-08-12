@@ -72,6 +72,43 @@ test('clears a previous chart when history becomes empty', async ({ page }) => {
   await expect(page.locator('#history-label')).toHaveText('History unavailable');
 });
 
+test('explores the nearest dashboard time slice across the full chart height', async ({ page }) => {
+  const history = [
+    { ...snapshot, scraped_at: '2026-08-01T00:00:00Z', five_h_pct: 90, weekly_pct: 70 },
+    { ...snapshot, scraped_at: '2026-08-02T00:00:00Z', five_h_pct: 60, weekly_pct: 40 },
+    { ...snapshot, scraped_at: '2026-08-03T00:00:00Z', five_h_pct: 30, weekly_pct: 20 },
+  ];
+  await mockUsage(page, history);
+  await page.goto('/dashboard.html');
+  await expect.poll(() => page.evaluate(() => Boolean(chart))).toBe(true);
+  await page.locator('#history-chart').scrollIntoViewIfNeeded();
+
+  const target = await page.evaluate(() => ({
+    x: chart.scales.x.getPixelForValue(Date.parse('2026-08-02T00:00:00Z')),
+    y: chart.chartArea.top + 1,
+  }));
+  const box = await page.locator('#history-chart').boundingBox();
+  await page.mouse.move(box.x + target.x, box.y + target.y);
+
+  await expect.poll(() => page.evaluate(() => chart.tooltip.dataPoints?.map(item => item.dataset.label))).toEqual([
+    '5h Limit %',
+    'Weekly Limit %',
+  ]);
+  const selection = await page.evaluate(() => ({
+    title: chart.tooltip.title,
+    body: chart.tooltip.body.map(item => item.lines[0]),
+    caretX: chart.tooltip.caretX,
+    expectedX: chart.scales.x.getPixelForValue(Date.parse('2026-08-02T00:00:00Z')),
+    mode: chart.options.interaction.mode,
+    cursorRegistered: Boolean(Chart.registry.plugins.get('timeSliceCursor')),
+  }));
+  expect(selection.title).toEqual(['02/08/2026 02:00']);
+  expect(selection.body).toEqual(['5h Limit %: 60%', 'Weekly Limit %: 40%']);
+  expect(selection.caretX).toBeCloseTo(selection.expectedX, 1);
+  expect(selection.mode).toBe('timeSlice');
+  expect(selection.cursorRegistered).toBe(true);
+});
+
 const analyticsPayload = {
   schema_version: 1,
   period: { range: '30d', from: '2026-07-05T10:00:00Z', to: '2026-08-04T10:00:00Z', timezone: 'Europe/Paris', granularity_seconds: 86400 },
@@ -365,6 +402,91 @@ test('renders detailed analytics, reset markers and cost mode by default', async
 
   await page.locator('#resets-next').click();
   await expect(page.locator('#reset-page-label')).toContainText('51–55');
+});
+
+test('groups visible Analytics units and excludes missing values and reset markers', async ({ page }) => {
+  const payload = {
+    ...enhancedAnalyticsPayload,
+    limits: {
+      ...enhancedAnalyticsPayload.limits,
+      series: enhancedAnalyticsPayload.limits.series.map((point, index) => index === 1 ? { ...point, weekly_pct: null } : point),
+    },
+  };
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+  await page.goto('/analytics.html');
+
+  const moveToSlice = async () => {
+    await page.locator('#limits-chart').scrollIntoViewIfNeeded();
+    const target = await page.evaluate(() => ({
+      x: limitsChart.scales.x.getPixelForValue(Date.parse('2026-08-04T00:00:00Z')),
+      y: limitsChart.chartArea.bottom - 1,
+    }));
+    const box = await page.locator('#limits-chart').boundingBox();
+    await page.mouse.move(box.x + target.x, box.y + target.y);
+  };
+  await moveToSlice();
+
+  await expect.poll(() => page.evaluate(() => limitsChart.tooltip.body?.map(item => item.lines[0]))).toEqual([
+    '5-hour remaining: 55%',
+    'codex: €9.68',
+    'opencode: €0.0000',
+  ]);
+  expect(await page.evaluate(() => limitsChart.tooltip.dataPoints.some(item => item.dataset.resetMarker))).toBe(false);
+
+  await page.evaluate(() => {
+    const index = limitsChart.data.datasets.findIndex(dataset => dataset.label === '5-hour remaining');
+    limitsChart.hide(index);
+    limitsChart.update('none');
+  });
+  await moveToSlice();
+  await expect.poll(() => page.evaluate(() => limitsChart.tooltip.body?.map(item => item.lines[0]))).toEqual([
+    'codex: €9.68',
+    'opencode: €0.0000',
+  ]);
+
+  await page.evaluate(() => {
+    const index = limitsChart.data.datasets.findIndex(dataset => dataset.label === '5-hour remaining');
+    limitsChart.show(index);
+    limitsChart.update('none');
+  });
+  await page.locator('#token-metric-toggle').click();
+  await moveToSlice();
+  await expect.poll(() => page.evaluate(() => limitsChart.tooltip.body?.map(item => item.lines[0]))).toEqual([
+    '5-hour remaining: 55%',
+    'codex: 1,200,000 tokens',
+    'opencode: 100 tokens',
+  ]);
+});
+
+test('retains a touch selection while allowing vertical page scrolling', async ({ browser }) => {
+  const context = await browser.newContext({ hasTouch: true, isMobile: true, viewport: { width: 390, height: 700 } });
+  const page = await context.newPage();
+  try {
+    await page.route('**/api/analytics?*', route => route.fulfill({ json: enhancedAnalyticsPayload }));
+    await page.goto('/analytics.html');
+    await page.locator('#limits-chart').scrollIntoViewIfNeeded();
+    const target = await page.evaluate(() => ({
+      x: limitsChart.scales.x.getPixelForValue(Date.parse('2026-08-04T00:00:00Z')),
+      y: (limitsChart.chartArea.top + limitsChart.chartArea.bottom) / 2,
+    }));
+    let box = await page.locator('#limits-chart').boundingBox();
+    await page.touchscreen.tap(box.x + target.x, box.y + target.y);
+    await expect.poll(() => page.evaluate(() => limitsChart.tooltip.dataPoints?.length || 0)).toBeGreaterThan(0);
+    await page.waitForTimeout(50);
+    expect(await page.evaluate(() => limitsChart.tooltip.dataPoints?.length || 0)).toBeGreaterThan(0);
+
+    const beforeScroll = await page.evaluate(() => window.scrollY);
+    box = await page.locator('#limits-chart').boundingBox();
+    const client = await context.newCDPSession(page);
+    const x = box.x + box.width / 2;
+    const y = box.y + box.height * 0.75;
+    await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+    await client.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: y - 140 }] });
+    await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(beforeScroll);
+  } finally {
+    await context.close();
+  }
 });
 
 test('does not render a 5-hour series when Codex returns null', async ({ page }) => {

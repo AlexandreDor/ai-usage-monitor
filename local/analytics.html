@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="assets/dashboard.css">
   <link rel="stylesheet" href="assets/analytics.css">
   <script src="assets/chart.umd.min.js" defer></script>
+  <script src="assets/chart-interactions.js" defer></script>
   <script src="assets/preferences.js" defer></script>
   <script src="assets/analytics.js" defer></script>
 </head>
@@ -143,7 +144,7 @@
             <span class="sample-count" id="limit-samples">—</span>
           </div>
         </div>
-        <div class="chart-wrap" id="limits-chart-wrap"><canvas id="limits-chart" role="img" aria-describedby="limits-chart-summary limits-data-table-caption"></canvas></div>
+        <div class="chart-wrap" id="limits-chart-wrap"><canvas id="limits-chart" class="time-slice-chart" role="img" aria-describedby="limits-chart-summary limits-data-table-caption"></canvas></div>
         <p class="empty-state" id="limits-empty" data-i18n="analytics.noLimitSamples" hidden>No limit samples in this period.</p>
         <p class="chart-summary" id="limits-chart-summary" role="status" aria-live="polite"></p>
         <details class="chart-data-details">
@@ -161,7 +162,7 @@
             <span class="sample-count" id="event-count">—</span>
           </div>
         </div>
-        <div class="chart-wrap" id="tokens-chart-wrap"><canvas id="tokens-chart" role="img" aria-describedby="tokens-chart-summary tokens-data-table-caption"></canvas></div>
+        <div class="chart-wrap" id="tokens-chart-wrap"><canvas id="tokens-chart" class="time-slice-chart" role="img" aria-describedby="tokens-chart-summary tokens-data-table-caption"></canvas></div>
         <p class="empty-state" id="tokens-empty" data-i18n="analytics.noTokenEvents" hidden>No token events in this period.</p>
         <p class="chart-summary" id="tokens-chart-summary" role="status" aria-live="polite"></p>
         <details class="chart-data-details">

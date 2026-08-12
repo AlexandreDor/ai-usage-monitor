@@ -17,6 +17,8 @@ reset probabilities from the independent Codex Forecast service.
 - Current remaining quota for the active 5-hour and weekly windows.
 - Reset dates and weekly pace compared with ideal consumption.
 - Rolling history chart generated from local snapshots.
+- Mouse and touch exploration by nearest time slice, with a vertical cursor and
+  one tooltip for every visible quota series at that time.
 - Automatic refresh based on the monitor collection interval.
 - Local and optional Gist-backed external modes.
 - English and French interfaces.
@@ -40,6 +42,8 @@ The local Analytics page provides:
 - filtering by application and model, with GPT-5.6 models selected by default
   when available;
 - quota, token, and API-equivalent cost charts;
+- mouse and touch exploration by nearest time slice, grouping visible series
+  while preserving percentage, token, and currency units;
 - cost allocation by application, provider, and model;
 - USD estimates from the local pricing catalog and optional EUR display
   conversion;
