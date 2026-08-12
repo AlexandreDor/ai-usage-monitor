@@ -102,4 +102,27 @@ assert_eq 1 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" "future retry ran too early"
 check_thresholds 70 100 later unknown '' '' 2000000420 >/dev/null
 assert_eq 2 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" "due retry did not run"
 
+# A threshold detected before its reset deadline is known expires when that
+# deadline is later armed and reached; it must not be delivered after refill.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-unarmed-reset"
+export FAKE_CURL_DISCORD_STATUS=503
+unset FAKE_CURL_DISCORD_STATUS_SEQUENCE FAKE_CURL_DISCORD_HEADERS
+unarmed_reset=2000000500
+check_thresholds 70 100 unknown unknown '' '' 2000000400 >/dev/null 2>&1 \
+  && fail "temporary unarmed threshold failure did not fail the cycle"
+check_thresholds 70 100 later unknown "$unarmed_reset" '' 2000000401 >/dev/null 2>&1 \
+  && fail "temporary armed threshold failure did not fail the cycle"
+export FAKE_CURL_DISCORD_STATUS=204
+check_thresholds 100 100 unknown unknown '' '' "$((unarmed_reset + 1))" >/dev/null
+assert_eq expired_after_reset \
+  "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.terminal_reason)" \
+  "unarmed threshold was not expired by reset"
+assert_eq 2 "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.attempt_count)" \
+  "expired unarmed threshold was replayed"
+assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.1.status)" \
+  "reset alert was not delivered"
+assert_eq 3 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" \
+  "stale threshold was sent after reset"
+
 printf 'PASS: monitor network tests\n'

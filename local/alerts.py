@@ -313,6 +313,12 @@ def _same_cycle(existing: str, requested: str) -> bool:
     )
 
 
+def _unarmed_cycle(cycle_key: str, limit_id: str) -> bool:
+    if cycle_key.startswith("legacy-v") and "|" in cycle_key:
+        cycle_key = cycle_key.split("|", 1)[1]
+    return cycle_key == f"limit:{limit_id}|unarmed"
+
+
 def register(document: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
     incoming = _request_alert(request)
     for existing in document["alerts"]:
@@ -330,7 +336,10 @@ def register(document: dict[str, Any], request: dict[str, Any]) -> dict[str, Any
     expire_cycle = request.get("expire_threshold_cycle")
     if expire_cycle is not None:
         for existing in document["alerts"]:
-            if (existing["kind"] == "threshold" and _same_cycle(existing["cycle_key"], expire_cycle)
+            cycle_matches = _same_cycle(existing["cycle_key"], expire_cycle) or _unarmed_cycle(
+                existing["cycle_key"], incoming["event_data"]["limit_id"])
+            if (existing["kind"] == "threshold" and existing["window"] == incoming["window"]
+                    and cycle_matches
                     and existing["status"] == "pending"):
                 _terminate(existing, "expired_after_reset", now, "expired_after_reset")
     document["alerts"].append(incoming)

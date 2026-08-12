@@ -27,6 +27,17 @@ def request(selector="25", channels=None, created=100, cycle="limit:default|rese
     }
 
 
+def reset_request(window="5h", created=200, cycle="limit:default|reset:200"):
+    return {
+        "kind": "reset", "window": window, "selector": "reset",
+        "cycle_key": cycle, "message": f"{window} reset",
+        "event_data": {"limit_id": "default", "reset_epoch": created},
+        "created_at": created, "expires_at": created + 100,
+        "channels": ["discord"], "replace_pending_thresholds": False,
+        "expire_threshold_cycle": cycle,
+    }
+
+
 class AlertJournalTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -57,6 +68,22 @@ class AlertJournalTests(unittest.TestCase):
         self.assertEqual("superseded", old["terminal_reason"])
         self.assertEqual(new["alert_id"], old["replacement_alert_id"])
         self.assertEqual("pending", new["status"])
+
+    def test_reset_expires_unarmed_threshold_in_the_same_window(self):
+        unarmed = alerts.register(
+            self.document,
+            request("50", channels=["discord"], cycle="limit:default|unarmed"),
+        )
+        weekly = request("50", channels=["discord"], cycle="limit:default|unarmed")
+        weekly["window"] = "weekly"
+        weekly = alerts.register(self.document, weekly)
+
+        reset = alerts.register(self.document, reset_request())
+
+        self.assertEqual("failed", unarmed["status"])
+        self.assertEqual("expired_after_reset", unarmed["terminal_reason"])
+        self.assertEqual("pending", weekly["status"])
+        self.assertEqual("pending", reset["status"])
 
     def test_channels_reach_aggregate_terminal_state_independently(self):
         item = alerts.register(self.document, request())
