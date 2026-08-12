@@ -264,7 +264,39 @@ place. Deux éléments de la spécification initiale restent absents.
 
 **Effort : S**
 
-### 10. Ajouter un lien vers Codex Forecast
+### 10. Explorer les graphiques par tranche temporelle
+
+Les graphiques demandent actuellement de viser précisément un point ou une
+courbe pour afficher ses informations. Cette interaction devient difficile sur
+les longues séries, lorsque les points sont masqués, ou sur un écran tactile.
+
+**Actions :**
+
+- Sélectionner automatiquement le relevé temporel le plus proche sur tout le
+  segment vertical du graphique, sans exiger que le pointeur touche un point.
+- Afficher une ligne verticale suivant la tranche temporelle sélectionnée.
+- Regrouper dans une même infobulle toutes les séries visibles à cet instant.
+- Formater séparément pourcentages, tokens et coûts dans les graphiques à
+  plusieurs axes.
+- Ignorer les points techniques utilisés pour dessiner les marqueurs de reset.
+- Prendre en charge la souris et les interactions tactiles sans bloquer le
+  défilement de la page.
+- Appliquer le même comportement au dashboard principal et à Analytics.
+
+**Critères de validation :**
+
+- Le survol d'une position horizontale affiche le relevé le plus proche même si
+  aucun point n'est visible à cet endroit.
+- L'infobulle présente toutes les valeurs disponibles pour la date sélectionnée
+  sans mélanger leurs unités.
+- Les valeurs absentes, les séries masquées et les marqueurs de reset ne
+  produisent pas d'informations trompeuses.
+- Le comportement fonctionne à la souris et sur un viewport tactile et reste
+  couvert par les tests navigateur.
+
+**Effort : S à M**
+
+### 11. Ajouter un lien vers Codex Forecast
 
 Ajouter au dashboard un accès explicite à
 `https://codex.lunarwerx.com/`, qui fournit une prévision statistique globale des
@@ -288,7 +320,7 @@ du compte surveillé.
 
 **Effort : XS**
 
-### 11. Compléter les contrôles de qualité de la CI
+### 12. Compléter les contrôles de qualité de la CI
 
 La CI exécute déjà les tests shell, Python, HTTP et navigateur ainsi que
 ShellCheck. Les contrôles de distribution et de couverture restent à ajouter.
@@ -312,7 +344,7 @@ ShellCheck. Les contrôles de distribution et de couverture restent à ajouter.
 
 ## P2 - Expérience utilisateur et maintenance
 
-### 12. Terminer l'accessibilité du dashboard principal
+### 13. Terminer l'accessibilité du dashboard principal
 
 Analytics possède déjà des résumés et tableaux alternatifs, des régions
 `aria-live` et une navigation clavier. Le dashboard principal n'offre pas encore
@@ -335,7 +367,7 @@ en partie sur l'attribut `title`.
 
 **Effort : M**
 
-### 13. Finaliser l'aide CLI du monitor
+### 14. Finaliser l'aide CLI du monitor
 
 Les modes `--once`, `--loop [SECONDS]`, `--check`, `--status-json` et
 `--fail-fast` sont implémentés, mais `monitor.sh` ne fournit pas encore d'aide
@@ -349,7 +381,7 @@ intégrée.
 
 **Effort : XS**
 
-### 14. Mettre la documentation en cohérence
+### 15. Mettre la documentation en cohérence
 
 **Actions :**
 
@@ -362,7 +394,7 @@ intégrée.
 
 **Effort : S**
 
-### 15. Préparer le packaging et les releases
+### 16. Préparer le packaging et les releases
 
 **Actions :**
 
@@ -373,7 +405,7 @@ intégrée.
 
 **Effort : M**
 
-### 16. Réduire progressivement le script monolithique
+### 17. Réduire progressivement le script monolithique
 
 Le stockage, l'archivage et la collecte Analytics sont déjà séparés en modules
 Python. Le protocole Codex, la validation principale et l'orchestration restent
@@ -404,7 +436,7 @@ Ces évolutions viendront après la stabilisation des fonctions existantes :
 La langue et la devise configurables ainsi que les commandes `--check`,
 `--once`, `--loop`, `--status-json`, `--fail-fast`, `--bind` et `--port` ont été
 retirées de cette liste car elles sont déjà implémentées. Seule l'aide intégrée
-du monitor reste à ajouter dans l'objectif 13.
+du monitor reste à ajouter dans l'objectif 14.
 
 ## Ordre d'exécution recommandé
 
@@ -414,8 +446,8 @@ du monitor reste à ajouter dans l'objectif 13.
    quota.
 3. Extraire l'historique JSON et centraliser la configuration.
 4. Finaliser WAL, les sauvegardes SQLite et l'empreinte du catalogue.
-5. Terminer les éléments Analytics restants et intégrer le lien vers Codex
-   Forecast.
+5. Terminer les éléments Analytics restants, améliorer l'exploration des
+   graphiques et intégrer le lien vers Codex Forecast.
 6. Terminer l'accessibilité du dashboard.
 7. Renforcer la CI.
 8. Ajouter l'aide CLI, corriger la documentation et préparer les releases.
@@ -446,6 +478,8 @@ Le programme restant est terminé lorsque :
 - le monitor et le serveur partagent une configuration non exécutable ;
 - SQLite est sauvegardé avant migration et fonctionne de manière fiable en WAL ;
 - le catalogue Analytics est identifiable par son empreinte ;
+- les graphiques peuvent être explorés par tranche temporelle à la souris comme
+  sur un écran tactile ;
 - les tests shell, Python, HTTP et navigateur passent en CI ;
 - la distribution comprend une version, un changelog, des unités systemd et des
   archives vérifiables.
