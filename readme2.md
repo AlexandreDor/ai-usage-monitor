@@ -392,7 +392,7 @@ crontab -e
 Open `http://localhost:8080/analytics.html` or follow **Advanced analytics** from the live limits page. This second, local-only page provides:
 
 - limit history over 24 hours, 7/30/90 days, one year, all retained data, or custom Paris calendar dates;
-- reset markers on the limit chart and a paginated history of detected 5-hour and weekly resets (50 rows per page);
+- reset markers on the limit chart and a paginated history of detected 5-hour and weekly resets (50 rows per page), including the last Forecast probabilities observed less than 45 minutes before each reset or `N/A` when unavailable;
 - separate uncached input, cache read, cache write, output, reasoning, total and assumed-zero token counters collected from local Codex, OpenCode, and Hermes data stores;
 - token series stacked by application, with a tokens/cost API-equivalent toggle and cost per time bucket;
 - breakdowns by application, provider, and model;

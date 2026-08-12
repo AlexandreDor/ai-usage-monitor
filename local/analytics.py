@@ -414,6 +414,25 @@ def limit_series(connection: sqlite3.Connection, start: int, end: int, granulari
     }
 
 
+FORECAST_BEFORE_RESET_MAX_AGE_SECONDS = 45 * 60
+
+
+def forecast_before_reset(
+    connection: sqlite3.Connection, reset_at_epoch: int
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT scraped_at_epoch, chance_24h_pct, chance_6h_pct
+          FROM forecast_samples
+         WHERE scraped_at_epoch <= ?
+           AND scraped_at_epoch > ?
+         ORDER BY scraped_at_epoch DESC
+         LIMIT 1
+        """,
+        (reset_at_epoch, reset_at_epoch - FORECAST_BEFORE_RESET_MAX_AGE_SECONDS),
+    ).fetchone()
+
+
 def reset_history(connection: sqlite3.Connection, start: int, end: int, kind: str, offset: int, limit: int) -> dict[str, Any]:
     clauses, values = ["reset_at_epoch >= ?", "reset_at_epoch < ?"], [start, end]
     if kind != "all":
@@ -462,6 +481,10 @@ def reset_history(connection: sqlite3.Connection, start: int, end: int, kind: st
         f"SELECT * FROM reset_events WHERE {where} ORDER BY reset_at_epoch DESC LIMIT ? OFFSET ?",
         [*values, limit, offset],
     ).fetchall()
+    forecast_by_reset = {
+        row["reset_at_epoch"]: forecast_before_reset(connection, row["reset_at_epoch"])
+        for row in rows
+    }
     return {
         "total": total,
         "weekly_total": len(weekly_rows),
@@ -477,6 +500,18 @@ def reset_history(connection: sqlite3.Connection, start: int, end: int, kind: st
                 "observation_delay_seconds": max(0, row["observed_at_epoch"] - row["reset_at_epoch"]),
                 "before_pct": row["before_pct"],
                 "after_pct": row["after_pct"],
+                "forecast_chance_24h_pct": (
+                    forecast_by_reset[row["reset_at_epoch"]]["chance_24h_pct"]
+                    if forecast_by_reset[row["reset_at_epoch"]] is not None else None
+                ),
+                "forecast_chance_6h_pct": (
+                    forecast_by_reset[row["reset_at_epoch"]]["chance_6h_pct"]
+                    if forecast_by_reset[row["reset_at_epoch"]] is not None else None
+                ),
+                "forecast_sample_at": (
+                    iso_utc(forecast_by_reset[row["reset_at_epoch"]]["scraped_at_epoch"])
+                    if forecast_by_reset[row["reset_at_epoch"]] is not None else None
+                ),
                 "detection_method": row["detection_method"],
                 "ideal_weekly_pace_pct": random_impacts.get(row["reset_at_epoch"], (None, None))[0],
                 "pace_delta_pct_points": random_impacts.get(row["reset_at_epoch"], (None, None))[1],

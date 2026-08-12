@@ -125,7 +125,7 @@ const analyticsPayload = {
     series: [{ at: '2026-08-04T00:00:00Z', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 25000, output_tokens: 200000, reasoning_tokens: 50000, estimated_cost_usd: 11.25 }],
     breakdown: [{ source: 'codex', provider: 'openai', model: 'gpt-5.6-sol', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 25000, output_tokens: 200000, estimated_cost_usd: 11.25, pricing_status: 'priced' }],
   },
-  resets: { total: 2, weekly_total: 2, weekly_summary: { random: { count: 1, gained_vs_ideal_pct_points: 30.004, lost_vs_ideal_pct_points: 0 }, end_of_week: { count: 1, unused_pct_points: 5 } }, offset: 0, limit: 10, items: [{ window: 'weekly', category: 'random', reset_at: '2026-08-04T08:00:00Z', observed_at: '2026-08-04T08:15:00Z', observation_delay_seconds: 900, before_pct: 28, after_pct: 100, ideal_weekly_pace_pct: 58.004, pace_delta_pct_points: 30.004, unused_pct_points: 0 }] },
+  resets: { total: 2, weekly_total: 2, weekly_summary: { random: { count: 1, gained_vs_ideal_pct_points: 30.004, lost_vs_ideal_pct_points: 0 }, end_of_week: { count: 1, unused_pct_points: 5 } }, offset: 0, limit: 10, items: [{ window: 'weekly', category: 'random', reset_at: '2026-08-04T08:00:00Z', observed_at: '2026-08-04T08:15:00Z', observation_delay_seconds: 900, before_pct: 28, after_pct: 100, forecast_chance_24h_pct: 64, forecast_chance_6h_pct: 22, forecast_sample_at: '2026-08-04T07:45:00Z', ideal_weekly_pace_pct: 58.004, pace_delta_pct_points: 30.004, unused_pct_points: 0 }] },
   baselines: { hermes: [{ tokens: 42 }] },
   pricing: { currency: 'USD', as_of: '2026-08-04', valuation_mode: 'current_catalog' },
   warnings: [
@@ -389,7 +389,8 @@ test('renders detailed analytics, reset markers and cost mode by default', async
   await expect(page.locator('#collector-grid')).toContainText('database unavailable');
   await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#tokens-chart-card')).toBeHidden();
-  await expect(page.locator('#resets-body tr').first().locator('td')).toHaveCount(5);
+  await expect(page.locator('#resets-body tr').first().locator('td')).toHaveCount(6);
+  await expect(page.locator('#resets-body tr').first().locator('td').last()).toHaveText('Forecast 24h: 64% · Forecast 6h: 22%');
 
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.filter(dataset => dataset.resetMarker).length)).toBe(2);
   await expect.poll(() => page.evaluate(() => tokensChart.data.datasets.length)).toBe(2);
@@ -520,6 +521,26 @@ test('does not render a 5-hour series when Codex returns null', async ({ page })
 
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.some(dataset => dataset.label === '5-hour remaining'))).toBe(false);
   await expect(page.locator('#limits-data-body tr').first()).toContainText('—');
+});
+
+test('shows N/A when no recent Forecast exists before a reset', async ({ page }) => {
+  await page.route('**/api/analytics?*', route => route.fulfill({
+    json: {
+      ...analyticsPayload,
+      resets: {
+        ...analyticsPayload.resets,
+        items: analyticsPayload.resets.items.map(item => ({
+          ...item,
+          forecast_chance_24h_pct: null,
+          forecast_chance_6h_pct: null,
+          forecast_sample_at: null,
+        })),
+      },
+    },
+  }));
+  await page.goto('/analytics.html');
+
+  await expect(page.locator('#resets-body tr').first().locator('td').last()).toHaveText('N/A');
 });
 
 test('keeps the last valid analytics payload after an API failure', async ({ page }) => {

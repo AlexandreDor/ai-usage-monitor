@@ -36,7 +36,8 @@ The local Analytics page provides:
 - quota history, ideal weekly pace, and Forecast probabilities for 24 hours, 7,
   30, or 90 days, one year, all retained data, or a custom date range;
 - detected 5-hour and weekly reset history, including scheduled and early
-  weekly resets;
+  weekly resets, with the last Forecast probabilities observed less than 45
+  minutes before each reset when available;
 - local token consumption from Codex, OpenCode, and Hermes;
 - uncached input, cache read, cache write, output, reasoning, and total token
   counters;

@@ -399,8 +399,8 @@ header h1 {
 }
 
 .forecast-metric strong.threshold-reached {
-  color: #fb7185;
-  text-shadow: 0 0 12px rgba(251, 113, 133, 0.42);
+  color: #f2a29d;
+  text-shadow: 0 0 12px rgba(242, 162, 157, 0.42);
 }
 
 .forecast-metric span,

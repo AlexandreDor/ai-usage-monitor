@@ -529,6 +529,14 @@ function renderResets(data = {}) {
     cell(row, formatDate(item.reset_at));
     cell(row, formatDate(item.observed_at));
     cell(row, `${item.before_pct ?? '—'}% → ${item.after_pct ?? '—'}%`);
+    const forecast24h = finiteNumber(item.forecast_chance_24h_pct);
+    const forecast6h = finiteNumber(item.forecast_chance_6h_pct);
+    cell(
+      row,
+      forecast24h === null || forecast6h === null
+        ? 'N/A'
+        : `${t('forecast24h')}: ${formatPercent(forecast24h)} · ${t('forecast6h')}: ${formatPercent(forecast6h)}`,
+    );
     body.appendChild(row);
   }
   const pagination = byId('reset-pagination');
