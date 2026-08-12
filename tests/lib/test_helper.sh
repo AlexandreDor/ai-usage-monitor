@@ -30,6 +30,7 @@ assert_file() {
 use_test_runtime() {
   RUNTIME_DIR="${TEST_ROOT}/runtime"
   STATE_FILE="${RUNTIME_DIR}/.alert_state"
+  ALERT_DELIVERIES_FILE="${RUNTIME_DIR}/alert-deliveries.json"
   DATA_FILE="${RUNTIME_DIR}/data.json"
   HISTORY_FILE="${RUNTIME_DIR}/history.json"
   ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"

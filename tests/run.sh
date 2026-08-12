@@ -3,6 +3,8 @@ set -euo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+python3 "$TEST_DIR/test_alerts.py"
+
 for test_file in "$TEST_DIR"/test_*.sh; do
   bash "$test_file"
 done
