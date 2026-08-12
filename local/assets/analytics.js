@@ -254,6 +254,10 @@ function updateTokenOverlay() {
     toggle.setAttribute('aria-pressed', String(active));
     toggle.textContent = active ? t('showTokensSeparately') : t('overlayTokens');
   }
+  const metricToggle = byId('token-metric-toggle');
+  const metricTarget = byId(active ? 'limits-chart-actions' : 'tokens-chart-actions');
+  const metricAnchor = byId(active ? 'toggle-token-overlay' : 'event-count');
+  if (metricToggle && metricTarget) metricTarget.insertBefore(metricToggle, metricAnchor);
   const tokenCard = byId('tokens-chart-card');
   if (tokenCard) tokenCard.hidden = active;
   if (!limitsChart) return;

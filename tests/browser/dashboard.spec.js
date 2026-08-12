@@ -165,12 +165,15 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#end-week-reset-count')).toHaveText('1');
   await expect(page.locator('.metric-card')).toHaveCount(10);
   await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#limits-chart-card #token-metric-toggle')).toHaveCount(1);
   await expect(page.locator('#toggle-token-overlay')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#tokens-chart-card')).toBeHidden();
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.yAxisID === 'tokens')?.data[0]?.y)).toBe(11.25);
   await page.locator('#toggle-token-overlay').click();
   await expect(page.locator('#toggle-token-overlay')).toHaveAttribute('aria-pressed', 'false');
   await expect(page.locator('#tokens-chart-card')).toBeVisible();
+  await expect(page.locator('#tokens-chart-card #token-metric-toggle')).toHaveCount(1);
+  await expect(page.locator('#limits-chart-card #token-metric-toggle')).toHaveCount(0);
   await expect(page.locator('#resets-body')).toContainText('Random');
   await expect(page.locator('#breakdown-body')).toContainText('gpt-5.6-sol');
   await expect(page.locator('#analytics-warnings')).toContainText('codex collector: delayed');
@@ -323,12 +326,17 @@ test('renders detailed analytics, reset markers and cost mode by default', async
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.filter(dataset => dataset.resetMarker).length)).toBe(2);
   await expect.poll(() => page.evaluate(() => tokensChart.data.datasets.length)).toBe(2);
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.label === 'codex')?.data[0]?.y)).toBe(11.25);
-  await page.locator('#token-metric-toggle').click();
-  await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'false');
-  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.label === 'codex')?.data[0]?.y)).toBe(1200000);
   await page.locator('#toggle-token-overlay').click();
   await expect(page.locator('#tokens-chart-card')).toBeVisible();
+  await expect(page.locator('#tokens-chart-card #token-metric-toggle')).toHaveCount(1);
+  await page.locator('#token-metric-toggle').click();
+  await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'false');
+  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.some(dataset => dataset.yAxisID === 'tokens'))).toBe(false);
   await expect.poll(() => page.evaluate(() => tokensChart.data.datasets[0].data[0].y)).toBe(1200000);
+  await page.locator('#toggle-token-overlay').click();
+  await expect(page.locator('#tokens-chart-card')).toBeHidden();
+  await expect(page.locator('#limits-chart-card #token-metric-toggle')).toHaveCount(1);
+  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.label === 'codex')?.data[0]?.y)).toBe(1200000);
 
   await page.locator('#resets-next').click();
   await expect(page.locator('#reset-page-label')).toContainText('51–55');

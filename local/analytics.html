@@ -137,7 +137,7 @@
       <article class="card analytics-card wide" id="limits-chart-card">
         <div class="section-heading chart-heading">
           <div><span class="section-kicker" data-i18n="analytics.codexLimits">Codex limits</span><h2 data-i18n="analytics.longTermAvailability">Long-term availability</h2></div>
-          <div class="chart-heading-actions">
+          <div class="chart-heading-actions" id="limits-chart-actions">
             <button type="button" id="token-metric-toggle" aria-pressed="true" data-i18n="analytics.showTokens">Show tokens</button>
             <button type="button" id="toggle-token-overlay" aria-pressed="true" aria-controls="tokens-chart-card" data-i18n="analytics.showTokensSeparately">Show tokens separately</button>
             <span class="sample-count" id="limit-samples">—</span>
@@ -155,9 +155,11 @@
       </article>
 
       <article class="card analytics-card wide" id="tokens-chart-card" hidden>
-          <div class="section-heading">
+        <div class="section-heading chart-heading">
           <div><span class="section-kicker" data-i18n="analytics.localConsumption">Local consumption</span><h2 data-i18n="analytics.tokensOverTime">Tokens over time</h2></div>
-          <span class="sample-count" id="event-count">—</span>
+          <div class="chart-heading-actions" id="tokens-chart-actions">
+            <span class="sample-count" id="event-count">—</span>
+          </div>
         </div>
         <div class="chart-wrap" id="tokens-chart-wrap"><canvas id="tokens-chart" role="img" aria-describedby="tokens-chart-summary tokens-data-table-caption"></canvas></div>
         <p class="empty-state" id="tokens-empty" data-i18n="analytics.noTokenEvents" hidden>No token events in this period.</p>
