@@ -440,6 +440,11 @@ canvas {
   max-height: 220px;
 }
 
+canvas.time-slice-chart {
+  cursor: crosshair;
+  touch-action: pan-y pinch-zoom;
+}
+
 @keyframes twinkle {
   from { opacity: 0.35; }
   to { opacity: 0.65; }

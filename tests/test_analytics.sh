@@ -102,6 +102,7 @@ assert_eq 35.0 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["reset
 assert_eq 52 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["baselines"]["hermes"][0]["tokens"])' <<<"$payload")" "Hermes baseline excludes the reasoning sub-counter"
 assert_eq 2 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["limits"]["series"][0]["samples"])' <<<"$payload")" "limit bucket sample count"
 assert_eq 45.0 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["limits"]["series"][0]["five_h_pct"])' <<<"$payload")" "limit bucket keeps the latest sample"
+assert_eq 23.28 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["limits"]["series"][0]["ideal_weekly_pct"])' <<<"$payload")" "limit bucket exposes ideal weekly pace"
 
 filtered="$(python3 "$ROOT_DIR/local/analytics.py" \
   --database "$database" \

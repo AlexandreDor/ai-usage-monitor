@@ -159,6 +159,7 @@ public_files = {
     "/assets/analytics.css": "/assets/analytics.css",
     "/assets/analytics.js": "/assets/analytics.js",
     "/assets/chart.umd.min.js": "/assets/chart.umd.min.js",
+    "/assets/chart-interactions.js": "/assets/chart-interactions.js",
     "/images/favicon.png": "/images/favicon.png",
     "/data.json": "/runtime/data.json",
     "/history.json": "/runtime/history.json",

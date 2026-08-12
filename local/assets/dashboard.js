@@ -212,6 +212,7 @@ function chartDatasets(points) {
       tension: 0.3,
       fill: true,
       spanGaps: false,
+      valueKind: 'percent',
     },
     {
       label: t('weeklyDataset'),
@@ -223,6 +224,7 @@ function chartDatasets(points) {
       tension: 0.3,
       fill: true,
       spanGaps: false,
+      valueKind: 'percent',
     },
     {
       label: t('idealDataset'),
@@ -238,6 +240,7 @@ function chartDatasets(points) {
       tension: 0,
       fill: false,
       spanGaps: false,
+      valueKind: 'percent',
     },
   ];
 }
@@ -277,40 +280,47 @@ function renderHistory(history) {
 
   if (typeof Chart !== 'function') throw new Error(t('chartFailed'));
   const context = document.getElementById('history-chart').getContext('2d');
+  let options = {
+    responsive: true,
+    maintainAspectRatio: true,
+    parsing: false,
+    normalized: true,
+    animation: false,
+    scales: {
+      y: {
+        min: 0,
+        max: 100,
+        grid: { color: 'rgba(255,255,255,0.05)' },
+        ticks: { color: '#8b949e', callback: value => `${value}%` },
+      },
+      x: {
+        type: 'linear',
+        ...(timeBounds || {}),
+        grid: { color: 'rgba(255,255,255,0.05)' },
+        ticks: { color: '#8b949e', maxTicksLimit: 12, callback: formatChartTimestamp },
+      },
+    },
+    plugins: {
+      decimation: {
+        enabled: true,
+        algorithm: 'lttb',
+        samples: DECIMATION_SAMPLES,
+        threshold: DECIMATION_THRESHOLD,
+      },
+      legend: { labels: { color: '#e6edf3', boxWidth: 12 } },
+      tooltip: { callbacks: { title: items => items.length ? formatParisDateTime(items[0].parsed.x) : '' } },
+    },
+  };
+  if (typeof CodexChartInteractions === 'object') {
+    options = CodexChartInteractions.enhanceOptions(options, {
+      formatTitle: value => formatParisDateTime(value),
+      formatValue: value => `${new Intl.NumberFormat(currentLocale(), { maximumFractionDigits: 1 }).format(value)}%`,
+    });
+  }
   chart = new Chart(context, {
     type: 'line',
     data: { datasets },
-    options: {
-      responsive: true,
-      maintainAspectRatio: true,
-      parsing: false,
-      normalized: true,
-      animation: false,
-      scales: {
-        y: {
-          min: 0,
-          max: 100,
-          grid: { color: 'rgba(255,255,255,0.05)' },
-          ticks: { color: '#8b949e', callback: value => `${value}%` },
-        },
-        x: {
-          type: 'linear',
-          ...(timeBounds || {}),
-          grid: { color: 'rgba(255,255,255,0.05)' },
-          ticks: { color: '#8b949e', maxTicksLimit: 12, callback: formatChartTimestamp },
-        },
-      },
-      plugins: {
-        decimation: {
-          enabled: true,
-          algorithm: 'lttb',
-          samples: DECIMATION_SAMPLES,
-          threshold: DECIMATION_THRESHOLD,
-        },
-        legend: { labels: { color: '#e6edf3', boxWidth: 12 } },
-        tooltip: { callbacks: { title: items => items.length ? formatParisDateTime(items[0].parsed.x) : '' } },
-      },
-    },
+    options,
   });
   setHistoryError();
 }

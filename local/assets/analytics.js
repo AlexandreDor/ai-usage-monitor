@@ -94,6 +94,11 @@ function formatPercent(value) {
   const number = finiteNumber(value);
   return number === null ? '—' : `${Math.round(number * 10) / 10}%`;
 }
+function formatChartValue(value, kind) {
+  if (kind === 'percent') return formatPercent(value);
+  if (kind === 'cost') return formatCost(value);
+  return t('tokenValue', { value: formatFullTokens(value) });
+}
 function totalBillable(summary) {
   return safeNumber(summary?.input_tokens)
     + safeNumber(summary?.cache_read_tokens)
@@ -195,7 +200,7 @@ function applyChartBounds(options, points) {
   else options.scales.x.max = bounds.max;
 }
 function chartBase(points = []) {
-  const options = {
+  let options = {
     responsive: true,
     maintainAspectRatio: false,
     parsing: false,
@@ -215,6 +220,12 @@ function chartBase(points = []) {
     },
   };
   applyChartBounds(options, points);
+  if (typeof CodexChartInteractions === 'object') {
+    options = CodexChartInteractions.enhanceOptions(options, {
+      formatTitle: value => formatDate(value),
+      formatValue: formatChartValue,
+    });
+  }
   return options;
 }
 function tokenAxis() {
@@ -287,6 +298,7 @@ function markerDataset(markers, window) {
     fill: false,
     spanGaps: false,
     resetMarker: true,
+    timeSliceExcluded: true,
   };
 }
 function renderLimitTable(points) {
@@ -297,6 +309,7 @@ function renderLimitTable(points) {
     cell(row, formatDate(point.at));
     cell(row, formatPercent(point.five_h_pct));
     cell(row, formatPercent(point.weekly_pct));
+    cell(row, formatPercent(point.ideal_weekly_pct));
     body?.appendChild(row);
   }
 }
@@ -325,11 +338,19 @@ function renderLimits(data = {}) {
       label: t('fiveHourRemaining'),
       data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.five_h_pct) })),
       borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,.10)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false,
+      valueKind: 'percent',
     },
     {
       label: t('weeklyRemaining'),
       data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.weekly_pct) })),
       borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.07)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false,
+      valueKind: 'percent',
+    },
+    {
+      label: t('idealWeeklyPace'),
+      data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.ideal_weekly_pct) })),
+      borderColor: '#a7f3d0', backgroundColor: 'transparent', fill: false, borderWidth: 2, borderDash: [8, 6], pointRadius: 0, tension: 0, spanGaps: false,
+      valueKind: 'percent',
     },
   ];
   limitDatasets = limitCandidates.filter(dataset => dataset.data.some(point => point.y !== null));
@@ -405,6 +426,7 @@ function datasetsForTokens(tokens) {
       data: points.map(point => ({ x: timestampMs(point.at), y: tokenDatasetValue(point) })),
       backgroundColor: source === 'codex' ? '#3b82f6' : source === 'opencode' ? '#a78bfa' : source === 'hermes' ? '#22c55e' : '#38bdf8',
       stack: 'applications',
+      valueKind: state.tokenMetric,
     }));
   }
   if (state.tokenMetric === 'cost') {
@@ -412,12 +434,13 @@ function datasetsForTokens(tokens) {
       label: t('estimatedCost'),
       data: tokenPoints.map(point => ({ x: timestampMs(point.at), y: pointCost(point) })),
       backgroundColor: '#a78bfa', stack: 'tokens',
+      valueKind: 'cost',
     }];
   }
   return [
-    { label: t('input'), data: tokenPoints.map(point => ({ x: timestampMs(point.at), y: safeNumber(point.input_tokens) })), backgroundColor: '#3b82f6', stack: 'tokens' },
-    { label: t('cacheReadWrite'), data: tokenPoints.map(point => ({ x: timestampMs(point.at), y: safeNumber(point.cache_read_tokens) + safeNumber(point.cache_write_tokens) })), backgroundColor: '#a78bfa', stack: 'tokens' },
-    { label: t('output'), data: tokenPoints.map(point => ({ x: timestampMs(point.at), y: safeNumber(point.output_tokens) })), backgroundColor: '#22c55e', stack: 'tokens' },
+    { label: t('input'), data: tokenPoints.map(point => ({ x: timestampMs(point.at), y: safeNumber(point.input_tokens) })), backgroundColor: '#3b82f6', stack: 'tokens', valueKind: 'tokens' },
+    { label: t('cacheReadWrite'), data: tokenPoints.map(point => ({ x: timestampMs(point.at), y: safeNumber(point.cache_read_tokens) + safeNumber(point.cache_write_tokens) })), backgroundColor: '#a78bfa', stack: 'tokens', valueKind: 'tokens' },
+    { label: t('output'), data: tokenPoints.map(point => ({ x: timestampMs(point.at), y: safeNumber(point.output_tokens) })), backgroundColor: '#22c55e', stack: 'tokens', valueKind: 'tokens' },
   ];
 }
 function renderTokens(data = {}) {

@@ -38,6 +38,8 @@ function FakeChart(_context, config) {
   this.update = () => {};
   this.destroy = () => { destroyed += 1; };
 }
+FakeChart.Interaction = { modes: {} };
+FakeChart.register = () => {};
 
 const context = vm.createContext({
   console,
@@ -59,6 +61,8 @@ const context = vm.createContext({
 
 const preferencesSource = fs.readFileSync(path.join(__dirname, '..', 'local', 'assets', 'preferences.js'), 'utf8');
 vm.runInContext(preferencesSource, context, { filename: 'preferences.js' });
+const interactionsSource = fs.readFileSync(path.join(__dirname, '..', 'local', 'assets', 'chart-interactions.js'), 'utf8');
+vm.runInContext(interactionsSource, context, { filename: 'chart-interactions.js' });
 const source = fs.readFileSync(path.join(__dirname, '..', 'local', 'assets', 'dashboard.js'), 'utf8');
 vm.runInContext(source, context, { filename: 'dashboard.js' });
 
@@ -104,6 +108,8 @@ function evaluate(expression) {
   if (evaluate(`chart.config.options.plugins.tooltip.callbacks.title([{parsed:{x:Date.parse('2026-08-03T17:30:00Z')}}])`) !== '03/08/2026 19:30') {
     fail('chart tooltip is not formatted in Paris time');
   }
+  if (evaluate('chart.config.options.interaction.mode') !== 'timeSlice') fail('dashboard does not use the shared time-slice interaction');
+  if (evaluate('chart.data.datasets.every(dataset => dataset.valueKind === "percent")') !== true) fail('dashboard datasets do not declare percent units');
 
   evaluate(`renderData({
     five_h_pct: 80,
