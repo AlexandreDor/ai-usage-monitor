@@ -40,7 +40,8 @@ que soit son âge.
 - Afficher un avertissement après environ deux intervalles sans mise à jour.
 - Distinguer visuellement les états `LOCAL`, `EXTERNAL` et `STALE`.
 - Afficher l'âge réel des données dans une région `aria-live`.
-- Conserver les dernières valeurs valides pendant une erreur de rafraîchissement.
+- Conserver le contexte `LOCAL` ou `EXTERNAL` des dernières valeurs valides et
+  annoncer séparément une erreur de rafraîchissement.
 
 **Critères de validation :**
 
@@ -104,8 +105,8 @@ correspondent pas à un reset identifiable.
   quota.
 - Signaler une date de reset qui recule dans le passé, oscille de manière
   répétée ou disparaît alors que la fenêtre était disponible.
-- Comparer uniquement des observations cohérentes appartenant au même
-  `limit_id`.
+- Généraliser aux anomalies la segmentation par `limit_id` déjà utilisée pour
+  les resets hebdomadaires anticipés.
 - Ajouter des tolérances et, lorsque nécessaire, une confirmation sur deux
   relevés pour éviter les faux positifs.
 - Dédupliquer les alertes et conserver dans SQLite leur type, leur date de
@@ -136,8 +137,8 @@ fichier `history.json` du dashboard principal reste géré inline dans
 - Refuser les pourcentages hors de l'intervalle `0..100`.
 - Trier et dédupliquer selon le timestamp réel.
 - Appliquer `HISTORY_RETENTION_HOURS` selon l'âge des relevés.
-- Écrire atomiquement et sauvegarder sous un nom unique tout historique
-  corrompu.
+- Conserver l'écriture atomique et la sauvegarde existantes, en garantissant un
+  nom réellement unique pour chaque historique corrompu.
 - Conserver un plafond défensif de 10 000 entrées et 16 MiB.
 
 **Critères de validation :**
@@ -158,8 +159,9 @@ entre plusieurs scripts.
 
 **Actions :**
 
-- Créer `local/config.py` pour lire `.env` comme des données et effectuer la
-  validation typée et le contrôle des permissions.
+- Extraire dans `local/config.py` les parseurs et validations déjà présents dans
+  `monitor.sh` et `serve.sh`, y compris les contrôles de permissions et de
+  liens symboliques.
 - Partager les valeurs nécessaires entre le monitor et le serveur.
 - Appliquer partout l'ordre de priorité suivant : option CLI, variable
   d'environnement, `local/.env`, valeur par défaut.
@@ -169,7 +171,8 @@ entre plusieurs scripts.
 
 - Le monitor et le serveur interprètent de la même manière une configuration
   valide ou invalide.
-- Un fichier `.env` n'est jamais exécuté comme du code shell.
+- La garantie existante qu'un fichier `.env` n'est jamais exécuté comme du code
+  shell ne régresse pas.
 - Les priorités et les cas de variables incomplètes sont testés.
 
 **Effort : M**
@@ -222,16 +225,16 @@ place. Deux éléments de la spécification initiale restent absents.
 **Actions :**
 
 - Ajouter une carte distincte pour les tokens associés à un modèle sans tarif.
-- Paginer le tableau par application, fournisseur et modèle par groupes de
-  50 lignes.
-- Conserver l'indication explicite que le coût est une estimation API et que le
-  reasoning est inclus dans l'output.
+- Paginer côté serveur le tableau par application, fournisseur et modèle par
+  groupes de 50 lignes, avec un total et un offset bornés.
 
 **Critères de validation :**
 
 - Les tokens sans tarif restent visibles sans être ajoutés au coût estimé.
 - Un résultat de plus de 50 groupes reste navigable au clavier sans réponse API
   démesurée.
+- L'indication existante que le coût est une estimation API et que le reasoning
+  est inclus dans l'output ne régresse pas.
 - La pagination et le changement de langue sont couverts par les tests
   navigateur.
 
@@ -304,7 +307,8 @@ en partie sur l'attribut `title`.
 
 - Fournir un résumé textuel et un tableau alternatif de l'historique.
 - Donner aux jauges des labels accessibles complets.
-- Afficher les détails d'allure dans le contenu visible.
+- Afficher dans le contenu visible les valeurs réelle et idéale encore limitées
+  à l'attribut `title`, en plus du delta déjà visible.
 - Vérifier la navigation clavier et l'état sans couleur.
 
 **Critères de validation :**
@@ -337,6 +341,8 @@ intégrée.
 - Remplacer les URL de clonage génériques par l'URL canonique du dépôt.
 - Vérifier les procédures LXC, systemd et GitHub Pages avec les noms et chemins
   actuels.
+- Supprimer ou synchroniser la liste d'idées du README avec la section P3 afin
+  d'éviter deux feuilles de route divergentes.
 - Expliquer les états de fraîcheur.
 - Documenter la sauvegarde et la restauration de SQLite, y compris le mode WAL.
 - Maintenir la référence de configuration avec les changements de `config.py`.
@@ -348,7 +354,8 @@ intégrée.
 **Actions :**
 
 - Ajouter des unités systemd réelles prêtes à être validées par la CI.
-- Ajouter `CHANGELOG.md`, des tags et une politique de version.
+- Ajouter `CHANGELOG.md`, définir une politique SemVer et publier le premier tag
+  conformément à cette politique.
 - Publier des archives de release avec checksums.
 - Documenter installation, mise à jour, retour arrière et désinstallation.
 
@@ -367,7 +374,8 @@ concentrés dans `monitor.sh`.
 - Définir un schéma versionné pour les snapshots et l'historique JSON.
 - Déplacer progressivement le protocole Codex et la validation vers des modules
   Python testables.
-- Conserver Bash comme lanceur léger tant que cela reste utile.
+- Extraire en priorité `history.py`, `config.py` et un client du protocole Codex,
+  puis limiter Bash au parsing CLI et à l'orchestration.
 
 **Effort : L**
 
@@ -377,10 +385,13 @@ Ces évolutions viendront après la stabilisation des fonctions existantes :
 
 - support de plusieurs comptes Codex ;
 - notifications Slack, ntfy ou e-mail ;
-- endpoint de santé et export Prometheus ;
-- agrégation quotidienne pour les historiques longs ;
+- exposition contrôlée des données déjà maintenues dans `runtime/health.json`,
+  puis export Prometheus distinct ;
+- rollups quotidiens persistants pour les historiques longs ;
 - fuseau horaire configurable ;
-- mode simulation avec fixtures anonymisées pour développer sans compte Codex.
+- transformation des fixtures anonymisées existantes en mode simulation
+  documenté pour développer sans compte Codex, sans notification ni Gist par
+  défaut.
 
 La langue et la devise configurables ainsi que les commandes `--check`,
 `--once`, `--loop`, `--status-json`, `--fail-fast`, `--bind` et `--port` ont été
