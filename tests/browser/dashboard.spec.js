@@ -519,6 +519,7 @@ test('does not render a 5-hour series when Codex returns null', async ({ page })
   }));
   await page.goto('/analytics.html');
 
+  await expect.poll(() => page.evaluate(() => typeof limitsChart !== 'undefined' && limitsChart !== null)).toBe(true);
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.some(dataset => dataset.label === '5-hour remaining'))).toBe(false);
   await expect(page.locator('#limits-data-body tr').first()).toContainText('—');
 });
