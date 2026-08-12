@@ -62,7 +62,7 @@ count_file_lines() {
 }
 
 reset_case() {
-  rm -f "$STATE_FILE" "$HOOK_LOG" "$NOTIFICATION_LOG"
+  rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$HOOK_LOG" "$NOTIFICATION_LOG"
   monitor_defaults
   ALERT_THRESHOLDS=0
 }
@@ -143,10 +143,14 @@ reset_case
 ALERT_SCRIPT_1="$CRASH_STATE_HOOK"
 ALERT_SCRIPT_1_EVENTS='weekly:50'
 validate_config
+# Invoked through register_network_alert's compatibility seam.
+# shellcheck disable=SC2317,SC2329
 send_alert() { printf '%s\n' "$1" >> "$NOTIFICATION_LOG"; return 1; }
 check_thresholds 100 100 unknown later '' "$old_weekly_deadline" "$now" group-a
 check_thresholds 100 40 unknown later '' "$old_weekly_deadline" "$((now + 1))" group-a >/dev/null || true
 cp "$CRASH_STATE" "$STATE_FILE"
+# Invoked through register_network_alert's compatibility seam.
+# shellcheck disable=SC2317,SC2329
 send_alert() { printf '%s\n' "$1" >> "$NOTIFICATION_LOG"; return 0; }
 check_thresholds 100 100 unknown later '' "$((old_weekly_deadline + 30 * 60))" "$((now + 2))" group-a
 assert_contains "$(tail -n 1 "$NOTIFICATION_LOG")" "weekly limit reset" "hook journal missed the following reset"
@@ -156,6 +160,8 @@ reset_case
 ALERT_SCRIPT_1="$HOOK_ONE"
 ALERT_SCRIPT_1_EVENTS='5h:reset'
 validate_config
+# Invoked through register_network_alert's compatibility seam.
+# shellcheck disable=SC2317,SC2329
 send_alert() { printf '%s\n' "$1" >> "$NOTIFICATION_LOG"; return 1; }
 check_thresholds 80 100 later unknown "$((now + 10))" '' "$now" >/dev/null || true
 check_thresholds 100 100 unknown unknown '' '' "$((now + 11))" >/dev/null || true

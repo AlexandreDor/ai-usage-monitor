@@ -28,13 +28,13 @@ run_sample 4 '' "$((now + 4))"
 assert_eq 3 "$(count_alerts)" "threshold oscillation duplicated notification"
 
 reset_at=$((now + 300))
-rm -f "$STATE_FILE" "$ALERT_LOG"
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$ALERT_LOG"
 run_sample 4 "$reset_at" "$now"
 run_sample 100 '' "$((reset_at + 1))"
 assert_eq 2 "$(count_alerts)" "4 to 100 reset sequence"
 assert_contains "$(tail -n 1 "$ALERT_LOG")" 'limit reset' "reset alert missing"
 
-rm -f "$STATE_FILE" "$ALERT_LOG"
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$ALERT_LOG"
 decimal_reset_at=$((now + 600))
 run_sample 79.75 "$decimal_reset_at" "$now"
 assert_eq "$decimal_reset_at" "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" "decimal percentage did not arm reset"

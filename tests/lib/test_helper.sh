@@ -30,6 +30,7 @@ assert_file() {
 use_test_runtime() {
   RUNTIME_DIR="${TEST_ROOT}/runtime"
   STATE_FILE="${RUNTIME_DIR}/.alert_state"
+  ALERT_DELIVERIES_FILE="${RUNTIME_DIR}/alert-deliveries.json"
   DATA_FILE="${RUNTIME_DIR}/data.json"
   HISTORY_FILE="${RUNTIME_DIR}/history.json"
   ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"
@@ -55,6 +56,7 @@ monitor_defaults() {
   CURL_RETRIES=0
   CURL_RETRY_DELAY_SECONDS=0
   MONITOR_DEBUG=0
+  CODEX_FORECAST_ENABLED=0
   DISCORD_WEBHOOK=""
   TELEGRAM_BOT_TOKEN=""
   TELEGRAM_CHAT_ID=""

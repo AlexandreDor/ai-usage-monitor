@@ -31,6 +31,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/.env"
 RUNTIME_DIR="${SCRIPT_DIR}/runtime"
 STATE_FILE="${RUNTIME_DIR}/.alert_state"
+ALERT_DELIVERIES_FILE="${RUNTIME_DIR}/alert-deliveries.json"
+ALERTS_PY="${SCRIPT_DIR}/alerts.py"
 DATA_FILE="${RUNTIME_DIR}/data.json"
 HISTORY_FILE="${RUNTIME_DIR}/history.json"
 ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"
@@ -61,7 +63,7 @@ load_config() {
     fi
 
     case "$key" in
-      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
+      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_FORECAST_ENABLED|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
         if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
           value="${value:1:${#value}-2}"
         fi
@@ -280,6 +282,7 @@ validate_config() {
   [[ -z "$TELEGRAM_BOT_TOKEN" || "$TELEGRAM_BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || { config_error "TELEGRAM_BOT_TOKEN has an invalid format." || true; invalid=1; }
   [[ -z "$TELEGRAM_CHAT_ID" || "$TELEGRAM_CHAT_ID" =~ ^-?[1-9][0-9]*$ ]] || { config_error "TELEGRAM_CHAT_ID must be a non-zero numeric chat ID." || true; invalid=1; }
   [[ "$MONITOR_DEBUG" == 0 || "$MONITOR_DEBUG" == 1 ]] || { config_error "MONITOR_DEBUG must be 0 or 1." || true; invalid=1; }
+  [[ "$CODEX_FORECAST_ENABLED" == 0 || "$CODEX_FORECAST_ENABLED" == 1 ]] || { config_error "CODEX_FORECAST_ENABLED must be 0 or 1." || true; invalid=1; }
   [[ "$GITHUB_API_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || { config_error "GITHUB_API_URL is not a valid HTTP(S) base URL." || true; invalid=1; }
   [[ "$TELEGRAM_API_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || { config_error "TELEGRAM_API_URL is not a valid HTTP(S) base URL." || true; invalid=1; }
   [[ "$TOKEN_USAGE_SOURCES" == auto || "$TOKEN_USAGE_SOURCES" == none || "$TOKEN_USAGE_SOURCES" =~ ^(codex|opencode|hermes)(,(codex|opencode|hermes))*$ ]] || { config_error "TOKEN_USAGE_SOURCES must be auto, none, or a comma-separated list of codex,opencode,hermes." || true; invalid=1; }
@@ -379,6 +382,7 @@ initialize() {
   CURL_RETRIES="${CURL_RETRIES:-2}"
   CURL_RETRY_DELAY_SECONDS="${CURL_RETRY_DELAY_SECONDS:-1}"
   MONITOR_DEBUG="${MONITOR_DEBUG:-0}"
+  CODEX_FORECAST_ENABLED="${CODEX_FORECAST_ENABLED:-1}"
   DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}"
   TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
   TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -634,6 +638,92 @@ print(value)
 PYEOF
 }
 
+fetch_codex_forecast() {
+  local bucket response_file response_bytes status curl_status=0
+  bucket=$(( $(date -u +%s) / 300 ))
+  response_file="$(mktemp "${RUNTIME_DIR}/.forecast-response.XXXXXX")"
+  status="$(curl --silent --show-error --connect-timeout 3 --max-time 8 --max-filesize 65536 \
+    --output "$response_file" --write-out '%{http_code}' \
+    "https://codex.lunarwerx.com/cnx/aireset/summary/t/${bucket}" 2>/dev/null)" || curl_status=$?
+  if (( curl_status != 0 )) || [[ "$status" != 200 ]]; then
+    rm -f "$response_file"
+    echo "[WARN] Codex Forecast is unavailable; continuing without global reset probabilities." >&2
+    return 1
+  fi
+  response_bytes="$(wc -c < "$response_file")"
+  if [[ ! "$response_bytes" =~ ^[0-9]+$ ]] || (( response_bytes > 65536 )); then
+    rm -f "$response_file"
+    echo "[WARN] Codex Forecast returned an oversized response; continuing without global reset probabilities." >&2
+    return 1
+  fi
+
+  if ! python3 - "$response_file" <<'PYEOF'
+import datetime
+import json
+import math
+import pathlib
+import sys
+
+try:
+    payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, ValueError):
+    raise SystemExit(1)
+
+if not isinstance(payload, dict):
+    raise SystemExit(1)
+
+
+def probability(name):
+    value = payload.get(name)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or not 0 <= value <= 1:
+        raise SystemExit(1)
+    return math.floor(value * 100 + 0.5)
+
+
+generated_at = payload.get("generatedAt")
+if not isinstance(generated_at, str) or not generated_at or len(generated_at) > 100:
+    raise SystemExit(1)
+try:
+    generated = datetime.datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+except (OverflowError, ValueError):
+    raise SystemExit(1)
+if generated.tzinfo is None:
+    raise SystemExit(1)
+generated = generated.astimezone(datetime.timezone.utc)
+if generated > datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5):
+    raise SystemExit(1)
+
+forecast = {
+    "chance_24h_pct": probability("chanceToday"),
+    "chance_6h_pct": probability("chanceSoon"),
+    "generated_at": generated.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+print(json.dumps(forecast, separators=(",", ":")))
+PYEOF
+  then
+    rm -f "$response_file"
+    echo "[WARN] Codex Forecast returned invalid data; continuing without global reset probabilities." >&2
+    return 1
+  fi
+  rm -f "$response_file"
+}
+
+enrich_snapshot_with_codex_forecast() {
+  local json="$1" forecast
+  forecast="$(fetch_codex_forecast)" || return 1
+  python3 - "$json" "$forecast" <<'PYEOF'
+import json
+import sys
+
+snapshot = json.loads(sys.argv[1])
+forecast = json.loads(sys.argv[2])
+if not isinstance(snapshot, dict) or not isinstance(forecast, dict):
+    raise SystemExit(1)
+snapshot["codex_forecast"] = forecast
+print(json.dumps(snapshot, indent=2))
+PYEOF
+}
+
 timestamp_to_epoch() {
   local timestamp="$1"
 
@@ -690,7 +780,7 @@ import time
 
 history_path = pathlib.Path(sys.argv[1])
 data_path = pathlib.Path(sys.argv[2])
-new_entry = json.loads(sys.argv[3])
+new_snapshot = json.loads(sys.argv[3])
 max_entries = int(sys.argv[4])
 public_fields = {
     "five_h_pct",
@@ -706,7 +796,27 @@ public_fields = {
 }
 
 
-def sanitize_entry(entry):
+def sanitize_forecast(value):
+    if not isinstance(value, dict):
+        return None
+    chance_24h = value.get("chance_24h_pct")
+    chance_6h = value.get("chance_6h_pct")
+    generated_at = value.get("generated_at")
+    if any(
+        not isinstance(chance, int) or isinstance(chance, bool) or not 0 <= chance <= 100
+        for chance in (chance_24h, chance_6h)
+    ):
+        return None
+    if not isinstance(generated_at, str) or not generated_at or len(generated_at) > 100:
+        return None
+    return {
+        "chance_24h_pct": chance_24h,
+        "chance_6h_pct": chance_6h,
+        "generated_at": generated_at,
+    }
+
+
+def sanitize_entry(entry, *, include_forecast=False):
     if not isinstance(entry, dict):
         return None
     sanitized = {key: entry[key] for key in public_fields if key in entry}
@@ -723,11 +833,16 @@ def sanitize_entry(entry):
             not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0
         ):
             sanitized[key] = None
+    if include_forecast:
+        forecast = sanitize_forecast(entry.get("codex_forecast"))
+        if forecast is not None:
+            sanitized["codex_forecast"] = forecast
     return sanitized
 
 
-new_entry = sanitize_entry(new_entry)
-if new_entry is None:
+new_history_entry = sanitize_entry(new_snapshot)
+new_data_entry = sanitize_entry(new_snapshot, include_forecast=True)
+if new_history_entry is None or new_data_entry is None:
     raise SystemExit("invalid usage snapshot")
 
 def atomic_write(path, content):
@@ -761,23 +876,23 @@ if history_path.exists():
         history = []
 
 history = [entry for item in history if (entry := sanitize_entry(item)) is not None]
-new_timestamp = new_entry.get("scraped_at", "")
+new_timestamp = new_history_entry.get("scraped_at", "")
 existing_timestamps = {entry.get("scraped_at") for entry in history}
 if new_timestamp not in existing_timestamps:
-    history.append(new_entry)
+    history.append(new_history_entry)
 history.sort(key=lambda entry: entry.get("scraped_at", ""), reverse=True)
 history = history[:max_entries]
 
 current = None
 if data_path.exists():
     try:
-        current = sanitize_entry(json.loads(data_path.read_text(encoding="utf-8")))
+        current = sanitize_entry(json.loads(data_path.read_text(encoding="utf-8")), include_forecast=True)
     except Exception:
         current = None
 
 atomic_write(history_path, json.dumps(history, indent=2) + "\n")
 if current is None or new_timestamp >= current.get("scraped_at", ""):
-    atomic_write(data_path, json.dumps(new_entry, indent=2) + "\n")
+    atomic_write(data_path, json.dumps(new_data_entry, indent=2) + "\n")
 else:
     sys.stderr.write("[WARN] Older snapshot retained in history but did not replace data.json.\n")
 PYEOF
@@ -954,6 +1069,199 @@ send_alert() {
   (( delivered > 0 ))
 }
 
+# Perform exactly one notification request. The durable retry orchestrator below
+# records the result before deciding whether another attempt is allowed.
+alert_http_attempt() {
+  local channel="$1" message="$2" response_file headers_file error_file payload status="000" curl_status=0
+  response_file="$(mktemp "${RUNTIME_DIR}/.${channel}-response.XXXXXX")" || return 1
+  headers_file="$(mktemp "${RUNTIME_DIR}/.${channel}-headers.XXXXXX")" || { rm -f "$response_file"; return 1; }
+  error_file="$(mktemp "${RUNTIME_DIR}/.${channel}-error.XXXXXX")" || { rm -f "$response_file" "$headers_file"; return 1; }
+  chmod 600 "$response_file" "$headers_file" "$error_file"
+  HTTP_LAST_RESPONSE_FILE="$response_file"
+  HTTP_LAST_HEADERS_FILE="$headers_file"
+  HTTP_LAST_ERROR_FILE="$error_file"
+
+  if [[ "$channel" == discord ]]; then
+    payload="$(python3 - "$message" <<'PYEOF'
+import json
+import sys
+print(json.dumps({"content": sys.argv[1]}))
+PYEOF
+)"
+    status="$(printf '%s\n' "url = \"${DISCORD_WEBHOOK}\"" | curl --config - --silent --show-error \
+      --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" --max-time "$CURL_MAX_TIME_SECONDS" \
+      --request POST --output "$response_file" --dump-header "$headers_file" --write-out '%{http_code}' \
+      -H "Content-Type: application/json" --data "$payload" 2>"$error_file")" || curl_status=$?
+  else
+    status="$(printf '%s\n' "url = \"${TELEGRAM_API_URL}/bot${TELEGRAM_BOT_TOKEN}/sendMessage\"" | curl --config - --silent --show-error \
+      --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" --max-time "$CURL_MAX_TIME_SECONDS" \
+      --request POST --output "$response_file" --dump-header "$headers_file" --write-out '%{http_code}' \
+      --data "chat_id=${TELEGRAM_CHAT_ID}" --data-urlencode "text=${message}" 2>"$error_file")" || curl_status=$?
+  fi
+  [[ "$status" =~ ^[0-9]{3}$ ]] || status=0
+  HTTP_LAST_CURL_CODE="$curl_status"
+  HTTP_LAST_STATUS="$((10#$status))"
+  return 0
+}
+
+cleanup_alert_http_attempt() {
+  rm -f "${HTTP_LAST_RESPONSE_FILE:-}" "${HTTP_LAST_HEADERS_FILE:-}" "${HTTP_LAST_ERROR_FILE:-}"
+  HTTP_LAST_RESPONSE_FILE=""
+  HTTP_LAST_HEADERS_FILE=""
+  HTTP_LAST_ERROR_FILE=""
+}
+
+configured_alert_channels_json() {
+  if [[ -n "${DISCORD_WEBHOOK:-}" && -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+    printf '["discord","telegram"]\n'
+  elif [[ -n "${DISCORD_WEBHOOK:-}" ]]; then
+    printf '["discord"]\n'
+  elif [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+    printf '["telegram"]\n'
+  else
+    printf '[]\n'
+  fi
+}
+
+register_network_alert() {
+  local kind="$1" window="$2" selector="$3" cycle_key="$4" message="$5"
+  local event_data="$6" created_at="$7" expires_at="$8" replace="${9:-false}" expire_cycle="${10:-}"
+  local channels request
+  channels="$(configured_alert_channels_json)" || return 1
+  if [[ "$channels" == "[]" ]]; then
+    # send_alert is retained as a no-channel compatibility seam for embedders
+    # and tests; its production implementation performs no network request here.
+    if send_alert "$message"; then return 2; else return 1; fi
+  fi
+  request="$(ALERT_REGISTER_MESSAGE="$message" python3 - "$kind" "$window" "$selector" "$cycle_key" \
+    "$event_data" "$created_at" "$expires_at" "$channels" "$replace" "$expire_cycle" <<'PYEOF'
+import json
+import os
+import sys
+kind, window, selector, cycle_key, event_data, created, expires, channels, replace, expire = sys.argv[1:]
+print(json.dumps({
+    "kind": kind, "window": window, "selector": selector, "cycle_key": cycle_key,
+    "message": os.environ["ALERT_REGISTER_MESSAGE"], "event_data": json.loads(event_data),
+    "created_at": int(created), "expires_at": int(expires), "channels": json.loads(channels),
+    "replace_pending_thresholds": replace == "true",
+    "expire_threshold_cycle": expire or None,
+}))
+PYEOF
+)" || return 1
+  if ! printf '%s\n' "$request" | python3 "$ALERTS_PY" register "$ALERT_DELIVERIES_FILE" >/dev/null; then
+    echo "[ERROR] Could not journal network alert; no request was started." >&2
+    return 1
+  fi
+  echo "[ALERT] Detected: $message"
+}
+
+deliver_due_alerts() {
+  local now="$1" configured due_file alert_id channel message attempt cycle_limit
+  local classification outcome error_class retryable retry_delay next_attempt used_retry_after record_payload
+  due_file="$(mktemp "${RUNTIME_DIR}/.alerts-due.XXXXXX")" || return 1
+  configured="$(configured_alert_channels_json)" || { rm -f "$due_file"; return 1; }
+  if ! printf '{"configured_channels":%s}\n' "$configured" \
+      | python3 "$ALERTS_PY" due "$ALERT_DELIVERIES_FILE" --now "$now" > "$due_file"; then
+    rm -f "$due_file"
+    return 1
+  fi
+  cycle_limit=$((CURL_RETRIES + 1))
+  while IFS=$'\t' read -r alert_id channel message; do
+    [[ -n "$alert_id" ]] || continue
+    message="$(printf '%s' "$message" | base64 --decode)" || { NETWORK_DELIVERY_ERROR=1; continue; }
+    attempt=1
+    while (( attempt <= cycle_limit )); do
+      echo "[INFO] ${channel}: alert ${alert_id} attempt ${attempt}/${cycle_limit}."
+      if ! alert_http_attempt "$channel" "$message"; then
+        NETWORK_DELIVERY_ERROR=1
+        cleanup_alert_http_attempt
+        break
+      fi
+      classification="$(python3 "$ALERTS_PY" classify "$HTTP_LAST_CURL_CODE" "$HTTP_LAST_STATUS" \
+        "$attempt" "$CURL_RETRY_DELAY_SECONDS" "$HTTP_LAST_HEADERS_FILE" --now "$now")" \
+        || { NETWORK_DELIVERY_ERROR=1; cleanup_alert_http_attempt; break; }
+      IFS=$'\t' read -r outcome error_class retryable retry_delay next_attempt used_retry_after < <(
+        printf '%s' "$classification" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["outcome"], d["error_class"] or "-", int(d["retryable"]), d["retry_delay"], d["next_attempt_at"], int(d["used_retry_after"]), sep="\t")'
+      )
+      [[ "$error_class" == - ]] && error_class=""
+      if (( HTTP_LAST_CURL_CODE == 0 )) && [[ "$outcome" == delivered ]]; then
+        if [[ "$channel" == discord && "$HTTP_LAST_STATUS" != 204 ]]; then
+          outcome=failed error_class=invalid_response retryable=0 retry_delay=0 next_attempt=0
+        elif [[ "$channel" == telegram ]]; then
+          if [[ "$HTTP_LAST_STATUS" != 200 ]] \
+            || ! python3 "$ALERTS_PY" telegram-delivered "$HTTP_LAST_RESPONSE_FILE"; then
+            outcome=failed error_class=invalid_response retryable=0 retry_delay=0 next_attempt=0
+          fi
+        fi
+      fi
+      if [[ "$outcome" == pending && "$attempt" == "$cycle_limit" && "$used_retry_after" == 0 ]]; then
+        next_attempt=0
+      fi
+      record_payload="$(python3 - "$alert_id" "$channel" "$outcome" "$error_class" "$now" \
+        "$next_attempt" "$HTTP_LAST_STATUS" "$HTTP_LAST_CURL_CODE" <<'PYEOF'
+import json
+import sys
+alert_id, channel, status, error, attempted, next_attempt, http, curl = sys.argv[1:]
+print(json.dumps({"alert_id": alert_id, "channel": channel, "status": status,
+                  "error_class": error or None, "attempted_at": int(attempted),
+                  "next_attempt_at": int(next_attempt), "http_status": int(http),
+                  "curl_code": int(curl)}))
+PYEOF
+)"
+      if ! printf '%s\n' "$record_payload" | python3 "$ALERTS_PY" record "$ALERT_DELIVERIES_FILE" >/dev/null; then
+        NETWORK_DELIVERY_ERROR=1
+        cleanup_alert_http_attempt
+        break
+      fi
+      if [[ "$outcome" == delivered ]]; then
+        echo "[OK] ${channel}: alert ${alert_id} delivered (HTTP ${HTTP_LAST_STATUS})."
+        cleanup_alert_http_attempt
+        break
+      fi
+      echo "[WARN] ${channel}: alert ${alert_id} failed (curl=${HTTP_LAST_CURL_CODE}, HTTP ${HTTP_LAST_STATUS}, class=${error_class})." >&2
+      NETWORK_DELIVERY_ERROR=1
+      cleanup_alert_http_attempt
+      if [[ "$outcome" != pending || "$retryable" != 1 || "$retry_delay" -gt 60 || "$attempt" == "$cycle_limit" ]]; then
+        break
+      fi
+      (( retry_delay > 0 )) && sleep "$retry_delay"
+      ((attempt += 1))
+    done
+  done < <(python3 - "$due_file" <<'PYEOF'
+import base64
+import json
+import pathlib
+import sys
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    item = json.loads(line)
+    message = base64.b64encode(item["message"].encode()).decode()
+    print(item["alert_id"], item["channel"], message, sep="\t")
+PYEOF
+)
+  if python3 "$ALERTS_PY" terminal-unacknowledged "$ALERT_DELIVERIES_FILE" \
+    | python3 -c 'import json,sys; raise SystemExit(0 if any(json.loads(line).get("terminal_reason") == "channel_unconfigured" for line in sys.stdin if line.strip()) else 1)'; then
+    NETWORK_DELIVERY_ERROR=1
+  fi
+  rm -f "$due_file"
+  return 0
+}
+
+journal_has_pending_alert() {
+  local kind="$1" window="$2" selector="$3" cycle_key="$4"
+  python3 - "$ALERT_DELIVERIES_FILE" "$kind" "$window" "$selector" "$cycle_key" <<'PYEOF'
+import json
+import pathlib
+import sys
+path, kind, window, selector, cycle = sys.argv[1:]
+document = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+def same_cycle(value):
+    return value == cycle or (value.startswith("legacy-v") and "|" in value and value.split("|", 1)[1] == cycle)
+raise SystemExit(0 if any(item["kind"] == kind and item["window"] == window
+                          and item["selector"] == selector and same_cycle(item["cycle_key"])
+                          and item["status"] == "pending" for item in document["alerts"]) else 1)
+PYEOF
+}
+
 weekly_pace_vs_ideal() {
   local weekly_pct="$1"
   local weekly_reset_at="$2"
@@ -1125,6 +1433,201 @@ attempt_alert_script() {
   run_alert_script "$rule_position" "$@"
 }
 
+reconcile_alert_deliveries() {
+  local now="$1" terminal_file line alert_id kind window reason selector remaining reset_epoch covered threshold ack_id
+  local -a ack_ids=()
+  terminal_file="$(mktemp "${RUNTIME_DIR}/.alerts-terminal.XXXXXX")" || return 1
+  if ! python3 "$ALERTS_PY" terminal-unacknowledged "$ALERT_DELIVERIES_FILE" > "$terminal_file"; then
+    rm -f "$terminal_file"
+    return 1
+  fi
+  while IFS=$'\t' read -r alert_id kind window reason selector remaining reset_epoch covered; do
+    [[ -n "$alert_id" ]] || continue
+    ack_ids+=("$alert_id")
+    if [[ "$kind" == threshold ]]; then
+      if [[ "$reason" == superseded || "$reason" == expired_after_reset ]]; then
+        continue
+      fi
+      if [[ "$window" == 5h ]]; then
+        IFS=',' read -r -a covered_values <<< "$covered"
+        for threshold in "${covered_values[@]}"; do
+          if [[ -n "$threshold" ]] && ! csv_contains "$notified_5h_thresholds" "$threshold"; then
+            notified_5h_thresholds="${notified_5h_thresholds:+${notified_5h_thresholds},}${threshold}"
+          fi
+        done
+        [[ "$pending_5h_threshold" == "$selector" ]] && pending_5h_threshold=""
+        [[ -n "$remaining" ]] && prev_5h_pct="$remaining"
+      else
+        IFS=',' read -r -a covered_values <<< "$covered"
+        for threshold in "${covered_values[@]}"; do
+          if [[ -n "$threshold" ]] && ! csv_contains "$notified_weekly_thresholds" "$threshold"; then
+            notified_weekly_thresholds="${notified_weekly_thresholds:+${notified_weekly_thresholds},}${threshold}"
+          fi
+        done
+        [[ "$pending_weekly_threshold" == "$selector" ]] && pending_weekly_threshold=""
+        [[ -n "$remaining" ]] && prev_weekly_pct="$remaining"
+      fi
+    elif [[ "$window" == 5h ]]; then
+      last_notified_5h_reset_at="$reset_epoch"
+      if [[ "$five_h_armed_reset_at" == "$reset_epoch" ]]; then
+        five_h_armed_reset_at=0
+        notified_5h_thresholds=""
+        pending_5h_threshold=""
+        prev_5h_pct=100
+      fi
+    else
+      last_notified_weekly_reset_at="$reset_epoch"
+      if [[ "$weekly_armed_reset_at" == "$reset_epoch" ]]; then
+        weekly_armed_reset_at=0
+        weekly_armed_limit_id=""
+        notified_weekly_thresholds=""
+        pending_weekly_threshold=""
+        if (( observed_weekly_reset == 1 )); then prev_weekly_pct="$weekly_pct"; else prev_weekly_pct=100; fi
+      fi
+    fi
+  done < <(python3 - "$terminal_file" <<'PYEOF'
+import json
+import pathlib
+import sys
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    item = json.loads(line)
+    event = item["event_data"]
+    covered = ",".join(str(value) for value in event.get("covered_thresholds", []))
+    print(item["alert_id"], item["kind"], item["window"], item["terminal_reason"],
+          item["selector"], event.get("remaining_pct", ""), event.get("reset_epoch", 0), covered, sep="\t")
+PYEOF
+)
+  rm -f "$terminal_file"
+  (( ${#ack_ids[@]} == 0 )) && return 0
+  if ! persist_alert_state; then
+    echo "[ERROR] Could not persist reconciled alert state." >&2
+    return 1
+  fi
+  for ack_id in "${ack_ids[@]}"; do
+    if ! python3 "$ALERTS_PY" acknowledge "$ALERT_DELIVERIES_FILE" "$ack_id" --at "$now"; then
+      return 1
+    fi
+  done
+}
+
+initialize_alert_delivery_journal() {
+  local state_version="$1" now="$2" limit_id="$3" five_h_pct="$4" weekly_pct="$5"
+  local five_h_reset="$6" weekly_reset="$7" channels thresholds_csv payload
+  if (( five_h_armed_reset_at > 0 && now > five_h_armed_reset_at + 5 * 60 * 60 )); then
+    last_notified_5h_reset_at="$five_h_armed_reset_at"
+    five_h_armed_reset_at=0
+    notified_5h_thresholds=""
+    pending_5h_threshold=""
+    prev_5h_pct=100
+  fi
+  if (( weekly_armed_reset_at > 0 && now > weekly_armed_reset_at + 7 * 24 * 60 * 60 )); then
+    last_notified_weekly_reset_at="$weekly_armed_reset_at"
+    weekly_armed_reset_at=0
+    weekly_armed_limit_id=""
+    notified_weekly_thresholds=""
+    pending_weekly_threshold=""
+    prev_weekly_pct=100
+  fi
+  channels="$(configured_alert_channels_json)" || return 1
+  thresholds_csv="$(load_thresholds | paste -sd, -)"
+  if [[ "$channels" != "[]" ]]; then
+    if [[ -n "$pending_5h_threshold" && ! "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+      echo "[ERROR] Historical 5h pending alert cannot be reconstructed from the current observation." >&2
+      return 1
+    fi
+    if [[ -n "$pending_weekly_threshold" && ! "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+      echo "[ERROR] Historical weekly pending alert cannot be reconstructed from the current observation." >&2
+      return 1
+    fi
+  else
+    if [[ -n "$pending_5h_threshold" ]]; then
+      for threshold in $(load_thresholds); do
+        if python3 - "$prev_5h_pct" "$pending_5h_threshold" "$threshold" <<'PYEOF'
+import sys
+raise SystemExit(0 if float(sys.argv[2]) <= float(sys.argv[3]) < float(sys.argv[1]) else 1)
+PYEOF
+        then
+          csv_contains "$notified_5h_thresholds" "$threshold" \
+            || notified_5h_thresholds="${notified_5h_thresholds:+${notified_5h_thresholds},}${threshold}"
+        fi
+      done
+      pending_5h_threshold=""
+      [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && prev_5h_pct="$five_h_pct"
+    fi
+    if [[ -n "$pending_weekly_threshold" ]]; then
+      for threshold in $(load_thresholds); do
+        if python3 - "$prev_weekly_pct" "$pending_weekly_threshold" "$threshold" <<'PYEOF'
+import sys
+raise SystemExit(0 if float(sys.argv[2]) <= float(sys.argv[3]) < float(sys.argv[1]) else 1)
+PYEOF
+        then
+          csv_contains "$notified_weekly_thresholds" "$threshold" \
+            || notified_weekly_thresholds="${notified_weekly_thresholds:+${notified_weekly_thresholds},}${threshold}"
+        fi
+      done
+      pending_weekly_threshold=""
+      [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && prev_weekly_pct="$weekly_pct"
+    fi
+  fi
+  payload="$(MIGRATION_FIVE_MESSAGE="*Codex 5h limit at ${five_h_pct}% remaining* (crossed ${pending_5h_threshold}% threshold). Resets at ${five_h_reset}" \
+    MIGRATION_WEEKLY_MESSAGE="*Codex weekly limit at ${weekly_pct}% remaining* (crossed ${pending_weekly_threshold}% threshold). Resets ${weekly_reset}" \
+    python3 - "$state_version" "$now" "$limit_id" "$channels" "$thresholds_csv" \
+      "$pending_5h_threshold" "$pending_weekly_threshold" "$prev_5h_pct" "$prev_weekly_pct" \
+      "$five_h_pct" "$weekly_pct" "$five_h_armed_reset_at" "$weekly_armed_reset_at" \
+      "$last_notified_5h_reset_at" "$last_notified_weekly_reset_at" "$weekly_armed_limit_id" <<'PYEOF'
+import json
+import os
+import sys
+
+(version, now, limit_id, channels_raw, thresholds_raw, pending_five, pending_weekly,
+ previous_five, previous_weekly, five_pct, weekly_pct, five_reset, weekly_reset,
+ last_five_reset, last_weekly_reset, weekly_limit_id) = sys.argv[1:]
+version, now, five_reset, weekly_reset, last_five_reset, last_weekly_reset = map(
+    int, (version, now, five_reset, weekly_reset, last_five_reset, last_weekly_reset))
+channels = json.loads(channels_raw)
+thresholds = [int(value) for value in thresholds_raw.split(",") if value]
+alerts = []
+
+def threshold(window, selector, previous, remaining, reset, message):
+    if not selector or not channels:
+        return
+    critical = int(selector)
+    cycle = f"legacy-v{version}|limit:{limit_id}|" + (f"reset:{reset}" if reset else "unarmed")
+    alerts.append({
+        "kind": "threshold", "window": window, "selector": selector,
+        "cycle_key": cycle, "id_namespace": f"legacy-v{version}", "message": message,
+        "event_data": {"limit_id": limit_id, "remaining_pct": float(remaining),
+                       "reset_epoch": reset,
+                       "covered_thresholds": [value for value in thresholds if critical <= value < float(previous)]},
+        "created_at": min(now, reset) if reset else now,
+        "expires_at": reset, "channels": channels,
+        "replace_pending_thresholds": True, "expire_threshold_cycle": None,
+    })
+
+def reset(window, reset_at, last_reset, validity, event_limit_id, message):
+    if not channels or not reset_at or reset_at > now or reset_at == last_reset or now > reset_at + validity:
+        return
+    cycle = f"legacy-v{version}|limit:{event_limit_id}|reset:{reset_at}"
+    alerts.append({
+        "kind": "reset", "window": window, "selector": "reset",
+        "cycle_key": cycle, "id_namespace": f"legacy-v{version}", "message": message,
+        "event_data": {"limit_id": event_limit_id, "reset_epoch": reset_at},
+        "created_at": reset_at, "expires_at": reset_at + validity, "channels": channels,
+        "replace_pending_thresholds": False, "expire_threshold_cycle": cycle,
+    })
+
+threshold("5h", pending_five, previous_five, five_pct, five_reset, os.environ["MIGRATION_FIVE_MESSAGE"])
+threshold("weekly", pending_weekly, previous_weekly, weekly_pct, weekly_reset, os.environ["MIGRATION_WEEKLY_MESSAGE"])
+reset("5h", five_reset, last_five_reset, 5 * 60 * 60, limit_id,
+      "*Codex 5h limit reset.* A new usage cycle is available.")
+reset("weekly", weekly_reset, last_weekly_reset, 7 * 24 * 60 * 60,
+      weekly_limit_id or limit_id, "*Codex weekly limit reset.* A new usage cycle is available.")
+print(json.dumps({"completed_at": now, "alerts": alerts}))
+PYEOF
+)" || return 1
+  printf '%s\n' "$payload" | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version "$state_version"
+}
+
 check_thresholds() {
   local five_h_pct="$1"
   local weekly_pct="$2"
@@ -1135,6 +1638,7 @@ check_thresholds() {
   local scraped_at_epoch="$7"
   local limit_id="${8:-default}"
 
+  local state_version=1
   local prev_5h_pct=100
   local prev_weekly_pct=100
   local observed_weekly_pct=""
@@ -1159,6 +1663,7 @@ check_thresholds() {
   local attempted_script_5h_reset_actions=""
   local attempted_script_weekly_reset_actions=""
   local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold
+  local original_pending cycle_key covered_json registration_status
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 initialize_script_baseline=0
   local observed_weekly_reset=0 weekly_observation_valid=0 process_weekly_sample=1 state_loaded=0
   local -a script_thresholds=()
@@ -1167,6 +1672,10 @@ check_thresholds() {
     state_loaded=1
     while IFS='=' read -r state_key state_value; do
       case "$state_key" in
+        state_version)
+          [[ "$state_value" =~ ^[0-9]+$ ]] || { ALERT_PROCESSING_ERROR="invalid alert state version"; return 1; }
+          state_version="$state_value"
+          ;;
         prev_5h_pct|prev_weekly_pct|observed_weekly_pct|script_prev_5h_pct|script_prev_weekly_pct)
           if [[ "$state_value" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
@@ -1199,12 +1708,46 @@ check_thresholds() {
     done < "$STATE_FILE"
   fi
 
+  if (( state_version > 4 )); then
+    echo "[ERROR] Unsupported future alert state version ${state_version}; alerts are disabled." >&2
+    ALERT_PROCESSING_ERROR="unsupported future alert state version"
+    return 1
+  fi
+  if (( state_version < 1 || state_version > 4 )); then
+    echo "[ERROR] Unsupported alert state version ${state_version}." >&2
+    ALERT_PROCESSING_ERROR="invalid alert state version"
+    return 1
+  fi
+
   mapfile -t thresholds < <(load_thresholds)
   pace="$(weekly_pace_vs_ideal "$weekly_pct" "$weekly_reset_at" "$scraped_at_epoch")"
   pace_suffix=""
   [[ -n "$pace" ]] && pace_suffix=$'\n'"*Pace vs ideal:* ${pace}"
   if [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ && "$weekly_reset_at" =~ ^[0-9]+$ ]]; then
     weekly_observation_valid=1
+  fi
+
+
+  if [[ ! -e "$ALERT_DELIVERIES_FILE" ]]; then
+    if ! initialize_alert_delivery_journal "$state_version" "$scraped_at_epoch" "$limit_id" \
+      "$five_h_pct" "$weekly_pct" "$five_h_reset" "$weekly_reset"; then
+      ALERT_PROCESSING_ERROR="alert journal initialization failed"
+      return 1
+    fi
+  elif ! python3 "$ALERTS_PY" validate "$ALERT_DELIVERIES_FILE"; then
+    echo "[ERROR] Alert delivery journal is invalid; no notification was sent." >&2
+    ALERT_PROCESSING_ERROR="invalid alert delivery journal"
+    return 1
+  fi
+
+  if ! reconcile_alert_deliveries "$scraped_at_epoch"; then
+    ALERT_PROCESSING_ERROR="alert reconciliation failed"
+    return 1
+  fi
+  if ! python3 "$ALERTS_PY" expire "$ALERT_DELIVERIES_FILE" --now "$scraped_at_epoch" \
+    || ! reconcile_alert_deliveries "$scraped_at_epoch"; then
+    ALERT_PROCESSING_ERROR="alert expiration failed"
+    return 1
   fi
 
   if (( ${#ALERT_SCRIPT_RULE_INDICES[@]} == 0 )); then
@@ -1283,12 +1826,25 @@ check_thresholds() {
     due_5h_reset_at="$five_h_armed_reset_at"
     reset_age=$(( scraped_at_epoch - five_h_armed_reset_at ))
     if (( reset_age <= 5 * 60 * 60 && last_notified_5h_reset_at != five_h_armed_reset_at )); then
-      if send_alert "*Codex 5h limit reset.* A new usage cycle is available."; then
+      cycle_key="limit:${limit_id}|reset:${five_h_armed_reset_at}"
+      if journal_has_pending_alert reset 5h reset "$cycle_key"; then
+        :
+      elif register_network_alert reset 5h reset \
+        "$cycle_key" \
+        "*Codex 5h limit reset.* A new usage cycle is available." \
+        "{\"limit_id\":\"${limit_id}\",\"reset_epoch\":${five_h_armed_reset_at}}" \
+        "$five_h_armed_reset_at" "$((five_h_armed_reset_at + 5 * 60 * 60))" false \
+        "$cycle_key"; then
+        :
+      elif [[ "$?" == 2 ]]; then
         last_notified_5h_reset_at="$five_h_armed_reset_at"
       else
         status=1
-        ALERT_PROCESSING_ERROR="alert delivery pending"
+        ALERT_PROCESSING_ERROR="alert journal registration failed"
       fi
+    fi
+    if (( reset_age > 5 * 60 * 60 )); then
+      last_notified_5h_reset_at="$five_h_armed_reset_at"
     fi
     if (( reset_age > 5 * 60 * 60 || last_notified_5h_reset_at == five_h_armed_reset_at )); then
       five_h_armed_reset_at=0
@@ -1319,12 +1875,25 @@ check_thresholds() {
     fi
     reset_age=$(( scraped_at_epoch - weekly_armed_reset_at ))
     if (( reset_age <= 7 * 24 * 60 * 60 && last_notified_weekly_reset_at != weekly_armed_reset_at )); then
-      if send_alert "*Codex weekly limit reset.* A new usage cycle is available."; then
+      cycle_key="limit:${limit_id}|reset:${weekly_armed_reset_at}"
+      if journal_has_pending_alert reset weekly reset "$cycle_key"; then
+        :
+      elif register_network_alert reset weekly reset \
+        "$cycle_key" \
+        "*Codex weekly limit reset.* A new usage cycle is available." \
+        "{\"limit_id\":\"${limit_id}\",\"reset_epoch\":${weekly_armed_reset_at}}" \
+        "$weekly_armed_reset_at" "$((weekly_armed_reset_at + 7 * 24 * 60 * 60))" false \
+        "$cycle_key"; then
+        :
+      elif [[ "$?" == 2 ]]; then
         last_notified_weekly_reset_at="$weekly_armed_reset_at"
       else
         status=1
-        ALERT_PROCESSING_ERROR="alert delivery pending"
+        ALERT_PROCESSING_ERROR="alert journal registration failed"
       fi
+    fi
+    if (( reset_age > 7 * 24 * 60 * 60 )); then
+      last_notified_weekly_reset_at="$weekly_armed_reset_at"
     fi
     if (( reset_age > 7 * 24 * 60 * 60 || last_notified_weekly_reset_at == weekly_armed_reset_at )); then
       weekly_armed_reset_at=0
@@ -1369,6 +1938,7 @@ check_thresholds() {
   # The first observation uses 100% as its baseline. A multi-threshold drop emits
   # one alert for the most critical crossed threshold and marks all crossed levels.
   if [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+    original_pending="$pending_5h_threshold"
     critical="$pending_5h_threshold"
     for t in "${thresholds[@]}"; do
       if python3 - "$five_h_pct" "$prev_5h_pct" "$t" "$notified_5h_thresholds" <<'PYEOF'
@@ -1383,7 +1953,27 @@ PYEOF
     done
     if [[ -n "$critical" ]]; then
       pending_5h_threshold="$critical"
-      if send_alert "*Codex 5h limit at ${five_h_pct}% remaining* (crossed ${critical}% threshold). Resets at ${five_h_reset}${pace_suffix}"; then
+      if [[ "$critical" == "$original_pending" ]]; then
+        : # The immutable occurrence is already in the delivery journal.
+      else
+        cycle_key="limit:${limit_id}|${five_h_armed_reset_at:+reset:${five_h_armed_reset_at}}"
+        [[ "$five_h_armed_reset_at" == 0 ]] && cycle_key="limit:${limit_id}|unarmed"
+        if journal_has_pending_alert threshold 5h "$critical" "$cycle_key"; then
+          : # Recover a crash between journal publication and detector persistence.
+        else
+          covered_json="$(python3 - "$prev_5h_pct" "$critical" "${thresholds[@]}" <<'PYEOF'
+import json
+import sys
+previous, critical = map(float, sys.argv[1:3])
+print(json.dumps([int(value) for value in sys.argv[3:] if critical <= float(value) < previous]))
+PYEOF
+)"
+          registration_status=0
+          register_network_alert threshold 5h "$critical" "$cycle_key" \
+            "*Codex 5h limit at ${five_h_pct}% remaining* (crossed ${critical}% threshold). Resets at ${five_h_reset}${pace_suffix}" \
+            "{\"limit_id\":\"${limit_id}\",\"remaining_pct\":${five_h_pct},\"reset_epoch\":${five_h_armed_reset_at},\"covered_thresholds\":${covered_json}}" \
+            "$scraped_at_epoch" "$five_h_armed_reset_at" true || registration_status=$?
+          if (( registration_status == 2 )); then
         local notified="${notified_5h_thresholds}"
         for t in "${thresholds[@]}"; do
           if python3 - "$prev_5h_pct" "$critical" "$t" <<'PYEOF'
@@ -1397,9 +1987,11 @@ PYEOF
         notified_5h_thresholds="$notified"
         pending_5h_threshold=""
         prev_5h_pct="$five_h_pct"
-      else
-        status=1
-        ALERT_PROCESSING_ERROR="alert delivery pending"
+          elif (( registration_status != 0 )); then
+            status=1
+            ALERT_PROCESSING_ERROR="alert journal registration failed"
+          fi
+        fi
       fi
     else
       prev_5h_pct="$five_h_pct"
@@ -1407,6 +1999,7 @@ PYEOF
   fi
 
   if (( process_weekly_sample == 1 )) && [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+    original_pending="$pending_weekly_threshold"
     critical="$pending_weekly_threshold"
     for t in "${thresholds[@]}"; do
       if python3 - "$weekly_pct" "$prev_weekly_pct" "$t" "$notified_weekly_thresholds" <<'PYEOF'
@@ -1421,7 +2014,27 @@ PYEOF
     done
     if [[ -n "$critical" ]]; then
       pending_weekly_threshold="$critical"
-      if send_alert "*Codex weekly limit at ${weekly_pct}% remaining* (crossed ${critical}% threshold). Resets ${weekly_reset}${pace_suffix}"; then
+      if [[ "$critical" == "$original_pending" ]]; then
+        :
+      else
+        cycle_key="limit:${limit_id}|${weekly_armed_reset_at:+reset:${weekly_armed_reset_at}}"
+        [[ "$weekly_armed_reset_at" == 0 ]] && cycle_key="limit:${limit_id}|unarmed"
+        if journal_has_pending_alert threshold weekly "$critical" "$cycle_key"; then
+          :
+        else
+          covered_json="$(python3 - "$prev_weekly_pct" "$critical" "${thresholds[@]}" <<'PYEOF'
+import json
+import sys
+previous, critical = map(float, sys.argv[1:3])
+print(json.dumps([int(value) for value in sys.argv[3:] if critical <= float(value) < previous]))
+PYEOF
+)"
+          registration_status=0
+          register_network_alert threshold weekly "$critical" "$cycle_key" \
+            "*Codex weekly limit at ${weekly_pct}% remaining* (crossed ${critical}% threshold). Resets ${weekly_reset}${pace_suffix}" \
+            "{\"limit_id\":\"${limit_id}\",\"remaining_pct\":${weekly_pct},\"reset_epoch\":${weekly_armed_reset_at},\"covered_thresholds\":${covered_json}}" \
+            "$scraped_at_epoch" "$weekly_armed_reset_at" true || registration_status=$?
+          if (( registration_status == 2 )); then
         local notified="${notified_weekly_thresholds}"
         for t in "${thresholds[@]}"; do
           if python3 - "$prev_weekly_pct" "$critical" "$t" <<'PYEOF'
@@ -1435,9 +2048,11 @@ PYEOF
         notified_weekly_thresholds="$notified"
         pending_weekly_threshold=""
         prev_weekly_pct="$weekly_pct"
-      else
-        status=1
-        ALERT_PROCESSING_ERROR="alert delivery pending"
+          elif (( registration_status != 0 )); then
+            status=1
+            ALERT_PROCESSING_ERROR="alert journal registration failed"
+          fi
+        fi
       fi
     else
       prev_weekly_pct="$weekly_pct"
@@ -1450,6 +2065,28 @@ PYEOF
     observed_weekly_pct="$weekly_pct"
     observed_weekly_reset_at="$weekly_reset_at"
     observed_weekly_limit_id="$limit_id"
+  fi
+
+  # Network occurrences are durable before this point. Delivery is independent
+  # per channel and every attempt is persisted before the next channel starts.
+  NETWORK_DELIVERY_ERROR=0
+  if (( status == 0 )); then
+    if ! persist_alert_state; then
+      NETWORK_DELIVERY_ERROR=1
+      ALERT_PROCESSING_ERROR="alert state persistence failed"
+    else
+      if ! deliver_due_alerts "$scraped_at_epoch"; then
+        NETWORK_DELIVERY_ERROR=1
+      fi
+      if ! reconcile_alert_deliveries "$scraped_at_epoch"; then
+        NETWORK_DELIVERY_ERROR=1
+        ALERT_PROCESSING_ERROR="alert reconciliation failed"
+      fi
+    fi
+  fi
+  if (( NETWORK_DELIVERY_ERROR != 0 )); then
+    status=1
+    [[ -n "$ALERT_PROCESSING_ERROR" ]] || ALERT_PROCESSING_ERROR="alert delivery pending"
   fi
 
   # Notifications above are always attempted before local scripts. Script actions
@@ -1541,6 +2178,9 @@ PYEOF
     echo "[ERROR] Could not persist alert state." >&2
     status=1
     ALERT_PROCESSING_ERROR="alert state persistence failed"
+  elif ! python3 "$ALERTS_PY" prune "$ALERT_DELIVERIES_FILE" --now "$scraped_at_epoch"; then
+    status=1
+    ALERT_PROCESSING_ERROR="alert journal pruning failed"
   fi
   return "$status"
 }
@@ -1635,21 +2275,27 @@ run_cycle() {
   local interval_seconds="$1"
   echo "[$(format_paris_now)] Scraping codex status..."
 
-  local json status=0 history_json="[]"
+  local json public_json status=0 history_json="[]"
   CYCLE_ERROR=""
   if json=$(fetch_status_json "$interval_seconds"); then
     echo "$json" | python3 -m json.tool 2>/dev/null || echo "$json"
+    public_json="$json"
+    if [[ "$CODEX_FORECAST_ENABLED" == 1 ]]; then
+      if ! public_json="$(enrich_snapshot_with_codex_forecast "$json")"; then
+        public_json="$json"
+      fi
+    fi
     if ! archive_snapshot "$json"; then
       status=1
       append_cycle_error "Long-term archive update failed"
     fi
-    if write_local_snapshot "$json" "$interval_seconds"; then
+    if write_local_snapshot "$public_json" "$interval_seconds"; then
       [[ -f "$HISTORY_FILE" ]] && history_json="$(<"$HISTORY_FILE")"
     else
       status=1
       append_cycle_error "Local snapshot write failed"
     fi
-    sync_gist "$json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
+    sync_gist "$public_json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
 
     local five_h weekly five_h_reset weekly_reset five_h_reset_at weekly_reset_at limit_id scraped_at scraped_at_epoch
     five_h=$(json_get_field "$json" "five_h_pct")
