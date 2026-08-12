@@ -337,6 +337,29 @@ def limit_series(connection: sqlite3.Connection, start: int, end: int, granulari
               ORDER BY latest.bucket_epoch""",
         (granularity, granularity, start, end),
     ).fetchall()
+    forecast_rows = connection.execute(
+        """WITH bucketed AS (
+                 SELECT scraped_at_epoch, generated_at_epoch,
+                        chance_24h_pct, chance_6h_pct,
+                        (scraped_at_epoch / ?) * ? AS bucket_epoch
+                   FROM forecast_samples
+                  WHERE scraped_at_epoch >= ? AND scraped_at_epoch < ?
+             ), latest AS (
+                 SELECT bucket_epoch, MAX(scraped_at_epoch) AS latest_epoch,
+                        COUNT(*) AS samples
+                   FROM bucketed
+                  GROUP BY bucket_epoch
+             )
+             SELECT latest.bucket_epoch, forecast_samples.generated_at_epoch,
+                    forecast_samples.chance_24h_pct,
+                    forecast_samples.chance_6h_pct, latest.samples
+               FROM latest
+               JOIN forecast_samples
+                 ON forecast_samples.scraped_at_epoch = latest.latest_epoch
+              ORDER BY latest.bucket_epoch""",
+        (granularity, granularity, start, end),
+    ).fetchall()
+    forecasts_by_bucket = {int(row["bucket_epoch"]): row for row in forecast_rows}
     reset_markers = connection.execute(
         """
         SELECT window, reset_at_epoch, observed_at_epoch, before_pct, after_pct,
@@ -350,12 +373,29 @@ def limit_series(connection: sqlite3.Connection, start: int, end: int, granulari
     ).fetchall()
     return {
         "samples": int(sum(row["samples"] for row in rows)),
+        "forecast_samples": int(sum(row["samples"] for row in forecast_rows)),
         "series": [
             {
                 "at": iso_utc(row["bucket_epoch"]),
                 "five_h_pct": round(row["five_h_pct"], 3) if row["five_h_pct"] is not None else None,
                 "weekly_pct": round(row["weekly_pct"], 3) if row["weekly_pct"] is not None else None,
                 "ideal_weekly_pct": ideal_weekly_remaining(row["bucket_epoch"], row["weekly_reset_at"]),
+                "forecast_chance_24h_pct": (
+                    forecasts_by_bucket[int(row["bucket_epoch"])]["chance_24h_pct"]
+                    if int(row["bucket_epoch"]) in forecasts_by_bucket else None
+                ),
+                "forecast_chance_6h_pct": (
+                    forecasts_by_bucket[int(row["bucket_epoch"])]["chance_6h_pct"]
+                    if int(row["bucket_epoch"]) in forecasts_by_bucket else None
+                ),
+                "forecast_generated_at": (
+                    iso_utc(forecasts_by_bucket[int(row["bucket_epoch"])]["generated_at_epoch"])
+                    if int(row["bucket_epoch"]) in forecasts_by_bucket else None
+                ),
+                "forecast_samples": (
+                    forecasts_by_bucket[int(row["bucket_epoch"])]["samples"]
+                    if int(row["bucket_epoch"]) in forecasts_by_bucket else 0
+                ),
                 "samples": row["samples"],
             }
             for row in rows

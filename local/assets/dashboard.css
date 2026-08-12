@@ -398,6 +398,11 @@ header h1 {
   line-height: 1;
 }
 
+.forecast-metric strong.threshold-reached {
+  color: #fb7185;
+  text-shadow: 0 0 12px rgba(251, 113, 133, 0.42);
+}
+
 .forecast-metric span,
 .forecast-status {
   color: var(--muted);
@@ -411,6 +416,7 @@ header h1 {
 
 .forecast-strip.unavailable .forecast-metric strong {
   color: var(--muted);
+  text-shadow: none;
 }
 
 .history-error {

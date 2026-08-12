@@ -40,6 +40,8 @@ CURL_CONNECT_TIMEOUT_SECONDS=1
 CURL_MAX_TIME_SECONDS=1
 CURL_RETRIES=0
 CURL_RETRY_DELAY_SECONDS=0
+CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD=0
+CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD=100
 ALERT_THRESHOLDS=0,100
 validate_config
 LOOP_INTERVAL=86400
@@ -50,6 +52,8 @@ CURL_CONNECT_TIMEOUT_SECONDS=60
 CURL_MAX_TIME_SECONDS=600
 CURL_RETRIES=5
 CURL_RETRY_DELAY_SECONDS=60
+CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD=100
+CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD=0
 validate_config
 for assignment in \
   'LOOP_INTERVAL=0' 'LOOP_INTERVAL=86401' \
@@ -59,11 +63,36 @@ for assignment in \
   'CURL_CONNECT_TIMEOUT_SECONDS=0' 'CURL_MAX_TIME_SECONDS=601' \
   'CURL_RETRIES=6' 'CURL_RETRY_DELAY_SECONDS=61' \
   'CODEX_FORECAST_ENABLED=2' \
+  'CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD=-1' 'CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD=101' \
+  'CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD=1.5' 'CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD=abc' \
   'ALERT_THRESHOLDS=101' 'ALERT_THRESHOLDS=50,,10'; do
   monitor_defaults
   eval "$assignment"
   validate_config >/dev/null 2>&1 && fail "invalid config accepted: $assignment"
 done
+
+monitor_defaults
+printf 'CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD=65\nCODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD=35\n' > "$ENV_FILE"
+load_config
+assert_eq 65 "$CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD" "24-hour Forecast threshold was not loaded"
+assert_eq 35 "$CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD" "6-hour Forecast threshold was not loaded"
+
+python3 - "$MONITOR_PATH" "${ROOT_DIR}/local/.env.example" <<'PYEOF'
+import re
+import sys
+from pathlib import Path
+
+monitor = Path(sys.argv[1]).read_text(encoding="utf-8")
+example = Path(sys.argv[2]).read_text(encoding="utf-8")
+case = re.search(r'case "\$key" in(.*?)\n\s*\*\)', monitor, re.S)
+assert case is not None
+keys = set()
+for group in re.findall(r'\n\s*([A-Z][A-Z0-9_|]+)\)', case.group(1)):
+    keys.update(group.split('|'))
+missing = sorted(key for key in keys if key not in example)
+if missing:
+    raise SystemExit(f".env.example is missing accepted keys: {', '.join(missing)}")
+PYEOF
 
 monitor_defaults
 GITHUB_PAT=token

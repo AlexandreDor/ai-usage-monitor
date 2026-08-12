@@ -33,6 +33,14 @@ archive_at() {
     --retention-days "$retention"
 }
 
+forecast_archive_at() {
+  local epoch="$1" chance_24h="${2:-50}" chance_6h="${3:-25}" retention="${4:-0}"
+  printf '{"five_h_pct":80,"weekly_pct":60,"scraped_at":"%s","codex_forecast":{"chance_24h_pct":%s,"chance_6h_pct":%s,"generated_at":"%s"}}\n' \
+    "$(iso_at "$epoch")" "$chance_24h" "$chance_6h" "$(iso_at "$((epoch - 10))")" \
+    | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" \
+      --history "$HISTORY_FILE" --retention-days "$retention"
+}
+
 count_rows() {
   python3 - "$ARCHIVE_FILE" <<'PYEOF'
 import sqlite3
@@ -68,13 +76,38 @@ with sqlite3.connect(sys.argv[1]) as connection:
     print(int(connection.execute("SELECT value FROM metadata WHERE key = 'history_json_migrated'").fetchone()[0] == "1"))
 PYEOF
 )" "migration marker missing"
-assert_eq 2 "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+assert_eq 3 "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
 import sqlite3
 import sys
 with sqlite3.connect(sys.argv[1]) as connection:
     print(connection.execute("PRAGMA user_version").fetchone()[0])
 PYEOF
-)" "archive schema was not migrated to v2"
+)" "archive schema was not migrated to v3"
+
+# Forecast samples from rolling history are imported without persisting display
+# thresholds, and quota-only cycles do not fabricate Forecast observations.
+rm -f "$ARCHIVE_FILE"
+printf '[{"five_h_pct":80,"scraped_at":"%s","codex_forecast":{"chance_24h_pct":51,"chance_6h_pct":26,"generated_at":"%s","highlight_threshold_24h_pct":50}}]\n' \
+  "$(iso_at "$((BASE - 100))")" "$(iso_at "$((BASE - 120))")" > "$HISTORY_FILE"
+archive_at "$BASE"
+assert_eq '1:51:26' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    row = connection.execute(
+        "SELECT COUNT(*), MAX(chance_24h_pct), MAX(chance_6h_pct) FROM forecast_samples"
+    ).fetchone()
+print(":".join(map(str, row)))
+PYEOF
+)" "rolling Forecast history was not imported"
+archive_at "$((BASE + 100))"
+assert_eq 1 "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("SELECT COUNT(*) FROM forecast_samples").fetchone()[0])
+PYEOF
+)" "quota-only cycle fabricated a Forecast sample"
 
 # Rebuild a clean archive for compaction checks.
 rm -f "$ARCHIVE_FILE"
@@ -113,12 +146,43 @@ assert_eq yes "$(has_epoch "$boundary_recent")" "24-hour boundary was compacted 
 assert_eq yes "$(has_epoch "$boundary_medium")" "7-day boundary was compacted incorrectly"
 assert_eq yes "$(has_epoch "$boundary_old")" "point just beyond 7 days was lost"
 
+# Forecast compaction is independent from the quota row selected for a bucket.
+rm -f "$ARCHIVE_FILE"
+printf '[]\n' > "$HISTORY_FILE"
+forecast_archive_at "$medium_one" 40 15
+forecast_archive_at "$medium_two" 60 35
+archive_at "$((medium_two + 100))"
+archive_at "$BASE"
+assert_eq "${medium_two}:60:35" "$(python3 - "$ARCHIVE_FILE" "$medium_bucket" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    row = connection.execute(
+        "SELECT scraped_at_epoch, chance_24h_pct, chance_6h_pct "
+        "FROM forecast_samples WHERE scraped_at_epoch >= ? AND scraped_at_epoch < ?",
+        (int(sys.argv[2]), int(sys.argv[2]) + 1800),
+    ).fetchone()
+print(":".join(map(str, row)))
+PYEOF
+)" "Forecast compaction did not keep its own latest bucket sample"
+
 # The default one-year retention removes older data while zero is unlimited.
 rm -f "$ARCHIVE_FILE"
 printf '[]\n' > "$HISTORY_FILE"
 archive_at "$((BASE - 366 * 86400))" 365
 archive_at "$BASE" 365
 assert_eq no "$(has_epoch "$((BASE - 366 * 86400))")" "default retention kept data beyond one year"
+
+rm -f "$ARCHIVE_FILE"
+forecast_archive_at "$((BASE - 366 * 86400))" 80 40 365
+archive_at "$BASE" 365
+assert_eq 0 "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("SELECT COUNT(*) FROM forecast_samples").fetchone()[0])
+PYEOF
+)" "disabled Forecast did not expire old observations from the quota anchor"
 
 rm -f "$ARCHIVE_FILE"
 archive_at "$((BASE - 366 * 86400))" 0

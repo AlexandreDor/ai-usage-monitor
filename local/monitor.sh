@@ -64,7 +64,7 @@ load_config() {
     fi
 
     case "$key" in
-      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_FORECAST_ENABLED|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
+      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_ENABLED|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
         if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
           value="${value:1:${#value}-2}"
         fi
@@ -263,6 +263,8 @@ validate_config() {
   validate_integer CURL_MAX_TIME_SECONDS "$CURL_MAX_TIME_SECONDS" 1 600 || invalid=1
   validate_integer CURL_RETRIES "$CURL_RETRIES" 0 5 || invalid=1
   validate_integer CURL_RETRY_DELAY_SECONDS "$CURL_RETRY_DELAY_SECONDS" 0 60 || invalid=1
+  validate_integer CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD "$CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD" 0 100 || invalid=1
+  validate_integer CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD "$CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD" 0 100 || invalid=1
   validate_thresholds || invalid=1
   validate_alert_scripts || invalid=1
 
@@ -384,6 +386,8 @@ initialize() {
   CURL_RETRY_DELAY_SECONDS="${CURL_RETRY_DELAY_SECONDS:-1}"
   MONITOR_DEBUG="${MONITOR_DEBUG:-0}"
   CODEX_FORECAST_ENABLED="${CODEX_FORECAST_ENABLED:-1}"
+  CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD="${CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD:-50}"
+  CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD="${CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD:-25}"
   DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}"
   TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
   TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -712,7 +716,9 @@ PYEOF
 enrich_snapshot_with_codex_forecast() {
   local json="$1" forecast
   forecast="$(fetch_codex_forecast)" || return 1
-  python3 - "$json" "$forecast" <<'PYEOF'
+  python3 - "$json" "$forecast" \
+    "${CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD:-50}" \
+    "${CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD:-25}" <<'PYEOF'
 import json
 import sys
 
@@ -720,6 +726,8 @@ snapshot = json.loads(sys.argv[1])
 forecast = json.loads(sys.argv[2])
 if not isinstance(snapshot, dict) or not isinstance(forecast, dict):
     raise SystemExit(1)
+forecast["highlight_threshold_24h_pct"] = int(sys.argv[3])
+forecast["highlight_threshold_6h_pct"] = int(sys.argv[4])
 snapshot["codex_forecast"] = forecast
 print(json.dumps(snapshot, indent=2))
 PYEOF
@@ -2145,7 +2153,7 @@ run_cycle() {
         public_json="$json"
       fi
     fi
-    if ! archive_snapshot "$json"; then
+    if ! archive_snapshot "$public_json"; then
       status=1
       append_cycle_error "Long-term archive update failed"
     fi

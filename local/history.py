@@ -150,7 +150,9 @@ def sanitize_limit_id(value: Any) -> str | None:
     return None
 
 
-def sanitize_forecast(value: Any) -> dict[str, Any] | None:
+def sanitize_forecast(
+    value: Any, *, include_thresholds: bool = False
+) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     chance_24h = value.get("chance_24h_pct")
@@ -165,14 +167,32 @@ def sanitize_forecast(value: Any) -> dict[str, Any] | None:
         return None
     if not isinstance(generated_at, str) or not generated_at or len(generated_at) > 100:
         return None
-    return {
+    sanitized = {
         "chance_24h_pct": chance_24h,
         "chance_6h_pct": chance_6h,
         "generated_at": generated_at,
     }
+    if include_thresholds:
+        for source, target in (
+            ("highlight_threshold_24h_pct", "highlight_threshold_24h_pct"),
+            ("highlight_threshold_6h_pct", "highlight_threshold_6h_pct"),
+        ):
+            threshold = value.get(source)
+            if (
+                isinstance(threshold, int)
+                and not isinstance(threshold, bool)
+                and 0 <= threshold <= 100
+            ):
+                sanitized[target] = threshold
+    return sanitized
 
 
-def normalize_entry(snapshot: Any, *, include_forecast: bool = False) -> Entry:
+def normalize_entry(
+    snapshot: Any,
+    *,
+    include_forecast: bool = False,
+    include_forecast_thresholds: bool = False,
+) -> Entry:
     if not isinstance(snapshot, Mapping) or isinstance(snapshot, list):
         raise SnapshotValidationError("snapshot must be a JSON object")
 
@@ -223,7 +243,10 @@ def normalize_entry(snapshot: Any, *, include_forecast: bool = False) -> Entry:
         normalized["limit_id"] = limit_id
 
     if include_forecast:
-        forecast = sanitize_forecast(snapshot.get("codex_forecast"))
+        forecast = sanitize_forecast(
+            snapshot.get("codex_forecast"),
+            include_thresholds=include_forecast_thresholds,
+        )
         if forecast is not None:
             normalized["codex_forecast"] = forecast
 
@@ -279,7 +302,7 @@ def read_existing_history(path: Path) -> LoadedHistory:
     invalid_count = 0
     for item in value:
         try:
-            valid_entries.append(normalize_entry(item))
+            valid_entries.append(normalize_entry(item, include_forecast=True))
         except SnapshotValidationError:
             invalid_count += 1
     entries = deduplicate(valid_entries)
@@ -456,8 +479,12 @@ def update_history(
     if history_file.resolve() == data_file.resolve():
         raise HistoryError("history and data paths must be different")
     retention = parse_retention_hours(retention_hours)
-    incoming_history = normalize_entry(snapshot)
-    incoming_data = normalize_entry(snapshot, include_forecast=True)
+    incoming_history = normalize_entry(snapshot, include_forecast=True)
+    incoming_data = normalize_entry(
+        snapshot,
+        include_forecast=True,
+        include_forecast_thresholds=True,
+    )
 
     if now_epoch is None:
         current_epoch = time.time()
@@ -493,7 +520,11 @@ def update_history(
             if data_file.stat().st_size > MAX_HISTORY_BYTES:
                 raise SnapshotValidationError("data.json exceeds the 16 MiB input limit")
             current_value = json.loads(data_file.read_text(encoding="utf-8"))
-            current_data = normalize_entry(current_value, include_forecast=True)
+            current_data = normalize_entry(
+                current_value,
+                include_forecast=True,
+                include_forecast_thresholds=True,
+            )
         except (OSError, UnicodeError, json.JSONDecodeError, SnapshotValidationError) as exc:
             warn(f"Current data snapshot is invalid and will be replaced: {exc}")
 

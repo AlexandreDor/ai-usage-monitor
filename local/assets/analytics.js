@@ -310,6 +310,8 @@ function renderLimitTable(points) {
     cell(row, formatPercent(point.five_h_pct));
     cell(row, formatPercent(point.weekly_pct));
     cell(row, formatPercent(point.ideal_weekly_pct));
+    cell(row, formatPercent(point.forecast_chance_24h_pct));
+    cell(row, formatPercent(point.forecast_chance_6h_pct));
     body?.appendChild(row);
   }
 }
@@ -319,6 +321,8 @@ function renderLimits(data = {}) {
     ? data.reset_markers
     : Array.isArray(data.markers) ? data.markers : [];
   const sampleCount = data.samples ?? limitPoints.reduce((total, point) => total + safeNumber(point.samples || 1), 0);
+  const forecastSampleCount = data.forecast_samples
+    ?? limitPoints.reduce((total, point) => total + safeNumber(point.forecast_samples), 0);
   byId('limit-samples').textContent = t('samples', { value: formatFullTokens(sampleCount) });
   byId('limits-empty').hidden = limitPoints.length > 0;
   byId('limits-chart-wrap').hidden = limitPoints.length === 0 || typeof Chart !== 'function';
@@ -331,6 +335,7 @@ function renderLimits(data = {}) {
       from: formatDate(first.at),
       to: formatDate(last.at),
       resets: formatFullTokens(markers.length),
+      forecasts: formatFullTokens(forecastSampleCount),
     })
     : t('noLimitSamples');
   const limitCandidates = [
@@ -350,6 +355,18 @@ function renderLimits(data = {}) {
       label: t('idealWeeklyPace'),
       data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.ideal_weekly_pct) })),
       borderColor: '#a7f3d0', backgroundColor: 'transparent', fill: false, borderWidth: 2, borderDash: [8, 6], pointRadius: 0, tension: 0, spanGaps: false,
+      valueKind: 'percent',
+    },
+    {
+      label: t('forecast24h'),
+      data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.forecast_chance_24h_pct) })),
+      borderColor: '#a78bfa', backgroundColor: 'transparent', fill: false, borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: false,
+      valueKind: 'percent',
+    },
+    {
+      label: t('forecast6h'),
+      data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.forecast_chance_6h_pct) })),
+      borderColor: '#fbbf24', backgroundColor: 'transparent', fill: false, borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: false,
       valueKind: 'percent',
     },
   ];
