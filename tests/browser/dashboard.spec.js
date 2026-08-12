@@ -10,6 +10,11 @@ const snapshot = {
   five_h_reset_at: 1785778500,
   weekly_reset_at: 1767443640,
   sample_interval_seconds: 900,
+  codex_forecast: {
+    chance_24h_pct: 76,
+    chance_6h_pct: 10,
+    generated_at: new Date().toISOString(),
+  },
 };
 
 async function mockUsage(page, history = [snapshot]) {
@@ -30,6 +35,14 @@ test('works offline and exposes no critical accessibility violations', async ({ 
   await expect(page.locator('#last-updated')).toHaveText('Last scraped 03/08/2026 19:30');
   await expect(page.locator('#five-h-reset')).toHaveText('03/08/2026 19:35');
   await expect(page.locator('#weekly-reset')).toHaveText('03/01/2026 13:34');
+  await expect(page.locator('#forecast-24h')).toHaveText('76%');
+  await expect(page.locator('#forecast-6h')).toHaveText('10%');
+  await expect(page.locator('.forecast-link')).toHaveAttribute('href', 'https://codex.lunarwerx.com/');
+  await expect(page.locator('.forecast-link')).toHaveAttribute('target', '_blank');
+  await expect(page.locator('.forecast-link')).toHaveAttribute('rel', 'noopener noreferrer');
+  await expect(page.locator('.dashboard-links .external-link')).toHaveAttribute('href', 'https://github.com/AlexandreDor/ai-usage-monitor');
+  await expect(page.locator('.dashboard-links a').first()).toHaveAttribute('href', 'https://github.com/AlexandreDor/ai-usage-monitor');
+  await expect(page.locator('.dashboard-links a').last()).toHaveAttribute('href', 'analytics.html');
   expect(externalRequests).toEqual([]);
 
   const results = await new AxeBuilder({ page }).analyze();
@@ -144,15 +157,23 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#estimated-cost')).toHaveText('€9.68');
   await expect(page.locator('#allocation-total-cost')).toHaveText('€9.68');
   await expect(page.locator('#estimated-cost')).toHaveAttribute('title', 'Converted from USD using fixed rate: 1 USD = €0.86');
-  await expect(page.locator('#random-reset-count')).toHaveText('2');
-  await expect(page.locator('#random-reset-impact')).toHaveText('1 random · 1 end of week');
+  await expect.poll(() => analyticsQueries[0]?.get('models')).toBe('gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra');
+  await expect(page.locator('#weekly-reset-count')).toHaveText('2');
+  await expect(page.locator('#weekly-reset-impact')).toHaveText('1 random · 1 end of week');
+  await expect(page.locator('#random-reset-count')).toHaveText('1');
+  await expect(page.locator('#random-reset-impact')).toHaveText('30.004 pts gained · 0 pts lost vs ideal pace');
   await expect(page.locator('#end-week-reset-count')).toHaveText('1');
+  await expect(page.locator('.metric-card')).toHaveCount(10);
+  await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#limits-chart-card #token-metric-toggle')).toHaveCount(1);
   await expect(page.locator('#toggle-token-overlay')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#tokens-chart-card')).toBeHidden();
-  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.length)).toBe(5);
+  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.yAxisID === 'tokens')?.data[0]?.y)).toBe(11.25);
   await page.locator('#toggle-token-overlay').click();
   await expect(page.locator('#toggle-token-overlay')).toHaveAttribute('aria-pressed', 'false');
   await expect(page.locator('#tokens-chart-card')).toBeVisible();
+  await expect(page.locator('#tokens-chart-card #token-metric-toggle')).toHaveCount(1);
+  await expect(page.locator('#limits-chart-card #token-metric-toggle')).toHaveCount(0);
   await expect(page.locator('#resets-body')).toContainText('Random');
   await expect(page.locator('#breakdown-body')).toContainText('gpt-5.6-sol');
   await expect(page.locator('#analytics-warnings')).toContainText('codex collector: delayed');
@@ -180,7 +201,10 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await page.locator('#source-filter [data-filter-value="codex"]').click();
   await expect.poll(() => analyticsQueries.at(-1)?.get('sources')).toBe('opencode,hermes');
   await expect(page.locator('.page-nav')).toHaveCount(0);
-  await expect(page.locator('.back-link')).toHaveCount(1);
+  await expect(page.locator('.analytics-nav .back-link')).toHaveCount(2);
+  await expect(page.locator('.back-link[href="dashboard.html"]')).toHaveCount(1);
+  await expect(page.locator('.analytics-nav .external-link')).toHaveAttribute('href', 'https://github.com/AlexandreDor/ai-usage-monitor');
+  await expect(page.locator('.analytics-nav .external-link')).toHaveAttribute('rel', 'noopener noreferrer');
   await expect(page.locator('#assumed-zero-tokens, #period-label, #granularity-label')).toHaveCount(0);
   const chartBounds = await page.evaluate(() => ({
     limitsMin: limitsChart.options.scales.x.min,
@@ -234,7 +258,76 @@ test('hides analytics warning containers when the API returns no warnings', asyn
   await expect(page.locator('#analytics-price-warnings')).toBeHidden();
 });
 
-test('renders detailed analytics, reset markers, application series and cost mode', async ({ page }) => {
+test('falls back once to all models when GPT 5.6 is unavailable', async ({ page }) => {
+  const queries = [];
+  const payload = {
+    ...analyticsPayload,
+    available: { ...analyticsPayload.available, models: ['legacy-model', 'unknown-model'] },
+  };
+  await page.route('**/api/analytics?*', route => {
+    queries.push(new URL(route.request().url()).searchParams);
+    return route.fulfill({ json: payload });
+  });
+  await page.goto('/analytics.html');
+
+  await expect.poll(() => queries.length).toBe(2);
+  expect(queries[0].get('models')).toBe('gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra');
+  expect(queries[1].get('models')).toBe('legacy-model,unknown-model');
+  await expect(page.locator('#analytics-error')).toContainText('No GPT 5.6 Sol, Terra, or Luna model is available');
+  await page.waitForTimeout(100);
+  expect(queries).toHaveLength(2);
+});
+
+test('selects GPT 5.6 when models appear after an initially empty archive', async ({ page }) => {
+  const queries = [];
+  let availableModels = [];
+  await page.route('**/api/analytics?*', route => {
+    queries.push(new URL(route.request().url()).searchParams);
+    return route.fulfill({
+      json: {
+        ...analyticsPayload,
+        available: { ...analyticsPayload.available, models: availableModels },
+      },
+    });
+  });
+  await page.goto('/analytics.html');
+
+  await expect.poll(() => queries.length).toBe(1);
+  await expect(page.locator('#analytics-error')).toBeHidden();
+  availableModels = ['gpt-5.6-sol', 'legacy-model'];
+  await page.locator('[data-range="7d"]').click();
+
+  await expect.poll(() => queries.length).toBe(2);
+  await expect(page.locator('#model-filter [data-filter-value="gpt-5.6-sol"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#model-filter [data-filter-value="legacy-model"]')).toHaveAttribute('aria-pressed', 'false');
+  await expect(page.locator('#analytics-error')).toBeHidden();
+});
+
+test('keeps the complete dashboard above the fold at 1920x1080', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await mockUsage(page);
+  await page.goto('/dashboard.html');
+
+  const layout = await page.evaluate(() => {
+    const history = document.querySelector('.history-card').getBoundingClientRect();
+    const preferences = document.querySelector('.preference-controls').getBoundingClientRect();
+    const links = document.querySelector('.dashboard-links').getBoundingClientRect();
+    const overlaps = !(preferences.right <= links.left || preferences.left >= links.right || preferences.bottom <= links.top || preferences.top >= links.bottom);
+    return {
+      viewportHeight: window.innerHeight,
+      scrollHeight: document.documentElement.scrollHeight,
+      historyBottom: history.bottom,
+      historyVisible: history.top >= 0 && history.bottom <= window.innerHeight,
+      navigationOverlap: overlaps,
+    };
+  });
+  expect(layout.scrollHeight).toBeLessThanOrEqual(layout.viewportHeight);
+  expect(layout.historyBottom).toBeLessThanOrEqual(layout.viewportHeight);
+  expect(layout.historyVisible).toBe(true);
+  expect(layout.navigationOverlap).toBe(false);
+});
+
+test('renders detailed analytics, reset markers and cost mode by default', async ({ page }) => {
   await page.route('**/api/analytics?*', route => {
     const query = new URL(route.request().url()).searchParams;
     const offset = Number(query.get('reset_offset') || 0);
@@ -251,18 +344,24 @@ test('renders detailed analytics, reset markers, application series and cost mod
   await expect(page.locator('#reset-pagination')).toBeVisible();
   await expect(page.locator('#reset-page-label')).toHaveText('1–50 of 55');
   await expect(page.locator('#collector-grid')).toContainText('database unavailable');
-  await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'false');
+  await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#tokens-chart-card')).toBeHidden();
   await expect(page.locator('#resets-body tr').first().locator('td')).toHaveCount(5);
 
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.filter(dataset => dataset.resetMarker).length)).toBe(2);
   await expect.poll(() => page.evaluate(() => tokensChart.data.datasets.length)).toBe(2);
-  await page.locator('#token-metric-toggle').click();
-  await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.label === 'codex')?.data[0]?.y)).toBe(11.25);
   await page.locator('#toggle-token-overlay').click();
   await expect(page.locator('#tokens-chart-card')).toBeVisible();
-  await expect.poll(() => page.evaluate(() => tokensChart.data.datasets[0].data[0].y)).toBe(11.25);
+  await expect(page.locator('#tokens-chart-card #token-metric-toggle')).toHaveCount(1);
+  await page.locator('#token-metric-toggle').click();
+  await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'false');
+  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.some(dataset => dataset.yAxisID === 'tokens'))).toBe(false);
+  await expect.poll(() => page.evaluate(() => tokensChart.data.datasets[0].data[0].y)).toBe(1200000);
+  await page.locator('#toggle-token-overlay').click();
+  await expect(page.locator('#tokens-chart-card')).toBeHidden();
+  await expect(page.locator('#limits-chart-card #token-metric-toggle')).toHaveCount(1);
+  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.label === 'codex')?.data[0]?.y)).toBe(1200000);
 
   await page.locator('#resets-next').click();
   await expect(page.locator('#reset-page-label')).toContainText('51–55');
@@ -348,6 +447,7 @@ test('switches locale and currency and persists the preference across pages', as
   await expect(page.locator('#language-toggle')).toHaveAttribute('data-selected', 'fr');
   await expect(page.locator('#currency-toggle')).toHaveAttribute('data-selected', 'EUR');
   await expect(page.locator('h1')).toHaveText('Limites Codex');
-  await expect(page.locator('.nav-link')).toContainText('Analytics avancées');
+  await expect(page.locator('.nav-link[href="analytics.html"]')).toContainText('Analytics avancées');
+  await expect(page.locator('.dashboard-links .external-link')).toContainText('Dépôt GitHub');
   await expect(page.locator('.page-nav')).toHaveCount(0);
 });

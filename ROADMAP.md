@@ -269,30 +269,6 @@ les longues séries, lorsque les points sont masqués, ou sur un écran tactile.
 
 **Effort : S à M**
 
-### 11. Ajouter un lien vers Codex Forecast
-
-Ajouter au dashboard un accès explicite à
-`https://codex.lunarwerx.com/`, qui fournit une prévision statistique globale des
-resets Codex. Ce lien doit rester clairement distinct des échéances personnelles
-du compte surveillé.
-
-**Actions :**
-
-- Ajouter un lien « Prévisions globales des resets » dans l'interface du
-  dashboard.
-- Indiquer visuellement qu'il s'agit d'un service tiers et d'un lien externe.
-- Ouvrir le lien avec `rel="noopener noreferrer"`.
-- Traduire son libellé en français et en anglais.
-
-**Critères de validation :**
-
-- Le lien est accessible au clavier et compréhensible hors contexte.
-- L'interface ne présente pas la prévision globale comme la date de reset du
-  compte local.
-- L'ajout ne modifie pas la CSP ni le caractère autonome du dashboard.
-
-**Effort : XS**
-
 ### 12. Compléter les contrôles de qualité de la CI
 
 La CI exécute déjà les tests shell, Python, HTTP et navigateur ainsi que
@@ -418,8 +394,8 @@ du monitor reste à ajouter dans l'objectif 14.
 2. Détecter les anomalies de quota.
 3. Extraire l'historique JSON et centraliser la configuration.
 4. Finaliser WAL, les sauvegardes SQLite et l'empreinte du catalogue.
-5. Terminer les éléments Analytics restants, améliorer l'exploration des
-   graphiques et intégrer le lien vers Codex Forecast.
+5. Terminer les éléments Analytics restants et améliorer l'exploration des
+   graphiques.
 6. Terminer l'accessibilité du dashboard.
 7. Renforcer la CI.
 8. Ajouter l'aide CLI, corriger la documentation et préparer les releases.

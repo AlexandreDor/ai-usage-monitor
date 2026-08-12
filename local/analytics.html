@@ -14,7 +14,10 @@
 </head>
 <body class="analytics-page">
   <header class="analytics-header">
-    <a class="back-link" href="dashboard.html"><span aria-hidden="true">←</span> <span data-i18n="analytics.backToLive">Live limits</span></a>
+    <nav class="analytics-nav" data-i18n-aria-label="analytics.navigationAria" aria-label="Analytics navigation">
+      <a class="back-link" href="dashboard.html"><span aria-hidden="true">←</span> <span data-i18n="analytics.backToLive">Live limits</span></a>
+      <a class="back-link external-link" href="https://github.com/AlexandreDor/ai-usage-monitor" target="_blank" rel="noopener noreferrer"><span data-i18n="analytics.githubLink">GitHub repository</span> <span aria-hidden="true">↗</span></a>
+    </nav>
     <div class="eyebrow" data-i18n="analytics.eyebrow">Local intelligence</div>
     <h1 data-i18n="analytics.heading">Advanced Analytics</h1>
     <p data-i18n="analytics.intro">Long-range limits, token consumption and API-equivalent cost—kept on this machine.</p>
@@ -115,8 +118,13 @@
       </article>
       <article class="metric-card">
         <span class="metric-label" data-i18n="analytics.weeklyResets">Weekly resets</span>
+        <strong id="weekly-reset-count">—</strong>
+        <small id="weekly-reset-impact">—</small>
+      </article>
+      <article class="metric-card">
+        <span class="metric-label" data-i18n="analytics.randomResets">Random resets</span>
         <strong id="random-reset-count">—</strong>
-        <small id="random-reset-impact">—</small>
+        <small id="random-reset-impact" data-i18n="analytics.randomImpactHint">Gain/loss versus ideal weekly pace</small>
       </article>
       <article class="metric-card">
         <span class="metric-label" data-i18n="analytics.endWeekResets">End-of-week resets</span>
@@ -129,8 +137,8 @@
       <article class="card analytics-card wide" id="limits-chart-card">
         <div class="section-heading chart-heading">
           <div><span class="section-kicker" data-i18n="analytics.codexLimits">Codex limits</span><h2 data-i18n="analytics.longTermAvailability">Long-term availability</h2></div>
-          <div class="chart-heading-actions">
-            <button type="button" id="token-metric-toggle" aria-pressed="false" data-i18n="analytics.showCost">Show cost</button>
+          <div class="chart-heading-actions" id="limits-chart-actions">
+            <button type="button" id="token-metric-toggle" aria-pressed="true" data-i18n="analytics.showTokens">Show tokens</button>
             <button type="button" id="toggle-token-overlay" aria-pressed="true" aria-controls="tokens-chart-card" data-i18n="analytics.showTokensSeparately">Show tokens separately</button>
             <span class="sample-count" id="limit-samples">—</span>
           </div>
@@ -147,9 +155,11 @@
       </article>
 
       <article class="card analytics-card wide" id="tokens-chart-card" hidden>
-          <div class="section-heading">
+        <div class="section-heading chart-heading">
           <div><span class="section-kicker" data-i18n="analytics.localConsumption">Local consumption</span><h2 data-i18n="analytics.tokensOverTime">Tokens over time</h2></div>
-          <span class="sample-count" id="event-count">—</span>
+          <div class="chart-heading-actions" id="tokens-chart-actions">
+            <span class="sample-count" id="event-count">—</span>
+          </div>
         </div>
         <div class="chart-wrap" id="tokens-chart-wrap"><canvas id="tokens-chart" role="img" aria-describedby="tokens-chart-summary tokens-data-table-caption"></canvas></div>
         <p class="empty-state" id="tokens-empty" data-i18n="analytics.noTokenEvents" hidden>No token events in this period.</p>

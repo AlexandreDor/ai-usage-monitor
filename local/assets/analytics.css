@@ -31,12 +31,19 @@
   margin-top: 0;
 }
 
+.analytics-nav {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin-bottom: 8px;
+}
+
 .back-link {
   color: #bfdbfe;
   text-decoration: none;
   font-size: 0.82rem;
   font-weight: 700;
-  margin-bottom: 8px;
 }
 
 .back-link:hover,
