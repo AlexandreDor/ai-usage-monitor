@@ -79,6 +79,7 @@ const context = vm.createContext({
     }
     if (!fetchQueue.length) return new Promise(() => {});
     const value = fetchQueue.shift();
+    if (value instanceof Error) throw value;
     return { ok: true, status: 200, json: async () => value };
   },
   setTimeout: (callback, delay) => {
@@ -112,6 +113,45 @@ function evaluate(expression) {
   if (intervalStarts !== 1) fail('heartbeat interval was not started exactly once');
   if (evaluate('dashboardActiveIntervalMs') !== 120000) fail('dashboard ignored the configured active interval');
 
+  evaluate('dashboardData = null; mainFailure = null; lastObservedScrapedAt = null; resetRefreshRetry()');
+  fetchQueue = [new Error('data unavailable')];
+  await evaluate('refresh()');
+  if (evaluate('dashboardMode') !== 'error') fail('local data failure did not set the visual error mode');
+  if (timeoutDelays[timeoutDelays.length - 1] !== 5000) fail('initial local failure did not retry after five seconds');
+
+  evaluate('resetRefreshRetry()');
+  const persistentFailureDelays = [];
+  for (let attempt = 0; attempt < 7; attempt += 1) {
+    fetchQueue = [new Error('still unavailable')];
+    await evaluate('refresh()');
+    persistentFailureDelays.push(timeoutDelays[timeoutDelays.length - 1]);
+  }
+  if (persistentFailureDelays.join(',') !== '5000,10000,20000,40000,80000,120000,120000') {
+    fail(`persistent local failures used unexpected backoff: ${persistentFailureDelays.join(',')}`);
+  }
+
+  evaluate('dashboardActiveIntervalMs = DEFAULT_ACTIVE_REFRESH_INTERVAL_MS; refreshRetryDelayMs = 160000; mainFailure = "data unavailable"');
+  heartbeatIntervalSeconds = '120';
+  await evaluate('sendDashboardHeartbeat()');
+  if (timeoutDelays[timeoutDelays.length - 1] !== 120000) fail('heartbeat interval change did not cap and reschedule an active retry');
+  if (evaluate('refreshRetryDelayMs') !== 120000) fail('retry backoff exceeded the updated active interval');
+
+  const oldScrapedAt = '2000-01-01T00:00:00Z';
+  evaluate('lastObservedScrapedAt = null; resetRefreshRetry()');
+  const unchangedSnapshotDelays = [];
+  for (let attempt = 0; attempt < 7; attempt += 1) {
+    evaluate(`scheduleRefresh({scraped_at: '${oldScrapedAt}', sample_interval_seconds: 900})`);
+    unchangedSnapshotDelays.push(timeoutDelays[timeoutDelays.length - 1]);
+  }
+  if (unchangedSnapshotDelays.join(',') !== '5000,10000,20000,40000,80000,120000,120000') {
+    fail(`unchanged stale snapshot used unexpected backoff: ${unchangedSnapshotDelays.join(',')}`);
+  }
+
+  evaluate(`scheduleRefresh({scraped_at: new Date().toISOString(), sample_interval_seconds: 900})`);
+  const recoveredDelay = timeoutDelays[timeoutDelays.length - 1];
+  if (recoveredDelay < 124000 || recoveredDelay > 126000) fail('new snapshot did not restore the active refresh deadline');
+  if (evaluate('refreshRetryDelayMs') !== 5000) fail('new snapshot did not reset retry backoff');
+
   evaluate(`dashboardMode = 'local'; scheduleRefresh({scraped_at: new Date().toISOString(), sample_interval_seconds: 900})`);
   const configuredDelay = timeoutDelays[timeoutDelays.length - 1];
   if (configuredDelay < 124000 || configuredDelay > 126000) fail('local refresh did not use the configured active interval');
@@ -127,24 +167,43 @@ function evaluate(expression) {
   await evaluate('sendDashboardHeartbeat()');
   if (evaluate('dashboardActiveIntervalMs') !== 120000) fail('dashboard accepted an invalid active interval');
 
+  let resolveHiddenData;
+  const hiddenData = new Promise(resolve => { resolveHiddenData = resolve; });
+  fetchQueue = [
+    hiddenData,
+    [{ five_h_pct: 65, weekly_pct: 55, scraped_at: new Date().toISOString() }],
+  ];
+  const hiddenRefresh = evaluate('refresh()');
   documentObject.visibilityState = 'hidden';
   documentListeners.get('visibilitychange')();
   if (intervalStops !== 1) fail('hidden dashboard did not stop its heartbeat interval');
+  const hiddenTimeoutCount = timeoutDelays.length;
+  resolveHiddenData({ five_h_pct: 65, weekly_pct: 55, scraped_at: new Date().toISOString() });
+  await hiddenRefresh;
+  if (timeoutDelays.length !== hiddenTimeoutCount) fail('request completion recreated a refresh timer while the dashboard was hidden');
   const hiddenHeartbeatCount = fetchCalls.filter(call => call.url === 'api/dashboard-heartbeat').length;
+  const hiddenDataFetchCount = fetchCalls.filter(call => call.url.startsWith('data.json?')).length;
   documentObject.visibilityState = 'visible';
   documentListeners.get('visibilitychange')();
   await new Promise(resolve => setImmediate(resolve));
   if (fetchCalls.filter(call => call.url === 'api/dashboard-heartbeat').length !== hiddenHeartbeatCount + 1) fail('visible dashboard did not resume heartbeat immediately');
   if (intervalStarts !== 2) fail('visible dashboard did not restart heartbeat interval');
+  if (fetchCalls.filter(call => call.url.startsWith('data.json?')).length !== hiddenDataFetchCount + 1) fail('visible dashboard did not refresh data immediately');
 
   heartbeatFailure = true;
   await evaluate('sendDashboardHeartbeat()');
   if (evaluate('mainFailure') !== null) fail('heartbeat failure polluted the dashboard error state');
   heartbeatFailure = false;
   const heartbeatCount = fetchCalls.filter(call => call.url === 'api/dashboard-heartbeat').length;
+  const retryDelayBeforeExternalFailure = evaluate('refreshRetryDelayMs');
   evaluate("GIST_ID = 'external-fixture'; stopDashboardHeartbeat(); startDashboardHeartbeat()");
   await new Promise(resolve => setImmediate(resolve));
   if (fetchCalls.filter(call => call.url === 'api/dashboard-heartbeat').length !== heartbeatCount) fail('external dashboard sent a local heartbeat');
+  fetchQueue = [new Error('gist unavailable')];
+  await evaluate('refresh()');
+  const externalRetryDelay = timeoutDelays[timeoutDelays.length - 1];
+  if (externalRetryDelay < 5000 || externalRetryDelay > 900000) fail('external failure did not retain regular scheduling');
+  if (evaluate('refreshRetryDelayMs') !== retryDelayBeforeExternalFailure) fail('external failure consumed local retry backoff');
   evaluate("GIST_ID = ''");
 
   if (evaluate(`formatParisDateTime('2026-01-03T12:34:00Z')`) !== '03/01/2026 13:34') {

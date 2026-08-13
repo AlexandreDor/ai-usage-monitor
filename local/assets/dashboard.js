@@ -5,6 +5,7 @@ let GIST_ID = '';
 const REFRESH_INTERVAL_MS = 900_000;
 const DEFAULT_ACTIVE_REFRESH_INTERVAL_MS = 300_000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
+const REFRESH_RETRY_INITIAL_MS = 5_000;
 const DECIMATION_THRESHOLD = 1000;
 const DECIMATION_SAMPLES = 600;
 const PARIS_TIME_ZONE = 'Europe/Paris';
@@ -14,6 +15,8 @@ let refreshTimer = null;
 let heartbeatTimer = null;
 let heartbeatInFlight = false;
 let dashboardActiveIntervalMs = DEFAULT_ACTIVE_REFRESH_INTERVAL_MS;
+let refreshRetryDelayMs = REFRESH_RETRY_INITIAL_MS;
+let lastObservedScrapedAt = null;
 let dashboardData = null;
 let dashboardHistory = null;
 let historyFailure = null;
@@ -38,21 +41,57 @@ function displayText(value, fallback = '-', maxLength = 200) {
   return typeof value === 'string' && value.length <= maxLength ? value : fallback;
 }
 
+function isLocalDashboard() {
+  return !GIST_ID;
+}
+
+function resetRefreshRetry() {
+  refreshRetryDelayMs = REFRESH_RETRY_INITIAL_MS;
+}
+
+function consumeRefreshRetryDelay(maximumMs) {
+  const delay = Math.min(refreshRetryDelayMs, maximumMs);
+  refreshRetryDelayMs = Math.min(delay * 2, maximumMs);
+  return delay;
+}
+
 function scheduleRefresh(data = null) {
+  clearTimeout(refreshTimer);
+  refreshTimer = null;
+  if (document.visibilityState !== 'visible') return;
+
   const intervalSeconds = Number(data?.sample_interval_seconds);
   const snapshotIntervalMs = Number.isFinite(intervalSeconds) && intervalSeconds > 0
     ? intervalSeconds * 1000
     : REFRESH_INTERVAL_MS;
-  const intervalMs = dashboardMode === 'local' && document.visibilityState === 'visible'
-    ? dashboardActiveIntervalMs
-    : snapshotIntervalMs;
   const now = Date.now();
-  const scrapedAt = Date.parse(displayText(data?.scraped_at, ''));
-  const nextUpdate = dashboardMode === 'local' && Number.isFinite(scrapedAt)
-    ? scrapedAt + intervalMs + 5_000
-    : (Math.floor((now - 5_000) / intervalMs) + 1) * intervalMs + 5_000;
-  clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(refresh, Math.max(5_000, nextUpdate - now));
+  const rawScrapedAt = displayText(data?.scraped_at, '');
+  const scrapedAt = Date.parse(rawScrapedAt);
+
+  if (!isLocalDashboard()) {
+    const nextUpdate = (Math.floor((now - 5_000) / snapshotIntervalMs) + 1) * snapshotIntervalMs + 5_000;
+    refreshTimer = setTimeout(refresh, Math.max(REFRESH_RETRY_INITIAL_MS, nextUpdate - now));
+    return;
+  }
+
+  if (Number.isFinite(scrapedAt) && rawScrapedAt !== lastObservedScrapedAt) {
+    lastObservedScrapedAt = rawScrapedAt;
+    resetRefreshRetry();
+  }
+
+  const nextUpdate = Number.isFinite(scrapedAt)
+    ? scrapedAt + dashboardActiveIntervalMs + REFRESH_RETRY_INITIAL_MS
+    : Number.NaN;
+  if (Number.isFinite(nextUpdate) && nextUpdate > now) {
+    resetRefreshRetry();
+    refreshTimer = setTimeout(refresh, nextUpdate - now);
+    return;
+  }
+
+  refreshTimer = setTimeout(
+    refresh,
+    consumeRefreshRetryDelay(dashboardActiveIntervalMs),
+  );
 }
 
 function applyDashboardActiveInterval(rawValue) {
@@ -61,11 +100,14 @@ function applyDashboardActiveInterval(rawValue) {
   const intervalMs = intervalSeconds * 1000;
   if (intervalMs === dashboardActiveIntervalMs) return;
   dashboardActiveIntervalMs = intervalMs;
-  if (dashboardData && dashboardMode === 'local') scheduleRefresh(dashboardData);
+  refreshRetryDelayMs = Math.min(refreshRetryDelayMs, dashboardActiveIntervalMs);
+  if (isLocalDashboard() && document.visibilityState === 'visible') {
+    scheduleRefresh(mainFailure ? null : dashboardData);
+  }
 }
 
 async function sendDashboardHeartbeat() {
-  if (GIST_ID || document.visibilityState !== 'visible' || heartbeatInFlight) return;
+  if (!isLocalDashboard() || document.visibilityState !== 'visible' || heartbeatInFlight) return;
   heartbeatInFlight = true;
   try {
     const response = await fetch('api/dashboard-heartbeat', {
@@ -88,7 +130,7 @@ function stopDashboardHeartbeat() {
 }
 
 function startDashboardHeartbeat() {
-  if (GIST_ID || document.visibilityState !== 'visible') return;
+  if (!isLocalDashboard() || document.visibilityState !== 'visible') return;
   stopDashboardHeartbeat();
   void sendDashboardHeartbeat();
   heartbeatTimer = setInterval(sendDashboardHeartbeat, HEARTBEAT_INTERVAL_MS);
