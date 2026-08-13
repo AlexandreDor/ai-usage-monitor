@@ -4,7 +4,7 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
 
 **Problem:** OpenAI already exposes Codex usage through its local app-server and in the ChatGPT Codex usage page, but those views do not give you rolling history or proactive notifications when you're running low.
 
-**Solution:** A local bash script that reads the Codex app-server on exact 15-minute boundaries, accelerates the current snapshot to five minutes while a local dashboard tab is visible, serves that dashboard in your browser, and fires Discord or Telegram alerts directly. The faster live checks never densify history or Analytics. An optional, enabled-by-default request to the third-party Codex Forecast service adds global 24-hour and 6-hour reset probabilities; it can be disabled without affecting local quota monitoring.
+**Solution:** A local bash script that reads the Codex app-server on exact 15-minute boundaries, accelerates the current snapshot to a configurable five-minute default while a local dashboard tab is visible, serves that dashboard in your browser, and fires Discord or Telegram alerts directly. The faster live checks never densify history or Analytics. An optional, enabled-by-default request to the third-party Codex Forecast service adds global 24-hour and 6-hour reset probabilities; it can be disabled without affecting local quota monitoring.
 
 ![Codex Limits dashboard hero](local/images/hero.png)
 
@@ -211,10 +211,12 @@ Loop mode reads immediately at startup, then aligns subsequent checks to the
 configured wall-clock boundaries. With `900`, checks run at `:00`, `:15`,
 `:30`, and `:45` instead of 15 minutes after the previous collection completes.
 While at least one locally served dashboard tab is visible, intermediate quota
-checks update `data.json` and alerts every five minutes. They stop within 90
+checks update `data.json`, the visible `Last scraped` value, and alerts every
+`DASHBOARD_ACTIVE_INTERVAL_SECONDS` (five minutes by default). They stop within 90
 seconds after all tabs are hidden or closed and never add `history.json`,
 SQLite, Forecast, token, graph, or Gist samples. A configured regular interval
-of five minutes or less remains a complete collection cadence.
+shorter than or equal to this active interval remains a complete collection
+cadence.
 
 Terminal 2:
 ```bash
@@ -658,6 +660,7 @@ complete template also documents process-only overrides in a separate section.
 | `OPENCODE_DB_PATH` | No | XDG OpenCode path | Absolute path to `opencode.db` |
 | `HERMES_DB_PATH` | No | `~/.hermes/state.db` | Absolute path to the Hermes state database |
 | `LOOP_INTERVAL` | No | `900` | Collection interval, from `1` to `86400` seconds |
+| `DASHBOARD_ACTIVE_INTERVAL_SECONDS` | No | `300` | Quota and alert interval while a local dashboard tab is visible, from `30` to `86400` seconds |
 | `CODEX_BIN` | No | `codex` | Codex CLI executable |
 | `CODEX_STATUS_TIMEOUT_SECONDS` | No | `20` | Codex app-server timeout, from `5` to `300` seconds |
 | `CURL_CONNECT_TIMEOUT_SECONDS` | No | `5` | HTTP connection timeout, from `1` to `60` seconds |

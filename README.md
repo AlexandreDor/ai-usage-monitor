@@ -132,11 +132,12 @@ the default 900-second interval, later runs align with `:00`, `:15`, `:30`, and
 `:45` instead of drifting from the previous execution time.
 
 While a locally served dashboard tab is visible, loop mode also refreshes the
-current quota snapshot and evaluates alerts at most every 300 seconds. These
+current quota snapshot and evaluates alerts at `DASHBOARD_ACTIVE_INTERVAL_SECONDS`
+(300 seconds by default). These
 live checks do not write `history.json`, SQLite, Forecast or token samples, or
 the optional Gist. Hiding or closing every dashboard tab restores the regular
-cadence after at most 90 seconds. Explicit regular intervals of 300 seconds or
-less keep their existing complete-cycle behavior.
+cadence after at most 90 seconds. A regular `LOOP_INTERVAL` shorter than or
+equal to the active interval keeps its existing complete-cycle behavior.
 
 ## Monitor Commands
 
@@ -197,6 +198,7 @@ HISTORY_RETENTION_HOURS=192
 ARCHIVE_RETENTION_DAYS=365
 TOKEN_USAGE_SOURCES=auto
 LOOP_INTERVAL=900
+DASHBOARD_ACTIVE_INTERVAL_SECONDS=300
 CODEX_FORECAST_ENABLED=1
 ```
 
@@ -272,6 +274,7 @@ Scripts receive:
 | Variable | Default | Accepted values | Description |
 |---|---:|---|---|
 | `LOOP_INTERVAL` | `900` | Integer from `1` to `86400` seconds | Collection cadence used by `--loop`. |
+| `DASHBOARD_ACTIVE_INTERVAL_SECONDS` | `300` | Integer from `30` to `86400` seconds | Quota and alert cadence while a locally served dashboard tab is visible; live checks update only the current snapshot. |
 | `HISTORY_RETENTION_HOURS` | `192` | Number from `0.25` to `8760` | Age-based rolling window for `history.json`; defensive limits of 10,000 entries and 16 MiB also apply. |
 | `ARCHIVE_RETENTION_DAYS` | `365` | Integer from `0` to `36500` | SQLite retention; `0` keeps data indefinitely. |
 | `CODEX_STATUS_TIMEOUT_SECONDS` | `20` | Integer from `5` to `300` | Timeout for the Codex app-server status request. |
