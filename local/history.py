@@ -57,6 +57,12 @@ class HistoryUpdate:
     backup: Path | None = None
 
 
+@dataclass(frozen=True)
+class DataUpdate:
+    snapshot: dict[str, Any]
+    data_updated: bool
+
+
 def warn(message: str) -> None:
     print(f"[WARN] {message}", file=sys.stderr)
 
@@ -464,6 +470,54 @@ def parse_retention_hours(value: Any) -> float:
     return retention
 
 
+def read_current_data(data_file: Path) -> Entry | None:
+    if not data_file.exists():
+        return None
+    try:
+        if data_file.stat().st_size > MAX_HISTORY_BYTES:
+            raise SnapshotValidationError("data.json exceeds the 16 MiB input limit")
+        current_value = json.loads(data_file.read_text(encoding="utf-8"))
+        return normalize_entry(
+            current_value,
+            include_forecast=True,
+            include_forecast_thresholds=True,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, SnapshotValidationError) as exc:
+        warn(f"Current data snapshot is invalid and will be replaced: {exc}")
+        return None
+
+
+def update_current_data(
+    data_path: str | os.PathLike[str],
+    snapshot: Mapping[str, Any],
+    *,
+    preserve_existing_forecast: bool = False,
+) -> DataUpdate:
+    """Validate and atomically replace the current public snapshot when newer."""
+
+    data_file = Path(data_path)
+    incoming = normalize_entry(
+        snapshot,
+        include_forecast=True,
+        include_forecast_thresholds=True,
+    )
+    current = read_current_data(data_file)
+    if current is not None and incoming.epoch_microseconds < current.epoch_microseconds:
+        warn("Older snapshot did not replace data.json.")
+        return DataUpdate(dict(current.public), False)
+
+    public = dict(incoming.public)
+    if (
+        preserve_existing_forecast
+        and "codex_forecast" not in public
+        and current is not None
+        and "codex_forecast" in current.public
+    ):
+        public["codex_forecast"] = current.public["codex_forecast"]
+    atomic_write(data_file, serialize_snapshot(public))
+    return DataUpdate(public, True)
+
+
 def update_history(
     history_path: str | os.PathLike[str],
     data_path: str | os.PathLike[str],
@@ -514,19 +568,7 @@ def update_history(
 
     atomic_write(history_file, serialize_history(retained))
 
-    current_data: Entry | None = None
-    if data_file.exists():
-        try:
-            if data_file.stat().st_size > MAX_HISTORY_BYTES:
-                raise SnapshotValidationError("data.json exceeds the 16 MiB input limit")
-            current_value = json.loads(data_file.read_text(encoding="utf-8"))
-            current_data = normalize_entry(
-                current_value,
-                include_forecast=True,
-                include_forecast_thresholds=True,
-            )
-        except (OSError, UnicodeError, json.JSONDecodeError, SnapshotValidationError) as exc:
-            warn(f"Current data snapshot is invalid and will be replaced: {exc}")
+    current_data = read_current_data(data_file)
 
     merged_incoming = next(
         (
@@ -563,9 +605,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Validate and update the rolling public quota history."
     )
-    parser.add_argument("--history", required=True, type=Path)
+    parser.add_argument("--history", type=Path)
     parser.add_argument("--data", required=True, type=Path)
-    parser.add_argument("--retention-hours", required=True)
+    parser.add_argument("--retention-hours")
+    parser.add_argument(
+        "--data-only",
+        action="store_true",
+        help="update only data.json and preserve an existing Forecast value",
+    )
     return parser
 
 
@@ -578,18 +625,32 @@ def main(argv: list[str] | None = None) -> int:
         snapshot = json.loads(raw)
         if not isinstance(snapshot, dict):
             raise SnapshotValidationError("snapshot must be a JSON object")
-        result = update_history(
-            args.history,
-            args.data,
-            snapshot,
-            args.retention_hours,
-        )
+        if args.data_only:
+            result = update_current_data(
+                args.data,
+                snapshot,
+                preserve_existing_forecast=True,
+            )
+        else:
+            if args.history is None or args.retention_hours is None:
+                raise HistoryError(
+                    "--history and --retention-hours are required unless --data-only is used"
+                )
+            result = update_history(
+                args.history,
+                args.data,
+                snapshot,
+                args.retention_hours,
+            )
     except (HistoryError, OSError, UnicodeError, json.JSONDecodeError) as exc:
         error(str(exc))
         return 1
 
-    count = len(result.history)
-    print(f"[OK] History updated: {count} entr{'y' if count == 1 else 'ies'}.")
+    if isinstance(result, DataUpdate):
+        print("[OK] Current snapshot updated." if result.data_updated else "[OK] Current snapshot kept.")
+    else:
+        count = len(result.history)
+        print(f"[OK] History updated: {count} entr{'y' if count == 1 else 'ies'}.")
     return 0
 
 
