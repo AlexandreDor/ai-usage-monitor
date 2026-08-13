@@ -53,42 +53,6 @@ que soit son âge.
 
 **Effort : S**
 
-### 3. Accélérer les relevés pendant la consultation du dashboard
-
-Lorsqu'un utilisateur consulte le dashboard local, le relevé principal doit être
-actualisé toutes les 5 minutes, sans augmenter la densité de l'historique ni des
-graphiques.
-
-**Actions :**
-
-- Faire signaler au serveur qu'un dashboard local est visible et actif.
-- Conserver un heartbeat borné dans `runtime/`, sans identifiant utilisateur ni
-  historique de navigation.
-- Passer temporairement la collecte des quotas à un intervalle de 5 minutes
-  lorsqu'une activité récente est détectée.
-- Mettre à jour uniquement le snapshot principal lors des relevés
-  intermédiaires.
-- Continuer à alimenter `history.json`, SQLite et les séries graphiques avec au
-  plus un point toutes les 15 minutes.
-- Revenir automatiquement à l'intervalle normal après la fermeture ou
-  l'inactivité du dashboard.
-- Limiter cette fonction au mode local ; le dashboard statique/Gist ne doit pas
-  nécessiter de callback vers le monitor.
-
-**Critères de validation :**
-
-- Un dashboard local actif obtient une nouvelle valeur au plus toutes les
-  5 minutes.
-- Une consultation prolongée ne crée jamais plus d'un point graphique par
-  tranche de 15 minutes.
-- La fermeture de la page restaure automatiquement la fréquence normale.
-- Plusieurs onglets ne provoquent ni collectes concurrentes ni multiplication
-  des points.
-- Les alertes et la détection de fraîcheur utilisent explicitement la fréquence
-  réellement applicable.
-
-**Effort : M à L**
-
 ## P1 - Robustesse et qualité
 
 ### 4. Alerter sur les mouvements de quota anormaux
@@ -341,8 +305,7 @@ du monitor reste à ajouter dans l'objectif 14.
 
 ## Ordre d'exécution recommandé
 
-1. Ajouter la détection des données périmées et le rafraîchissement adaptatif au
-   dashboard principal.
+1. Ajouter la détection des données périmées au dashboard principal.
 2. Détecter les anomalies de quota.
 3. Centraliser la configuration partagée.
 4. Finaliser WAL, les sauvegardes SQLite et l'empreinte du catalogue.
@@ -368,8 +331,6 @@ Une amélioration est considérée comme terminée lorsque :
 Le programme restant est terminé lorsque :
 
 - le dashboard principal détecte et annonce les données périmées ;
-- un dashboard local actif actualise le relevé principal toutes les 5 minutes
-  sans densifier les historiques ;
 - les mouvements de quota anormaux sont détectés sans confondre les resets
   légitimes ;
 - le monitor et le serveur partagent une configuration non exécutable ;
