@@ -38,8 +38,12 @@ DATA_FILE="${RUNTIME_DIR}/data.json"
 HISTORY_FILE="${RUNTIME_DIR}/history.json"
 ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"
 HEALTH_FILE="${RUNTIME_DIR}/health.json"
+HEARTBEAT_FILE="${RUNTIME_DIR}/dashboard-heartbeat"
 LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
 DEFAULT_INTERVAL_SECONDS=900
+DASHBOARD_INTERVAL_SECONDS=300
+DASHBOARD_HEARTBEAT_MAX_AGE_SECONDS=90
+DASHBOARD_HEARTBEAT_POLL_SECONDS=5
 INVALID_ALERT_SCRIPT_CONFIG=0
 RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT=20
 RANDOM_WEEKLY_RESET_FULL_REFILL_PCT=98
@@ -766,6 +770,28 @@ write_local_snapshot() {
     --retention-hours "$HISTORY_RETENTION_HOURS"
 
   echo "[OK] Snapshot storage processed at ${DATA_FILE}"
+}
+
+write_current_snapshot() {
+  local json="$1"
+
+  printf '%s\n' "$json" | python3 "$HISTORY_PY" \
+    --data "$DATA_FILE" \
+    --data-only
+
+  echo "[OK] Current snapshot updated at ${DATA_FILE}"
+}
+
+snapshot_with_interval() {
+  local json="$1" interval_seconds="$2"
+  python3 - "$json" "$interval_seconds" <<'PYEOF'
+import json
+import sys
+
+snapshot = json.loads(sys.argv[1])
+snapshot["sample_interval_seconds"] = int(sys.argv[2])
+print(json.dumps(snapshot, indent=2))
+PYEOF
 }
 
 load_thresholds() {
@@ -2057,8 +2083,8 @@ PYEOF
 # Main
 # ============================================================================
 update_health() {
-  local result="$1" detail="$2" duration_ms="$3"
-  python3 - "$HEALTH_FILE" "$result" "$detail" "$duration_ms" <<'PYEOF'
+  local result="$1" detail="$2" duration_ms="$3" cycle_mode="${4:-full}" interval_seconds="${5:-$LOOP_INTERVAL}"
+  python3 - "$HEALTH_FILE" "$result" "$detail" "$duration_ms" "$cycle_mode" "$interval_seconds" <<'PYEOF'
 import datetime
 import json
 import os
@@ -2067,7 +2093,7 @@ import sys
 import tempfile
 
 path = pathlib.Path(sys.argv[1])
-result, detail, duration = sys.argv[2], sys.argv[3], int(sys.argv[4])
+result, detail, duration, cycle_mode, interval = sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], int(sys.argv[6])
 try:
     health = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 except (OSError, ValueError):
@@ -2076,6 +2102,8 @@ now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"
 health["last_cycle"] = now
 health["last_cycle_duration_ms"] = duration
 health["last_cycle_result"] = result
+health["last_cycle_mode"] = cycle_mode
+health["last_cycle_interval_seconds"] = interval
 if result == "success":
     health["last_success"] = now
     health["consecutive_failures"] = 0
@@ -2141,29 +2169,47 @@ check_token_usage() {
 
 run_cycle() {
   local interval_seconds="$1"
-  echo "[$(format_paris_now)] Scraping codex status..."
+  local cycle_mode="${2:-full}" regular_interval
+  regular_interval="${3:-$interval_seconds}"
+  if [[ "$cycle_mode" != full && "$cycle_mode" != live ]]; then
+    echo "[ERROR] Unsupported cycle mode: ${cycle_mode}." >&2
+    return 2
+  fi
+  echo "[$(format_paris_now)] Scraping codex status (${cycle_mode} cycle)..."
 
-  local json public_json status=0 history_json="[]"
+  local json public_json gist_json status=0 history_json="[]"
   CYCLE_ERROR=""
   if json=$(fetch_status_json "$interval_seconds"); then
     echo "$json" | python3 -m json.tool 2>/dev/null || echo "$json"
     public_json="$json"
-    if [[ "$CODEX_FORECAST_ENABLED" == 1 ]]; then
+    if [[ "$cycle_mode" == full && "$CODEX_FORECAST_ENABLED" == 1 ]]; then
       if ! public_json="$(enrich_snapshot_with_codex_forecast "$json")"; then
         public_json="$json"
       fi
     fi
-    if ! archive_snapshot "$public_json"; then
-      status=1
-      append_cycle_error "Long-term archive update failed"
-    fi
-    if write_local_snapshot "$public_json"; then
-      [[ -f "$HISTORY_FILE" ]] && history_json="$(<"$HISTORY_FILE")"
+    if [[ "$cycle_mode" == full ]]; then
+      if ! archive_snapshot "$public_json"; then
+        status=1
+        append_cycle_error "Long-term archive update failed"
+      fi
+      if write_local_snapshot "$public_json"; then
+        [[ -f "$HISTORY_FILE" ]] && history_json="$(<"$HISTORY_FILE")"
+      else
+        status=1
+        append_cycle_error "Local snapshot write failed"
+      fi
+      gist_json="$public_json"
+      if (( interval_seconds != regular_interval )); then
+        if ! gist_json="$(snapshot_with_interval "$public_json" "$regular_interval")"; then
+          gist_json="$public_json"
+          status=1
+          append_cycle_error "External snapshot cadence update failed"
+        fi
+      fi
+      sync_gist "$gist_json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
     else
-      status=1
-      append_cycle_error "Local snapshot write failed"
+      write_current_snapshot "$public_json" || { status=1; append_cycle_error "Current snapshot write failed"; }
     fi
-    sync_gist "$public_json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
 
     local five_h weekly five_h_reset weekly_reset five_h_reset_at weekly_reset_at limit_id scraped_at scraped_at_epoch
     five_h=$(json_get_field "$json" "five_h_pct")
@@ -2183,12 +2229,16 @@ run_cycle() {
     append_cycle_error "Codex limit collection failed"
   fi
 
-  collect_token_usage || { status=1; append_cycle_error "Local token usage collection failed"; }
+  if [[ "$cycle_mode" == full ]]; then
+    collect_token_usage || { status=1; append_cycle_error "Local token usage collection failed"; }
+  fi
   return "$status"
 }
 
 run_once() {
-  local interval_seconds="$1" lock_fd start_ms end_ms duration_ms status=0
+  local interval_seconds="$1" cycle_mode="${2:-full}" regular_interval
+  regular_interval="${3:-$interval_seconds}"
+  local lock_fd start_ms end_ms duration_ms status=0
   exec {lock_fd}>"$LOCK_FILE"
   chmod 600 "$LOCK_FILE"
   if ! flock -n "$lock_fd"; then
@@ -2198,7 +2248,7 @@ run_once() {
   fi
 
   start_ms="$(date -u +%s%3N)"
-  if run_cycle "$interval_seconds"; then
+  if run_cycle "$interval_seconds" "$cycle_mode" "$regular_interval"; then
     status=0
   else
     status=$?
@@ -2206,10 +2256,10 @@ run_once() {
   end_ms="$(date -u +%s%3N)"
   duration_ms=$((end_ms - start_ms))
   if (( status == 0 )); then
-    update_health success "" "$duration_ms"
+    update_health success "" "$duration_ms" "$cycle_mode" "$interval_seconds"
     echo "[OK] Cycle completed in ${duration_ms}ms."
   else
-    update_health failure "${CYCLE_ERROR:-Collection or delivery failed}" "$duration_ms"
+    update_health failure "${CYCLE_ERROR:-Collection or delivery failed}" "$duration_ms" "$cycle_mode" "$interval_seconds"
     echo "[WARN] Cycle failed in ${duration_ms}ms." >&2
   fi
   exec {lock_fd}>&-

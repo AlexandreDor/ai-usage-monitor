@@ -35,6 +35,7 @@ use_test_runtime() {
   HISTORY_FILE="${RUNTIME_DIR}/history.json"
   ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"
   HEALTH_FILE="${RUNTIME_DIR}/health.json"
+  HEARTBEAT_FILE="${RUNTIME_DIR}/dashboard-heartbeat"
   LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
   ENV_FILE="${TEST_ROOT}/.env"
   mkdir -p "$RUNTIME_DIR"
