@@ -38,8 +38,12 @@ DATA_FILE="${RUNTIME_DIR}/data.json"
 HISTORY_FILE="${RUNTIME_DIR}/history.json"
 ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"
 HEALTH_FILE="${RUNTIME_DIR}/health.json"
+HEARTBEAT_FILE="${RUNTIME_DIR}/dashboard-heartbeat"
 LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
 DEFAULT_INTERVAL_SECONDS=900
+DEFAULT_DASHBOARD_ACTIVE_INTERVAL_SECONDS=300
+DASHBOARD_HEARTBEAT_MAX_AGE_SECONDS=90
+DASHBOARD_HEARTBEAT_POLL_SECONDS=5
 INVALID_ALERT_SCRIPT_CONFIG=0
 RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT=20
 RANDOM_WEEKLY_RESET_FULL_REFILL_PCT=98
@@ -64,7 +68,7 @@ load_config() {
     fi
 
     case "$key" in
-      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_ENABLED|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
+      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_ENABLED|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DASHBOARD_ACTIVE_INTERVAL_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
         if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
           value="${value:1:${#value}-2}"
         fi
@@ -256,6 +260,7 @@ PYEOF
 validate_config() {
   local invalid=0 secret path_value
   validate_integer LOOP_INTERVAL "$LOOP_INTERVAL" 1 86400 || invalid=1
+  validate_integer DASHBOARD_ACTIVE_INTERVAL_SECONDS "$DASHBOARD_ACTIVE_INTERVAL_SECONDS" 30 86400 || invalid=1
   validate_integer CODEX_STATUS_TIMEOUT_SECONDS "$CODEX_STATUS_TIMEOUT_SECONDS" 5 300 || invalid=1
   validate_integer ARCHIVE_RETENTION_DAYS "$ARCHIVE_RETENTION_DAYS" 0 36500 || invalid=1
   validate_number HISTORY_RETENTION_HOURS "$HISTORY_RETENTION_HOURS" 0.25 8760 || invalid=1
@@ -379,6 +384,7 @@ initialize() {
   ARCHIVE_RETENTION_DAYS="${ARCHIVE_RETENTION_DAYS:-365}"
   HISTORY_RETENTION_HOURS="${HISTORY_RETENTION_HOURS:-192}"
   LOOP_INTERVAL="${LOOP_INTERVAL:-$DEFAULT_INTERVAL_SECONDS}"
+  DASHBOARD_ACTIVE_INTERVAL_SECONDS="${DASHBOARD_ACTIVE_INTERVAL_SECONDS:-$DEFAULT_DASHBOARD_ACTIVE_INTERVAL_SECONDS}"
   CODEX_STATUS_TIMEOUT_SECONDS="${CODEX_STATUS_TIMEOUT_SECONDS:-20}"
   CURL_CONNECT_TIMEOUT_SECONDS="${CURL_CONNECT_TIMEOUT_SECONDS:-5}"
   CURL_MAX_TIME_SECONDS="${CURL_MAX_TIME_SECONDS:-20}"
@@ -766,6 +772,28 @@ write_local_snapshot() {
     --retention-hours "$HISTORY_RETENTION_HOURS"
 
   echo "[OK] Snapshot storage processed at ${DATA_FILE}"
+}
+
+write_current_snapshot() {
+  local json="$1"
+
+  printf '%s\n' "$json" | python3 "$HISTORY_PY" \
+    --data "$DATA_FILE" \
+    --data-only
+
+  echo "[OK] Current snapshot updated at ${DATA_FILE}"
+}
+
+snapshot_with_interval() {
+  local json="$1" interval_seconds="$2"
+  python3 - "$json" "$interval_seconds" <<'PYEOF'
+import json
+import sys
+
+snapshot = json.loads(sys.argv[1])
+snapshot["sample_interval_seconds"] = int(sys.argv[2])
+print(json.dumps(snapshot, indent=2))
+PYEOF
 }
 
 load_thresholds() {
@@ -2057,8 +2085,8 @@ PYEOF
 # Main
 # ============================================================================
 update_health() {
-  local result="$1" detail="$2" duration_ms="$3"
-  python3 - "$HEALTH_FILE" "$result" "$detail" "$duration_ms" <<'PYEOF'
+  local result="$1" detail="$2" duration_ms="$3" cycle_mode="${4:-full}" interval_seconds="${5:-$LOOP_INTERVAL}"
+  python3 - "$HEALTH_FILE" "$result" "$detail" "$duration_ms" "$cycle_mode" "$interval_seconds" <<'PYEOF'
 import datetime
 import json
 import os
@@ -2067,7 +2095,7 @@ import sys
 import tempfile
 
 path = pathlib.Path(sys.argv[1])
-result, detail, duration = sys.argv[2], sys.argv[3], int(sys.argv[4])
+result, detail, duration, cycle_mode, interval = sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], int(sys.argv[6])
 try:
     health = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 except (OSError, ValueError):
@@ -2076,6 +2104,8 @@ now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"
 health["last_cycle"] = now
 health["last_cycle_duration_ms"] = duration
 health["last_cycle_result"] = result
+health["last_cycle_mode"] = cycle_mode
+health["last_cycle_interval_seconds"] = interval
 if result == "success":
     health["last_success"] = now
     health["consecutive_failures"] = 0
@@ -2141,29 +2171,47 @@ check_token_usage() {
 
 run_cycle() {
   local interval_seconds="$1"
-  echo "[$(format_paris_now)] Scraping codex status..."
+  local cycle_mode="${2:-full}" regular_interval
+  regular_interval="${3:-$interval_seconds}"
+  if [[ "$cycle_mode" != full && "$cycle_mode" != live ]]; then
+    echo "[ERROR] Unsupported cycle mode: ${cycle_mode}." >&2
+    return 2
+  fi
+  echo "[$(format_paris_now)] Scraping codex status (${cycle_mode} cycle)..."
 
-  local json public_json status=0 history_json="[]"
+  local json public_json gist_json status=0 history_json="[]"
   CYCLE_ERROR=""
   if json=$(fetch_status_json "$interval_seconds"); then
     echo "$json" | python3 -m json.tool 2>/dev/null || echo "$json"
     public_json="$json"
-    if [[ "$CODEX_FORECAST_ENABLED" == 1 ]]; then
+    if [[ "$cycle_mode" == full && "$CODEX_FORECAST_ENABLED" == 1 ]]; then
       if ! public_json="$(enrich_snapshot_with_codex_forecast "$json")"; then
         public_json="$json"
       fi
     fi
-    if ! archive_snapshot "$public_json"; then
-      status=1
-      append_cycle_error "Long-term archive update failed"
-    fi
-    if write_local_snapshot "$public_json"; then
-      [[ -f "$HISTORY_FILE" ]] && history_json="$(<"$HISTORY_FILE")"
+    if [[ "$cycle_mode" == full ]]; then
+      if ! archive_snapshot "$public_json"; then
+        status=1
+        append_cycle_error "Long-term archive update failed"
+      fi
+      if write_local_snapshot "$public_json"; then
+        [[ -f "$HISTORY_FILE" ]] && history_json="$(<"$HISTORY_FILE")"
+      else
+        status=1
+        append_cycle_error "Local snapshot write failed"
+      fi
+      gist_json="$public_json"
+      if (( interval_seconds != regular_interval )); then
+        if ! gist_json="$(snapshot_with_interval "$public_json" "$regular_interval")"; then
+          gist_json="$public_json"
+          status=1
+          append_cycle_error "External snapshot cadence update failed"
+        fi
+      fi
+      sync_gist "$gist_json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
     else
-      status=1
-      append_cycle_error "Local snapshot write failed"
+      write_current_snapshot "$public_json" || { status=1; append_cycle_error "Current snapshot write failed"; }
     fi
-    sync_gist "$public_json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
 
     local five_h weekly five_h_reset weekly_reset five_h_reset_at weekly_reset_at limit_id scraped_at scraped_at_epoch
     five_h=$(json_get_field "$json" "five_h_pct")
@@ -2183,12 +2231,23 @@ run_cycle() {
     append_cycle_error "Codex limit collection failed"
   fi
 
-  collect_token_usage || { status=1; append_cycle_error "Local token usage collection failed"; }
+  if [[ "$cycle_mode" == full ]]; then
+    collect_token_usage || { status=1; append_cycle_error "Local token usage collection failed"; }
+  fi
   return "$status"
 }
 
+monotonic_milliseconds() {
+  python3 - <<'PYEOF'
+import time
+print(time.monotonic_ns() // 1_000_000)
+PYEOF
+}
+
 run_once() {
-  local interval_seconds="$1" lock_fd start_ms end_ms duration_ms status=0
+  local interval_seconds="$1" cycle_mode="${2:-full}" regular_interval
+  regular_interval="${3:-$interval_seconds}"
+  local lock_fd start_ms end_ms duration_ms status=0
   exec {lock_fd}>"$LOCK_FILE"
   chmod 600 "$LOCK_FILE"
   if ! flock -n "$lock_fd"; then
@@ -2197,19 +2256,19 @@ run_once() {
     return 0
   fi
 
-  start_ms="$(date -u +%s%3N)"
-  if run_cycle "$interval_seconds"; then
+  start_ms="$(monotonic_milliseconds)"
+  if run_cycle "$interval_seconds" "$cycle_mode" "$regular_interval"; then
     status=0
   else
     status=$?
   fi
-  end_ms="$(date -u +%s%3N)"
+  end_ms="$(monotonic_milliseconds)"
   duration_ms=$((end_ms - start_ms))
   if (( status == 0 )); then
-    update_health success "" "$duration_ms"
+    update_health success "" "$duration_ms" "$cycle_mode" "$interval_seconds"
     echo "[OK] Cycle completed in ${duration_ms}ms."
   else
-    update_health failure "${CYCLE_ERROR:-Collection or delivery failed}" "$duration_ms"
+    update_health failure "${CYCLE_ERROR:-Collection or delivery failed}" "$duration_ms" "$cycle_mode" "$interval_seconds"
     echo "[WARN] Cycle failed in ${duration_ms}ms." >&2
   fi
   exec {lock_fd}>&-
@@ -2230,8 +2289,86 @@ seconds_until_next_interval() {
   printf '%s\n' "$((interval - now_epoch % interval))"
 }
 
+dashboard_activity_recent() {
+  local now_epoch="${1:-}" metadata owner size modified
+  [[ -n "$now_epoch" ]] || now_epoch="$(date -u +%s)"
+  [[ "$now_epoch" =~ ^[0-9]+$ ]] || return 1
+  [[ -f "$HEARTBEAT_FILE" && ! -L "$HEARTBEAT_FILE" ]] || return 1
+  metadata="$(stat -c '%u %s %Y' -- "$HEARTBEAT_FILE" 2>/dev/null)" || return 1
+  read -r owner size modified <<< "$metadata"
+  [[ "$owner" =~ ^[0-9]+$ && "$size" == 0 && "$modified" =~ ^[0-9]+$ ]] || return 1
+  [[ "$owner" == "$(id -u)" ]] || return 1
+  (( modified <= now_epoch && now_epoch - modified <= DASHBOARD_HEARTBEAT_MAX_AGE_SECONDS ))
+}
+
+effective_collection_interval() {
+  local regular_interval="$1" now_epoch="$2"
+  if (( regular_interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS )) && dashboard_activity_recent "$now_epoch"; then
+    printf '%s\n' "$DASHBOARD_ACTIVE_INTERVAL_SECONDS"
+  else
+    printf '%s\n' "$regular_interval"
+  fi
+}
+
+run_loop() {
+  local interval="$1" fail_fast="$2"
+  local now_epoch completed_at next_regular last_attempt delay effective cycle_status=0 live_due
+
+  now_epoch="$(date -u +%s)"
+  effective="$(effective_collection_interval "$interval" "$now_epoch")"
+  last_attempt="$now_epoch"
+  run_once "$effective" full "$interval" || cycle_status=$?
+  if (( cycle_status != 0 )); then
+    echo "[WARN] Scrape cycle failed, will retry at the next scheduled check"
+    (( fail_fast == 1 )) && return "$cycle_status"
+  fi
+  completed_at="$(date -u +%s)"
+  delay="$(seconds_until_next_interval "$completed_at" "$interval")"
+  next_regular=$((completed_at + delay))
+  echo "[$(format_paris_now)] Next regular check at $(format_paris_timestamp "$next_regular") (in ${delay}s)..."
+
+  while true; do
+    now_epoch="$(date -u +%s)"
+    cycle_status=0
+    if (( now_epoch >= next_regular )); then
+      effective="$(effective_collection_interval "$interval" "$now_epoch")"
+      last_attempt="$now_epoch"
+      run_once "$effective" full "$interval" || cycle_status=$?
+      completed_at="$(date -u +%s)"
+      delay="$(seconds_until_next_interval "$completed_at" "$interval")"
+      next_regular=$((completed_at + delay))
+      echo "[$(format_paris_now)] Next regular check at $(format_paris_timestamp "$next_regular") (in ${delay}s)..."
+    elif (( interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS )) \
+      && dashboard_activity_recent "$now_epoch" \
+      && (( now_epoch - last_attempt >= DASHBOARD_ACTIVE_INTERVAL_SECONDS )); then
+      last_attempt="$now_epoch"
+      run_once "$DASHBOARD_ACTIVE_INTERVAL_SECONDS" live "$interval" || cycle_status=$?
+      echo "[$(format_paris_now)] Dashboard active; next live check is eligible in ${DASHBOARD_ACTIVE_INTERVAL_SECONDS}s."
+    else
+      delay=$((next_regular - now_epoch))
+      if (( interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS && delay > DASHBOARD_HEARTBEAT_POLL_SECONDS )); then
+        delay="$DASHBOARD_HEARTBEAT_POLL_SECONDS"
+      fi
+      if (( interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS )) && dashboard_activity_recent "$now_epoch"; then
+        live_due=$((last_attempt + DASHBOARD_ACTIVE_INTERVAL_SECONDS))
+        if (( live_due > now_epoch && live_due - now_epoch < delay )); then
+          delay=$((live_due - now_epoch))
+        fi
+      fi
+      (( delay > 0 )) || delay=1
+      sleep "$delay"
+      continue
+    fi
+
+    if (( cycle_status != 0 )); then
+      echo "[WARN] Scrape cycle failed, will retry at the next scheduled check"
+      (( fail_fast == 1 )) && return "$cycle_status"
+    fi
+  done
+}
+
 main() {
-  local interval mode=once fail_fast=0 now_epoch delay next_epoch next_check
+  local interval mode=once fail_fast=0
   initialize || return 1
   interval="$LOOP_INTERVAL"
 
@@ -2269,18 +2406,7 @@ main() {
 
   if [[ "$mode" == loop ]]; then
     echo "Starting monitor loop (aligned interval: ${interval}s). Press Ctrl+C to stop."
-    while true; do
-      if ! run_once "$interval"; then
-        echo "[WARN] Scrape cycle failed, will retry at the next scheduled check"
-        (( fail_fast == 1 )) && return 1
-      fi
-      now_epoch="$(date -u +%s)"
-      delay="$(seconds_until_next_interval "$now_epoch" "$interval")"
-      next_epoch="$((now_epoch + delay))"
-      next_check="$(format_paris_timestamp "$next_epoch")"
-      echo "[$(format_paris_now)] Next check at ${next_check} (in ${delay}s)..."
-      sleep "$delay"
-    done
+    run_loop "$interval" "$fail_fast"
   else
     run_once "$interval"
   fi

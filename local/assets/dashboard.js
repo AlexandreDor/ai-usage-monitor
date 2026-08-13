@@ -1,14 +1,22 @@
 'use strict';
 
 // Set a Gist ID to use the GitHub API instead of local JSON files.
-const GIST_ID = '';
+let GIST_ID = '';
 const REFRESH_INTERVAL_MS = 900_000;
+const DEFAULT_ACTIVE_REFRESH_INTERVAL_MS = 300_000;
+const HEARTBEAT_INTERVAL_MS = 30_000;
+const REFRESH_RETRY_INITIAL_MS = 5_000;
 const DECIMATION_THRESHOLD = 1000;
 const DECIMATION_SAMPLES = 600;
 const PARIS_TIME_ZONE = 'Europe/Paris';
 
 let chart = null;
 let refreshTimer = null;
+let heartbeatTimer = null;
+let heartbeatInFlight = false;
+let dashboardActiveIntervalMs = DEFAULT_ACTIVE_REFRESH_INTERVAL_MS;
+let refreshRetryDelayMs = REFRESH_RETRY_INITIAL_MS;
+let lastObservedScrapedAt = null;
 let dashboardData = null;
 let dashboardHistory = null;
 let historyFailure = null;
@@ -33,15 +41,109 @@ function displayText(value, fallback = '-', maxLength = 200) {
   return typeof value === 'string' && value.length <= maxLength ? value : fallback;
 }
 
+function isLocalDashboard() {
+  return !GIST_ID;
+}
+
+function resetRefreshRetry() {
+  refreshRetryDelayMs = REFRESH_RETRY_INITIAL_MS;
+}
+
+function consumeRefreshRetryDelay(maximumMs) {
+  const delay = Math.min(refreshRetryDelayMs, maximumMs);
+  refreshRetryDelayMs = Math.min(delay * 2, maximumMs);
+  return delay;
+}
+
 function scheduleRefresh(data = null) {
+  clearTimeout(refreshTimer);
+  refreshTimer = null;
+  if (document.visibilityState !== 'visible') return;
+
   const intervalSeconds = Number(data?.sample_interval_seconds);
-  const intervalMs = Number.isFinite(intervalSeconds) && intervalSeconds > 0
+  const snapshotIntervalMs = Number.isFinite(intervalSeconds) && intervalSeconds > 0
     ? intervalSeconds * 1000
     : REFRESH_INTERVAL_MS;
   const now = Date.now();
-  const nextUpdate = (Math.floor((now - 5_000) / intervalMs) + 1) * intervalMs + 5_000;
-  clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(refresh, nextUpdate - now);
+  const rawScrapedAt = displayText(data?.scraped_at, '');
+  const scrapedAt = Date.parse(rawScrapedAt);
+
+  if (!isLocalDashboard()) {
+    const nextUpdate = (Math.floor((now - 5_000) / snapshotIntervalMs) + 1) * snapshotIntervalMs + 5_000;
+    refreshTimer = setTimeout(refresh, Math.max(REFRESH_RETRY_INITIAL_MS, nextUpdate - now));
+    return;
+  }
+
+  if (Number.isFinite(scrapedAt) && rawScrapedAt !== lastObservedScrapedAt) {
+    lastObservedScrapedAt = rawScrapedAt;
+    resetRefreshRetry();
+  }
+
+  const nextUpdate = Number.isFinite(scrapedAt)
+    ? scrapedAt + dashboardActiveIntervalMs + REFRESH_RETRY_INITIAL_MS
+    : Number.NaN;
+  if (Number.isFinite(nextUpdate) && nextUpdate > now) {
+    resetRefreshRetry();
+    refreshTimer = setTimeout(refresh, nextUpdate - now);
+    return;
+  }
+
+  refreshTimer = setTimeout(
+    refresh,
+    consumeRefreshRetryDelay(dashboardActiveIntervalMs),
+  );
+}
+
+function applyDashboardActiveInterval(rawValue) {
+  const intervalSeconds = Number(rawValue);
+  if (!Number.isInteger(intervalSeconds) || intervalSeconds < 30 || intervalSeconds > 86_400) return;
+  const intervalMs = intervalSeconds * 1000;
+  if (intervalMs === dashboardActiveIntervalMs) return;
+  dashboardActiveIntervalMs = intervalMs;
+  refreshRetryDelayMs = Math.min(refreshRetryDelayMs, dashboardActiveIntervalMs);
+  if (isLocalDashboard() && document.visibilityState === 'visible') {
+    scheduleRefresh(mainFailure ? null : dashboardData);
+  }
+}
+
+async function sendDashboardHeartbeat() {
+  if (!isLocalDashboard() || document.visibilityState !== 'visible' || heartbeatInFlight) return;
+  heartbeatInFlight = true;
+  try {
+    const response = await fetch('api/dashboard-heartbeat', {
+      method: 'POST',
+      headers: { 'X-Codex-Dashboard-Activity': 'visible' },
+      cache: 'no-store',
+      credentials: 'same-origin',
+    });
+    applyDashboardActiveInterval(response.headers?.get('X-Codex-Dashboard-Interval-Seconds'));
+  } catch (_error) {
+    // Activity signaling is advisory and must never hide otherwise valid data.
+  } finally {
+    heartbeatInFlight = false;
+  }
+}
+
+function stopDashboardHeartbeat() {
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+}
+
+function startDashboardHeartbeat() {
+  if (!isLocalDashboard() || document.visibilityState !== 'visible') return;
+  stopDashboardHeartbeat();
+  void sendDashboardHeartbeat();
+  heartbeatTimer = setInterval(sendDashboardHeartbeat, HEARTBEAT_INTERVAL_MS);
+}
+
+function handleDashboardVisibility() {
+  if (document.visibilityState === 'visible') {
+    startDashboardHeartbeat();
+    void refresh();
+  } else {
+    stopDashboardHeartbeat();
+    clearTimeout(refreshTimer);
+  }
 }
 
 function formatParisDateTime(value, includeYear = true) {
@@ -453,4 +555,8 @@ function refreshLocalizedDashboard() {
 }
 
 if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(refreshLocalizedDashboard);
+document.addEventListener('visibilitychange', handleDashboardVisibility);
+window.addEventListener('pageshow', handleDashboardVisibility);
+window.addEventListener('pagehide', stopDashboardHeartbeat);
+startDashboardHeartbeat();
 refresh();

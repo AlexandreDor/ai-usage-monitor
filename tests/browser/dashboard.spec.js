@@ -18,9 +18,34 @@ const snapshot = {
 };
 
 async function mockUsage(page, history = [snapshot]) {
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
   await page.route('**/data.json?*', route => route.fulfill({ json: snapshot }));
   await page.route('**/history.json?*', route => route.fulfill({ json: history }));
 }
+
+test('signals visible local dashboard activity without affecting rendering', async ({ page }) => {
+  const heartbeats = [];
+  await page.route('**/api/dashboard-heartbeat', route => {
+    heartbeats.push({
+      method: route.request().method(),
+      header: route.request().headers()['x-codex-dashboard-activity'],
+      body: route.request().postData(),
+    });
+    return route.fulfill({
+      status: 204,
+      headers: { 'X-Codex-Dashboard-Interval-Seconds': '120' },
+    });
+  });
+  await page.route('**/data.json?*', route => route.fulfill({ json: snapshot }));
+  await page.route('**/history.json?*', route => route.fulfill({ json: [snapshot] }));
+  await page.goto('/dashboard.html');
+
+  await expect.poll(() => heartbeats.length).toBe(1);
+  expect(heartbeats[0]).toEqual({ method: 'POST', header: 'visible', body: null });
+  await expect.poll(() => page.evaluate(() => dashboardActiveIntervalMs)).toBe(120000);
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await expect(page.locator('#error-banner')).toBeHidden();
+});
 
 test('works offline and exposes no critical accessibility violations', async ({ page }) => {
   const externalRequests = [];

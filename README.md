@@ -78,6 +78,8 @@ price remain visible and are valued at zero with a warning.
 - Long-term quota, reset, and token archive in
   `local/runtime/usage-history.sqlite3`.
 - Cycle health information in `local/runtime/health.json`.
+- A zero-byte `local/runtime/dashboard-heartbeat` records recent visible local
+  dashboard activity without storing identity or navigation data.
 - A process lock prevents concurrent monitor cycles.
 - Atomic writes and private runtime permissions.
 - Configuration, dependencies, Codex authentication, and analytics source
@@ -129,6 +131,14 @@ Open:
 the default 900-second interval, later runs align with `:00`, `:15`, `:30`, and
 `:45` instead of drifting from the previous execution time.
 
+While a locally served dashboard tab is visible, loop mode also refreshes the
+current quota snapshot and evaluates alerts at `DASHBOARD_ACTIVE_INTERVAL_SECONDS`
+(300 seconds by default). These
+live checks do not write `history.json`, SQLite, Forecast or token samples, or
+the optional Gist. Hiding or closing every dashboard tab restores the regular
+cadence after at most 90 seconds. A regular `LOOP_INTERVAL` shorter than or
+equal to the active interval keeps its existing complete-cycle behavior.
+
 ## Monitor Commands
 
 | Command | Behavior |
@@ -156,8 +166,10 @@ the default 900-second interval, later runs align with `:00`, `:15`, `:30`, and
 The default bind address is `127.0.0.1`. The server has no authentication or
 TLS; only bind it to a trusted network. It exposes an explicit allowlist of
 dashboard assets, sanitized JSON files, and the read-only Analytics API. It does
-not serve `.env`, SQLite, health data, delivery journals, locks, or directory
-listings.
+not serve `.env`, SQLite, health data, the dashboard heartbeat, delivery
+journals, locks, or directory listings. The local dashboard sends a bodyless
+`POST /api/dashboard-heartbeat`; the server records activity but never launches
+the separate monitor process.
 
 ## Configuration
 
@@ -186,6 +198,7 @@ HISTORY_RETENTION_HOURS=192
 ARCHIVE_RETENTION_DAYS=365
 TOKEN_USAGE_SOURCES=auto
 LOOP_INTERVAL=900
+DASHBOARD_ACTIVE_INTERVAL_SECONDS=300
 CODEX_FORECAST_ENABLED=1
 ```
 
@@ -261,6 +274,7 @@ Scripts receive:
 | Variable | Default | Accepted values | Description |
 |---|---:|---|---|
 | `LOOP_INTERVAL` | `900` | Integer from `1` to `86400` seconds | Collection cadence used by `--loop`. |
+| `DASHBOARD_ACTIVE_INTERVAL_SECONDS` | `300` | Integer from `30` to `86400` seconds | Quota and alert cadence while a locally served dashboard tab is visible; live checks update only the current snapshot. |
 | `HISTORY_RETENTION_HOURS` | `192` | Number from `0.25` to `8760` | Age-based rolling window for `history.json`; defensive limits of 10,000 entries and 16 MiB also apply. |
 | `ARCHIVE_RETENTION_DAYS` | `365` | Integer from `0` to `36500` | SQLite retention; `0` keeps data indefinitely. |
 | `CODEX_STATUS_TIMEOUT_SECONDS` | `20` | Integer from `5` to `300` | Timeout for the Codex app-server status request. |
@@ -273,7 +287,9 @@ their next writable monitor or `--check` run.
 The rolling JSON history is separate and retains samples according to their
 actual timestamps. Changing the collection interval does not change the time
 span requested by `HISTORY_RETENTION_HOURS`; only the defensive entry and size
-limits can shorten it.
+limits can shorten it. Dashboard-triggered live checks update only `data.json`,
+so they never increase graph or archive density. Alerts use every successful
+live observation, while Forecast and token collection remain on full cycles.
 
 ### Token Analytics
 
@@ -467,9 +483,11 @@ tmux, or another process manager:
 ./local/serve.sh
 ```
 
-The monitor and dashboard server are intentionally separate. The server does
-not trigger collections. Use `--bind 0.0.0.0` only behind a trusted firewall or
-proper reverse proxy because the built-in server has no authentication or TLS.
+The monitor and dashboard server remain separate processes. The server records
+recent visible-dashboard activity, and a monitor already running in `--loop`
+mode reacts to it; the server never starts a collection itself. Use
+`--bind 0.0.0.0` only behind a trusted firewall or proper reverse proxy because
+the built-in server has no authentication or TLS.
 
 For a static external dashboard, publish `local/dashboard.html`, `local/assets/`,
 and `local/images/favicon.png`, configure `GIST_ID`, and keep the local monitor
