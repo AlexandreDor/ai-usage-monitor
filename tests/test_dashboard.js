@@ -31,6 +31,8 @@ function element(id) {
 }
 
 let fetchQueue = [];
+const fetchCalls = [];
+let heartbeatFailure = false;
 let destroyed = 0;
 function FakeChart(_context, config) {
   this.config = config;
@@ -41,6 +43,15 @@ function FakeChart(_context, config) {
 FakeChart.Interaction = { modes: {} };
 FakeChart.register = () => {};
 
+const documentListeners = new Map();
+const windowListeners = new Map();
+let intervalStarts = 0;
+let intervalStops = 0;
+const documentObject = {
+  visibilityState: 'visible',
+  getElementById: element,
+  addEventListener: (name, callback) => documentListeners.set(name, callback),
+};
 const context = vm.createContext({
   console,
   Date,
@@ -49,15 +60,24 @@ const context = vm.createContext({
   Map,
   Number,
   Chart: FakeChart,
-  document: { getElementById: element },
-  fetch: async () => {
+  document: documentObject,
+  addEventListener: (name, callback) => windowListeners.set(name, callback),
+  fetch: async (url, options = {}) => {
+    fetchCalls.push({ url, options });
+    if (url === 'api/dashboard-heartbeat') {
+      if (heartbeatFailure) throw new Error('heartbeat failed');
+      return { ok: true, status: 204, json: async () => ({}) };
+    }
     if (!fetchQueue.length) return new Promise(() => {});
     const value = fetchQueue.shift();
     return { ok: true, status: 200, json: async () => value };
   },
   setTimeout: () => 1,
   clearTimeout: () => {},
+  setInterval: () => { intervalStarts += 1; return intervalStarts; },
+  clearInterval: timer => { if (timer !== null) intervalStops += 1; },
 });
+context.window = context;
 
 const preferencesSource = fs.readFileSync(path.join(__dirname, '..', 'local', 'assets', 'preferences.js'), 'utf8');
 vm.runInContext(preferencesSource, context, { filename: 'preferences.js' });
@@ -71,6 +91,32 @@ function evaluate(expression) {
 }
 
 (async () => {
+  await new Promise(resolve => setImmediate(resolve));
+  const firstHeartbeat = fetchCalls.find(call => call.url === 'api/dashboard-heartbeat');
+  if (!firstHeartbeat) fail('visible local dashboard did not send an initial heartbeat');
+  if (firstHeartbeat.options.method !== 'POST') fail('heartbeat did not use POST');
+  if (firstHeartbeat.options.headers['X-Codex-Dashboard-Activity'] !== 'visible') fail('heartbeat activity header is missing');
+  if (intervalStarts !== 1) fail('heartbeat interval was not started exactly once');
+
+  documentObject.visibilityState = 'hidden';
+  documentListeners.get('visibilitychange')();
+  if (intervalStops !== 1) fail('hidden dashboard did not stop its heartbeat interval');
+  documentObject.visibilityState = 'visible';
+  documentListeners.get('visibilitychange')();
+  await new Promise(resolve => setImmediate(resolve));
+  if (fetchCalls.filter(call => call.url === 'api/dashboard-heartbeat').length !== 2) fail('visible dashboard did not resume heartbeat immediately');
+  if (intervalStarts !== 2) fail('visible dashboard did not restart heartbeat interval');
+
+  heartbeatFailure = true;
+  await evaluate('sendDashboardHeartbeat()');
+  if (evaluate('mainFailure') !== null) fail('heartbeat failure polluted the dashboard error state');
+  heartbeatFailure = false;
+  const heartbeatCount = fetchCalls.filter(call => call.url === 'api/dashboard-heartbeat').length;
+  evaluate("GIST_ID = 'external-fixture'; stopDashboardHeartbeat(); startDashboardHeartbeat()");
+  await new Promise(resolve => setImmediate(resolve));
+  if (fetchCalls.filter(call => call.url === 'api/dashboard-heartbeat').length !== heartbeatCount) fail('external dashboard sent a local heartbeat');
+  evaluate("GIST_ID = ''");
+
   if (evaluate(`formatParisDateTime('2026-01-03T12:34:00Z')`) !== '03/01/2026 13:34') {
     fail('winter timestamp is not formatted in Paris time');
   }

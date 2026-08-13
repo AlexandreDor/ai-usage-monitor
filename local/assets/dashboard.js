@@ -1,14 +1,17 @@
 'use strict';
 
 // Set a Gist ID to use the GitHub API instead of local JSON files.
-const GIST_ID = '';
+let GIST_ID = '';
 const REFRESH_INTERVAL_MS = 900_000;
+const HEARTBEAT_INTERVAL_MS = 30_000;
 const DECIMATION_THRESHOLD = 1000;
 const DECIMATION_SAMPLES = 600;
 const PARIS_TIME_ZONE = 'Europe/Paris';
 
 let chart = null;
 let refreshTimer = null;
+let heartbeatTimer = null;
+let heartbeatInFlight = false;
 let dashboardData = null;
 let dashboardHistory = null;
 let historyFailure = null;
@@ -42,6 +45,40 @@ function scheduleRefresh(data = null) {
   const nextUpdate = (Math.floor((now - 5_000) / intervalMs) + 1) * intervalMs + 5_000;
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(refresh, nextUpdate - now);
+}
+
+async function sendDashboardHeartbeat() {
+  if (GIST_ID || document.visibilityState !== 'visible' || heartbeatInFlight) return;
+  heartbeatInFlight = true;
+  try {
+    await fetch('api/dashboard-heartbeat', {
+      method: 'POST',
+      headers: { 'X-Codex-Dashboard-Activity': 'visible' },
+      cache: 'no-store',
+      credentials: 'same-origin',
+    });
+  } catch (_error) {
+    // Activity signaling is advisory and must never hide otherwise valid data.
+  } finally {
+    heartbeatInFlight = false;
+  }
+}
+
+function stopDashboardHeartbeat() {
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+}
+
+function startDashboardHeartbeat() {
+  if (GIST_ID || document.visibilityState !== 'visible') return;
+  stopDashboardHeartbeat();
+  void sendDashboardHeartbeat();
+  heartbeatTimer = setInterval(sendDashboardHeartbeat, HEARTBEAT_INTERVAL_MS);
+}
+
+function handleDashboardVisibility() {
+  if (document.visibilityState === 'visible') startDashboardHeartbeat();
+  else stopDashboardHeartbeat();
 }
 
 function formatParisDateTime(value, includeYear = true) {
@@ -453,4 +490,8 @@ function refreshLocalizedDashboard() {
 }
 
 if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(refreshLocalizedDashboard);
+document.addEventListener('visibilitychange', handleDashboardVisibility);
+window.addEventListener('pageshow', handleDashboardVisibility);
+window.addEventListener('pagehide', stopDashboardHeartbeat);
+startDashboardHeartbeat();
 refresh();
