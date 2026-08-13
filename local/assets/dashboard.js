@@ -3,6 +3,7 @@
 // Set a Gist ID to use the GitHub API instead of local JSON files.
 let GIST_ID = '';
 const REFRESH_INTERVAL_MS = 900_000;
+const DEFAULT_ACTIVE_REFRESH_INTERVAL_MS = 300_000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const DECIMATION_THRESHOLD = 1000;
 const DECIMATION_SAMPLES = 600;
@@ -12,6 +13,7 @@ let chart = null;
 let refreshTimer = null;
 let heartbeatTimer = null;
 let heartbeatInFlight = false;
+let dashboardActiveIntervalMs = DEFAULT_ACTIVE_REFRESH_INTERVAL_MS;
 let dashboardData = null;
 let dashboardHistory = null;
 let historyFailure = null;
@@ -38,25 +40,41 @@ function displayText(value, fallback = '-', maxLength = 200) {
 
 function scheduleRefresh(data = null) {
   const intervalSeconds = Number(data?.sample_interval_seconds);
-  const intervalMs = Number.isFinite(intervalSeconds) && intervalSeconds > 0
+  const snapshotIntervalMs = Number.isFinite(intervalSeconds) && intervalSeconds > 0
     ? intervalSeconds * 1000
     : REFRESH_INTERVAL_MS;
+  const intervalMs = dashboardMode === 'local' && document.visibilityState === 'visible'
+    ? dashboardActiveIntervalMs
+    : snapshotIntervalMs;
   const now = Date.now();
-  const nextUpdate = (Math.floor((now - 5_000) / intervalMs) + 1) * intervalMs + 5_000;
+  const scrapedAt = Date.parse(displayText(data?.scraped_at, ''));
+  const nextUpdate = dashboardMode === 'local' && Number.isFinite(scrapedAt)
+    ? scrapedAt + intervalMs + 5_000
+    : (Math.floor((now - 5_000) / intervalMs) + 1) * intervalMs + 5_000;
   clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(refresh, nextUpdate - now);
+  refreshTimer = setTimeout(refresh, Math.max(5_000, nextUpdate - now));
+}
+
+function applyDashboardActiveInterval(rawValue) {
+  const intervalSeconds = Number(rawValue);
+  if (!Number.isInteger(intervalSeconds) || intervalSeconds < 30 || intervalSeconds > 86_400) return;
+  const intervalMs = intervalSeconds * 1000;
+  if (intervalMs === dashboardActiveIntervalMs) return;
+  dashboardActiveIntervalMs = intervalMs;
+  if (dashboardData && dashboardMode === 'local') scheduleRefresh(dashboardData);
 }
 
 async function sendDashboardHeartbeat() {
   if (GIST_ID || document.visibilityState !== 'visible' || heartbeatInFlight) return;
   heartbeatInFlight = true;
   try {
-    await fetch('api/dashboard-heartbeat', {
+    const response = await fetch('api/dashboard-heartbeat', {
       method: 'POST',
       headers: { 'X-Codex-Dashboard-Activity': 'visible' },
       cache: 'no-store',
       credentials: 'same-origin',
     });
+    applyDashboardActiveInterval(response.headers?.get('X-Codex-Dashboard-Interval-Seconds'));
   } catch (_error) {
     // Activity signaling is advisory and must never hide otherwise valid data.
   } finally {
@@ -77,8 +95,13 @@ function startDashboardHeartbeat() {
 }
 
 function handleDashboardVisibility() {
-  if (document.visibilityState === 'visible') startDashboardHeartbeat();
-  else stopDashboardHeartbeat();
+  if (document.visibilityState === 'visible') {
+    startDashboardHeartbeat();
+    void refresh();
+  } else {
+    stopDashboardHeartbeat();
+    clearTimeout(refreshTimer);
+  }
 }
 
 function formatParisDateTime(value, includeYear = true) {

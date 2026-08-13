@@ -31,7 +31,10 @@ test('signals visible local dashboard activity without affecting rendering', asy
       header: route.request().headers()['x-codex-dashboard-activity'],
       body: route.request().postData(),
     });
-    return route.fulfill({ status: 503, json: { error: 'unavailable' } });
+    return route.fulfill({
+      status: 204,
+      headers: { 'X-Codex-Dashboard-Interval-Seconds': '120' },
+    });
   });
   await page.route('**/data.json?*', route => route.fulfill({ json: snapshot }));
   await page.route('**/history.json?*', route => route.fulfill({ json: [snapshot] }));
@@ -39,6 +42,7 @@ test('signals visible local dashboard activity without affecting rendering', asy
 
   await expect.poll(() => heartbeats.length).toBe(1);
   expect(heartbeats[0]).toEqual({ method: 'POST', header: 'visible', body: null });
+  await expect.poll(() => page.evaluate(() => dashboardActiveIntervalMs)).toBe(120000);
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   await expect(page.locator('#error-banner')).toBeHidden();
 });

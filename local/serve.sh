@@ -6,6 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ANALYTICS_DATABASE_PATH="${DASHBOARD_ANALYTICS_DATABASE:-${SCRIPT_DIR}/runtime/usage-history.sqlite3}"
 ANALYTICS_PRICING_PATH="${DASHBOARD_PRICING_FILE:-${TOKEN_PRICING_FILE:-}}"
+DASHBOARD_ACTIVE_INTERVAL="${DASHBOARD_ACTIVE_INTERVAL_SECONDS:-}"
 PORT=8080
 BIND_ADDRESS="127.0.0.1"
 POSITIONAL_PORT=""
@@ -73,21 +74,31 @@ if [[ -e "${SCRIPT_DIR}/.env" && ( -L "${SCRIPT_DIR}/.env" || ! -O "${SCRIPT_DIR
   echo "[ERROR] local/.env must be a regular file owned by the current user." >&2
   exit 2
 fi
-if [[ -z "$ANALYTICS_PRICING_PATH" && -f "${SCRIPT_DIR}/.env" ]]; then
+if [[ -f "${SCRIPT_DIR}/.env" && ( -z "$ANALYTICS_PRICING_PATH" || -z "$DASHBOARD_ACTIVE_INTERVAL" ) ]]; then
   while IFS= read -r env_line || [[ -n "$env_line" ]]; do
     env_line="${env_line%$'\r'}"
-    [[ "$env_line" =~ ^[[:space:]]*TOKEN_PRICING_FILE[[:space:]]*= ]] || continue
+    [[ "$env_line" == *=* ]] || continue
+    env_key="${env_line%%=*}"
+    env_key="${env_key#"${env_key%%[![:space:]]*}"}"
+    env_key="${env_key%"${env_key##*[![:space:]]}"}"
     env_value="${env_line#*=}"
     env_value="${env_value#"${env_value%%[![:space:]]*}"}"
     env_value="${env_value%"${env_value##*[![:space:]]}"}"
     if (( ${#env_value} >= 2 )) && { [[ "$env_value" == \"*\" ]] || [[ "$env_value" == \'*\' ]]; }; then
       env_value="${env_value:1:${#env_value}-2}"
     fi
-    ANALYTICS_PRICING_PATH="$env_value"
-    break
+    case "$env_key" in
+      TOKEN_PRICING_FILE)
+        [[ -n "$ANALYTICS_PRICING_PATH" ]] || ANALYTICS_PRICING_PATH="$env_value"
+        ;;
+      DASHBOARD_ACTIVE_INTERVAL_SECONDS)
+        [[ -n "$DASHBOARD_ACTIVE_INTERVAL" ]] || DASHBOARD_ACTIVE_INTERVAL="$env_value"
+        ;;
+    esac
   done < "${SCRIPT_DIR}/.env"
 fi
 ANALYTICS_PRICING_PATH="${ANALYTICS_PRICING_PATH:-${SCRIPT_DIR}/pricing.json}"
+DASHBOARD_ACTIVE_INTERVAL="${DASHBOARD_ACTIVE_INTERVAL:-300}"
 
 if ! command -v python3 &>/dev/null; then
   echo "[ERROR] python3 is required to serve the dashboard." >&2
@@ -106,6 +117,13 @@ fi
 
 if [[ ! "$PORT" =~ ^[0-9]+$ ]] || ((${#PORT} > 5)) || ((10#$PORT < 1 || 10#$PORT > 65535)); then
   echo "[ERROR] Port must be an integer between 1 and 65535." >&2
+  exit 2
+fi
+
+if [[ ! "$DASHBOARD_ACTIVE_INTERVAL" =~ ^[0-9]+$ ]] \
+  || ((${#DASHBOARD_ACTIVE_INTERVAL} > 5)) \
+  || ((10#$DASHBOARD_ACTIVE_INTERVAL < 30 || 10#$DASHBOARD_ACTIVE_INTERVAL > 86400)); then
+  echo "[ERROR] DASHBOARD_ACTIVE_INTERVAL_SECONDS must be an integer between 30 and 86400." >&2
   exit 2
 fi
 
@@ -131,7 +149,7 @@ fi
 echo "Serving dashboard at http://${DISPLAY_ADDRESS}:${PORT}/dashboard.html"
 echo "Only allowlisted dashboard assets and usage JSON are exposed. Press Ctrl+C to stop."
 
-python3 - "$SCRIPT_DIR" "$PORT" "$BIND_ADDRESS" "$ANALYTICS_DATABASE_PATH" "$ANALYTICS_PRICING_PATH" <<'PYEOF'
+python3 - "$SCRIPT_DIR" "$PORT" "$BIND_ADDRESS" "$ANALYTICS_DATABASE_PATH" "$ANALYTICS_PRICING_PATH" "$DASHBOARD_ACTIVE_INTERVAL" <<'PYEOF'
 import functools
 import http.server
 import os
@@ -153,6 +171,7 @@ port = int(sys.argv[2])
 bind_address = sys.argv[3]
 analytics_database = pathlib.Path(sys.argv[4])
 analytics_pricing = pathlib.Path(sys.argv[5])
+dashboard_active_interval = int(sys.argv[6])
 runtime_directory = root / "runtime"
 heartbeat_path = runtime_directory / "dashboard-heartbeat"
 heartbeat_lock = threading.Lock()
@@ -272,6 +291,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json(503, {"error": "dashboard activity cannot be recorded"})
             return
         self.send_response(204)
+        self.send_header("X-Codex-Dashboard-Interval-Seconds", str(dashboard_active_interval))
         self.send_header("Content-Length", "0")
         self.end_headers()
 

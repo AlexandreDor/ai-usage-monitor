@@ -64,6 +64,7 @@ trap cleanup EXIT
 bash "$SERVE" --port 0 >/dev/null 2>&1 && fail "port zero accepted"
 bash "$SERVE" --bind localhost --port 8080 >/dev/null 2>&1 && fail "hostname bind accepted"
 bash "$SERVE" --unknown >/dev/null 2>&1 && fail "unknown CLI option accepted"
+DASHBOARD_ACTIVE_INTERVAL_SECONDS=29 bash "$SERVE" --port "$port" >/dev/null 2>&1 && fail "invalid dashboard active interval accepted"
 assert_contains "$(bash "$SERVE" --help)" 'default: 127.0.0.1' "help omits localhost default"
 
 TOKEN_PRICING_FILE="$custom_pricing" DASHBOARD_ANALYTICS_DATABASE="$analytics_database" \
@@ -127,7 +128,7 @@ server_pid=""
 serve_fixture="${TEST_ROOT}/serve-fixture"
 mkdir -p "$serve_fixture"
 cp "$SERVE" "$ROOT_DIR/local/analytics.py" "$ROOT_DIR/local/storage.py" "$ROOT_DIR/local/token_usage.py" "$serve_fixture/"
-printf "TOKEN_PRICING_FILE='%s'\n" "$custom_pricing" > "${serve_fixture}/.env"
+printf "TOKEN_PRICING_FILE='%s'\nDASHBOARD_ACTIVE_INTERVAL_SECONDS=120\n" "$custom_pricing" > "${serve_fixture}/.env"
 env_port="$(python3 - <<'PY'
 import socket
 with socket.socket() as sock:
@@ -161,6 +162,7 @@ assert_eq 404 "$unknown_post_code" "unknown POST route was accepted"
 heartbeat_headers="${TEST_ROOT}/heartbeat-headers"
 heartbeat_code="$(curl --silent --request POST -H 'X-Codex-Dashboard-Activity: visible' --dump-header "$heartbeat_headers" --output /dev/null --write-out '%{http_code}' "$heartbeat_url")"
 assert_eq 204 "$heartbeat_code" "valid dashboard heartbeat response"
+assert_contains "$(<"$heartbeat_headers")" 'X-Codex-Dashboard-Interval-Seconds: 120' "heartbeat omitted configured dashboard interval"
 assert_file "$heartbeat_file"
 assert_eq 0 "$(stat -c '%s' "$heartbeat_file")" "heartbeat file stored request data"
 assert_eq 600 "$(stat -c '%a' "$heartbeat_file")" "heartbeat permissions are not private"

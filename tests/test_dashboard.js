@@ -33,10 +33,12 @@ function element(id) {
 let fetchQueue = [];
 const fetchCalls = [];
 let heartbeatFailure = false;
+let heartbeatIntervalSeconds = '120';
 let destroyed = 0;
 function FakeChart(_context, config) {
   this.config = config;
   this.data = config.data;
+  this.options = config.options;
   this.update = () => {};
   this.destroy = () => { destroyed += 1; };
 }
@@ -47,6 +49,8 @@ const documentListeners = new Map();
 const windowListeners = new Map();
 let intervalStarts = 0;
 let intervalStops = 0;
+const timeoutDelays = [];
+const timeoutCallbacks = [];
 const documentObject = {
   visibilityState: 'visible',
   getElementById: element,
@@ -66,13 +70,22 @@ const context = vm.createContext({
     fetchCalls.push({ url, options });
     if (url === 'api/dashboard-heartbeat') {
       if (heartbeatFailure) throw new Error('heartbeat failed');
-      return { ok: true, status: 204, json: async () => ({}) };
+      return {
+        ok: true,
+        status: 204,
+        headers: { get: name => name === 'X-Codex-Dashboard-Interval-Seconds' ? heartbeatIntervalSeconds : null },
+        json: async () => ({}),
+      };
     }
     if (!fetchQueue.length) return new Promise(() => {});
     const value = fetchQueue.shift();
     return { ok: true, status: 200, json: async () => value };
   },
-  setTimeout: () => 1,
+  setTimeout: (callback, delay) => {
+    timeoutCallbacks.push(callback);
+    timeoutDelays.push(delay);
+    return timeoutDelays.length;
+  },
   clearTimeout: () => {},
   setInterval: () => { intervalStarts += 1; return intervalStarts; },
   clearInterval: timer => { if (timer !== null) intervalStops += 1; },
@@ -97,14 +110,31 @@ function evaluate(expression) {
   if (firstHeartbeat.options.method !== 'POST') fail('heartbeat did not use POST');
   if (firstHeartbeat.options.headers['X-Codex-Dashboard-Activity'] !== 'visible') fail('heartbeat activity header is missing');
   if (intervalStarts !== 1) fail('heartbeat interval was not started exactly once');
+  if (evaluate('dashboardActiveIntervalMs') !== 120000) fail('dashboard ignored the configured active interval');
+
+  evaluate(`dashboardMode = 'local'; scheduleRefresh({scraped_at: new Date().toISOString(), sample_interval_seconds: 900})`);
+  const configuredDelay = timeoutDelays[timeoutDelays.length - 1];
+  if (configuredDelay < 124000 || configuredDelay > 126000) fail('local refresh did not use the configured active interval');
+  const scheduledRefresh = timeoutCallbacks[timeoutCallbacks.length - 1];
+  fetchQueue = [
+    { five_h_pct: 77, weekly_pct: 66, scraped_at: '2026-08-13T14:02:00Z', sample_interval_seconds: 120 },
+    [{ five_h_pct: 77, weekly_pct: 66, scraped_at: '2026-08-13T14:02:00Z' }],
+  ];
+  await scheduledRefresh();
+  if (evaluate('dashboardData.scraped_at') !== '2026-08-13T14:02:00Z') fail('scheduled local refresh did not update the rendered snapshot');
+  if (!element('last-updated').textContent.includes('13/08/2026 16:02')) fail('scheduled local refresh did not update Last scraped');
+  heartbeatIntervalSeconds = 'invalid';
+  await evaluate('sendDashboardHeartbeat()');
+  if (evaluate('dashboardActiveIntervalMs') !== 120000) fail('dashboard accepted an invalid active interval');
 
   documentObject.visibilityState = 'hidden';
   documentListeners.get('visibilitychange')();
   if (intervalStops !== 1) fail('hidden dashboard did not stop its heartbeat interval');
+  const hiddenHeartbeatCount = fetchCalls.filter(call => call.url === 'api/dashboard-heartbeat').length;
   documentObject.visibilityState = 'visible';
   documentListeners.get('visibilitychange')();
   await new Promise(resolve => setImmediate(resolve));
-  if (fetchCalls.filter(call => call.url === 'api/dashboard-heartbeat').length !== 2) fail('visible dashboard did not resume heartbeat immediately');
+  if (fetchCalls.filter(call => call.url === 'api/dashboard-heartbeat').length !== hiddenHeartbeatCount + 1) fail('visible dashboard did not resume heartbeat immediately');
   if (intervalStarts !== 2) fail('visible dashboard did not restart heartbeat interval');
 
   heartbeatFailure = true;

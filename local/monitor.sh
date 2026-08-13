@@ -41,7 +41,7 @@ HEALTH_FILE="${RUNTIME_DIR}/health.json"
 HEARTBEAT_FILE="${RUNTIME_DIR}/dashboard-heartbeat"
 LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
 DEFAULT_INTERVAL_SECONDS=900
-DASHBOARD_INTERVAL_SECONDS=300
+DEFAULT_DASHBOARD_ACTIVE_INTERVAL_SECONDS=300
 DASHBOARD_HEARTBEAT_MAX_AGE_SECONDS=90
 DASHBOARD_HEARTBEAT_POLL_SECONDS=5
 INVALID_ALERT_SCRIPT_CONFIG=0
@@ -68,7 +68,7 @@ load_config() {
     fi
 
     case "$key" in
-      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_ENABLED|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
+      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_ENABLED|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DASHBOARD_ACTIVE_INTERVAL_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
         if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
           value="${value:1:${#value}-2}"
         fi
@@ -260,6 +260,7 @@ PYEOF
 validate_config() {
   local invalid=0 secret path_value
   validate_integer LOOP_INTERVAL "$LOOP_INTERVAL" 1 86400 || invalid=1
+  validate_integer DASHBOARD_ACTIVE_INTERVAL_SECONDS "$DASHBOARD_ACTIVE_INTERVAL_SECONDS" 30 86400 || invalid=1
   validate_integer CODEX_STATUS_TIMEOUT_SECONDS "$CODEX_STATUS_TIMEOUT_SECONDS" 5 300 || invalid=1
   validate_integer ARCHIVE_RETENTION_DAYS "$ARCHIVE_RETENTION_DAYS" 0 36500 || invalid=1
   validate_number HISTORY_RETENTION_HOURS "$HISTORY_RETENTION_HOURS" 0.25 8760 || invalid=1
@@ -383,6 +384,7 @@ initialize() {
   ARCHIVE_RETENTION_DAYS="${ARCHIVE_RETENTION_DAYS:-365}"
   HISTORY_RETENTION_HOURS="${HISTORY_RETENTION_HOURS:-192}"
   LOOP_INTERVAL="${LOOP_INTERVAL:-$DEFAULT_INTERVAL_SECONDS}"
+  DASHBOARD_ACTIVE_INTERVAL_SECONDS="${DASHBOARD_ACTIVE_INTERVAL_SECONDS:-$DEFAULT_DASHBOARD_ACTIVE_INTERVAL_SECONDS}"
   CODEX_STATUS_TIMEOUT_SECONDS="${CODEX_STATUS_TIMEOUT_SECONDS:-20}"
   CURL_CONNECT_TIMEOUT_SECONDS="${CURL_CONNECT_TIMEOUT_SECONDS:-5}"
   CURL_MAX_TIME_SECONDS="${CURL_MAX_TIME_SECONDS:-20}"
@@ -2235,6 +2237,13 @@ run_cycle() {
   return "$status"
 }
 
+monotonic_milliseconds() {
+  python3 - <<'PYEOF'
+import time
+print(time.monotonic_ns() // 1_000_000)
+PYEOF
+}
+
 run_once() {
   local interval_seconds="$1" cycle_mode="${2:-full}" regular_interval
   regular_interval="${3:-$interval_seconds}"
@@ -2247,13 +2256,13 @@ run_once() {
     return 0
   fi
 
-  start_ms="$(date -u +%s%3N)"
+  start_ms="$(monotonic_milliseconds)"
   if run_cycle "$interval_seconds" "$cycle_mode" "$regular_interval"; then
     status=0
   else
     status=$?
   fi
-  end_ms="$(date -u +%s%3N)"
+  end_ms="$(monotonic_milliseconds)"
   duration_ms=$((end_ms - start_ms))
   if (( status == 0 )); then
     update_health success "" "$duration_ms" "$cycle_mode" "$interval_seconds"
@@ -2294,8 +2303,8 @@ dashboard_activity_recent() {
 
 effective_collection_interval() {
   local regular_interval="$1" now_epoch="$2"
-  if (( regular_interval > DASHBOARD_INTERVAL_SECONDS )) && dashboard_activity_recent "$now_epoch"; then
-    printf '%s\n' "$DASHBOARD_INTERVAL_SECONDS"
+  if (( regular_interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS )) && dashboard_activity_recent "$now_epoch"; then
+    printf '%s\n' "$DASHBOARD_ACTIVE_INTERVAL_SECONDS"
   else
     printf '%s\n' "$regular_interval"
   fi
@@ -2329,19 +2338,19 @@ run_loop() {
       delay="$(seconds_until_next_interval "$completed_at" "$interval")"
       next_regular=$((completed_at + delay))
       echo "[$(format_paris_now)] Next regular check at $(format_paris_timestamp "$next_regular") (in ${delay}s)..."
-    elif (( interval > DASHBOARD_INTERVAL_SECONDS )) \
+    elif (( interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS )) \
       && dashboard_activity_recent "$now_epoch" \
-      && (( now_epoch - last_attempt >= DASHBOARD_INTERVAL_SECONDS )); then
+      && (( now_epoch - last_attempt >= DASHBOARD_ACTIVE_INTERVAL_SECONDS )); then
       last_attempt="$now_epoch"
-      run_once "$DASHBOARD_INTERVAL_SECONDS" live "$interval" || cycle_status=$?
-      echo "[$(format_paris_now)] Dashboard active; next live check is eligible in ${DASHBOARD_INTERVAL_SECONDS}s."
+      run_once "$DASHBOARD_ACTIVE_INTERVAL_SECONDS" live "$interval" || cycle_status=$?
+      echo "[$(format_paris_now)] Dashboard active; next live check is eligible in ${DASHBOARD_ACTIVE_INTERVAL_SECONDS}s."
     else
       delay=$((next_regular - now_epoch))
-      if (( interval > DASHBOARD_INTERVAL_SECONDS && delay > DASHBOARD_HEARTBEAT_POLL_SECONDS )); then
+      if (( interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS && delay > DASHBOARD_HEARTBEAT_POLL_SECONDS )); then
         delay="$DASHBOARD_HEARTBEAT_POLL_SECONDS"
       fi
-      if (( interval > DASHBOARD_INTERVAL_SECONDS )) && dashboard_activity_recent "$now_epoch"; then
-        live_due=$((last_attempt + DASHBOARD_INTERVAL_SECONDS))
+      if (( interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS )) && dashboard_activity_recent "$now_epoch"; then
+        live_due=$((last_attempt + DASHBOARD_ACTIVE_INTERVAL_SECONDS))
         if (( live_due > now_epoch && live_due - now_epoch < delay )); then
           delay=$((live_due - now_epoch))
         fi

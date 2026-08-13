@@ -41,6 +41,9 @@ touch -d "@${heartbeat_now}" "$HEARTBEAT_FILE"
 dashboard_activity_recent "$heartbeat_now" || fail "fresh heartbeat was not detected"
 assert_eq 300 "$(effective_collection_interval 900 "$heartbeat_now")" "fresh heartbeat did not accelerate collection"
 assert_eq 300 "$(effective_collection_interval 300 "$heartbeat_now")" "configured fast cadence was changed"
+DASHBOARD_ACTIVE_INTERVAL_SECONDS=120
+assert_eq 120 "$(effective_collection_interval 900 "$heartbeat_now")" "custom dashboard cadence was ignored"
+DASHBOARD_ACTIVE_INTERVAL_SECONDS=300
 
 touch -d "@$((heartbeat_now - DASHBOARD_HEARTBEAT_MAX_AGE_SECONDS - 1))" "$HEARTBEAT_FILE"
 if dashboard_activity_recent "$heartbeat_now"; then fail "expired heartbeat remained active"; fi
