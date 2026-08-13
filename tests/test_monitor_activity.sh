@@ -35,4 +35,46 @@ if run_cycle 300 unsupported 900 >/dev/null 2>&1; then
   fail "unsupported cycle mode was accepted"
 fi
 
+heartbeat_now=1786622400
+: > "$HEARTBEAT_FILE"
+touch -d "@${heartbeat_now}" "$HEARTBEAT_FILE"
+dashboard_activity_recent "$heartbeat_now" || fail "fresh heartbeat was not detected"
+assert_eq 300 "$(effective_collection_interval 900 "$heartbeat_now")" "fresh heartbeat did not accelerate collection"
+assert_eq 300 "$(effective_collection_interval 300 "$heartbeat_now")" "configured fast cadence was changed"
+
+touch -d "@$((heartbeat_now - DASHBOARD_HEARTBEAT_MAX_AGE_SECONDS - 1))" "$HEARTBEAT_FILE"
+if dashboard_activity_recent "$heartbeat_now"; then fail "expired heartbeat remained active"; fi
+touch -d "@$((heartbeat_now + 1))" "$HEARTBEAT_FILE"
+if dashboard_activity_recent "$heartbeat_now"; then fail "future heartbeat was accepted"; fi
+printf 'x' > "$HEARTBEAT_FILE"
+if dashboard_activity_recent "$heartbeat_now"; then fail "non-empty heartbeat was accepted"; fi
+rm -f "$HEARTBEAT_FILE"
+ln -s "${TEST_ROOT}/missing-heartbeat" "$HEARTBEAT_FILE"
+if dashboard_activity_recent "$heartbeat_now"; then fail "heartbeat symlink was accepted"; fi
+rm -f "$HEARTBEAT_FILE"
+
+LOOP_LOG="${TEST_ROOT}/adaptive-loop"
+(
+  fake_now=43200
+  cycles=0
+  dashboard_activity_recent() { return 0; }
+  date() {
+    case "$*" in
+      '-u +%s') printf '%s\n' "$fake_now" ;;
+      '-d @'*'+%d/%m/%Y %H:%M') printf '01/01/1970 12:00\n' ;;
+      '+%d/%m/%Y %H:%M') printf '01/01/1970 12:00\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  sleep() { fake_now=$((fake_now + $1)); }
+  run_once() {
+    printf '%s:%s:%s\n' "$2" "$1" "$3" >> "$LOOP_LOG"
+    cycles=$((cycles + 1))
+    (( cycles < 4 )) || exit 0
+  }
+  run_loop 900 0 >/dev/null
+)
+expected_loop=$'full:300:900\nlive:300:900\nlive:300:900\nfull:300:900'
+assert_eq "$expected_loop" "$(<"$LOOP_LOG")" "adaptive loop did not preserve full/live cadence"
+
 printf 'PASS: monitor dashboard activity tests\n'

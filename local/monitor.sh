@@ -2280,8 +2280,84 @@ seconds_until_next_interval() {
   printf '%s\n' "$((interval - now_epoch % interval))"
 }
 
+dashboard_activity_recent() {
+  local now_epoch="${1:-}" metadata owner size modified
+  [[ -n "$now_epoch" ]] || now_epoch="$(date -u +%s)"
+  [[ "$now_epoch" =~ ^[0-9]+$ ]] || return 1
+  [[ -f "$HEARTBEAT_FILE" && ! -L "$HEARTBEAT_FILE" ]] || return 1
+  metadata="$(stat -c '%u %s %Y' -- "$HEARTBEAT_FILE" 2>/dev/null)" || return 1
+  read -r owner size modified <<< "$metadata"
+  [[ "$owner" =~ ^[0-9]+$ && "$size" == 0 && "$modified" =~ ^[0-9]+$ ]] || return 1
+  [[ "$owner" == "$(id -u)" ]] || return 1
+  (( modified <= now_epoch && now_epoch - modified <= DASHBOARD_HEARTBEAT_MAX_AGE_SECONDS ))
+}
+
+effective_collection_interval() {
+  local regular_interval="$1" now_epoch="$2"
+  if (( regular_interval > DASHBOARD_INTERVAL_SECONDS )) && dashboard_activity_recent "$now_epoch"; then
+    printf '%s\n' "$DASHBOARD_INTERVAL_SECONDS"
+  else
+    printf '%s\n' "$regular_interval"
+  fi
+}
+
+run_loop() {
+  local interval="$1" fail_fast="$2"
+  local now_epoch next_regular last_attempt delay effective cycle_status=0 live_due
+
+  now_epoch="$(date -u +%s)"
+  effective="$(effective_collection_interval "$interval" "$now_epoch")"
+  run_once "$effective" full "$interval" || cycle_status=$?
+  if (( cycle_status != 0 )); then
+    echo "[WARN] Scrape cycle failed, will retry at the next scheduled check"
+    (( fail_fast == 1 )) && return "$cycle_status"
+  fi
+  last_attempt="$(date -u +%s)"
+  delay="$(seconds_until_next_interval "$last_attempt" "$interval")"
+  next_regular=$((last_attempt + delay))
+  echo "[$(format_paris_now)] Next regular check at $(format_paris_timestamp "$next_regular") (in ${delay}s)..."
+
+  while true; do
+    now_epoch="$(date -u +%s)"
+    cycle_status=0
+    if (( now_epoch >= next_regular )); then
+      effective="$(effective_collection_interval "$interval" "$now_epoch")"
+      run_once "$effective" full "$interval" || cycle_status=$?
+      last_attempt="$(date -u +%s)"
+      delay="$(seconds_until_next_interval "$last_attempt" "$interval")"
+      next_regular=$((last_attempt + delay))
+      echo "[$(format_paris_now)] Next regular check at $(format_paris_timestamp "$next_regular") (in ${delay}s)..."
+    elif (( interval > DASHBOARD_INTERVAL_SECONDS )) \
+      && dashboard_activity_recent "$now_epoch" \
+      && (( now_epoch - last_attempt >= DASHBOARD_INTERVAL_SECONDS )); then
+      run_once "$DASHBOARD_INTERVAL_SECONDS" live "$interval" || cycle_status=$?
+      last_attempt="$(date -u +%s)"
+      echo "[$(format_paris_now)] Dashboard active; next live check is eligible in ${DASHBOARD_INTERVAL_SECONDS}s."
+    else
+      delay=$((next_regular - now_epoch))
+      if (( interval > DASHBOARD_INTERVAL_SECONDS && delay > DASHBOARD_HEARTBEAT_POLL_SECONDS )); then
+        delay="$DASHBOARD_HEARTBEAT_POLL_SECONDS"
+      fi
+      if (( interval > DASHBOARD_INTERVAL_SECONDS )) && dashboard_activity_recent "$now_epoch"; then
+        live_due=$((last_attempt + DASHBOARD_INTERVAL_SECONDS))
+        if (( live_due > now_epoch && live_due - now_epoch < delay )); then
+          delay=$((live_due - now_epoch))
+        fi
+      fi
+      (( delay > 0 )) || delay=1
+      sleep "$delay"
+      continue
+    fi
+
+    if (( cycle_status != 0 )); then
+      echo "[WARN] Scrape cycle failed, will retry at the next scheduled check"
+      (( fail_fast == 1 )) && return "$cycle_status"
+    fi
+  done
+}
+
 main() {
-  local interval mode=once fail_fast=0 now_epoch delay next_epoch next_check
+  local interval mode=once fail_fast=0
   initialize || return 1
   interval="$LOOP_INTERVAL"
 
@@ -2319,18 +2395,7 @@ main() {
 
   if [[ "$mode" == loop ]]; then
     echo "Starting monitor loop (aligned interval: ${interval}s). Press Ctrl+C to stop."
-    while true; do
-      if ! run_once "$interval"; then
-        echo "[WARN] Scrape cycle failed, will retry at the next scheduled check"
-        (( fail_fast == 1 )) && return 1
-      fi
-      now_epoch="$(date -u +%s)"
-      delay="$(seconds_until_next_interval "$now_epoch" "$interval")"
-      next_epoch="$((now_epoch + delay))"
-      next_check="$(format_paris_timestamp "$next_epoch")"
-      echo "[$(format_paris_now)] Next check at ${next_check} (in ${delay}s)..."
-      sleep "$delay"
-    done
+    run_loop "$interval" "$fail_fast"
   else
     run_once "$interval"
   fi

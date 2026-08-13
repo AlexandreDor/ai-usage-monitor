@@ -56,9 +56,9 @@ LOOP_OUTPUT="${TEST_ROOT}/loop.out"
   main --loop 900 > "$LOOP_OUTPUT"
 )
 
-expected_log=$'scrape:900\nsleep:480'
+expected_log=$'scrape:900\nsleep:5'
 actual_log="$(<"$LOOP_LOG")"
 [[ "$actual_log" == "$expected_log" ]] || fail "loop did not scrape before aligned sleep"
-assert_contains "$(<"$LOOP_OUTPUT")" '[01/01/1970 13:07] Next check at 01/01/1970 13:15 (in 480s)...' "loop timestamps are not formatted in Paris time"
+assert_contains "$(<"$LOOP_OUTPUT")" '[01/01/1970 13:07] Next regular check at 01/01/1970 13:15 (in 480s)...' "loop timestamps are not formatted in Paris time"
 
 printf 'PASS: monitor schedule tests\n'
