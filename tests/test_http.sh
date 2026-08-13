@@ -93,6 +93,9 @@ for path in /monitor.sh /runtime/.alert_state /runtime/alert-deliveries.json /ru
   assert_eq 404 "$code" "non-allowlisted path exposed: $path"
 done
 
+heartbeat_get_code="$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:${port}/api/dashboard-heartbeat")"
+assert_eq 404 "$heartbeat_get_code" "dashboard heartbeat was exposed through GET"
+
 analytics_code="$(curl --silent --output "${TEST_ROOT}/analytics-error" --write-out '%{http_code}' "http://127.0.0.1:${port}/api/analytics?range=24h")"
 assert_eq 200 "$analytics_code" "analytics API response"
 assert_eq 1 "$(json_field "${TEST_ROOT}/analytics-error" schema_version)" "analytics schema version"
@@ -141,5 +144,43 @@ for _ in {1..50}; do
 done
 kill -0 "$server_pid" 2>/dev/null || fail "HTTP server using .env pricing did not start"
 assert_eq 123.0 "$(json_field "${TEST_ROOT}/env-analytics" tokens.summary.estimated_cost_usd)" "pricing catalog from .env was ignored"
+
+heartbeat_url="http://127.0.0.1:${env_port}/api/dashboard-heartbeat"
+heartbeat_file="${serve_fixture}/runtime/dashboard-heartbeat"
+missing_header_code="$(curl --silent --request POST --output "${TEST_ROOT}/heartbeat-forbidden" --write-out '%{http_code}' "$heartbeat_url")"
+assert_eq 403 "$missing_header_code" "heartbeat without activity header was accepted"
+[[ ! -e "$heartbeat_file" ]] || fail "forbidden heartbeat created runtime state"
+
+body_code="$(curl --silent --request POST -H 'X-Codex-Dashboard-Activity: visible' --data 'x' --output "${TEST_ROOT}/heartbeat-body" --write-out '%{http_code}' "$heartbeat_url")"
+assert_eq 400 "$body_code" "heartbeat with a request body was accepted"
+[[ ! -e "$heartbeat_file" ]] || fail "heartbeat with a body created runtime state"
+
+unknown_post_code="$(curl --silent --request POST -H 'X-Codex-Dashboard-Activity: visible' --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:${env_port}/api/unknown")"
+assert_eq 404 "$unknown_post_code" "unknown POST route was accepted"
+
+heartbeat_headers="${TEST_ROOT}/heartbeat-headers"
+heartbeat_code="$(curl --silent --request POST -H 'X-Codex-Dashboard-Activity: visible' --dump-header "$heartbeat_headers" --output /dev/null --write-out '%{http_code}' "$heartbeat_url")"
+assert_eq 204 "$heartbeat_code" "valid dashboard heartbeat response"
+assert_file "$heartbeat_file"
+assert_eq 0 "$(stat -c '%s' "$heartbeat_file")" "heartbeat file stored request data"
+assert_eq 600 "$(stat -c '%a' "$heartbeat_file")" "heartbeat permissions are not private"
+assert_eq 700 "$(stat -c '%a' "${serve_fixture}/runtime")" "runtime directory permissions are not private"
+if grep -Fiq 'Access-Control-Allow-Origin:' "$heartbeat_headers"; then
+  fail "heartbeat response enabled cross-origin access"
+fi
+
+for _ in {1..20}; do
+  curl --silent --fail --request POST -H 'X-Codex-Dashboard-Activity: visible' "$heartbeat_url" -o /dev/null &
+done
+wait
+assert_eq 1 "$(find "${serve_fixture}/runtime" -maxdepth 1 -type f -name 'dashboard-heartbeat' | wc -l)" "concurrent heartbeats created multiple files"
+assert_eq 0 "$(stat -c '%s' "$heartbeat_file")" "concurrent heartbeat wrote content"
+
+rm -f "$heartbeat_file"
+printf 'preserve\n' > "${TEST_ROOT}/heartbeat-target"
+ln -s "${TEST_ROOT}/heartbeat-target" "$heartbeat_file"
+symlink_code="$(curl --silent --request POST -H 'X-Codex-Dashboard-Activity: visible' --output "${TEST_ROOT}/heartbeat-error" --write-out '%{http_code}' "$heartbeat_url")"
+assert_eq 503 "$symlink_code" "symbolic-link heartbeat was accepted"
+assert_eq preserve "$(<"${TEST_ROOT}/heartbeat-target")" "heartbeat symlink target was modified"
 
 printf 'PASS: local HTTP server tests\n'

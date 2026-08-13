@@ -134,12 +134,15 @@ echo "Only allowlisted dashboard assets and usage JSON are exposed. Press Ctrl+C
 python3 - "$SCRIPT_DIR" "$PORT" "$BIND_ADDRESS" "$ANALYTICS_DATABASE_PATH" "$ANALYTICS_PRICING_PATH" <<'PYEOF'
 import functools
 import http.server
+import os
 import pathlib
 import socket
 import socketserver
 import sqlite3
+import stat
 import sys
 import threading
+import time
 from urllib.parse import parse_qs, unquote, urlsplit
 
 sys.path.insert(0, str(pathlib.Path(sys.argv[1]).resolve()))
@@ -150,6 +153,10 @@ port = int(sys.argv[2])
 bind_address = sys.argv[3]
 analytics_database = pathlib.Path(sys.argv[4])
 analytics_pricing = pathlib.Path(sys.argv[5])
+runtime_directory = root / "runtime"
+heartbeat_path = runtime_directory / "dashboard-heartbeat"
+heartbeat_lock = threading.Lock()
+heartbeat_coalesce_seconds = 5
 public_files = {
     "/dashboard.html": "/dashboard.html",
     "/analytics.html": "/analytics.html",
@@ -164,6 +171,43 @@ public_files = {
     "/data.json": "/runtime/data.json",
     "/history.json": "/runtime/history.json",
 }
+
+
+def prepare_runtime_directory():
+    if runtime_directory.is_symlink():
+        raise OSError("runtime directory must not be a symbolic link")
+    runtime_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metadata = runtime_directory.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise OSError("runtime directory must be owned by the current user")
+    runtime_directory.chmod(0o700)
+
+
+def record_dashboard_heartbeat():
+    with heartbeat_lock:
+        try:
+            metadata = heartbeat_path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            metadata = None
+        if metadata is not None:
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+                raise OSError("dashboard heartbeat must be a regular file owned by the current user")
+            if time.time() - metadata.st_mtime < heartbeat_coalesce_seconds:
+                return
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(heartbeat_path, flags, 0o600)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+                raise OSError("dashboard heartbeat must be a regular file owned by the current user")
+            os.fchmod(descriptor, 0o600)
+            os.ftruncate(descriptor, 0)
+            os.utime(descriptor, None)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):
@@ -203,6 +247,32 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.serve_analytics()
             return
         super().do_GET()
+
+    def do_POST(self):
+        request_path = unquote(urlsplit(self.path).path)
+        if request_path != "/api/dashboard-heartbeat":
+            self.send_error(404, "Not found")
+            return
+        if self.headers.get("X-Codex-Dashboard-Activity") != "visible":
+            self.send_json(403, {"error": "dashboard activity header is required"})
+            return
+        raw_content_length = self.headers.get("Content-Length", "0")
+        try:
+            content_length = int(raw_content_length)
+        except ValueError:
+            self.send_json(400, {"error": "request body must be empty"})
+            return
+        if content_length != 0 or self.headers.get("Transfer-Encoding") is not None:
+            self.send_json(400, {"error": "request body must be empty"})
+            return
+        try:
+            record_dashboard_heartbeat()
+        except OSError:
+            self.send_json(503, {"error": "dashboard activity cannot be recorded"})
+            return
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_HEAD(self):
         if unquote(urlsplit(self.path).path) == "/api/analytics":
@@ -262,6 +332,11 @@ class BoundedThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPSe
 
 
 handler = functools.partial(DashboardHandler, directory=str(root))
+try:
+    prepare_runtime_directory()
+except OSError as error:
+    print(f"[ERROR] Unable to prepare dashboard runtime: {error}", file=sys.stderr)
+    raise SystemExit(1)
 try:
     server = BoundedThreadingHTTPServer((bind_address, port), handler)
 except OSError as error:
