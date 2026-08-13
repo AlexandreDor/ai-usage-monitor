@@ -169,10 +169,14 @@ if grep -Fiq 'Access-Control-Allow-Origin:' "$heartbeat_headers"; then
   fail "heartbeat response enabled cross-origin access"
 fi
 
+heartbeat_pids=()
 for _ in {1..20}; do
   curl --silent --fail --request POST -H 'X-Codex-Dashboard-Activity: visible' "$heartbeat_url" -o /dev/null &
+  heartbeat_pids+=("$!")
 done
-wait
+for heartbeat_pid in "${heartbeat_pids[@]}"; do
+  wait "$heartbeat_pid"
+done
 assert_eq 1 "$(find "${serve_fixture}/runtime" -maxdepth 1 -type f -name 'dashboard-heartbeat' | wc -l)" "concurrent heartbeats created multiple files"
 assert_eq 0 "$(stat -c '%s' "$heartbeat_file")" "concurrent heartbeat wrote content"
 
