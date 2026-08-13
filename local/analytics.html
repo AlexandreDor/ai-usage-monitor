@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="assets/dashboard.css">
   <link rel="stylesheet" href="assets/analytics.css">
   <script src="assets/chart.umd.min.js" defer></script>
+  <script src="assets/chart-interactions.js" defer></script>
   <script src="assets/preferences.js" defer></script>
   <script src="assets/analytics.js" defer></script>
 </head>
@@ -143,13 +144,13 @@
             <span class="sample-count" id="limit-samples">—</span>
           </div>
         </div>
-        <div class="chart-wrap" id="limits-chart-wrap"><canvas id="limits-chart" role="img" aria-describedby="limits-chart-summary limits-data-table-caption"></canvas></div>
+        <div class="chart-wrap" id="limits-chart-wrap"><canvas id="limits-chart" class="time-slice-chart" role="img" aria-describedby="limits-chart-summary limits-data-table-caption"></canvas></div>
         <p class="empty-state" id="limits-empty" data-i18n="analytics.noLimitSamples" hidden>No limit samples in this period.</p>
         <p class="chart-summary" id="limits-chart-summary" role="status" aria-live="polite"></p>
         <details class="chart-data-details">
           <summary data-i18n="analytics.showLimitTable">Show limit data table</summary>
           <div class="table-scroll">
-            <table class="chart-data-table"><caption id="limits-data-table-caption" data-i18n="analytics.limitTableCaption">Limit history data</caption><thead><tr><th data-i18n="analytics.date">Date</th><th data-i18n="analytics.fiveHour">5-hour</th><th data-i18n="analytics.weekly">Weekly</th></tr></thead><tbody id="limits-data-body"></tbody></table>
+            <table class="chart-data-table"><caption id="limits-data-table-caption" data-i18n="analytics.limitTableCaption">Limit history data</caption><thead><tr><th data-i18n="analytics.date">Date</th><th data-i18n="analytics.fiveHour">5-hour</th><th data-i18n="analytics.weekly">Weekly</th><th data-i18n="analytics.idealWeeklyPace">Ideal weekly pace</th><th data-i18n="analytics.forecast24h">Forecast 24h</th><th data-i18n="analytics.forecast6h">Forecast 6h</th></tr></thead><tbody id="limits-data-body"></tbody></table>
           </div>
         </details>
       </article>
@@ -161,7 +162,7 @@
             <span class="sample-count" id="event-count">—</span>
           </div>
         </div>
-        <div class="chart-wrap" id="tokens-chart-wrap"><canvas id="tokens-chart" role="img" aria-describedby="tokens-chart-summary tokens-data-table-caption"></canvas></div>
+        <div class="chart-wrap" id="tokens-chart-wrap"><canvas id="tokens-chart" class="time-slice-chart" role="img" aria-describedby="tokens-chart-summary tokens-data-table-caption"></canvas></div>
         <p class="empty-state" id="tokens-empty" data-i18n="analytics.noTokenEvents" hidden>No token events in this period.</p>
         <p class="chart-summary" id="tokens-chart-summary" role="status" aria-live="polite"></p>
         <details class="chart-data-details">
@@ -197,7 +198,7 @@
         <div class="table-scroll">
           <table class="reset-table">
             <caption class="sr-only" data-i18n="analytics.resetCaption">Detected limit resets</caption>
-            <thead><tr><th data-i18n="analytics.window">Window</th><th data-i18n="analytics.category">Category</th><th data-i18n="analytics.scheduledReset">Scheduled reset</th><th data-i18n="analytics.firstObservation">First observation</th><th data-i18n="analytics.beforeAfter">Before → after</th></tr></thead>
+            <thead><tr><th data-i18n="analytics.window">Window</th><th data-i18n="analytics.category">Category</th><th data-i18n="analytics.scheduledReset">Scheduled reset</th><th data-i18n="analytics.firstObservation">First observation</th><th data-i18n="analytics.beforeAfter">Before → after</th><th data-i18n="analytics.forecastBeforeReset">Forecast before reset</th></tr></thead>
             <tbody id="resets-body"></tbody>
           </table>
         </div>

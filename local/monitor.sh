@@ -33,6 +33,7 @@ RUNTIME_DIR="${SCRIPT_DIR}/runtime"
 STATE_FILE="${RUNTIME_DIR}/.alert_state"
 ALERT_DELIVERIES_FILE="${RUNTIME_DIR}/alert-deliveries.json"
 ALERTS_PY="${SCRIPT_DIR}/alerts.py"
+HISTORY_PY="${SCRIPT_DIR}/history.py"
 DATA_FILE="${RUNTIME_DIR}/data.json"
 HISTORY_FILE="${RUNTIME_DIR}/history.json"
 ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"
@@ -63,7 +64,7 @@ load_config() {
     fi
 
     case "$key" in
-      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_FORECAST_ENABLED|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
+      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_ENABLED|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
         if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
           value="${value:1:${#value}-2}"
         fi
@@ -262,6 +263,8 @@ validate_config() {
   validate_integer CURL_MAX_TIME_SECONDS "$CURL_MAX_TIME_SECONDS" 1 600 || invalid=1
   validate_integer CURL_RETRIES "$CURL_RETRIES" 0 5 || invalid=1
   validate_integer CURL_RETRY_DELAY_SECONDS "$CURL_RETRY_DELAY_SECONDS" 0 60 || invalid=1
+  validate_integer CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD "$CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD" 0 100 || invalid=1
+  validate_integer CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD "$CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD" 0 100 || invalid=1
   validate_thresholds || invalid=1
   validate_alert_scripts || invalid=1
 
@@ -383,6 +386,8 @@ initialize() {
   CURL_RETRY_DELAY_SECONDS="${CURL_RETRY_DELAY_SECONDS:-1}"
   MONITOR_DEBUG="${MONITOR_DEBUG:-0}"
   CODEX_FORECAST_ENABLED="${CODEX_FORECAST_ENABLED:-1}"
+  CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD="${CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD:-50}"
+  CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD="${CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD:-25}"
   DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}"
   TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
   TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -711,7 +716,9 @@ PYEOF
 enrich_snapshot_with_codex_forecast() {
   local json="$1" forecast
   forecast="$(fetch_codex_forecast)" || return 1
-  python3 - "$json" "$forecast" <<'PYEOF'
+  python3 - "$json" "$forecast" \
+    "${CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD:-50}" \
+    "${CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD:-25}" <<'PYEOF'
 import json
 import sys
 
@@ -719,6 +726,8 @@ snapshot = json.loads(sys.argv[1])
 forecast = json.loads(sys.argv[2])
 if not isinstance(snapshot, dict) or not isinstance(forecast, dict):
     raise SystemExit(1)
+forecast["highlight_threshold_24h_pct"] = int(sys.argv[3])
+forecast["highlight_threshold_6h_pct"] = int(sys.argv[4])
 snapshot["codex_forecast"] = forecast
 print(json.dumps(snapshot, indent=2))
 PYEOF
@@ -748,154 +757,13 @@ format_paris_timestamp() {
   TZ=Europe/Paris date -d "@${epoch}" '+%d/%m/%Y %H:%M'
 }
 
-history_max_entries() {
-  local interval_seconds="$1"
-
-  python3 - "$interval_seconds" "$HISTORY_RETENTION_HOURS" <<'PYEOF'
-import math
-import sys
-
-interval_seconds = max(1, int(sys.argv[1]))
-hours = float(sys.argv[2])
-entries = max(1, math.ceil((hours * 3600) / interval_seconds))
-print(entries)
-PYEOF
-}
-
 write_local_snapshot() {
   local json="$1"
-  local interval_seconds="$2"
-  local max_entries
 
-  max_entries="$(history_max_entries "$interval_seconds")"
-
-  python3 - "$HISTORY_FILE" "$DATA_FILE" "$json" "$max_entries" <<'PYEOF'
-import json
-import os
-import pathlib
-import shutil
-import sys
-import tempfile
-import time
-
-history_path = pathlib.Path(sys.argv[1])
-data_path = pathlib.Path(sys.argv[2])
-new_snapshot = json.loads(sys.argv[3])
-max_entries = int(sys.argv[4])
-public_fields = {
-    "five_h_pct",
-    "five_h_reset",
-    "five_h_reset_at",
-    "weekly_pct",
-    "weekly_reset",
-    "weekly_reset_at",
-    "scraped_at",
-    "sample_interval_seconds",
-    "history_window_hours",
-    "limit_id",
-}
-
-
-def sanitize_forecast(value):
-    if not isinstance(value, dict):
-        return None
-    chance_24h = value.get("chance_24h_pct")
-    chance_6h = value.get("chance_6h_pct")
-    generated_at = value.get("generated_at")
-    if any(
-        not isinstance(chance, int) or isinstance(chance, bool) or not 0 <= chance <= 100
-        for chance in (chance_24h, chance_6h)
-    ):
-        return None
-    if not isinstance(generated_at, str) or not generated_at or len(generated_at) > 100:
-        return None
-    return {
-        "chance_24h_pct": chance_24h,
-        "chance_6h_pct": chance_6h,
-        "generated_at": generated_at,
-    }
-
-
-def sanitize_entry(entry, *, include_forecast=False):
-    if not isinstance(entry, dict):
-        return None
-    sanitized = {key: entry[key] for key in public_fields if key in entry}
-    for key in ("five_h_reset", "weekly_reset"):
-        value = sanitized.get(key)
-        if not isinstance(value, str) or len(value) > 100 or "@" in value:
-            sanitized[key] = "unknown"
-    value = sanitized.get("limit_id")
-    if value is not None and (not isinstance(value, str) or len(value) > 100 or any(ord(char) < 32 for char in value)):
-        sanitized.pop("limit_id", None)
-    for key in ("five_h_reset_at", "weekly_reset_at"):
-        value = sanitized.get(key)
-        if value is not None and (
-            not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0
-        ):
-            sanitized[key] = None
-    if include_forecast:
-        forecast = sanitize_forecast(entry.get("codex_forecast"))
-        if forecast is not None:
-            sanitized["codex_forecast"] = forecast
-    return sanitized
-
-
-new_history_entry = sanitize_entry(new_snapshot)
-new_data_entry = sanitize_entry(new_snapshot, include_forecast=True)
-if new_history_entry is None or new_data_entry is None:
-    raise SystemExit("invalid usage snapshot")
-
-def atomic_write(path, content):
-    fd, temporary_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", text=True
-    )
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as temporary_file:
-            temporary_file.write(content)
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
-        os.replace(temporary_name, path)
-    finally:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-
-
-history = []
-if history_path.exists():
-    try:
-        history = json.loads(history_path.read_text(encoding="utf-8"))
-        if not isinstance(history, list):
-            raise ValueError("history root is not an array")
-    except Exception as error:
-        backup = history_path.with_name(f"{history_path.name}.corrupt.{int(time.time())}")
-        shutil.copy2(history_path, backup)
-        sys.stderr.write(f"[WARN] Corrupt history copied to {backup} before reconstruction: {error}\n")
-        history = []
-
-history = [entry for item in history if (entry := sanitize_entry(item)) is not None]
-new_timestamp = new_history_entry.get("scraped_at", "")
-existing_timestamps = {entry.get("scraped_at") for entry in history}
-if new_timestamp not in existing_timestamps:
-    history.append(new_history_entry)
-history.sort(key=lambda entry: entry.get("scraped_at", ""), reverse=True)
-history = history[:max_entries]
-
-current = None
-if data_path.exists():
-    try:
-        current = sanitize_entry(json.loads(data_path.read_text(encoding="utf-8")), include_forecast=True)
-    except Exception:
-        current = None
-
-atomic_write(history_path, json.dumps(history, indent=2) + "\n")
-if current is None or new_timestamp >= current.get("scraped_at", ""):
-    atomic_write(data_path, json.dumps(new_data_entry, indent=2) + "\n")
-else:
-    sys.stderr.write("[WARN] Older snapshot retained in history but did not replace data.json.\n")
-PYEOF
+  printf '%s\n' "$json" | python3 "$HISTORY_PY" \
+    --history "$HISTORY_FILE" \
+    --data "$DATA_FILE" \
+    --retention-hours "$HISTORY_RETENTION_HOURS"
 
   echo "[OK] Snapshot storage processed at ${DATA_FILE}"
 }
@@ -2285,11 +2153,11 @@ run_cycle() {
         public_json="$json"
       fi
     fi
-    if ! archive_snapshot "$json"; then
+    if ! archive_snapshot "$public_json"; then
       status=1
       append_cycle_error "Long-term archive update failed"
     fi
-    if write_local_snapshot "$public_json" "$interval_seconds"; then
+    if write_local_snapshot "$public_json"; then
       [[ -f "$HISTORY_FILE" ]] && history_json="$(<"$HISTORY_FILE")"
     else
       status=1

@@ -124,33 +124,6 @@ correspondent pas à un reset identifiable.
 
 **Effort : M**
 
-### 5. Rendre l'historique JSON réellement temporel
-
-L'archive SQLite applique déjà une rétention temporelle et un compactage. Le
-fichier `history.json` du dashboard principal reste géré inline dans
-`monitor.sh` et tronqué selon un nombre d'entrées dérivé de l'intervalle courant.
-
-**Actions :**
-
-- Extraire la gestion de l'historique dans `local/history.py`.
-- Valider les snapshots et normaliser leurs timestamps en epoch.
-- Refuser les pourcentages hors de l'intervalle `0..100`.
-- Trier et dédupliquer selon le timestamp réel.
-- Appliquer `HISTORY_RETENTION_HOURS` selon l'âge des relevés.
-- Conserver l'écriture atomique et la sauvegarde existantes, en garantissant un
-  nom réellement unique pour chaque historique corrompu.
-- Conserver un plafond défensif de 10 000 entrées et 16 MiB.
-
-**Critères de validation :**
-
-- La durée conservée reste correcte après une interruption ou un changement
-  d'intervalle `900 -> 60 -> 900`.
-- Une corruption ne provoque pas la perte silencieuse de l'historique.
-- Les entrées invalides, dupliquées, trop anciennes ou trop nombreuses sont
-  traitées sans crash.
-
-**Effort : S à M**
-
 ### 6. Centraliser la configuration partagée
 
 La configuration est validée par le monitor et `serve.sh` sait déjà relire le
@@ -239,38 +212,6 @@ place. Deux éléments de la spécification initiale restent absents.
   navigateur.
 
 **Effort : S**
-
-### 10. Explorer les graphiques par tranche temporelle
-
-Les graphiques demandent actuellement de viser précisément un point ou une
-courbe pour afficher ses informations. Cette interaction devient difficile sur
-les longues séries, lorsque les points sont masqués, ou sur un écran tactile.
-
-**Actions :**
-
-- Sélectionner automatiquement le relevé temporel le plus proche sur tout le
-  segment vertical du graphique, sans exiger que le pointeur touche un point.
-- Afficher une ligne verticale suivant la tranche temporelle sélectionnée.
-- Regrouper dans une même infobulle toutes les séries visibles à cet instant.
-- Formater séparément pourcentages, tokens et coûts dans les graphiques à
-  plusieurs axes.
-- Ignorer les points techniques utilisés pour dessiner les marqueurs de reset.
-- Prendre en charge la souris et les interactions tactiles sans bloquer le
-  défilement de la page.
-- Appliquer le même comportement au dashboard principal et à Analytics.
-
-**Critères de validation :**
-
-- Le survol d'une position horizontale affiche le relevé le plus proche même si
-  aucun point n'est visible à cet endroit.
-- L'infobulle présente toutes les valeurs disponibles pour la date sélectionnée
-  sans mélanger leurs unités.
-- Les valeurs absentes, les séries masquées et les marqueurs de reset ne
-  produisent pas d'informations trompeuses.
-- Le comportement fonctionne à la souris et sur un viewport tactile et reste
-  couvert par les tests navigateur.
-
-**Effort : S à M**
 
 ### 12. Compléter les contrôles de qualité de la CI
 
@@ -363,9 +304,9 @@ intégrée.
 
 ### 17. Réduire progressivement le script monolithique
 
-Le stockage, l'archivage et la collecte Analytics sont déjà séparés en modules
-Python. Le protocole Codex, la validation principale et l'orchestration restent
-concentrés dans `monitor.sh`.
+Le stockage, l'historique, l'archivage et la collecte Analytics sont déjà
+séparés en modules Python. Le protocole Codex, la validation principale et
+l'orchestration restent concentrés dans `monitor.sh`.
 
 **Objectif :** améliorer la testabilité sans lancer une réécriture prématurée.
 
@@ -374,8 +315,8 @@ concentrés dans `monitor.sh`.
 - Définir un schéma versionné pour les snapshots et l'historique JSON.
 - Déplacer progressivement le protocole Codex et la validation vers des modules
   Python testables.
-- Extraire en priorité `history.py`, `config.py` et un client du protocole Codex,
-  puis limiter Bash au parsing CLI et à l'orchestration.
+- Extraire en priorité `config.py` et un client du protocole Codex, puis limiter
+  Bash au parsing CLI et à l'orchestration.
 
 **Effort : L**
 
@@ -403,10 +344,9 @@ du monitor reste à ajouter dans l'objectif 14.
 1. Ajouter la détection des données périmées et le rafraîchissement adaptatif au
    dashboard principal.
 2. Détecter les anomalies de quota.
-3. Extraire l'historique JSON et centraliser la configuration.
+3. Centraliser la configuration partagée.
 4. Finaliser WAL, les sauvegardes SQLite et l'empreinte du catalogue.
-5. Terminer les éléments Analytics restants et améliorer l'exploration des
-   graphiques.
+5. Terminer les éléments Analytics restants.
 6. Terminer l'accessibilité du dashboard.
 7. Renforcer la CI.
 8. Ajouter l'aide CLI, corriger la documentation et préparer les releases.
@@ -430,14 +370,11 @@ Le programme restant est terminé lorsque :
 - le dashboard principal détecte et annonce les données périmées ;
 - un dashboard local actif actualise le relevé principal toutes les 5 minutes
   sans densifier les historiques ;
-- l'historique JSON applique une rétention temporelle robuste ;
 - les mouvements de quota anormaux sont détectés sans confondre les resets
   légitimes ;
 - le monitor et le serveur partagent une configuration non exécutable ;
 - SQLite est sauvegardé avant migration et fonctionne de manière fiable en WAL ;
 - le catalogue Analytics est identifiable par son empreinte ;
-- les graphiques peuvent être explorés par tranche temporelle à la souris comme
-  sur un écran tactile ;
 - les tests shell, Python, HTTP et navigateur passent en CI ;
 - la distribution comprend une version, un changelog, des unités systemd et des
   archives vérifiables.

@@ -37,6 +37,8 @@ test('works offline and exposes no critical accessibility violations', async ({ 
   await expect(page.locator('#weekly-reset')).toHaveText('03/01/2026 13:34');
   await expect(page.locator('#forecast-24h')).toHaveText('76%');
   await expect(page.locator('#forecast-6h')).toHaveText('10%');
+  await expect(page.locator('#forecast-24h')).toHaveClass(/threshold-reached/);
+  await expect(page.locator('#forecast-24h')).toHaveAttribute('title', 'Highlight threshold reached: 50%');
   await expect(page.locator('.forecast-link')).toHaveAttribute('href', 'https://codex.lunarwerx.com/');
   await expect(page.locator('.forecast-link')).toHaveAttribute('target', '_blank');
   await expect(page.locator('.forecast-link')).toHaveAttribute('rel', 'noopener noreferrer');
@@ -72,19 +74,58 @@ test('clears a previous chart when history becomes empty', async ({ page }) => {
   await expect(page.locator('#history-label')).toHaveText('History unavailable');
 });
 
+test('explores the nearest dashboard time slice across the full chart height', async ({ page }) => {
+  const history = [
+    { ...snapshot, scraped_at: '2026-08-01T00:00:00Z', five_h_pct: 90, weekly_pct: 70 },
+    { ...snapshot, scraped_at: '2026-08-02T00:00:00Z', five_h_pct: 60, weekly_pct: 40 },
+    { ...snapshot, scraped_at: '2026-08-03T00:00:00Z', five_h_pct: 30, weekly_pct: 20 },
+  ];
+  await mockUsage(page, history);
+  await page.goto('/dashboard.html');
+  await expect.poll(() => page.evaluate(() => Boolean(chart))).toBe(true);
+  await page.locator('#history-chart').scrollIntoViewIfNeeded();
+
+  const target = await page.evaluate(() => ({
+    x: chart.scales.x.getPixelForValue(Date.parse('2026-08-02T00:00:00Z')),
+    y: chart.chartArea.top + 1,
+  }));
+  const box = await page.locator('#history-chart').boundingBox();
+  await page.mouse.move(box.x + target.x, box.y + target.y);
+
+  await expect.poll(() => page.evaluate(() => chart.tooltip.dataPoints?.map(item => item.dataset.label))).toEqual([
+    '5h Limit %',
+    'Weekly Limit %',
+    'Forecast 24h',
+    'Forecast 6h',
+  ]);
+  const selection = await page.evaluate(() => ({
+    title: chart.tooltip.title,
+    body: chart.tooltip.body.map(item => item.lines[0]),
+    caretX: chart.tooltip.caretX,
+    expectedX: chart.scales.x.getPixelForValue(Date.parse('2026-08-02T00:00:00Z')),
+    mode: chart.options.interaction.mode,
+    cursorRegistered: Boolean(Chart.registry.plugins.get('timeSliceCursor')),
+  }));
+  expect(selection.title).toEqual(['02/08/2026 02:00']);
+  expect(selection.body).toEqual(['5h Limit %: 60%', 'Weekly Limit %: 40%', 'Forecast 24h: 76%', 'Forecast 6h: 10%']);
+  expect(selection.caretX).toBeCloseTo(selection.expectedX, 1);
+  expect(selection.mode).toBe('timeSlice');
+  expect(selection.cursorRegistered).toBe(true);
+});
+
 const analyticsPayload = {
   schema_version: 1,
   period: { range: '30d', from: '2026-07-05T10:00:00Z', to: '2026-08-04T10:00:00Z', timezone: 'Europe/Paris', granularity_seconds: 86400 },
   filters: { sources: [], models: [], reset_type: 'all' },
   available: { sources: ['codex', 'opencode'], models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'unknown-model'] },
   freshness: { limits_last_sample_at: '2026-08-04T09:45:00Z', collectors: { codex: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, opencode: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, hermes: { status: 'disabled', last_success_at: null } } },
-  limits: { samples: 2, series: [{ at: '2026-08-03T00:00:00Z', five_h_pct: 80, weekly_pct: 60 }, { at: '2026-08-04T00:00:00Z', five_h_pct: 55, weekly_pct: 52 }] },
+  limits: { samples: 2, forecast_samples: 2, series: [{ at: '2026-08-03T00:00:00Z', five_h_pct: 80, weekly_pct: 60, ideal_weekly_pct: 65.5, forecast_chance_24h_pct: 60, forecast_chance_6h_pct: 20, forecast_generated_at: '2026-08-02T23:55:00Z', forecast_samples: 1 }, { at: '2026-08-04T00:00:00Z', five_h_pct: 55, weekly_pct: 52, ideal_weekly_pct: 51.2, forecast_chance_24h_pct: 70, forecast_chance_6h_pct: 30, forecast_generated_at: '2026-08-03T23:55:00Z', forecast_samples: 1 }] },
   tokens: {
     summary: { input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 25000, output_tokens: 200000, reasoning_tokens: 50000, events: 2, estimated_cost_usd: 11.25, assumed_zero_tokens: 100 },
     series: [{ at: '2026-08-04T00:00:00Z', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 25000, output_tokens: 200000, reasoning_tokens: 50000, estimated_cost_usd: 11.25 }],
     breakdown: [{ source: 'codex', provider: 'openai', model: 'gpt-5.6-sol', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 25000, output_tokens: 200000, estimated_cost_usd: 11.25, pricing_status: 'priced' }],
   },
-  resets: { total: 2, weekly_total: 2, weekly_summary: { random: { count: 1, gained_vs_ideal_pct_points: 30.004, lost_vs_ideal_pct_points: 0 }, end_of_week: { count: 1, unused_pct_points: 5 } }, offset: 0, limit: 10, items: [{ window: 'weekly', category: 'random', reset_at: '2026-08-04T08:00:00Z', observed_at: '2026-08-04T08:15:00Z', observation_delay_seconds: 900, before_pct: 28, after_pct: 100, ideal_weekly_pace_pct: 58.004, pace_delta_pct_points: 30.004, unused_pct_points: 0 }] },
+  resets: { total: 2, weekly_total: 2, weekly_summary: { random: { count: 1, gained_vs_ideal_pct_points: 30.004, lost_vs_ideal_pct_points: 0 }, end_of_week: { count: 1, unused_pct_points: 5 } }, offset: 0, limit: 10, items: [{ window: 'weekly', category: 'random', reset_at: '2026-08-04T08:00:00Z', observed_at: '2026-08-04T08:15:00Z', observation_delay_seconds: 900, before_pct: 28, after_pct: 100, forecast_chance_24h_pct: 64, forecast_chance_6h_pct: 22, forecast_sample_at: '2026-08-04T07:45:00Z', ideal_weekly_pace_pct: 58.004, pace_delta_pct_points: 30.004, unused_pct_points: 0 }] },
   baselines: { hermes: [{ tokens: 42 }] },
   pricing: { currency: 'USD', as_of: '2026-08-04', valuation_mode: 'current_catalog' },
   warnings: [
@@ -340,17 +381,22 @@ test('renders detailed analytics, reset markers and cost mode by default', async
   await expect(page.locator('#cache-write-tokens')).toHaveText('25K');
   await expect(page.locator('#reasoning-tokens')).toHaveText('50K');
   await expect(page.locator('#limits-chart-summary')).toContainText('2 reset markers');
+  await expect(page.locator('#limits-chart-summary')).toContainText('2 forecast samples');
+  await expect(page.locator('#limits-data-body tr').first().locator('td')).toHaveCount(6);
   await expect(page.locator('#breakdown-body tr td')).toHaveCount(11);
   await expect(page.locator('#reset-pagination')).toBeVisible();
   await expect(page.locator('#reset-page-label')).toHaveText('1–50 of 55');
   await expect(page.locator('#collector-grid')).toContainText('database unavailable');
   await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#tokens-chart-card')).toBeHidden();
-  await expect(page.locator('#resets-body tr').first().locator('td')).toHaveCount(5);
+  await expect(page.locator('#resets-body tr').first().locator('td')).toHaveCount(6);
+  await expect(page.locator('#resets-body tr').first().locator('td').last()).toHaveText('Forecast 24h: 64% · Forecast 6h: 22%');
 
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.filter(dataset => dataset.resetMarker).length)).toBe(2);
   await expect.poll(() => page.evaluate(() => tokensChart.data.datasets.length)).toBe(2);
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.label === 'codex')?.data[0]?.y)).toBe(11.25);
+  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.label === 'Ideal weekly pace')?.data[1]?.y)).toBe(51.2);
+  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.filter(dataset => dataset.valueKind === 'percent').length)).toBe(5);
   await page.locator('#toggle-token-overlay').click();
   await expect(page.locator('#tokens-chart-card')).toBeVisible();
   await expect(page.locator('#tokens-chart-card #token-metric-toggle')).toHaveCount(1);
@@ -367,6 +413,100 @@ test('renders detailed analytics, reset markers and cost mode by default', async
   await expect(page.locator('#reset-page-label')).toContainText('51–55');
 });
 
+test('groups visible Analytics units and excludes missing values and reset markers', async ({ page }) => {
+  const payload = {
+    ...enhancedAnalyticsPayload,
+    limits: {
+      ...enhancedAnalyticsPayload.limits,
+      series: enhancedAnalyticsPayload.limits.series.map((point, index) => index === 1 ? { ...point, weekly_pct: null } : point),
+    },
+  };
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+  await page.goto('/analytics.html');
+
+  const moveToSlice = async () => {
+    await page.locator('#limits-chart').scrollIntoViewIfNeeded();
+    const target = await page.evaluate(() => ({
+      x: limitsChart.scales.x.getPixelForValue(Date.parse('2026-08-04T00:00:00Z')),
+      y: limitsChart.chartArea.bottom - 1,
+    }));
+    const box = await page.locator('#limits-chart').boundingBox();
+    await page.mouse.move(box.x + target.x, box.y + target.y);
+  };
+  await moveToSlice();
+
+  await expect.poll(() => page.evaluate(() => limitsChart.tooltip.body?.map(item => item.lines[0]))).toEqual([
+    '5-hour remaining: 55%',
+    'Ideal weekly pace: 51.2%',
+    'Forecast 24h: 70%',
+    'Forecast 6h: 30%',
+    'codex: €9.68',
+    'opencode: €0.0000',
+  ]);
+  expect(await page.evaluate(() => limitsChart.tooltip.dataPoints.some(item => item.dataset.resetMarker))).toBe(false);
+
+  await page.evaluate(() => {
+    const index = limitsChart.data.datasets.findIndex(dataset => dataset.label === '5-hour remaining');
+    limitsChart.hide(index);
+    limitsChart.update('none');
+  });
+  await moveToSlice();
+  await expect.poll(() => page.evaluate(() => limitsChart.tooltip.body?.map(item => item.lines[0]))).toEqual([
+    'Ideal weekly pace: 51.2%',
+    'Forecast 24h: 70%',
+    'Forecast 6h: 30%',
+    'codex: €9.68',
+    'opencode: €0.0000',
+  ]);
+
+  await page.evaluate(() => {
+    const index = limitsChart.data.datasets.findIndex(dataset => dataset.label === '5-hour remaining');
+    limitsChart.show(index);
+    limitsChart.update('none');
+  });
+  await page.locator('#token-metric-toggle').click();
+  await moveToSlice();
+  await expect.poll(() => page.evaluate(() => limitsChart.tooltip.body?.map(item => item.lines[0]))).toEqual([
+    '5-hour remaining: 55%',
+    'Ideal weekly pace: 51.2%',
+    'Forecast 24h: 70%',
+    'Forecast 6h: 30%',
+    'codex: 1,200,000 tokens',
+    'opencode: 100 tokens',
+  ]);
+});
+
+test('retains a touch selection while allowing vertical page scrolling', async ({ browser }) => {
+  const context = await browser.newContext({ hasTouch: true, isMobile: true, viewport: { width: 390, height: 700 } });
+  const page = await context.newPage();
+  try {
+    await page.route('**/api/analytics?*', route => route.fulfill({ json: enhancedAnalyticsPayload }));
+    await page.goto('/analytics.html');
+    await page.locator('#limits-chart').scrollIntoViewIfNeeded();
+    const target = await page.evaluate(() => ({
+      x: limitsChart.scales.x.getPixelForValue(Date.parse('2026-08-04T00:00:00Z')),
+      y: (limitsChart.chartArea.top + limitsChart.chartArea.bottom) / 2,
+    }));
+    let box = await page.locator('#limits-chart').boundingBox();
+    await page.touchscreen.tap(box.x + target.x, box.y + target.y);
+    await expect.poll(() => page.evaluate(() => limitsChart.tooltip.dataPoints?.length || 0)).toBeGreaterThan(0);
+    await page.waitForTimeout(50);
+    expect(await page.evaluate(() => limitsChart.tooltip.dataPoints?.length || 0)).toBeGreaterThan(0);
+
+    const beforeScroll = await page.evaluate(() => window.scrollY);
+    box = await page.locator('#limits-chart').boundingBox();
+    const client = await context.newCDPSession(page);
+    const x = box.x + box.width / 2;
+    const y = box.y + box.height * 0.75;
+    await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+    await client.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: y - 140 }] });
+    await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(beforeScroll);
+  } finally {
+    await context.close();
+  }
+});
+
 test('does not render a 5-hour series when Codex returns null', async ({ page }) => {
   await page.route('**/api/analytics?*', route => route.fulfill({
     json: {
@@ -379,8 +519,29 @@ test('does not render a 5-hour series when Codex returns null', async ({ page })
   }));
   await page.goto('/analytics.html');
 
+  await expect.poll(() => page.evaluate(() => typeof limitsChart !== 'undefined' && limitsChart !== null)).toBe(true);
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.some(dataset => dataset.label === '5-hour remaining'))).toBe(false);
   await expect(page.locator('#limits-data-body tr').first()).toContainText('—');
+});
+
+test('shows N/A when no recent Forecast exists before a reset', async ({ page }) => {
+  await page.route('**/api/analytics?*', route => route.fulfill({
+    json: {
+      ...analyticsPayload,
+      resets: {
+        ...analyticsPayload.resets,
+        items: analyticsPayload.resets.items.map(item => ({
+          ...item,
+          forecast_chance_24h_pct: null,
+          forecast_chance_6h_pct: null,
+          forecast_sample_at: null,
+        })),
+      },
+    },
+  }));
+  await page.goto('/analytics.html');
+
+  await expect(page.locator('#resets-body tr').first().locator('td').last()).toHaveText('N/A');
 });
 
 test('keeps the last valid analytics payload after an API failure', async ({ page }) => {

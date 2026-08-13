@@ -16,7 +16,9 @@ reset probabilities from the independent Codex Forecast service.
 
 - Current remaining quota for the active 5-hour and weekly windows.
 - Reset dates and weekly pace compared with ideal consumption.
-- Rolling history chart generated from local snapshots.
+- Rolling history chart generated from local quota and Forecast snapshots.
+- Mouse and touch exploration by nearest time slice, with a vertical cursor and
+  one tooltip for every visible quota series at that time.
 - Automatic refresh based on the monitor collection interval.
 - Local and optional Gist-backed external modes.
 - English and French interfaces.
@@ -24,22 +26,26 @@ reset probabilities from the independent Codex Forecast service.
 - Optional global 24-hour and 6-hour reset probabilities from
   [Codex Forecast](https://codex.lunarwerx.com/).
 - No direct third-party request from the browser: the monitor fetches Forecast
-  data and publishes only the current probabilities.
+  data, stores valid observations locally, and publishes them with rolling
+  history when Gist mode is enabled.
 
 ### Advanced Analytics
 
 The local Analytics page provides:
 
-- quota history for 24 hours, 7, 30, or 90 days, one year, all retained data,
-  or a custom date range;
+- quota history, ideal weekly pace, and Forecast probabilities for 24 hours, 7,
+  30, or 90 days, one year, all retained data, or a custom date range;
 - detected 5-hour and weekly reset history, including scheduled and early
-  weekly resets;
+  weekly resets, with the last Forecast probabilities observed less than 45
+  minutes before each reset when available;
 - local token consumption from Codex, OpenCode, and Hermes;
 - uncached input, cache read, cache write, output, reasoning, and total token
   counters;
 - filtering by application and model, with GPT-5.6 models selected by default
   when available;
 - quota, token, and API-equivalent cost charts;
+- mouse and touch exploration by nearest time slice, grouping visible series
+  while preserving percentage, token, and currency units;
 - cost allocation by application, provider, and model;
 - USD estimates from the local pricing catalog and optional EUR display
   conversion;
@@ -255,15 +261,19 @@ Scripts receive:
 | Variable | Default | Accepted values | Description |
 |---|---:|---|---|
 | `LOOP_INTERVAL` | `900` | Integer from `1` to `86400` seconds | Collection cadence used by `--loop`. |
-| `HISTORY_RETENTION_HOURS` | `192` | Number from `0.25` to `8760` | Rolling `history.json` target. It is currently converted to an entry limit using the active interval. |
+| `HISTORY_RETENTION_HOURS` | `192` | Number from `0.25` to `8760` | Age-based rolling window for `history.json`; defensive limits of 10,000 entries and 16 MiB also apply. |
 | `ARCHIVE_RETENTION_DAYS` | `365` | Integer from `0` to `36500` | SQLite retention; `0` keeps data indefinitely. |
 | `CODEX_STATUS_TIMEOUT_SECONDS` | `20` | Integer from `5` to `300` | Timeout for the Codex app-server status request. |
 | `CODEX_BIN` | `codex` | Executable name or path | Codex CLI command used by the monitor. |
 | `MONITOR_DEBUG` | `0` | `0` or `1` | Enables bounded sanitized Codex and HTTP diagnostics. |
 
-The SQLite archive retains detailed quota, reset, and token data for Analytics.
-The rolling JSON history is separate and currently uses an entry count derived
-from `HISTORY_RETENTION_HOURS` and the active collection interval.
+The SQLite archive retains detailed quota, Forecast, reset, and token data for
+Analytics. Existing schema v1 and v2 archives migrate transactionally to v3 on
+their next writable monitor or `--check` run.
+The rolling JSON history is separate and retains samples according to their
+actual timestamps. Changing the collection interval does not change the time
+span requested by `HISTORY_RETENTION_HOURS`; only the defensive entry and size
+limits can shorten it.
 
 ### Token Analytics
 
@@ -297,10 +307,14 @@ OPENCODE_DB_PATH=/home/user/.local/share/opencode/opencode.db
 | Variable | Default | Accepted values | Description |
 |---|---:|---|---|
 | `CODEX_FORECAST_ENABLED` | `1` | `0` or `1` | Fetches third-party global reset probabilities once per collection cycle. |
+| `CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD` | `50` | Integer from `0` to `100` | Highlights the current 24-hour probability at or above this value. |
+| `CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD` | `25` | Integer from `0` to `100` | Highlights the current 6-hour probability at or above this value. |
 
-Forecast failures never fail quota collection. Forecast values are included only
-in the current `data.json` snapshot and optional Gist payload. They are excluded
-from `history.json` and SQLite, and stale values are hidden by the dashboard.
+Forecast failures never fail quota collection and never create placeholder
+observations. Valid values are written to `data.json`, rolling `history.json`,
+the optional Gist history, and the local SQLite archive. Both dashboard graphs
+show the 24-hour and 6-hour series; stale current values remain hidden in the
+Forecast banner.
 
 Disable all Forecast requests with:
 
@@ -330,7 +344,8 @@ cannot delay the monitor for long.
 | `GITHUB_API_URL` | `https://api.github.com` | HTTP(S) base URL without credentials or query string | Primarily available for testing or compatible API endpoints. |
 
 `GITHUB_PAT` and `GITHUB_GIST_ID` must both be configured or both be empty. The
-Gist receives the current sanitized quota snapshot and rolling quota history.
+Gist receives the current sanitized quota/Forecast snapshot and rolling
+quota/Forecast history.
 It never receives SQLite Analytics data, token usage, credentials, account
 identity, alert state, or health data.
 
@@ -354,6 +369,11 @@ These variables are normally unnecessary:
 | `TELEGRAM_API_URL` | `https://api.telegram.org` | Telegram-compatible HTTP(S) API base URL, mainly for tests. |
 | `DASHBOARD_ANALYTICS_DATABASE` | `local/runtime/usage-history.sqlite3` | Environment-only absolute database path override for `serve.sh`. |
 | `DASHBOARD_PRICING_FILE` | `TOKEN_PRICING_FILE`, then `local/pricing.json` | Environment-only absolute pricing path override for `serve.sh`. |
+| `CODEX_BIN_OVERRIDE` | empty | Environment-only override that takes precedence over `CODEX_BIN` during monitor initialization. |
+
+These three variables are process-environment overrides and are not read from
+`local/.env`. `GIST_ID` is a constant in `local/assets/dashboard.js`, while
+`serve.sh --port` and `--bind` are command-line options rather than `.env` keys.
 
 HTTP endpoint overrides must not contain credentials, query strings, or control
 characters. Use HTTPS for real services.

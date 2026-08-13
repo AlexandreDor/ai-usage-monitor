@@ -68,6 +68,7 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
 codex-usage-monitor/
 |-- local/
 |   |-- monitor.sh        # Codex usage collector, alerts, optional Gist sync
+|   |-- history.py        # Temporal history validation, retention and recovery
 |   |-- dashboard.html    # Local dashboard UI
 |   |-- analytics.html    # Local long-term limits/token analytics UI
 |   |-- analytics.py      # Read-only aggregation used by /api/analytics
@@ -171,7 +172,7 @@ chmod +x monitor.sh serve.sh
 
 Important: `serve.sh` only hosts an explicit allowlist containing the two dashboards, their local assets, the favicon, `data.json`, `history.json`, and the read-only `/api/analytics` response. The raw SQLite archive and files such as `.env`, `.alert_state`, `alert-deliveries.json`, `health.json`, locks, logs, and directory listings are never served. It does not refresh usage by itself; `monitor.sh` must also run on a loop or schedule.
 
-The compact global reset forecast on the live dashboard comes from [Codex Forecast](https://codex.lunarwerx.com/), an independent third-party service not affiliated with OpenAI. `monitor.sh` fetches its 24-hour and 6-hour probabilities once per collection cycle and adds only those percentages and their generation time to the current `data.json`. The browser never contacts Codex Forecast directly. Forecast failures are warnings only: quota snapshots, alerts and Analytics continue normally, and the dashboard shows the forecast as unavailable.
+The compact global reset forecast on the live dashboard comes from [Codex Forecast](https://codex.lunarwerx.com/), an independent third-party service not affiliated with OpenAI. `monitor.sh` fetches its 24-hour and 6-hour probabilities once per collection cycle, adds them to `data.json` and rolling `history.json`, and archives valid observations in SQLite for both live and long-term graphs. The browser never contacts Codex Forecast directly. Forecast failures are warnings only: quota snapshots, alerts and Analytics continue normally, no placeholder observation is stored, and the dashboard shows the current forecast as unavailable.
 
 ### LAN security
 
@@ -391,7 +392,7 @@ crontab -e
 Open `http://localhost:8080/analytics.html` or follow **Advanced analytics** from the live limits page. This second, local-only page provides:
 
 - limit history over 24 hours, 7/30/90 days, one year, all retained data, or custom Paris calendar dates;
-- reset markers on the limit chart and a paginated history of detected 5-hour and weekly resets (50 rows per page);
+- reset markers on the limit chart and a paginated history of detected 5-hour and weekly resets (50 rows per page), including the last Forecast probabilities observed less than 45 minutes before each reset or `N/A` when unavailable;
 - separate uncached input, cache read, cache write, output, reasoning, total and assumed-zero token counters collected from local Codex, OpenCode, and Hermes data stores;
 - token series stacked by application, with a tokens/cost API-equivalent toggle and cost per time bucket;
 - breakdowns by application, provider, and model;
@@ -632,7 +633,8 @@ Option B — Enable Pages on this repo:
 
 ## Configuration Reference
 
-All variables go in `local/.env` (copy from `local/.env.example`).
+Application variables go in `local/.env` (copy from `local/.env.example`). The
+complete template also documents process-only overrides in a separate section.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -643,7 +645,7 @@ All variables go in `local/.env` (copy from `local/.env.example`).
 | `ALERT_SCRIPT_<N>` | No | — | Absolute executable path for script rule 1..99 |
 | `ALERT_SCRIPT_<N>_EVENTS` | With matching script | — | Comma-separated threshold/reset selectors |
 | `ALERT_SCRIPT_TIMEOUT_SECONDS` | No | `30` | Per-script timeout, from `1` to `1800` seconds |
-| `HISTORY_RETENTION_HOURS` | No | `192` | Entry-count retention target, from `0.25` to `8760` hours |
+| `HISTORY_RETENTION_HOURS` | No | `192` | Age-based rolling window, from `0.25` to `8760` hours; 10,000-entry and 16 MiB defensive limits apply |
 | `ARCHIVE_RETENTION_DAYS` | No | `365` | Long-term SQLite archive retention; `0` means unlimited, maximum `36500` days |
 | `TOKEN_USAGE_SOURCES` | No | `auto` | `auto`, `none`, or a comma-separated list of `codex`, `opencode`, `hermes` |
 | `TOKEN_PRICING_FILE` | No | `local/pricing.json` | Absolute path to the validated versioned pricing catalog |
@@ -659,6 +661,8 @@ All variables go in `local/.env` (copy from `local/.env.example`).
 | `CURL_RETRY_DELAY_SECONDS` | No | `1` | Initial retry delay, from `0` to `60` seconds |
 | `MONITOR_DEBUG` | No | `0` | Set to `1` for bounded diagnostics without credentials |
 | `CODEX_FORECAST_ENABLED` | No | `1` | Fetch global 24h/6h reset probabilities from the third-party Codex Forecast service; `0` disables it |
+| `CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD` | No | `50` | Highlight the current 24-hour probability at or above this integer percentage |
+| `CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD` | No | `25` | Highlight the current 6-hour probability at or above this integer percentage |
 | `GITHUB_PAT` | No (Tier 2 only) | — | GitHub Personal Access Token (`gist` scope) |
 | `GITHUB_GIST_ID` | No (Tier 2 only) | — | ID of the Gist to update |
 | `GITHUB_API_URL` | No | `https://api.github.com` | GitHub API base URL; primarily injectable for tests |
@@ -666,7 +670,20 @@ All variables go in `local/.env` (copy from `local/.env.example`).
 
 `GITHUB_PAT`/`GITHUB_GIST_ID` and `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` must be configured as complete pairs. Python 3.9 or newer, `tzdata` with `Europe/Paris`, `curl`, and `flock` are required.
 
-When Gist synchronization is enabled, the optional `codex_forecast` object is included in the current `data.json` sent to the Gist. It is never written to `history.json` or the SQLite archive. This keeps Forecast data current-only and avoids presenting old global probabilities as historical account data.
+The following process-environment overrides are documented in
+`local/.env.example` but are deliberately not read from `local/.env`:
+
+| Variable | Default | Description |
+|---|---|---|
+| `DASHBOARD_ANALYTICS_DATABASE` | `local/runtime/usage-history.sqlite3` | Absolute SQLite path used by `serve.sh` |
+| `DASHBOARD_PRICING_FILE` | process `TOKEN_PRICING_FILE`, parsed `.env` value, then `local/pricing.json` | Absolute pricing catalog used by `serve.sh` |
+| `CODEX_BIN_OVERRIDE` | empty | Process-only override that takes precedence over `CODEX_BIN` |
+
+`GIST_ID` is a static constant in `local/assets/dashboard.js`; `serve.sh
+--port` and `--bind` are command-line options. None of these three interfaces
+is a `local/.env` key.
+
+When Gist synchronization is enabled, the optional `codex_forecast` object is included in both `data.json` and rolling `history.json`. Display thresholds stay only in the current snapshot, while probability observations and generation times are retained in history and in the independent SQLite `forecast_samples` table. Existing schema v1 and v2 archives migrate transactionally to schema v3 during the next writable monitor or `--check` run.
 
 ---
 
@@ -722,8 +739,8 @@ PRs welcome. Some ideas:
 
 - Run `tests/run.sh` for the dependency-free suite and `npm ci && npm run test:browser` for Playwright/axe-core checks.
 - CI runs Bash syntax checks, ShellCheck, the complete shell/Node suite, and Chromium browser tests.
-- History retention remains entry-count based so existing long-term data behavior is preserved. Changing the collection interval changes the effective time span represented by `HISTORY_RETENTION_HOURS`.
-- Long-term history is stored separately in `runtime/usage-history.sqlite3`: all limit points are kept for 24 hours, then the archive's retention compaction applies. Analytics uses 15-minute buckets through 48 hours, 30-minute buckets through 30 days, then hourly buckets. Token events and reconstructed resets use the same retention period without limit-series downsampling. The default retention is one year; `ARCHIVE_RETENTION_DAYS=0` keeps it indefinitely. SQLite is provided by Python's standard library; the raw archive is not served by `serve.sh` or synchronized to the Gist.
+- Rolling `history.json` retention uses the samples' actual timestamps, so changing the collection interval does not change the time span requested by `HISTORY_RETENTION_HOURS`. The 10,000-entry and 16 MiB defensive limits can shorten the available window and produce an explicit warning.
+- Long-term history is stored separately in `runtime/usage-history.sqlite3`: all limit and Forecast points are kept for 24 hours, then each series is compacted independently. Analytics uses 15-minute buckets through 48 hours, 30-minute buckets through 30 days, then hourly buckets. Token events and reconstructed resets use the same retention period without limit-series downsampling. The default retention is one year; `ARCHIVE_RETENTION_DAYS=0` keeps it indefinitely. SQLite schema v3 migrates recognized v1/v2 archives automatically. SQLite is provided by Python's standard library; the raw archive is not served by `serve.sh` or synchronized to the Gist.
 - The SQLite archive is local state, not an off-machine backup. Back it up separately if the long-term history must survive disk loss.
 - Docker should only be used when the container can access an authenticated Codex CLI config. A common setup is mounting `~/.codex` into `/root/.codex`. If `codex /status` does not work on the host, it will not work inside Docker either — authenticate first.
 - The container now performs a startup collection and exits if monitoring cannot start, so it will not keep serving stale data after the monitor dies.

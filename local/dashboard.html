@@ -8,6 +8,7 @@
   <link rel="icon" type="image/png" sizes="128x128" href="images/favicon.png">
   <link rel="stylesheet" href="assets/dashboard.css">
   <script src="assets/chart.umd.min.js" defer></script>
+  <script src="assets/chart-interactions.js" defer></script>
   <script src="assets/preferences.js" defer></script>
   <script src="assets/dashboard.js" defer></script>
 </head>
@@ -76,7 +77,7 @@
     <section class="card full history-card">
       <div class="card-label history-label" id="history-label" data-i18n="dashboard.history">History</div>
       <div id="history-error" class="history-error" role="alert" hidden></div>
-      <canvas id="history-chart"></canvas>
+      <canvas id="history-chart" class="time-slice-chart"></canvas>
     </section>
   </main>
 

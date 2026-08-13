@@ -4,12 +4,14 @@ set -euo pipefail
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 python3 "$TEST_DIR/test_alerts.py"
+python3 "$TEST_DIR/test_history.py"
 
 for test_file in "$TEST_DIR"/test_*.sh; do
   bash "$test_file"
 done
 
 if command -v node >/dev/null 2>&1; then
+  node "$TEST_DIR/test_chart_interactions.js"
   node "$TEST_DIR/test_preferences.js"
   node "$TEST_DIR/test_dashboard.js"
 else

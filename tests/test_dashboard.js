@@ -38,6 +38,8 @@ function FakeChart(_context, config) {
   this.update = () => {};
   this.destroy = () => { destroyed += 1; };
 }
+FakeChart.Interaction = { modes: {} };
+FakeChart.register = () => {};
 
 const context = vm.createContext({
   console,
@@ -59,6 +61,8 @@ const context = vm.createContext({
 
 const preferencesSource = fs.readFileSync(path.join(__dirname, '..', 'local', 'assets', 'preferences.js'), 'utf8');
 vm.runInContext(preferencesSource, context, { filename: 'preferences.js' });
+const interactionsSource = fs.readFileSync(path.join(__dirname, '..', 'local', 'assets', 'chart-interactions.js'), 'utf8');
+vm.runInContext(interactionsSource, context, { filename: 'chart-interactions.js' });
 const source = fs.readFileSync(path.join(__dirname, '..', 'local', 'assets', 'dashboard.js'), 'utf8');
 vm.runInContext(source, context, { filename: 'dashboard.js' });
 
@@ -104,6 +108,16 @@ function evaluate(expression) {
   if (evaluate(`chart.config.options.plugins.tooltip.callbacks.title([{parsed:{x:Date.parse('2026-08-03T17:30:00Z')}}])`) !== '03/08/2026 19:30') {
     fail('chart tooltip is not formatted in Paris time');
   }
+  if (evaluate('chart.config.options.interaction.mode') !== 'timeSlice') fail('dashboard does not use the shared time-slice interaction');
+  if (evaluate('chart.data.datasets.every(dataset => dataset.valueKind === "percent")') !== true) fail('dashboard datasets do not declare percent units');
+
+  const forecastPoints = evaluate(`normalizeHistory([
+    {scraped_at:'2026-08-01T00:00:00Z', five_h_pct:80, codex_forecast:{chance_24h_pct:55,chance_6h_pct:20,generated_at:'2026-08-01T00:00:00Z'}},
+    {scraped_at:'2026-08-02T00:00:00Z', five_h_pct:70},
+  ])`);
+  context.forecastPoints = forecastPoints;
+  if (evaluate('chartDatasets(forecastPoints).length') !== 5) fail('Forecast datasets are missing');
+  if (evaluate('chartDatasets(forecastPoints)[3].data[1].y') !== null) fail('missing Forecast sample did not create a chart gap');
 
   evaluate(`renderData({
     five_h_pct: 80,
@@ -127,6 +141,22 @@ function evaluate(expression) {
   if (element('forecast-24h').textContent !== '76%') fail('24-hour forecast chance is not rendered');
   if (element('forecast-6h').textContent !== '10%') fail('6-hour forecast chance is not rendered');
   if (!element('forecast-status').textContent.startsWith('Forecast updated ')) fail('forecast freshness is not rendered');
+  if (!element('forecast-24h').classList.contains('threshold-reached')) fail('fallback 24-hour threshold was not highlighted');
+  if (element('forecast-6h').classList.contains('threshold-reached')) fail('fallback 6-hour threshold highlighted below threshold');
+  if (element('forecast-24h').title !== 'Highlight threshold reached: 50%') fail('threshold highlight title is missing');
+
+  evaluate(`renderForecast({
+    sample_interval_seconds: 900,
+    codex_forecast: {
+      chance_24h_pct: 60,
+      chance_6h_pct: 35,
+      generated_at: new Date().toISOString(),
+      highlight_threshold_24h_pct: 60,
+      highlight_threshold_6h_pct: 35,
+    },
+  })`);
+  if (!element('forecast-24h').classList.contains('threshold-reached')) fail('24-hour equality did not highlight');
+  if (!element('forecast-6h').classList.contains('threshold-reached')) fail('6-hour equality did not highlight');
 
   evaluate(`renderForecast({
     sample_interval_seconds: 900,
@@ -138,6 +168,7 @@ function evaluate(expression) {
   })`);
   if (element('forecast-24h').textContent !== '--') fail('stale forecast remained visible');
   if (element('forecast-status').textContent !== 'Forecast unavailable') fail('stale forecast was not marked unavailable');
+  if (element('forecast-24h').classList.contains('threshold-reached')) fail('stale Forecast retained threshold highlight');
 
   evaluate(`renderForecast({
     sample_interval_seconds: 900,

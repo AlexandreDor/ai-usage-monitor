@@ -125,6 +125,8 @@ function renderForecast(data) {
   const forecast = data?.codex_forecast;
   const chance24h = validPct(forecast?.chance_24h_pct);
   const chance6h = validPct(forecast?.chance_6h_pct);
+  const threshold24h = validPct(forecast?.highlight_threshold_24h_pct) ?? 50;
+  const threshold6h = validPct(forecast?.highlight_threshold_6h_pct) ?? 25;
   const generatedAt = Date.parse(displayText(forecast?.generated_at, ''));
   const intervalSeconds = Number(data?.sample_interval_seconds);
   const staleAfterMs = Math.max(
@@ -138,8 +140,16 @@ function renderForecast(data) {
     && ageMs >= -5 * 60 * 1000
     && ageMs <= staleAfterMs;
 
-  document.getElementById('forecast-24h').textContent = available ? `${chance24h}%` : '--';
-  document.getElementById('forecast-6h').textContent = available ? `${chance6h}%` : '--';
+  const value24h = document.getElementById('forecast-24h');
+  const value6h = document.getElementById('forecast-6h');
+  value24h.textContent = available ? `${chance24h}%` : '--';
+  value6h.textContent = available ? `${chance6h}%` : '--';
+  const highlight24h = available && chance24h >= threshold24h;
+  const highlight6h = available && chance6h >= threshold6h;
+  value24h.classList.toggle('threshold-reached', highlight24h);
+  value6h.classList.toggle('threshold-reached', highlight6h);
+  value24h.title = highlight24h ? t('forecastThresholdReached', { value: threshold24h }) : '';
+  value6h.title = highlight6h ? t('forecastThresholdReached', { value: threshold6h }) : '';
   strip.classList.toggle('unavailable', !available);
   status.textContent = available
     ? t('forecastUpdated', { value: formatParisDateTime(generatedAt) })
@@ -179,11 +189,15 @@ function normalizeHistory(history) {
     const weekly = validPct(item.weekly_pct);
     if (!Number.isFinite(timestamp) || (fiveHour === null && weekly === null)) continue;
     const weeklyReset = Number(item.weekly_reset_at);
+    const forecast24h = validPct(item.codex_forecast?.chance_24h_pct);
+    const forecast6h = validPct(item.codex_forecast?.chance_6h_pct);
     byTimestamp.set(timestamp, {
       timestamp,
       fiveHour,
       weekly,
       weeklyReset: Number.isFinite(weeklyReset) && weeklyReset > 0 ? weeklyReset : null,
+      forecast24h,
+      forecast6h,
     });
   }
 
@@ -212,6 +226,7 @@ function chartDatasets(points) {
       tension: 0.3,
       fill: true,
       spanGaps: false,
+      valueKind: 'percent',
     },
     {
       label: t('weeklyDataset'),
@@ -223,6 +238,7 @@ function chartDatasets(points) {
       tension: 0.3,
       fill: true,
       spanGaps: false,
+      valueKind: 'percent',
     },
     {
       label: t('idealDataset'),
@@ -238,6 +254,31 @@ function chartDatasets(points) {
       tension: 0,
       fill: false,
       spanGaps: false,
+      valueKind: 'percent',
+    },
+    {
+      label: t('forecast24hDataset'),
+      data: points.map(point => ({ x: point.timestamp, y: point.forecast24h })),
+      borderColor: '#a78bfa',
+      backgroundColor: 'transparent',
+      borderWidth: 2,
+      pointRadius: points.length > 200 ? 0 : 2,
+      tension: 0.3,
+      fill: false,
+      spanGaps: false,
+      valueKind: 'percent',
+    },
+    {
+      label: t('forecast6hDataset'),
+      data: points.map(point => ({ x: point.timestamp, y: point.forecast6h })),
+      borderColor: '#fbbf24',
+      backgroundColor: 'transparent',
+      borderWidth: 2,
+      pointRadius: points.length > 200 ? 0 : 2,
+      tension: 0.3,
+      fill: false,
+      spanGaps: false,
+      valueKind: 'percent',
     },
   ];
 }
@@ -277,40 +318,47 @@ function renderHistory(history) {
 
   if (typeof Chart !== 'function') throw new Error(t('chartFailed'));
   const context = document.getElementById('history-chart').getContext('2d');
+  let options = {
+    responsive: true,
+    maintainAspectRatio: true,
+    parsing: false,
+    normalized: true,
+    animation: false,
+    scales: {
+      y: {
+        min: 0,
+        max: 100,
+        grid: { color: 'rgba(255,255,255,0.05)' },
+        ticks: { color: '#8b949e', callback: value => `${value}%` },
+      },
+      x: {
+        type: 'linear',
+        ...(timeBounds || {}),
+        grid: { color: 'rgba(255,255,255,0.05)' },
+        ticks: { color: '#8b949e', maxTicksLimit: 12, callback: formatChartTimestamp },
+      },
+    },
+    plugins: {
+      decimation: {
+        enabled: true,
+        algorithm: 'lttb',
+        samples: DECIMATION_SAMPLES,
+        threshold: DECIMATION_THRESHOLD,
+      },
+      legend: { labels: { color: '#e6edf3', boxWidth: 12 } },
+      tooltip: { callbacks: { title: items => items.length ? formatParisDateTime(items[0].parsed.x) : '' } },
+    },
+  };
+  if (typeof CodexChartInteractions === 'object') {
+    options = CodexChartInteractions.enhanceOptions(options, {
+      formatTitle: value => formatParisDateTime(value),
+      formatValue: value => `${new Intl.NumberFormat(currentLocale(), { maximumFractionDigits: 1 }).format(value)}%`,
+    });
+  }
   chart = new Chart(context, {
     type: 'line',
     data: { datasets },
-    options: {
-      responsive: true,
-      maintainAspectRatio: true,
-      parsing: false,
-      normalized: true,
-      animation: false,
-      scales: {
-        y: {
-          min: 0,
-          max: 100,
-          grid: { color: 'rgba(255,255,255,0.05)' },
-          ticks: { color: '#8b949e', callback: value => `${value}%` },
-        },
-        x: {
-          type: 'linear',
-          ...(timeBounds || {}),
-          grid: { color: 'rgba(255,255,255,0.05)' },
-          ticks: { color: '#8b949e', maxTicksLimit: 12, callback: formatChartTimestamp },
-        },
-      },
-      plugins: {
-        decimation: {
-          enabled: true,
-          algorithm: 'lttb',
-          samples: DECIMATION_SAMPLES,
-          threshold: DECIMATION_THRESHOLD,
-        },
-        legend: { labels: { color: '#e6edf3', boxWidth: 12 } },
-        tooltip: { callbacks: { title: items => items.length ? formatParisDateTime(items[0].parsed.x) : '' } },
-      },
-    },
+    options,
   });
   setHistoryError();
 }
