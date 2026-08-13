@@ -68,13 +68,14 @@ LOOP_LOG="${TEST_ROOT}/adaptive-loop"
   }
   sleep() { fake_now=$((fake_now + $1)); }
   run_once() {
-    printf '%s:%s:%s\n' "$2" "$1" "$3" >> "$LOOP_LOG"
+    printf '%s:%s:%s:%s\n' "$2" "$1" "$3" "$fake_now" >> "$LOOP_LOG"
     cycles=$((cycles + 1))
+    (( cycles != 1 )) || fake_now=$((fake_now + 120))
     (( cycles < 4 )) || exit 0
   }
   run_loop 900 0 >/dev/null
 )
-expected_loop=$'full:300:900\nlive:300:900\nlive:300:900\nfull:300:900'
+expected_loop=$'full:300:900:43200\nlive:300:900:43500\nlive:300:900:43800\nfull:300:900:44100'
 assert_eq "$expected_loop" "$(<"$LOOP_LOG")" "adaptive loop did not preserve full/live cadence"
 
 printf 'PASS: monitor dashboard activity tests\n'

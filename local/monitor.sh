@@ -2303,18 +2303,19 @@ effective_collection_interval() {
 
 run_loop() {
   local interval="$1" fail_fast="$2"
-  local now_epoch next_regular last_attempt delay effective cycle_status=0 live_due
+  local now_epoch completed_at next_regular last_attempt delay effective cycle_status=0 live_due
 
   now_epoch="$(date -u +%s)"
   effective="$(effective_collection_interval "$interval" "$now_epoch")"
+  last_attempt="$now_epoch"
   run_once "$effective" full "$interval" || cycle_status=$?
   if (( cycle_status != 0 )); then
     echo "[WARN] Scrape cycle failed, will retry at the next scheduled check"
     (( fail_fast == 1 )) && return "$cycle_status"
   fi
-  last_attempt="$(date -u +%s)"
-  delay="$(seconds_until_next_interval "$last_attempt" "$interval")"
-  next_regular=$((last_attempt + delay))
+  completed_at="$(date -u +%s)"
+  delay="$(seconds_until_next_interval "$completed_at" "$interval")"
+  next_regular=$((completed_at + delay))
   echo "[$(format_paris_now)] Next regular check at $(format_paris_timestamp "$next_regular") (in ${delay}s)..."
 
   while true; do
@@ -2322,16 +2323,17 @@ run_loop() {
     cycle_status=0
     if (( now_epoch >= next_regular )); then
       effective="$(effective_collection_interval "$interval" "$now_epoch")"
+      last_attempt="$now_epoch"
       run_once "$effective" full "$interval" || cycle_status=$?
-      last_attempt="$(date -u +%s)"
-      delay="$(seconds_until_next_interval "$last_attempt" "$interval")"
-      next_regular=$((last_attempt + delay))
+      completed_at="$(date -u +%s)"
+      delay="$(seconds_until_next_interval "$completed_at" "$interval")"
+      next_regular=$((completed_at + delay))
       echo "[$(format_paris_now)] Next regular check at $(format_paris_timestamp "$next_regular") (in ${delay}s)..."
     elif (( interval > DASHBOARD_INTERVAL_SECONDS )) \
       && dashboard_activity_recent "$now_epoch" \
       && (( now_epoch - last_attempt >= DASHBOARD_INTERVAL_SECONDS )); then
+      last_attempt="$now_epoch"
       run_once "$DASHBOARD_INTERVAL_SECONDS" live "$interval" || cycle_status=$?
-      last_attempt="$(date -u +%s)"
       echo "[$(format_paris_now)] Dashboard active; next live check is eligible in ${DASHBOARD_INTERVAL_SECONDS}s."
     else
       delay=$((next_regular - now_epoch))

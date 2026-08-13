@@ -192,7 +192,8 @@ def record_dashboard_heartbeat():
         if metadata is not None:
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
                 raise OSError("dashboard heartbeat must be a regular file owned by the current user")
-            if time.time() - metadata.st_mtime < heartbeat_coalesce_seconds:
+            heartbeat_age = time.time() - metadata.st_mtime
+            if 0 <= heartbeat_age < heartbeat_coalesce_seconds:
                 return
 
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC

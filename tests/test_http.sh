@@ -180,6 +180,14 @@ done
 assert_eq 1 "$(find "${serve_fixture}/runtime" -maxdepth 1 -type f -name 'dashboard-heartbeat' | wc -l)" "concurrent heartbeats created multiple files"
 assert_eq 0 "$(stat -c '%s' "$heartbeat_file")" "concurrent heartbeat wrote content"
 
+future_epoch=$(( $(date -u +%s) + 3600 ))
+touch -d "@${future_epoch}" "$heartbeat_file"
+future_code="$(curl --silent --request POST -H 'X-Codex-Dashboard-Activity: visible' --output /dev/null --write-out '%{http_code}' "$heartbeat_url")"
+assert_eq 204 "$future_code" "future-dated heartbeat was not repaired"
+if (( $(stat -c '%Y' "$heartbeat_file") >= future_epoch )); then
+  fail "future-dated heartbeat was incorrectly coalesced"
+fi
+
 rm -f "$heartbeat_file"
 printf 'preserve\n' > "${TEST_ROOT}/heartbeat-target"
 ln -s "${TEST_ROOT}/heartbeat-target" "$heartbeat_file"
