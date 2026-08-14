@@ -94,6 +94,43 @@ test('works offline and exposes no critical accessibility violations', async ({ 
   expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
 });
 
+test('animates changed metrics once and then returns to idle', async ({ page }) => {
+  let currentSnapshot = { ...snapshot, scraped_at: new Date().toISOString() };
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
+  await page.route('**/data.json?*', route => route.fulfill({ json: currentSnapshot }));
+  await page.route('**/history.json?*', route => route.fulfill({ json: [currentSnapshot] }));
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await page.waitForTimeout(750);
+
+  await expect.poll(() => page.evaluate(() => document.getAnimations({ subtree: true })
+    .filter(animation => animation.playState === 'running').length)).toBe(0);
+
+  currentSnapshot = { ...currentSnapshot, five_h_pct: 68, scraped_at: new Date().toISOString() };
+  await page.evaluate(() => refresh());
+  await expect(page.locator('#five-h-pct')).toHaveText('68%');
+  await expect.poll(() => page.locator('#five-h-pct').evaluate(element => element.getAnimations()
+    .some(animation => animation.playState === 'running'))).toBe(true);
+  await page.waitForTimeout(700);
+  await expect.poll(() => page.locator('#five-h-pct').evaluate(element => element.getAnimations()
+    .filter(animation => animation.playState === 'running').length)).toBe(0);
+});
+
+test('does not animate metric changes when reduced motion is requested', async ({ page }) => {
+  let currentSnapshot = { ...snapshot, scraped_at: new Date().toISOString() };
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
+  await page.route('**/data.json?*', route => route.fulfill({ json: currentSnapshot }));
+  await page.route('**/history.json?*', route => route.fulfill({ json: [currentSnapshot] }));
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+
+  currentSnapshot = { ...currentSnapshot, five_h_pct: 68, scraped_at: new Date().toISOString() };
+  await page.evaluate(() => refresh());
+  await expect(page.locator('#five-h-pct')).toHaveText('68%');
+  expect(await page.locator('#five-h-pct').evaluate(element => element.getAnimations().length)).toBe(0);
+});
+
 test('hides the freshness badge when no valid snapshot is available', async ({ page }) => {
   await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
   await page.route('**/data.json?*', route => route.fulfill({ status: 503 }));

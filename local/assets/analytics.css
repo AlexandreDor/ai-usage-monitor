@@ -323,12 +323,3 @@ td { color: #dbeafe; }
   .allocation-total span { font-size: .58rem; }
   .allocation-total strong { font-size: 1.05rem; }
 }
-
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    scroll-behavior: auto !important;
-    animation-duration: .01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: .01ms !important;
-  }
-}

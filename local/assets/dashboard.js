@@ -321,9 +321,27 @@ function setBar(barId, pctId, pct) {
   const safePct = validPct(pct);
   const bar = document.getElementById(barId);
   const value = document.getElementById(pctId);
+  const nextText = safePct === null ? '--' : `${safePct}%`;
   bar.value = safePct ?? 0;
-  value.textContent = safePct === null ? '--' : `${safePct}%`;
+  setAnimatedMetricText(value, nextText);
   value.classList.toggle('unavailable', safePct === null);
+}
+
+function setAnimatedMetricText(element, text) {
+  const changed = element.textContent !== text;
+  element.textContent = text;
+  if (!changed
+      || typeof element.animate !== 'function'
+      || (typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches)) return;
+
+  element.getAnimations().forEach(animation => animation.cancel());
+  element.animate([
+    { opacity: 0.62, transform: 'translateY(3px) scale(0.985)' },
+    { opacity: 1, transform: 'none' },
+  ], {
+    duration: 650,
+    easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
+  });
 }
 
 function renderForecast(data) {
@@ -349,8 +367,8 @@ function renderForecast(data) {
 
   const value24h = document.getElementById('forecast-24h');
   const value6h = document.getElementById('forecast-6h');
-  value24h.textContent = available ? `${chance24h}%` : '--';
-  value6h.textContent = available ? `${chance6h}%` : '--';
+  setAnimatedMetricText(value24h, available ? `${chance24h}%` : '--');
+  setAnimatedMetricText(value6h, available ? `${chance6h}%` : '--');
   const highlight24h = available && chance24h >= threshold24h;
   const highlight6h = available && chance6h >= threshold6h;
   value24h.classList.toggle('threshold-reached', highlight24h);

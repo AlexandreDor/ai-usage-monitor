@@ -84,11 +84,28 @@ function formatCost(value) {
 }
 function setCost(element, value) {
   if (!element) return;
-  element.textContent = formatCost(value);
+  setAnimatedMetricText(element, formatCost(value));
   const currency = typeof CodexPreferences === 'object' ? CodexPreferences.get().currency : 'USD';
   element.title = currency === 'EUR'
     ? t('currencyTooltip', { rate: CodexPreferences.formatRate() })
     : '';
+}
+function setAnimatedMetricText(element, text) {
+  if (!element) return;
+  const changed = element.textContent !== text;
+  element.textContent = text;
+  if (!changed
+      || typeof element.animate !== 'function'
+      || (typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches)) return;
+
+  element.getAnimations().forEach(animation => animation.cancel());
+  element.animate([
+    { opacity: 0.62, transform: 'translateY(3px) scale(0.985)' },
+    { opacity: 1, transform: 'none' },
+  ], {
+    duration: 650,
+    easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
+  });
 }
 function formatSignedPoints(value) {
   const number = Math.round((finiteNumber(value) || 0) * 1000) / 1000;
@@ -686,12 +703,12 @@ function render(payload) {
     reasoning: safeNumber(summary.reasoning_tokens),
   };
   const total = totalBillable(summary);
-  byId('input-tokens').textContent = formatTokens(fields.input);
-  byId('cache-read-tokens').textContent = formatTokens(fields.cacheRead);
-  byId('cache-write-tokens').textContent = formatTokens(fields.cacheWrite);
-  byId('output-tokens').textContent = formatTokens(fields.output);
-  byId('reasoning-tokens').textContent = formatTokens(fields.reasoning);
-  byId('total-tokens').textContent = formatTokens(total);
+  setAnimatedMetricText(byId('input-tokens'), formatTokens(fields.input));
+  setAnimatedMetricText(byId('cache-read-tokens'), formatTokens(fields.cacheRead));
+  setAnimatedMetricText(byId('cache-write-tokens'), formatTokens(fields.cacheWrite));
+  setAnimatedMetricText(byId('output-tokens'), formatTokens(fields.output));
+  setAnimatedMetricText(byId('reasoning-tokens'), formatTokens(fields.reasoning));
+  setAnimatedMetricText(byId('total-tokens'), formatTokens(total));
   byId('total-tokens').title = t('billableTokensTitle', { value: formatFullTokens(total) });
   byId('token-detail').textContent = `${formatTokens(fields.input)} ${t('input').toLowerCase()} · ${formatTokens(fields.cacheRead + fields.cacheWrite)} ${t('cache').toLowerCase()} · ${formatTokens(fields.output)} ${t('output').toLowerCase()}`;
   setCost(byId('estimated-cost'), summary.estimated_cost_usd);
@@ -705,17 +722,17 @@ function render(payload) {
   const random = weeklySummary.random || {};
   const endOfWeek = weeklySummary.end_of_week || {};
   const weeklyTotal = safeNumber(payload.resets?.weekly_total ?? safeNumber(random.count) + safeNumber(endOfWeek.count));
-  byId('weekly-reset-count').textContent = formatFullTokens(weeklyTotal);
+  setAnimatedMetricText(byId('weekly-reset-count'), formatFullTokens(weeklyTotal));
   byId('weekly-reset-impact').textContent = t('weeklyResetBreakdown', {
     random: formatFullTokens(random.count),
     regular: formatFullTokens(endOfWeek.count),
   });
-  byId('random-reset-count').textContent = formatFullTokens(random.count);
+  setAnimatedMetricText(byId('random-reset-count'), formatFullTokens(random.count));
   byId('random-reset-impact').textContent = t('randomResetImpact', {
     gained: formatPoints(random.gained_vs_ideal_pct_points),
     lost: formatPoints(random.lost_vs_ideal_pct_points),
   });
-  byId('end-week-reset-count').textContent = formatFullTokens(endOfWeek.count);
+  setAnimatedMetricText(byId('end-week-reset-count'), formatFullTokens(endOfWeek.count));
   byId('end-week-reset-impact').textContent = t('ofUnusedQuotaExpired', { value: formatPercent(endOfWeek.unused_pct_points) });
   const period = payload.period || {};
   currentPeriod = period;
