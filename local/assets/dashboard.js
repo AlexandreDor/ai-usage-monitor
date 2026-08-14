@@ -92,7 +92,9 @@ function renderSource(source) {
   if (source !== 'local' && source !== 'external') return;
   dashboardSource = source;
   document.body.dataset.dashboardSource = source;
-  document.getElementById('mode-badge').textContent = t(source);
+  const badge = document.getElementById('mode-badge');
+  badge.hidden = source === 'local';
+  badge.textContent = source === 'external' ? t(source) : '';
 }
 
 function stopFreshnessUpdate() {

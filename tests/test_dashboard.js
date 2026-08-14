@@ -118,7 +118,7 @@ function evaluate(expression) {
   fetchQueue = [new Error('data unavailable')];
   await evaluate('refresh()');
   if (evaluate('dashboardSource') !== 'local') fail('local data failure did not preserve the source mode');
-  if (element('mode-badge').textContent !== 'LOCAL') fail('local source badge was replaced by an error mode');
+  if (!element('mode-badge').hidden || element('mode-badge').textContent !== '') fail('local source badge was displayed');
   if (documentObject.body.dataset.freshness !== 'unavailable') fail('missing initial data did not remain unavailable');
   if (!element('error-banner').textContent.includes('no valid data is available')) fail('initial failure did not explain that no valid data exists');
   if (timeoutDelays[timeoutDelays.length - 1] !== 5000) fail('initial local failure did not retry after five seconds');

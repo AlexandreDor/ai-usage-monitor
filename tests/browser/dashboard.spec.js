@@ -48,7 +48,8 @@ test('signals visible local dashboard activity without affecting rendering', asy
   expect(heartbeats[0]).toEqual({ method: 'POST', header: 'visible', body: null });
   await expect.poll(() => page.evaluate(() => dashboardActiveIntervalMs)).toBe(120000);
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
-  await expect(page.locator('#mode-badge')).toHaveText('LOCAL');
+  await expect(page.locator('#mode-badge')).toBeHidden();
+  await expect(page.locator('#mode-badge')).toHaveText('');
   await expect(page.locator('#freshness-status')).toContainText('FRESH');
   await expect(page.locator('body')).toHaveAttribute('data-dashboard-source', 'local');
   await expect(page.locator('body')).toHaveAttribute('data-freshness', 'fresh');
@@ -176,7 +177,7 @@ test('keeps stale values and source through a refresh error, then recovers', asy
   failRefresh = true;
   await page.evaluate(() => refresh());
   await expect(page.locator('#error-banner')).toContainText('Refresh failed; showing the last valid data. HTTP 503');
-  await expect(page.locator('#mode-badge')).toHaveText('LOCAL');
+  await expect(page.locator('#mode-badge')).toBeHidden();
   await expect(page.locator('body')).toHaveAttribute('data-freshness', 'stale');
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
 
@@ -185,7 +186,7 @@ test('keeps stale values and source through a refresh error, then recovers', asy
   await page.evaluate(() => refresh());
   await expect(page.locator('#error-banner')).toContainText('Invalid or missing collection timestamp');
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
-  await expect(page.locator('#mode-badge')).toHaveText('LOCAL');
+  await expect(page.locator('#mode-badge')).toBeHidden();
 
   currentSnapshot = {
     ...currentSnapshot,
