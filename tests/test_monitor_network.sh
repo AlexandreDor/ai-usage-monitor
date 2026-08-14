@@ -122,7 +122,55 @@ assert_eq 2 "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.att
   "expired unarmed threshold was replayed"
 assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.1.status)" \
   "reset alert was not delivered"
+assert_eq "$unarmed_reset" \
+  "$(awk -F= '$1 == "last_notified_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "delivered reset was not reconciled into detector state"
+assert_eq 0 "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "delivered reset left its old cycle armed"
 assert_eq 3 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" \
   "stale threshold was sent after reset"
+
+# If detector state rolls back after a reset has already reached a terminal
+# journal state, the old reset is reconciled instead of pinning future threshold
+# occurrences to its expired cycle.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-reset-recovery"
+export FAKE_CURL_DISCORD_STATUS=204
+recovered_reset=2000000600
+next_reset=2000600000
+check_thresholds 100 80 unknown later '' "$recovered_reset" 2000000500 >/dev/null
+check_thresholds 100 100 unknown later '' "$next_reset" "$recovered_reset" >/dev/null
+assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.status)" \
+  "reset recovery fixture was not delivered"
+python3 - "$STATE_FILE" "$recovered_reset" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+reset_at = sys.argv[2]
+lines = []
+for line in path.read_text(encoding="utf-8").splitlines():
+    key, _, value = line.partition("=")
+    if key == "weekly_armed_reset_at":
+        value = reset_at
+    elif key == "weekly_armed_limit_id":
+        value = "default"
+    elif key == "last_notified_weekly_reset_at":
+        value = "0"
+    lines.append(f"{key}={value}")
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+check_thresholds 100 70 unknown later '' "$next_reset" "$((recovered_reset + 1))" >/dev/null
+assert_eq "$next_reset" \
+  "$(awk -F= '$1 == "weekly_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "terminal reset did not release the stale cycle"
+assert_eq 2 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]))' "$ALERT_DELIVERIES_FILE")" \
+  "post-reset threshold was not journaled"
+assert_eq threshold "$(json_field "$ALERT_DELIVERIES_FILE" alerts.1.kind)" \
+  "post-reset occurrence kind"
+assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.1.status)" \
+  "post-reset threshold was not delivered"
+assert_eq 2 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" \
+  "terminal reset was replayed instead of sending the new threshold"
 
 printf 'PASS: monitor network tests\n'
