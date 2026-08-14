@@ -6,6 +6,7 @@ const { test, expect } = require('@playwright/test');
 const VIEWPORT = { width: 1440, height: 1000 };
 const WARMUP_MS = 750;
 const SAMPLE_MS = 2_000;
+const SAMPLE_COUNT = 3;
 const TRACE_CATEGORIES = [
   'devtools.timeline',
   'blink.animations',
@@ -82,6 +83,11 @@ function countTraceEvents(events, name) {
   return events.reduce((count, event) => count + Number(event.name === name), 0);
 }
 
+function median(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
 async function runningInfiniteAnimations(page) {
   return page.evaluate(() => document.getAnimations({ subtree: true })
     .filter(animation => {
@@ -130,13 +136,25 @@ async function measureIdleRendering(page) {
 
 async function expectIdleRenderingWithinBudget(page, browser, testInfo, pageName) {
   await page.waitForTimeout(WARMUP_MS);
-  const measurements = await measureIdleRendering(page);
+  const samples = [];
+  for (let index = 0; index < SAMPLE_COUNT; index += 1) {
+    samples.push(await measureIdleRendering(page));
+  }
+  const measurements = {
+    infiniteAnimations: [...new Set(samples.flatMap(sample => sample.infiniteAnimations))],
+    paintEvents: median(samples.map(sample => sample.paintEvents)),
+    rasterTasks: median(samples.map(sample => sample.rasterTasks)),
+    pipelineDraws: median(samples.map(sample => sample.pipelineDraws)),
+    taskDurationMs: median(samples.map(sample => sample.taskDurationMs)),
+  };
   const report = {
     page: pageName,
     browserVersion: browser.version(),
     viewport: page.viewportSize(),
     warmupMs: WARMUP_MS,
     sampleMs: SAMPLE_MS,
+    sampleCount: SAMPLE_COUNT,
+    samples,
     measurements,
     budgets: BUDGETS,
   };
@@ -158,7 +176,7 @@ async function expectIdleRenderingWithinBudget(page, browser, testInfo, pageName
 
 test.use({ viewport: VIEWPORT });
 
-test('dashboard remains within the idle rendering budget', async ({ page, browser }, testInfo) => {
+test('dashboard remains within the idle rendering budget', { tag: '@performance' }, async ({ page, browser }, testInfo) => {
   await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
   await page.route('**/data.json?*', route => route.fulfill({ json: dashboardSnapshot }));
   await page.route('**/history.json?*', route => route.fulfill({ json: [dashboardSnapshot] }));
@@ -169,7 +187,7 @@ test('dashboard remains within the idle rendering budget', async ({ page, browse
   await expectIdleRenderingWithinBudget(page, browser, testInfo, 'dashboard');
 });
 
-test('analytics remains within the idle rendering budget', async ({ page, browser }, testInfo) => {
+test('analytics remains within the idle rendering budget', { tag: '@performance' }, async ({ page, browser }, testInfo) => {
   await page.route('**/api/analytics?*', route => route.fulfill({ json: analyticsPayload }));
   await page.goto('/analytics.html');
   await expect(page.locator('#analytics-loading')).toBeHidden();
