@@ -4,7 +4,7 @@ Track your OpenAI Codex CLI usage limits in real time locally, with optional ext
 
 **Problem:** OpenAI already exposes Codex usage through its local app-server and in the ChatGPT Codex usage page, but those views do not give you rolling history or proactive notifications when you're running low.
 
-**Solution:** A local bash script that reads the Codex app-server on exact 15-minute boundaries, writes a `data.json` snapshot, serves a dashboard in your browser, and fires Discord or Telegram alerts directly. An optional, enabled-by-default request to the third-party Codex Forecast service adds global 24-hour and 6-hour reset probabilities; it can be disabled without affecting local quota monitoring.
+**Solution:** A local bash script that reads the Codex app-server on exact 15-minute boundaries, accelerates the current snapshot to a configurable five-minute default while a local dashboard tab is visible, serves that dashboard in your browser, and fires Discord or Telegram alerts directly. The faster live checks never densify history or Analytics. An optional, enabled-by-default request to the third-party Codex Forecast service adds global 24-hour and 6-hour reset probabilities; it can be disabled without affecting local quota monitoring.
 
 ![Codex Limits dashboard hero](local/images/hero.png)
 
@@ -170,9 +170,19 @@ chmod +x monitor.sh serve.sh
 # For trusted LAN access: ./serve.sh --bind 0.0.0.0 --port 8080
 ```
 
-Important: `serve.sh` only hosts an explicit allowlist containing the two dashboards, their local assets, the favicon, `data.json`, `history.json`, and the read-only `/api/analytics` response. The raw SQLite archive and files such as `.env`, `.alert_state`, `alert-deliveries.json`, `health.json`, locks, logs, and directory listings are never served. It does not refresh usage by itself; `monitor.sh` must also run on a loop or schedule.
+Important: `serve.sh` only hosts an explicit allowlist containing the two dashboards, their local assets, the favicon, `data.json`, `history.json`, and the read-only `/api/analytics` response. The raw SQLite archive and files such as `.env`, `.alert_state`, `alert-deliveries.json`, `health.json`, `dashboard-heartbeat`, locks, logs, and directory listings are never served. A visible local dashboard sends a bodyless heartbeat that the server records privately; `serve.sh` never starts a collection, so `monitor.sh --loop` must also be running for adaptive refreshes.
 
-The compact global reset forecast on the live dashboard comes from [Codex Forecast](https://codex.lunarwerx.com/), an independent third-party service not affiliated with OpenAI. `monitor.sh` fetches its 24-hour and 6-hour probabilities once per collection cycle, adds them to `data.json` and rolling `history.json`, and archives valid observations in SQLite for both live and long-term graphs. The browser never contacts Codex Forecast directly. Forecast failures are warnings only: quota snapshots, alerts and Analytics continue normally, no placeholder observation is stored, and the dashboard shows the current forecast as unavailable.
+The live dashboard keeps source, freshness, and refresh failures independent.
+`LOCAL` or `EXTERNAL` identifies where the last valid snapshot came from. Its
+age is calculated in the browser from `scraped_at` and
+`sample_interval_seconds`; it becomes `STALE` after the greater of two
+collection intervals or one interval plus 60 seconds. Old values remain visible
+with their total age and accumulated delay, while a failed refresh is announced
+separately. A recent successful snapshot restores the normal state
+automatically. This check does not call Analytics or require another endpoint,
+and can reveal either a stopped local monitor or an interrupted Gist update.
+
+The compact global reset forecast on the live dashboard comes from [Codex Forecast](https://codex.lunarwerx.com/), an independent third-party service not affiliated with OpenAI. `monitor.sh` fetches its 24-hour and 6-hour probabilities once per full collection cycle, adds them to `data.json` and rolling `history.json`, and archives valid observations in SQLite for both live and long-term graphs. Intermediate dashboard-triggered quota checks preserve the previous valid Forecast value. The browser never contacts Codex Forecast directly. Forecast failures are warnings only: quota snapshots, alerts and Analytics continue normally, no placeholder observation is stored, and the dashboard shows the current forecast as unavailable.
 
 ### LAN security
 
@@ -195,6 +205,15 @@ Pick the simplest option that fits your environment. In every setup:
   also maintaining the local SQLite archive
 - `serve.sh` serves `dashboard.html`, `analytics.html`, and the local read-only analytics API
 
+Run `./monitor.sh --help` (or `-h`) for the integrated command reference. It
+returns `0` without loading `.env`, checking dependencies, creating runtime
+files, or contacting Codex. The `--once`, `--loop`, `--check`, and
+`--status-json` modes are mutually exclusive, and `--fail-fast` is valid only
+with `--loop`. An optional `--loop [SECONDS]` value from `1` to `86400`
+overrides `LOOP_INTERVAL`; the unconfigured default is `900` seconds. Invalid
+command-line usage returns `2`, while configuration and runtime failures return
+`1`.
+
 This project is designed for local Linux-style execution. Docker is intentionally not documented as a supported runtime because the current status capture depends on an authenticated local Codex CLI environment.
 
 ### Option A: Two Local Terminals (easiest)
@@ -210,6 +229,13 @@ cd /path/to/codex-usage-monitor/local
 Loop mode reads immediately at startup, then aligns subsequent checks to the
 configured wall-clock boundaries. With `900`, checks run at `:00`, `:15`,
 `:30`, and `:45` instead of 15 minutes after the previous collection completes.
+While at least one locally served dashboard tab is visible, intermediate quota
+checks update `data.json`, the visible `Last scraped` value, and alerts every
+`DASHBOARD_ACTIVE_INTERVAL_SECONDS` (five minutes by default). They stop within 90
+seconds after all tabs are hidden or closed and never add `history.json`,
+SQLite, Forecast, token, graph, or Gist samples. A configured regular interval
+shorter than or equal to this active interval remains a complete collection
+cadence.
 
 Terminal 2:
 ```bash
@@ -401,7 +427,7 @@ Open `http://localhost:8080/analytics.html` or follow **Advanced analytics** fro
 - EUR display conversion using the local fixed rate `1 USD = 0.86 EUR`, with the active rate shown on the cost tooltip;
 - collector freshness, failures, and Hermes pre-monitor baselines.
 
-Collection runs with every monitor cycle—every 15 minutes by default—and is independent of limit retrieval. In `TOKEN_USAGE_SOURCES=auto` mode, missing or empty applications are disabled without failing the cycle. An explicitly requested missing source marks the cycle as failed/degraded.
+Token collection runs with every full monitor cycle—every 15 minutes by default—and is independent of intermediate dashboard-triggered limit retrieval. In `TOKEN_USAGE_SOURCES=auto` mode, missing or empty applications are disabled without failing the cycle. An explicitly requested missing source marks the cycle as failed/degraded.
 
 Codex and OpenCode histories are initially imported when their events have reliable dates. Existing cumulative Hermes counters become a separately displayed baseline and are excluded from dated totals. Collection only reads local usage metadata and counters; it does not read Codex authentication data or transmit analytics to the Gist.
 
@@ -653,6 +679,7 @@ complete template also documents process-only overrides in a separate section.
 | `OPENCODE_DB_PATH` | No | XDG OpenCode path | Absolute path to `opencode.db` |
 | `HERMES_DB_PATH` | No | `~/.hermes/state.db` | Absolute path to the Hermes state database |
 | `LOOP_INTERVAL` | No | `900` | Collection interval, from `1` to `86400` seconds |
+| `DASHBOARD_ACTIVE_INTERVAL_SECONDS` | No | `300` | Quota and alert interval while a local dashboard tab is visible, from `30` to `86400` seconds |
 | `CODEX_BIN` | No | `codex` | Codex CLI executable |
 | `CODEX_STATUS_TIMEOUT_SECONDS` | No | `20` | Codex app-server timeout, from `5` to `300` seconds |
 | `CURL_CONNECT_TIMEOUT_SECONDS` | No | `5` | HTTP connection timeout, from `1` to `60` seconds |

@@ -3,6 +3,8 @@
 const { test, expect } = require('@playwright/test');
 const AxeBuilder = require('@axe-core/playwright').default;
 
+const DASHBOARD_NOW = new Date('2026-08-03T17:30:31Z');
+
 const snapshot = {
   five_h_pct: 72,
   weekly_pct: 36,
@@ -13,14 +15,45 @@ const snapshot = {
   codex_forecast: {
     chance_24h_pct: 76,
     chance_6h_pct: 10,
-    generated_at: new Date().toISOString(),
+    generated_at: '2026-08-03T17:30:01Z',
   },
 };
 
 async function mockUsage(page, history = [snapshot]) {
+  await page.clock.install({ time: DASHBOARD_NOW });
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
   await page.route('**/data.json?*', route => route.fulfill({ json: snapshot }));
   await page.route('**/history.json?*', route => route.fulfill({ json: history }));
 }
+
+test('signals visible local dashboard activity without affecting rendering', async ({ page }) => {
+  await page.clock.install({ time: DASHBOARD_NOW });
+  const heartbeats = [];
+  await page.route('**/api/dashboard-heartbeat', route => {
+    heartbeats.push({
+      method: route.request().method(),
+      header: route.request().headers()['x-codex-dashboard-activity'],
+      body: route.request().postData(),
+    });
+    return route.fulfill({
+      status: 204,
+      headers: { 'X-Codex-Dashboard-Interval-Seconds': '120' },
+    });
+  });
+  await page.route('**/data.json?*', route => route.fulfill({ json: snapshot }));
+  await page.route('**/history.json?*', route => route.fulfill({ json: [snapshot] }));
+  await page.goto('/dashboard.html');
+
+  await expect.poll(() => heartbeats.length).toBe(1);
+  expect(heartbeats[0]).toEqual({ method: 'POST', header: 'visible', body: null });
+  await expect.poll(() => page.evaluate(() => dashboardActiveIntervalMs)).toBe(120000);
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await expect(page.locator('#mode-badge')).toHaveText('LOCAL');
+  await expect(page.locator('#freshness-status')).toContainText('FRESH');
+  await expect(page.locator('body')).toHaveAttribute('data-dashboard-source', 'local');
+  await expect(page.locator('body')).toHaveAttribute('data-freshness', 'fresh');
+  await expect(page.locator('#error-banner')).toBeHidden();
+});
 
 test('works offline and exposes no critical accessibility violations', async ({ page }) => {
   const externalRequests = [];
@@ -32,6 +65,14 @@ test('works offline and exposes no critical accessibility violations', async ({ 
 
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   await expect(page.locator('#weekly-pct')).toHaveText('36%');
+  await expect(page.locator('#freshness-status')).toHaveAttribute('role', 'status');
+  await expect(page.locator('#freshness-status')).toHaveAttribute('aria-live', 'polite');
+  await expect(page.locator('#freshness-status')).toHaveAttribute('aria-atomic', 'true');
+  await expect(page.locator('#freshness-status')).toHaveText('FRESH less than a minute');
+  await expect(page.locator('#freshness-badge')).toHaveText('FRESH');
+  await expect(page.locator('#freshness-badge')).toHaveClass(/badge/);
+  await expect(page.locator('#freshness-badge')).toBeVisible();
+  await expect(page.locator('#freshness-detail')).toHaveText('less than a minute');
   await expect(page.locator('#last-updated')).toHaveText('Last scraped 03/08/2026 19:30');
   await expect(page.locator('#five-h-reset')).toHaveText('03/08/2026 19:35');
   await expect(page.locator('#weekly-reset')).toHaveText('03/01/2026 13:34');
@@ -46,9 +87,121 @@ test('works offline and exposes no critical accessibility violations', async ({ 
   await expect(page.locator('.dashboard-links a').first()).toHaveAttribute('href', 'https://github.com/AlexandreDor/ai-usage-monitor');
   await expect(page.locator('.dashboard-links a').last()).toHaveAttribute('href', 'analytics.html');
   expect(externalRequests).toEqual([]);
+  await expect(page.locator('body')).not.toContainText('—');
 
   const results = await new AxeBuilder({ page }).analyze();
   expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+});
+
+test('hides the freshness badge when no valid snapshot is available', async ({ page }) => {
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
+  await page.route('**/data.json?*', route => route.fulfill({ status: 503 }));
+  await page.route('**/history.json?*', route => route.fulfill({ status: 503 }));
+  await page.goto('/dashboard.html');
+
+  await expect(page.locator('body')).toHaveAttribute('data-freshness', 'unavailable');
+  await expect(page.locator('#freshness-badge')).toBeHidden();
+  await expect(page.locator('#freshness-detail')).toHaveText('Data unavailable');
+  await expect(page.locator('#freshness-status')).toHaveText('Data unavailable');
+});
+
+test('renders fresh external Gist data with independent source and freshness states', async ({ page }) => {
+  await page.clock.install({ time: DASHBOARD_NOW });
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
+  await page.route('**/data.json?*', route => route.fulfill({ status: 503 }));
+  await page.route('https://api.github.com/gists/**', route => route.fulfill({
+    json: {
+      files: {
+        'data.json': { content: JSON.stringify(snapshot) },
+        'history.json': { content: JSON.stringify([snapshot]) },
+      },
+    },
+  }));
+  await page.goto('/dashboard.html');
+  await page.evaluate(async () => {
+    GIST_ID = 'external-fixture';
+    await refresh();
+  });
+
+  await expect(page.locator('#mode-badge')).toHaveText('EXTERNAL');
+  await expect(page.locator('body')).toHaveAttribute('data-dashboard-source', 'external');
+  await expect(page.locator('body')).toHaveAttribute('data-freshness', 'fresh');
+  await expect(page.locator('#freshness-status')).toContainText('FRESH');
+  await expect(page.locator('#error-banner')).toBeHidden();
+});
+
+test('becomes stale without a request and exposes age and collection delay', async ({ page }) => {
+  const shortIntervalSnapshot = { ...snapshot, sample_interval_seconds: 60 };
+  await page.clock.install({ time: DASHBOARD_NOW });
+  const dataRequests = [];
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
+  await page.route('**/data.json?*', route => {
+    dataRequests.push(route.request().url());
+    return route.fulfill({ json: shortIntervalSnapshot });
+  });
+  await page.route('**/history.json?*', route => route.fulfill({ json: [shortIntervalSnapshot] }));
+  await page.goto('/dashboard.html');
+  await expect(page.locator('body')).toHaveAttribute('data-freshness', 'fresh');
+  const requestsBefore = dataRequests.length;
+
+  await page.clock.runFor(91_000);
+
+  await expect(page.locator('body')).toHaveAttribute('data-freshness', 'stale');
+  await expect(page.locator('#freshness-status')).toContainText('STALE 2 min; collection delayed by less than a minute');
+  await expect(page.locator('#freshness-badge')).toHaveText('STALE');
+  await expect(page.locator('#freshness-badge')).toHaveClass(/badge/);
+  await expect(page.locator('#freshness-badge')).toBeVisible();
+  await page.locator('#language-toggle').click();
+  await expect(page.locator('#freshness-badge')).toHaveText('PÉRIMÉ');
+  await expect(page.locator('#freshness-detail')).toContainText('2 min ; collecte en retard');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  expect(dataRequests).toHaveLength(requestsBefore);
+  const results = await new AxeBuilder({ page }).analyze();
+  expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+});
+
+test('keeps stale values and source through a refresh error, then recovers', async ({ page }) => {
+  let currentSnapshot = { ...snapshot, sample_interval_seconds: 60 };
+  let failRefresh = false;
+  await page.clock.install({ time: DASHBOARD_NOW });
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
+  await page.route('**/data.json?*', route => failRefresh
+    ? route.fulfill({ status: 503 })
+    : route.fulfill({ json: currentSnapshot }));
+  await page.route('**/history.json?*', route => route.fulfill({ json: [currentSnapshot] }));
+  await page.goto('/dashboard.html');
+  await page.clock.runFor(91_000);
+  await expect(page.locator('body')).toHaveAttribute('data-freshness', 'stale');
+
+  failRefresh = true;
+  await page.evaluate(() => refresh());
+  await expect(page.locator('#error-banner')).toContainText('Refresh failed; showing the last valid data. HTTP 503');
+  await expect(page.locator('#mode-badge')).toHaveText('LOCAL');
+  await expect(page.locator('body')).toHaveAttribute('data-freshness', 'stale');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+
+  failRefresh = false;
+  currentSnapshot = { ...currentSnapshot, five_h_pct: 1, scraped_at: 'not-a-timestamp' };
+  await page.evaluate(() => refresh());
+  await expect(page.locator('#error-banner')).toContainText('Invalid or missing collection timestamp');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await expect(page.locator('#mode-badge')).toHaveText('LOCAL');
+
+  currentSnapshot = {
+    ...currentSnapshot,
+    five_h_pct: 68,
+    scraped_at: await page.evaluate(() => new Date().toISOString()),
+  };
+  await page.evaluate(() => refresh());
+  await expect(page.locator('#five-h-pct')).toHaveText('68%');
+  await expect(page.locator('body')).toHaveAttribute('data-freshness', 'fresh');
+  await expect(page.locator('#freshness-status')).toContainText('FRESH');
+  await expect(page.locator('#error-banner')).toBeHidden();
+
+  await page.locator('#language-toggle').click();
+  await expect(page.locator('#freshness-badge')).toHaveText('À JOUR');
+  await expect(page.locator('#freshness-detail')).toHaveText('moins d’une minute');
+  await expect(page.locator('#freshness-status')).not.toContainText('—');
 });
 
 test('keeps metrics visible when Chart.js is unavailable', async ({ page }) => {
@@ -521,7 +674,8 @@ test('does not render a 5-hour series when Codex returns null', async ({ page })
 
   await expect.poll(() => page.evaluate(() => typeof limitsChart !== 'undefined' && limitsChart !== null)).toBe(true);
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.some(dataset => dataset.label === '5-hour remaining'))).toBe(false);
-  await expect(page.locator('#limits-data-body tr').first()).toContainText('—');
+  await expect(page.locator('#limits-data-body tr').first()).toContainText('-');
+  await expect(page.locator('body')).not.toContainText('—');
 });
 
 test('shows N/A when no recent Forecast exists before a reset', async ({ page }) => {

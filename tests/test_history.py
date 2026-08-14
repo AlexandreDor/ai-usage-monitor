@@ -367,6 +367,100 @@ class HistoryTests(unittest.TestCase):
             )
             self.assertTrue(all("scraped_at_epoch" not in item for item in rolling))
 
+    def test_data_only_updates_snapshot_without_touching_history(self):
+        now = 1_700_000_000
+        forecast = {
+            "chance_24h_pct": 60,
+            "chance_6h_pct": 20,
+            "generated_at": timestamp(now),
+            "highlight_threshold_24h_pct": 50,
+            "highlight_threshold_6h_pct": 25,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history_path = root / "history.json"
+            data_path = root / "data.json"
+            history_path.write_text(json.dumps([snapshot(now)]), encoding="utf-8")
+            original_history = history_path.read_bytes()
+            history.update_current_data(
+                data_path,
+                snapshot(now, five=80, codex_forecast=forecast),
+                preserve_existing_forecast=True,
+            )
+            result = history.update_current_data(
+                data_path,
+                snapshot(now + 300, five=70, sample_interval_seconds=300),
+                preserve_existing_forecast=True,
+            )
+
+            self.assertTrue(result.data_updated)
+            self.assertEqual(original_history, history_path.read_bytes())
+            current = json.loads(data_path.read_text(encoding="utf-8"))
+            self.assertEqual(70, current["five_h_pct"])
+            self.assertEqual(300, current["sample_interval_seconds"])
+            self.assertEqual(forecast, current["codex_forecast"])
+            self.assertEqual(0o600, stat.S_IMODE(data_path.stat().st_mode))
+
+    def test_data_only_replaces_forecast_and_rejects_older_snapshot(self):
+        now = 1_700_000_000
+        first_forecast = {
+            "chance_24h_pct": 60,
+            "chance_6h_pct": 20,
+            "generated_at": timestamp(now),
+        }
+        next_forecast = {
+            "chance_24h_pct": 70,
+            "chance_6h_pct": 30,
+            "generated_at": timestamp(now + 300),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            data_path = Path(directory) / "data.json"
+            history.update_current_data(
+                data_path,
+                snapshot(now, codex_forecast=first_forecast),
+                preserve_existing_forecast=True,
+            )
+            history.update_current_data(
+                data_path,
+                snapshot(now + 300, five=40, codex_forecast=next_forecast),
+                preserve_existing_forecast=True,
+            )
+            result = history.update_current_data(
+                data_path,
+                snapshot(now + 60, five=10),
+                preserve_existing_forecast=True,
+            )
+
+            self.assertFalse(result.data_updated)
+            current = json.loads(data_path.read_text(encoding="utf-8"))
+            self.assertEqual(40, current["five_h_pct"])
+            self.assertEqual(next_forecast, current["codex_forecast"])
+
+    def test_data_only_cli_does_not_require_or_repair_history(self):
+        now = 1_700_000_000
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history_path = root / "history.json"
+            data_path = root / "data.json"
+            history_path.write_text("{broken", encoding="utf-8")
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "local" / "history.py"),
+                    "--data",
+                    str(data_path),
+                    "--data-only",
+                ],
+                input=json.dumps(snapshot(now)),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(0, process.returncode, process.stderr)
+            self.assertEqual("{broken", history_path.read_text(encoding="utf-8"))
+            self.assertTrue(data_path.exists())
+
     def test_cli_reads_stdin_and_reports_validation_errors_without_traceback(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

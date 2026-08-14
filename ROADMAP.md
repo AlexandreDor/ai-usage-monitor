@@ -26,69 +26,6 @@ jusqu'à la stabilisation du socle.
 | M | Entre deux et quatre jours |
 | L | Une semaine ou plus |
 
-## P0 - Fiabilité critique
-
-### 1. Détecter les données périmées dans le dashboard principal
-
-Analytics expose déjà la fraîcheur de ses données et de ses collecteurs. Le
-dashboard principal considère encore un fichier JSON lisible comme valide quel
-que soit son âge.
-
-**Actions :**
-
-- Comparer `scraped_at` à `sample_interval_seconds`.
-- Afficher un avertissement après environ deux intervalles sans mise à jour.
-- Distinguer visuellement les états `LOCAL`, `EXTERNAL` et `STALE`.
-- Afficher l'âge réel des données dans une région `aria-live`.
-- Conserver le contexte `LOCAL` ou `EXTERNAL` des dernières valeurs valides et
-  annoncer séparément une erreur de rafraîchissement.
-
-**Critères de validation :**
-
-- Des données anciennes sont distinguées des données fraîches sans dépendre
-  uniquement de la couleur.
-- Le dashboard indique depuis combien de temps la collecte est arrêtée.
-- Une nouvelle collecte réussie restaure automatiquement l'état normal.
-- Les états frais, périmés et en erreur sont couverts par les tests navigateur.
-
-**Effort : S**
-
-### 3. Accélérer les relevés pendant la consultation du dashboard
-
-Lorsqu'un utilisateur consulte le dashboard local, le relevé principal doit être
-actualisé toutes les 5 minutes, sans augmenter la densité de l'historique ni des
-graphiques.
-
-**Actions :**
-
-- Faire signaler au serveur qu'un dashboard local est visible et actif.
-- Conserver un heartbeat borné dans `runtime/`, sans identifiant utilisateur ni
-  historique de navigation.
-- Passer temporairement la collecte des quotas à un intervalle de 5 minutes
-  lorsqu'une activité récente est détectée.
-- Mettre à jour uniquement le snapshot principal lors des relevés
-  intermédiaires.
-- Continuer à alimenter `history.json`, SQLite et les séries graphiques avec au
-  plus un point toutes les 15 minutes.
-- Revenir automatiquement à l'intervalle normal après la fermeture ou
-  l'inactivité du dashboard.
-- Limiter cette fonction au mode local ; le dashboard statique/Gist ne doit pas
-  nécessiter de callback vers le monitor.
-
-**Critères de validation :**
-
-- Un dashboard local actif obtient une nouvelle valeur au plus toutes les
-  5 minutes.
-- Une consultation prolongée ne crée jamais plus d'un point graphique par
-  tranche de 15 minutes.
-- La fermeture de la page restaure automatiquement la fréquence normale.
-- Plusieurs onglets ne provoquent ni collectes concurrentes ni multiplication
-  des points.
-- Les alertes et la détection de fraîcheur utilisent explicitement la fréquence
-  réellement applicable.
-
-**Effort : M à L**
-
 ## P1 - Robustesse et qualité
 
 ### 4. Alerter sur les mouvements de quota anormaux
@@ -261,20 +198,6 @@ en partie sur l'attribut `title`.
 
 **Effort : M**
 
-### 14. Finaliser l'aide CLI du monitor
-
-Les modes `--once`, `--loop [SECONDS]`, `--check`, `--status-json` et
-`--fail-fast` sont implémentés, mais `monitor.sh` ne fournit pas encore d'aide
-intégrée.
-
-**Actions :**
-
-- Ajouter `--help` et `-h` sans initialiser la configuration ni contacter Codex.
-- Décrire les modes, leurs incompatibilités et les valeurs par défaut.
-- Tester la sortie et le code de retour.
-
-**Effort : XS**
-
 ### 15. Mettre la documentation en cohérence
 
 **Actions :**
@@ -336,20 +259,18 @@ Ces évolutions viendront après la stabilisation des fonctions existantes :
 
 La langue et la devise configurables ainsi que les commandes `--check`,
 `--once`, `--loop`, `--status-json`, `--fail-fast`, `--bind` et `--port` ont été
-retirées de cette liste car elles sont déjà implémentées. Seule l'aide intégrée
-du monitor reste à ajouter dans l'objectif 14.
+retirées de cette liste car elles sont déjà implémentées.
 
 ## Ordre d'exécution recommandé
 
-1. Ajouter la détection des données périmées et le rafraîchissement adaptatif au
-   dashboard principal.
+1. Ajouter la détection des données périmées au dashboard principal.
 2. Détecter les anomalies de quota.
 3. Centraliser la configuration partagée.
 4. Finaliser WAL, les sauvegardes SQLite et l'empreinte du catalogue.
 5. Terminer les éléments Analytics restants.
 6. Terminer l'accessibilité du dashboard.
 7. Renforcer la CI.
-8. Ajouter l'aide CLI, corriger la documentation et préparer les releases.
+8. Corriger la documentation et préparer les releases.
 9. Réduire progressivement le script monolithique.
 10. Ajouter les évolutions P3 selon les besoins utilisateurs.
 
@@ -368,8 +289,6 @@ Une amélioration est considérée comme terminée lorsque :
 Le programme restant est terminé lorsque :
 
 - le dashboard principal détecte et annonce les données périmées ;
-- un dashboard local actif actualise le relevé principal toutes les 5 minutes
-  sans densifier les historiques ;
 - les mouvements de quota anormaux sont détectés sans confondre les resets
   légitimes ;
 - le monitor et le serveur partagent une configuration non exécutable ;

@@ -64,6 +64,7 @@ trap cleanup EXIT
 bash "$SERVE" --port 0 >/dev/null 2>&1 && fail "port zero accepted"
 bash "$SERVE" --bind localhost --port 8080 >/dev/null 2>&1 && fail "hostname bind accepted"
 bash "$SERVE" --unknown >/dev/null 2>&1 && fail "unknown CLI option accepted"
+DASHBOARD_ACTIVE_INTERVAL_SECONDS=29 bash "$SERVE" --port "$port" >/dev/null 2>&1 && fail "invalid dashboard active interval accepted"
 assert_contains "$(bash "$SERVE" --help)" 'default: 127.0.0.1' "help omits localhost default"
 
 TOKEN_PRICING_FILE="$custom_pricing" DASHBOARD_ANALYTICS_DATABASE="$analytics_database" \
@@ -92,6 +93,9 @@ for path in /monitor.sh /runtime/.alert_state /runtime/alert-deliveries.json /ru
   code="$(curl --path-as-is --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:${port}${path}")"
   assert_eq 404 "$code" "non-allowlisted path exposed: $path"
 done
+
+heartbeat_get_code="$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:${port}/api/dashboard-heartbeat")"
+assert_eq 404 "$heartbeat_get_code" "dashboard heartbeat was exposed through GET"
 
 analytics_code="$(curl --silent --output "${TEST_ROOT}/analytics-error" --write-out '%{http_code}' "http://127.0.0.1:${port}/api/analytics?range=24h")"
 assert_eq 200 "$analytics_code" "analytics API response"
@@ -124,7 +128,7 @@ server_pid=""
 serve_fixture="${TEST_ROOT}/serve-fixture"
 mkdir -p "$serve_fixture"
 cp "$SERVE" "$ROOT_DIR/local/analytics.py" "$ROOT_DIR/local/storage.py" "$ROOT_DIR/local/token_usage.py" "$serve_fixture/"
-printf "TOKEN_PRICING_FILE='%s'\n" "$custom_pricing" > "${serve_fixture}/.env"
+printf "TOKEN_PRICING_FILE='%s'\nDASHBOARD_ACTIVE_INTERVAL_SECONDS=120\n" "$custom_pricing" > "${serve_fixture}/.env"
 env_port="$(python3 - <<'PY'
 import socket
 with socket.socket() as sock:
@@ -141,5 +145,56 @@ for _ in {1..50}; do
 done
 kill -0 "$server_pid" 2>/dev/null || fail "HTTP server using .env pricing did not start"
 assert_eq 123.0 "$(json_field "${TEST_ROOT}/env-analytics" tokens.summary.estimated_cost_usd)" "pricing catalog from .env was ignored"
+
+heartbeat_url="http://127.0.0.1:${env_port}/api/dashboard-heartbeat"
+heartbeat_file="${serve_fixture}/runtime/dashboard-heartbeat"
+missing_header_code="$(curl --silent --request POST --output "${TEST_ROOT}/heartbeat-forbidden" --write-out '%{http_code}' "$heartbeat_url")"
+assert_eq 403 "$missing_header_code" "heartbeat without activity header was accepted"
+[[ ! -e "$heartbeat_file" ]] || fail "forbidden heartbeat created runtime state"
+
+body_code="$(curl --silent --request POST -H 'X-Codex-Dashboard-Activity: visible' --data 'x' --output "${TEST_ROOT}/heartbeat-body" --write-out '%{http_code}' "$heartbeat_url")"
+assert_eq 400 "$body_code" "heartbeat with a request body was accepted"
+[[ ! -e "$heartbeat_file" ]] || fail "heartbeat with a body created runtime state"
+
+unknown_post_code="$(curl --silent --request POST -H 'X-Codex-Dashboard-Activity: visible' --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:${env_port}/api/unknown")"
+assert_eq 404 "$unknown_post_code" "unknown POST route was accepted"
+
+heartbeat_headers="${TEST_ROOT}/heartbeat-headers"
+heartbeat_code="$(curl --silent --request POST -H 'X-Codex-Dashboard-Activity: visible' --dump-header "$heartbeat_headers" --output /dev/null --write-out '%{http_code}' "$heartbeat_url")"
+assert_eq 204 "$heartbeat_code" "valid dashboard heartbeat response"
+assert_contains "$(<"$heartbeat_headers")" 'X-Codex-Dashboard-Interval-Seconds: 120' "heartbeat omitted configured dashboard interval"
+assert_file "$heartbeat_file"
+assert_eq 0 "$(stat -c '%s' "$heartbeat_file")" "heartbeat file stored request data"
+assert_eq 600 "$(stat -c '%a' "$heartbeat_file")" "heartbeat permissions are not private"
+assert_eq 700 "$(stat -c '%a' "${serve_fixture}/runtime")" "runtime directory permissions are not private"
+if grep -Fiq 'Access-Control-Allow-Origin:' "$heartbeat_headers"; then
+  fail "heartbeat response enabled cross-origin access"
+fi
+
+heartbeat_pids=()
+for _ in {1..20}; do
+  curl --silent --fail --request POST -H 'X-Codex-Dashboard-Activity: visible' "$heartbeat_url" -o /dev/null &
+  heartbeat_pids+=("$!")
+done
+for heartbeat_pid in "${heartbeat_pids[@]}"; do
+  wait "$heartbeat_pid"
+done
+assert_eq 1 "$(find "${serve_fixture}/runtime" -maxdepth 1 -type f -name 'dashboard-heartbeat' | wc -l)" "concurrent heartbeats created multiple files"
+assert_eq 0 "$(stat -c '%s' "$heartbeat_file")" "concurrent heartbeat wrote content"
+
+future_epoch=$(( $(date -u +%s) + 3600 ))
+touch -d "@${future_epoch}" "$heartbeat_file"
+future_code="$(curl --silent --request POST -H 'X-Codex-Dashboard-Activity: visible' --output /dev/null --write-out '%{http_code}' "$heartbeat_url")"
+assert_eq 204 "$future_code" "future-dated heartbeat was not repaired"
+if (( $(stat -c '%Y' "$heartbeat_file") >= future_epoch )); then
+  fail "future-dated heartbeat was incorrectly coalesced"
+fi
+
+rm -f "$heartbeat_file"
+printf 'preserve\n' > "${TEST_ROOT}/heartbeat-target"
+ln -s "${TEST_ROOT}/heartbeat-target" "$heartbeat_file"
+symlink_code="$(curl --silent --request POST -H 'X-Codex-Dashboard-Activity: visible' --output "${TEST_ROOT}/heartbeat-error" --write-out '%{http_code}' "$heartbeat_url")"
+assert_eq 503 "$symlink_code" "symbolic-link heartbeat was accepted"
+assert_eq preserve "$(<"${TEST_ROOT}/heartbeat-target")" "heartbeat symlink target was modified"
 
 printf 'PASS: local HTTP server tests\n'
