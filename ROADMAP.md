@@ -111,30 +111,6 @@ créée.
 
 **Effort : M**
 
-### 9. Terminer les derniers éléments de l'interface Analytics
-
-Les graphiques, les marqueurs de reset, les séries par application, la bascule
-tokens/coût, les cartes principales et les tableaux alternatifs sont déjà en
-place. Deux éléments de la spécification initiale restent absents.
-
-**Actions :**
-
-- Ajouter une carte distincte pour les tokens associés à un modèle sans tarif.
-- Paginer côté serveur le tableau par application, fournisseur et modèle par
-  groupes de 50 lignes, avec un total et un offset bornés.
-
-**Critères de validation :**
-
-- Les tokens sans tarif restent visibles sans être ajoutés au coût estimé.
-- Un résultat de plus de 50 groupes reste navigable au clavier sans réponse API
-  démesurée.
-- L'indication existante que le coût est une estimation API et que le reasoning
-  est inclus dans l'output ne régresse pas.
-- La pagination et le changement de langue sont couverts par les tests
-  navigateur.
-
-**Effort : S**
-
 ### 12. Compléter les contrôles de qualité de la CI
 
 La CI exécute déjà les tests shell, Python, HTTP et navigateur ainsi que
@@ -252,12 +228,11 @@ retirées de cette liste car elles sont déjà implémentées.
 2. Détecter les anomalies de quota.
 3. Centraliser la configuration partagée.
 4. Finaliser WAL et les sauvegardes SQLite.
-5. Terminer les éléments Analytics restants.
-6. Terminer l'accessibilité du dashboard.
-7. Renforcer la CI.
-8. Corriger la documentation et préparer les releases.
-9. Réduire progressivement le script monolithique.
-10. Ajouter les évolutions P3 selon les besoins utilisateurs.
+5. Terminer l'accessibilité du dashboard.
+6. Renforcer la CI.
+7. Corriger la documentation et préparer les releases.
+8. Réduire progressivement le script monolithique.
+9. Ajouter les évolutions P3 selon les besoins utilisateurs.
 
 ## Définition globale de terminé
 

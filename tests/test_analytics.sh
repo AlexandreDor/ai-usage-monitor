@@ -114,6 +114,54 @@ assert_eq 2 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["limits"]
 assert_eq 45.0 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["limits"]["series"][0]["five_h_pct"])' <<<"$payload")" "limit bucket keeps the latest sample"
 assert_eq 23.28 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["limits"]["series"][0]["ideal_weekly_pct"])' <<<"$payload")" "limit bucket exposes ideal weekly pace"
 
+pagination_database="${TEST_ROOT}/analytics-pagination.sqlite3"
+python3 - "$ROOT_DIR" "$pagination_database" <<'PY'
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "local"))
+from storage import connect_database
+
+with connect_database(Path(sys.argv[2])) as connection:
+    connection.executemany(
+        """INSERT INTO token_usage_events
+           (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+           VALUES (?, 'opencode', 'unpriced-provider', ?, 1, ?)""",
+        [
+            (1785859200 + index, f"model-{index:03d}", f"pagination-{index:03d}")
+            for index in range(105)
+        ],
+    )
+PY
+
+pagination_page() {
+  local offset="$1"
+  python3 "$ROOT_DIR/local/analytics.py" \
+    --database "$pagination_database" \
+    --pricing "$ROOT_DIR/local/pricing.json" \
+    --params "{\"range\":\"24h\",\"breakdown_offset\":\"${offset}\"}" \
+    --now 1785866400
+}
+
+page_one="$(pagination_page 0)"
+page_two="$(pagination_page 50)"
+page_three="$(pagination_page 100)"
+page_clamped="$(pagination_page 9999)"
+assert_eq 50 "$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tokens"]["breakdown"]))' <<<"$page_one")" "first token breakdown page size"
+assert_eq 50 "$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tokens"]["breakdown"]))' <<<"$page_two")" "second token breakdown page size"
+assert_eq 5 "$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tokens"]["breakdown"]))' <<<"$page_three")" "last token breakdown page size"
+assert_eq '105:0:50' "$(python3 -c 'import json,sys; p=json.load(sys.stdin)["tokens"]["breakdown_pagination"]; print("{}:{}:{}".format(p["total"],p["offset"],p["limit"]))' <<<"$page_one")" "first token breakdown pagination metadata"
+assert_eq '105:50:50' "$(python3 -c 'import json,sys; p=json.load(sys.stdin)["tokens"]["breakdown_pagination"]; print("{}:{}:{}".format(p["total"],p["offset"],p["limit"]))' <<<"$page_two")" "second token breakdown pagination metadata"
+assert_eq 100 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["breakdown_pagination"]["offset"])' <<<"$page_clamped")" "excessive token breakdown offset was not clamped"
+assert_eq 'model-000:model-049' "$(python3 -c 'import json,sys; b=json.load(sys.stdin)["tokens"]["breakdown"]; print("{}:{}".format(b[0]["model"],b[-1]["model"]))' <<<"$page_one")" "first token breakdown page order"
+assert_eq 'model-050:model-099' "$(python3 -c 'import json,sys; b=json.load(sys.stdin)["tokens"]["breakdown"]; print("{}:{}".format(b[0]["model"],b[-1]["model"]))' <<<"$page_two")" "second token breakdown page order"
+assert_eq 'model-100:model-104' "$(python3 -c 'import json,sys; b=json.load(sys.stdin)["tokens"]["breakdown"]; print("{}:{}".format(b[0]["model"],b[-1]["model"]))' <<<"$page_three")" "last token breakdown page order"
+for page in "$page_one" "$page_two" "$page_three"; do
+  assert_eq '105:105:0.0' "$(python3 -c 'import json,sys; s=json.load(sys.stdin)["tokens"]["summary"]; print("{}:{}:{}".format(s["total_tokens"],s["assumed_zero_tokens"],s["estimated_cost_usd"]))' <<<"$page")" "token summary changed with breakdown page"
+done
+python3 "$ROOT_DIR/local/analytics.py" --database "$pagination_database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"range":"24h","breakdown_offset":"-1"}' --now 1785866400 >/dev/null 2>&1 && fail "negative token breakdown offset accepted"
+python3 "$ROOT_DIR/local/analytics.py" --database "$pagination_database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"range":"24h","breakdown_offset":"invalid"}' --now 1785866400 >/dev/null 2>&1 && fail "non-integer token breakdown offset accepted"
+
 filtered="$(python3 "$ROOT_DIR/local/analytics.py" \
   --database "$database" \
   --pricing "$ROOT_DIR/local/pricing.json" \

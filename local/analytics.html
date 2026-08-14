@@ -112,6 +112,11 @@
         <strong id="total-tokens">-</strong>
         <small id="token-detail" data-i18n="analytics.tokenDetail">Input, cache and output</small>
       </article>
+      <article class="metric-card assumed-zero-card">
+        <span class="metric-label" data-i18n="analytics.assumedZero">Assumed-zero tokens</span>
+        <strong id="assumed-zero-tokens">-</strong>
+        <small data-i18n="analytics.assumedZeroDescription">Models without a catalog price</small>
+      </article>
       <article class="metric-card cost-card">
         <span class="metric-label" data-i18n="analytics.apiCost">API-equivalent cost</span>
         <strong id="estimated-cost">-</strong>
@@ -186,6 +191,11 @@
           </table>
         </div>
         <p class="empty-state" id="breakdown-empty" data-i18n="analytics.noModelConsumption" hidden>No model consumption to display.</p>
+        <nav class="pagination" id="breakdown-pagination" data-i18n-aria-label="analytics.breakdownPaginationAria" aria-label="Model breakdown pagination" hidden>
+          <button type="button" id="breakdown-previous" data-i18n="analytics.previous">Previous</button>
+          <span id="breakdown-page-label" aria-live="polite"></span>
+          <button type="button" id="breakdown-next" data-i18n="analytics.next">Next</button>
+        </nav>
       </article>
 
       <article class="card analytics-card wide table-card" id="reset-history-card">
