@@ -198,20 +198,6 @@ en partie sur l'attribut `title`.
 
 **Effort : M**
 
-### 14. Finaliser l'aide CLI du monitor
-
-Les modes `--once`, `--loop [SECONDS]`, `--check`, `--status-json` et
-`--fail-fast` sont implémentés, mais `monitor.sh` ne fournit pas encore d'aide
-intégrée.
-
-**Actions :**
-
-- Ajouter `--help` et `-h` sans initialiser la configuration ni contacter Codex.
-- Décrire les modes, leurs incompatibilités et les valeurs par défaut.
-- Tester la sortie et le code de retour.
-
-**Effort : XS**
-
 ### 15. Mettre la documentation en cohérence
 
 **Actions :**
@@ -273,8 +259,7 @@ Ces évolutions viendront après la stabilisation des fonctions existantes :
 
 La langue et la devise configurables ainsi que les commandes `--check`,
 `--once`, `--loop`, `--status-json`, `--fail-fast`, `--bind` et `--port` ont été
-retirées de cette liste car elles sont déjà implémentées. Seule l'aide intégrée
-du monitor reste à ajouter dans l'objectif 14.
+retirées de cette liste car elles sont déjà implémentées.
 
 ## Ordre d'exécution recommandé
 
@@ -285,7 +270,7 @@ du monitor reste à ajouter dans l'objectif 14.
 5. Terminer les éléments Analytics restants.
 6. Terminer l'accessibilité du dashboard.
 7. Renforcer la CI.
-8. Ajouter l'aide CLI, corriger la documentation et préparer les releases.
+8. Corriger la documentation et préparer les releases.
 9. Réduire progressivement le script monolithique.
 10. Ajouter les évolutions P3 selon les besoins utilisateurs.
 

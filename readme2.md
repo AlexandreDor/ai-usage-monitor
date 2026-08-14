@@ -205,6 +205,15 @@ Pick the simplest option that fits your environment. In every setup:
   also maintaining the local SQLite archive
 - `serve.sh` serves `dashboard.html`, `analytics.html`, and the local read-only analytics API
 
+Run `./monitor.sh --help` (or `-h`) for the integrated command reference. It
+returns `0` without loading `.env`, checking dependencies, creating runtime
+files, or contacting Codex. The `--once`, `--loop`, `--check`, and
+`--status-json` modes are mutually exclusive, and `--fail-fast` is valid only
+with `--loop`. An optional `--loop [SECONDS]` value from `1` to `86400`
+overrides `LOOP_INTERVAL`; the unconfigured default is `900` seconds. Invalid
+command-line usage returns `2`, while configuration and runtime failures return
+`1`.
+
 This project is designed for local Linux-style execution. Docker is intentionally not documented as a supported runtime because the current status capture depends on an authenticated local Codex CLI environment.
 
 ### Option A: Two Local Terminals (easiest)

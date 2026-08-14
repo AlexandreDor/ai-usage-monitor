@@ -162,9 +162,14 @@ identify an interrupted Gist publication.
 | `./monitor.sh --loop --fail-fast` | Stop loop mode after the first failed cycle. |
 | `./monitor.sh --check` | Validate configuration, dependencies, paths, Codex authentication, and analytics sources without collecting data. |
 | `./monitor.sh --status-json` | Print the current sanitized Codex quota snapshot as JSON without storing it. |
+| `./monitor.sh -h` or `./monitor.sh --help` | Show the integrated command reference without loading configuration or contacting Codex. |
 
-`--fail-fast` only affects loop mode. The monitor does not currently provide a
-`--help` option.
+The mode options `--once`, `--loop`, `--check`, and `--status-json` are mutually
+exclusive. `--fail-fast` is accepted only with `--loop`. An explicit loop
+interval must be from `1` to `86400` seconds and overrides `LOOP_INTERVAL`,
+which defaults to `900`. Help and successful commands return `0`, configuration
+or runtime failures return `1`, and invalid command-line usage returns `2` with
+the help text on standard error.
 
 ## Dashboard Server Commands
 
