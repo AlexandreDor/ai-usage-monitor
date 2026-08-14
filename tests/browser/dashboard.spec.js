@@ -68,11 +68,11 @@ test('works offline and exposes no critical accessibility violations', async ({ 
   await expect(page.locator('#freshness-status')).toHaveAttribute('role', 'status');
   await expect(page.locator('#freshness-status')).toHaveAttribute('aria-live', 'polite');
   await expect(page.locator('#freshness-status')).toHaveAttribute('aria-atomic', 'true');
-  await expect(page.locator('#freshness-status')).toHaveText('FRESH data age: less than a minute');
+  await expect(page.locator('#freshness-status')).toHaveText('FRESH less than a minute');
   await expect(page.locator('#freshness-badge')).toHaveText('FRESH');
   await expect(page.locator('#freshness-badge')).toHaveClass(/badge/);
   await expect(page.locator('#freshness-badge')).toBeVisible();
-  await expect(page.locator('#freshness-detail')).toHaveText('data age: less than a minute');
+  await expect(page.locator('#freshness-detail')).toHaveText('less than a minute');
   await expect(page.locator('#last-updated')).toHaveText('Last scraped 03/08/2026 19:30');
   await expect(page.locator('#five-h-reset')).toHaveText('03/08/2026 19:35');
   await expect(page.locator('#weekly-reset')).toHaveText('03/01/2026 13:34');
@@ -147,13 +147,13 @@ test('becomes stale without a request and exposes age and collection delay', asy
   await page.clock.runFor(91_000);
 
   await expect(page.locator('body')).toHaveAttribute('data-freshness', 'stale');
-  await expect(page.locator('#freshness-status')).toContainText('STALE data age: 2 min; collection delayed by less than a minute');
+  await expect(page.locator('#freshness-status')).toContainText('STALE 2 min; collection delayed by less than a minute');
   await expect(page.locator('#freshness-badge')).toHaveText('STALE');
   await expect(page.locator('#freshness-badge')).toHaveClass(/badge/);
   await expect(page.locator('#freshness-badge')).toBeVisible();
   await page.locator('#language-toggle').click();
   await expect(page.locator('#freshness-badge')).toHaveText('PÉRIMÉ');
-  await expect(page.locator('#freshness-detail')).toContainText('âge des données');
+  await expect(page.locator('#freshness-detail')).toContainText('2 min ; collecte en retard');
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   expect(dataRequests).toHaveLength(requestsBefore);
   const results = await new AxeBuilder({ page }).analyze();
@@ -200,7 +200,7 @@ test('keeps stale values and source through a refresh error, then recovers', asy
 
   await page.locator('#language-toggle').click();
   await expect(page.locator('#freshness-badge')).toHaveText('À JOUR');
-  await expect(page.locator('#freshness-detail')).toContainText('âge des données');
+  await expect(page.locator('#freshness-detail')).toHaveText('moins d’une minute');
   await expect(page.locator('#freshness-status')).not.toContainText('—');
 });
 
