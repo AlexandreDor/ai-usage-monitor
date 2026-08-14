@@ -49,6 +49,46 @@ RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT=20
 RANDOM_WEEKLY_RESET_FULL_REFILL_PCT=98
 RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS=$((30 * 60))
 
+usage() {
+  cat <<EOF
+Usage: ./monitor.sh [--once]
+       ./monitor.sh --loop [SECONDS] [--fail-fast]
+       ./monitor.sh --check
+       ./monitor.sh --status-json
+       ./monitor.sh (-h | --help)
+
+Collect and monitor local Codex usage limits.
+
+Modes:
+  --once             Run one complete collection cycle (default mode)
+  --loop [SECONDS]   Run immediately, then continue on aligned intervals
+  --check            Validate configuration, dependencies, Codex access, and analytics sources
+  --status-json      Print a sanitized Codex quota snapshot without storing it
+
+Options:
+  --fail-fast        Stop loop mode after the first failed collection cycle
+  -h, --help         Show this help without loading configuration or contacting Codex
+
+SECONDS must be an integer from 1 to 86400. It overrides LOOP_INTERVAL for
+this process. When neither is set, the loop interval defaults to
+${DEFAULT_INTERVAL_SECONDS} seconds.
+
+The mode options --once, --loop, --check, and --status-json are mutually
+exclusive. --fail-fast can only be used with --loop.
+
+Exit status:
+  0  Success or help displayed
+  1  Configuration or runtime failure
+  2  Invalid command-line usage
+EOF
+}
+
+cli_error() {
+  printf '[ERROR] %s\n\n' "$1" >&2
+  usage >&2
+  return 2
+}
+
 load_config() {
   local line key value
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -2368,28 +2408,70 @@ run_loop() {
 }
 
 main() {
-  local interval mode=once fail_fast=0
-  initialize || return 1
-  interval="$LOOP_INTERVAL"
+  local argument interval interval_override="" interval_was_set=0 mode="" fail_fast=0
+
+  for argument in "$@"; do
+    case "$argument" in
+      -h|--help)
+        usage
+        return 0
+        ;;
+    esac
+  done
 
   while (( $# > 0 )); do
     case "$1" in
       --loop)
+        if [[ -n "$mode" ]]; then
+          cli_error "Only one of --once, --loop, --check, or --status-json may be specified." || return $?
+        fi
         mode=loop
-        if [[ -n "${2:-}" && "${2:-}" != --* ]]; then
-          interval="$2"
+        if (( $# >= 2 )) && [[ "$2" != -* ]]; then
+          interval_override="$2"
+          interval_was_set=1
           shift
         fi
         ;;
-      --status-json) mode=status_json ;;
-      --check) mode=check ;;
+      --status-json)
+        if [[ -n "$mode" ]]; then
+          cli_error "Only one of --once, --loop, --check, or --status-json may be specified." || return $?
+        fi
+        mode=status_json
+        ;;
+      --check)
+        if [[ -n "$mode" ]]; then
+          cli_error "Only one of --once, --loop, --check, or --status-json may be specified." || return $?
+        fi
+        mode=check
+        ;;
       --fail-fast) fail_fast=1 ;;
-      --once) mode=once ;;
-      *) config_error "Unknown argument: $1"; return 1 ;;
+      --once)
+        if [[ -n "$mode" ]]; then
+          cli_error "Only one of --once, --loop, --check, or --status-json may be specified." || return $?
+        fi
+        mode=once
+        ;;
+      -*) cli_error "Unknown option: $1" || return $? ;;
+      *) cli_error "Unexpected positional argument: $1" || return $? ;;
     esac
     shift
   done
 
+  mode="${mode:-once}"
+  if (( fail_fast == 1 )) && [[ "$mode" != loop ]]; then
+    cli_error "--fail-fast can only be used with --loop." || return $?
+  fi
+  if (( interval_was_set == 1 )) && ! validate_interval "$interval_override"; then
+    usage >&2
+    return 2
+  fi
+
+  initialize || return 1
+  if (( interval_was_set == 1 )); then
+    interval="$interval_override"
+  else
+    interval="$LOOP_INTERVAL"
+  fi
   validate_interval "$interval" || return 1
   if [[ "$mode" == status_json ]]; then
     fetch_status_json "$interval"
