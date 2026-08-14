@@ -2,6 +2,7 @@
 
 const ANALYTICS_REFRESH_MS = 900_000;
 const RESET_PAGE_SIZE = 50;
+const BREAKDOWN_PAGE_SIZE = 50;
 const PARIS_ZONE = 'Europe/Paris';
 const EMPTY_VALUE = '-';
 const PRICE_WARNING_PATTERN = /^No catalog price; assumed zero: (.+)$/u;
@@ -15,6 +16,8 @@ const state = {
   modelFallbackNotice: false,
   resetType: 'all',
   resetOffset: 0,
+  breakdownOffset: 0,
+  breakdownLimit: BREAKDOWN_PAGE_SIZE,
   fromDate: '',
   toDate: '',
   tokenOverlay: true,
@@ -30,6 +33,7 @@ let limitDatasets = [];
 let tokenDatasets = [];
 let lastPayload = null;
 let currentPeriod = {};
+let refreshSequence = 0;
 
 function byId(id) { return document.getElementById(id); }
 function safeNumber(value) {
@@ -167,6 +171,7 @@ function queryString() {
     reset_type: state.resetType,
     reset_offset: String(state.resetOffset),
     reset_limit: String(RESET_PAGE_SIZE),
+    breakdown_offset: String(state.breakdownOffset),
   });
   if (state.sources.length) query.set('sources', state.sources.join(','));
   if (state.models.length) query.set('models', state.models.join(','));
@@ -494,7 +499,7 @@ function renderTokens(data = {}) {
   updateTokenOverlay();
 }
 
-function renderBreakdown(items) {
+function renderBreakdown(items, paginationData) {
   const body = byId('breakdown-body');
   clearRows(body);
   const values = Array.isArray(items) ? items : [];
@@ -516,6 +521,22 @@ function renderBreakdown(items) {
     cell(row, item.pricing_status || EMPTY_VALUE, item.pricing_status === 'assumed-zero' ? 'pricing-unknown' : '');
     body.appendChild(row);
   }
+  const pagination = byId('breakdown-pagination');
+  if (!paginationData || typeof paginationData !== 'object') {
+    pagination.hidden = true;
+    byId('breakdown-page-label').textContent = '';
+    return;
+  }
+  const total = safeNumber(paginationData.total);
+  const limit = Math.max(1, safeNumber(paginationData.limit) || BREAKDOWN_PAGE_SIZE);
+  const offset = safeNumber(paginationData.offset);
+  state.breakdownOffset = offset;
+  state.breakdownLimit = limit;
+  pagination.hidden = total <= limit;
+  byId('breakdown-previous').setAttribute('aria-disabled', String(offset === 0));
+  byId('breakdown-next').setAttribute('aria-disabled', String(offset + limit >= total));
+  const first = total ? offset + 1 : 0;
+  byId('breakdown-page-label').textContent = t('pageOf', { from: first, to: Math.min(offset + limit, total), total });
 }
 
 function renderResets(data = {}) {
@@ -700,7 +721,7 @@ function render(payload) {
   currentPeriod = period;
   renderLimits(payload.limits || {});
   renderTokens(payload.tokens || {});
-  renderBreakdown(payload.tokens?.breakdown || []);
+  renderBreakdown(payload.tokens?.breakdown || [], payload.tokens?.breakdown_pagination);
   renderResets(payload.resets || {});
   renderFreshness(payload.freshness || {}, period);
   const refreshForModelFallback = updateModelOptions(payload.available?.models || []);
@@ -718,7 +739,9 @@ function refreshSchedule(payload = lastPayload) {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(refresh, Math.max(1000, nextUpdate - now));
 }
-async function refresh() {
+async function refresh({ restoreBreakdownOffsetOnError = false } = {}) {
+  const sequence = ++refreshSequence;
+  const displayedBreakdownOffset = safeNumber(lastPayload?.tokens?.breakdown_pagination?.offset);
   clearTimeout(refreshTimer);
   const loading = byId('analytics-loading');
   if (loading) loading.hidden = false;
@@ -731,13 +754,17 @@ async function refresh() {
       error.status = response.status;
       throw error;
     }
+    if (sequence !== refreshSequence) return;
     render(payload);
   } catch (error) {
+    if (sequence !== refreshSequence) return;
+    if (restoreBreakdownOffsetOnError) state.breakdownOffset = displayedBreakdownOffset;
     const message = error instanceof Error ? error.message : t('unableToLoadAnalytics');
     const localOnly = !lastPayload || error?.status === 503 || /not available|cannot be read|local mode/i.test(message);
     setMessage('analytics-local-only', localOnly ? t('localOnly') : '');
     setMessage('analytics-error', lastPayload ? `${message} · ${t('showingLastData')}` : message);
   } finally {
+    if (sequence !== refreshSequence) return;
     if (loading) loading.hidden = true;
     refreshSchedule();
   }
@@ -748,6 +775,7 @@ for (const button of document.querySelectorAll('[data-range]')) {
     document.querySelectorAll('[data-range]').forEach(item => item.classList.toggle('active', item === button));
     state.range = button.dataset.range;
     state.resetOffset = 0;
+    state.breakdownOffset = 0;
     byId('custom-dates').hidden = state.range !== 'custom';
     if (state.range !== 'custom') refresh();
   });
@@ -762,6 +790,7 @@ byId('source-filter').addEventListener('click', event => {
     state.sources = [button.dataset.filterValue];
   }
   state.resetOffset = 0;
+  state.breakdownOffset = 0;
   refresh();
 });
 byId('model-filter').addEventListener('click', event => {
@@ -774,12 +803,14 @@ byId('model-filter').addEventListener('click', event => {
     state.models = [button.dataset.filterValue];
   }
   state.resetOffset = 0;
+  state.breakdownOffset = 0;
   refresh();
 });
 byId('select-all-models').addEventListener('click', () => {
   state.models = [...state.availableModels];
   setPressedValues(byId('model-filter'), state.models);
   state.resetOffset = 0;
+  state.breakdownOffset = 0;
   refresh();
 });
 byId('select-gpt-5-6').addEventListener('click', () => {
@@ -788,16 +819,27 @@ byId('select-gpt-5-6').addEventListener('click', () => {
   state.models = gpt56;
   setPressedValues(byId('model-filter'), state.models);
   state.resetOffset = 0;
+  state.breakdownOffset = 0;
   refresh();
 });
 byId('reset-filter').addEventListener('change', event => { state.resetType = event.target.value; state.resetOffset = 0; refresh(); });
 byId('apply-dates').addEventListener('click', () => {
-  state.fromDate = byId('from-date').value; state.toDate = byId('to-date').value; state.resetOffset = 0;
+  state.fromDate = byId('from-date').value; state.toDate = byId('to-date').value; state.resetOffset = 0; state.breakdownOffset = 0;
   if (!state.fromDate || !state.toDate) { setMessage('analytics-error', t('chooseBothDates')); return; }
   refresh();
 });
 byId('resets-previous').addEventListener('click', () => { state.resetOffset = Math.max(0, state.resetOffset - RESET_PAGE_SIZE); refresh(); });
 byId('resets-next').addEventListener('click', () => { state.resetOffset += RESET_PAGE_SIZE; refresh(); });
+byId('breakdown-previous').addEventListener('click', event => {
+  if (event.currentTarget.getAttribute('aria-disabled') === 'true') return;
+  state.breakdownOffset = Math.max(0, state.breakdownOffset - state.breakdownLimit);
+  refresh({ restoreBreakdownOffsetOnError: true });
+});
+byId('breakdown-next').addEventListener('click', event => {
+  if (event.currentTarget.getAttribute('aria-disabled') === 'true') return;
+  state.breakdownOffset += state.breakdownLimit;
+  refresh({ restoreBreakdownOffsetOnError: true });
+});
 byId('toggle-token-overlay').addEventListener('click', () => {
   if (!limitPoints.length || !tokenPoints.length) return;
   state.tokenOverlay = !state.tokenOverlay;

@@ -110,11 +110,6 @@ header h1 {
   letter-spacing: 0.06em;
 }
 
-body[data-dashboard-source="local"] #mode-badge {
-  color: #bfdbfe;
-  border-color: rgba(96, 165, 250, 0.48);
-}
-
 body[data-dashboard-source="external"] #mode-badge {
   color: #d8b4fe;
   border-color: rgba(192, 132, 252, 0.48);

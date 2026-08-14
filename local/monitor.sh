@@ -1190,11 +1190,43 @@ import pathlib
 import sys
 path, kind, window, selector, cycle = sys.argv[1:]
 document = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+
 def same_cycle(value):
     return value == cycle or (value.startswith("legacy-v") and "|" in value and value.split("|", 1)[1] == cycle)
 raise SystemExit(0 if any(item["kind"] == kind and item["window"] == window
                           and item["selector"] == selector and same_cycle(item["cycle_key"])
                           and item["status"] == "pending" for item in document["alerts"]) else 1)
+PYEOF
+}
+
+journal_has_terminal_alert() {
+  local kind="$1" window="$2" selector="$3" cycle_key="$4"
+  python3 - "$ALERT_DELIVERIES_FILE" "$kind" "$window" "$selector" "$cycle_key" <<'PYEOF'
+import json
+import pathlib
+import sys
+path, kind, window, selector, cycle = sys.argv[1:]
+document = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+
+def same_cycle(value):
+    return value == cycle or (value.startswith("legacy-v") and "|" in value and value.split("|", 1)[1] == cycle)
+raise SystemExit(0 if any(item["kind"] == kind and item["window"] == window
+                          and item["selector"] == selector and same_cycle(item["cycle_key"])
+                          and item["status"] != "pending" for item in document["alerts"]) else 1)
+PYEOF
+}
+
+journal_has_pending_selector() {
+  local kind="$1" window="$2" selector="$3"
+  python3 - "$ALERT_DELIVERIES_FILE" "$kind" "$window" "$selector" <<'PYEOF'
+import json
+import pathlib
+import sys
+path, kind, window, selector = sys.argv[1:]
+document = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+raise SystemExit(0 if any(item["kind"] == kind and item["window"] == window
+                          and item["selector"] == selector and item["status"] == "pending"
+                          for item in document["alerts"]) else 1)
 PYEOF
 }
 
@@ -1377,7 +1409,9 @@ reconcile_alert_deliveries() {
     rm -f "$terminal_file"
     return 1
   fi
-  while IFS=$'\t' read -r alert_id kind window reason selector remaining reset_epoch covered; do
+  # A non-whitespace separator preserves the empty threshold-only/reset-only
+  # fields that Bash would otherwise collapse when parsing tab-separated rows.
+  while IFS=$'\x1f' read -r alert_id kind window reason selector remaining reset_epoch covered; do
     [[ -n "$alert_id" ]] || continue
     ack_ids+=("$alert_id")
     if [[ "$kind" == threshold ]]; then
@@ -1430,7 +1464,7 @@ for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
     event = item["event_data"]
     covered = ",".join(str(value) for value in event.get("covered_thresholds", []))
     print(item["alert_id"], item["kind"], item["window"], item["terminal_reason"],
-          item["selector"], event.get("remaining_pct", ""), event.get("reset_epoch", 0), covered, sep="\t")
+          item["selector"], event.get("remaining_pct", ""), event.get("reset_epoch", 0), covered, sep="\x1f")
 PYEOF
 )
   rm -f "$terminal_file"
@@ -1765,6 +1799,10 @@ check_thresholds() {
       cycle_key="limit:${limit_id}|reset:${five_h_armed_reset_at}"
       if journal_has_pending_alert reset 5h reset "$cycle_key"; then
         :
+      elif journal_has_terminal_alert reset 5h reset "$cycle_key"; then
+        # The delivery journal is authoritative if detector state was restored
+        # from an older copy after the terminal occurrence was acknowledged.
+        last_notified_5h_reset_at="$five_h_armed_reset_at"
       elif register_network_alert reset 5h reset \
         "$cycle_key" \
         "*Codex 5h limit reset.* A new usage cycle is available." \
@@ -1814,6 +1852,10 @@ check_thresholds() {
       cycle_key="limit:${limit_id}|reset:${weekly_armed_reset_at}"
       if journal_has_pending_alert reset weekly reset "$cycle_key"; then
         :
+      elif journal_has_terminal_alert reset weekly reset "$cycle_key"; then
+        # Recover from detector/journal divergence without replaying a reset or
+        # keeping its expired deadline attached to the next threshold cycle.
+        last_notified_weekly_reset_at="$weekly_armed_reset_at"
       elif register_network_alert reset weekly reset \
         "$cycle_key" \
         "*Codex weekly limit reset.* A new usage cycle is available." \
@@ -1889,44 +1931,48 @@ PYEOF
     done
     if [[ -n "$critical" ]]; then
       pending_5h_threshold="$critical"
-      if [[ "$critical" == "$original_pending" ]]; then
+      cycle_key="limit:${limit_id}|${five_h_armed_reset_at:+reset:${five_h_armed_reset_at}}"
+      [[ "$five_h_armed_reset_at" == 0 ]] && cycle_key="limit:${limit_id}|unarmed"
+      if [[ "$critical" == "$original_pending" ]] \
+        && journal_has_pending_selector threshold 5h "$critical"; then
+        : # The detector marker still has a durable occurrence to reconcile.
+      elif [[ "$critical" == "$original_pending" && "$due_5h_reset_at" != 0 ]]; then
+        : # The due reset will expire and reconcile this threshold occurrence.
+      elif journal_has_pending_alert threshold 5h "$critical" "$cycle_key"; then
         : # The immutable occurrence is already in the delivery journal.
       else
-        cycle_key="limit:${limit_id}|${five_h_armed_reset_at:+reset:${five_h_armed_reset_at}}"
-        [[ "$five_h_armed_reset_at" == 0 ]] && cycle_key="limit:${limit_id}|unarmed"
-        if journal_has_pending_alert threshold 5h "$critical" "$cycle_key"; then
-          : # Recover a crash between journal publication and detector persistence.
-        else
-          covered_json="$(python3 - "$prev_5h_pct" "$critical" "${thresholds[@]}" <<'PYEOF'
+        # A pending detector marker without a matching journal occurrence can
+        # remain after a registration failure followed by a script-state write.
+        # Recreate the durable occurrence instead of suppressing it forever.
+        covered_json="$(python3 - "$prev_5h_pct" "$critical" "${thresholds[@]}" <<'PYEOF'
 import json
 import sys
 previous, critical = map(float, sys.argv[1:3])
 print(json.dumps([int(value) for value in sys.argv[3:] if critical <= float(value) < previous]))
 PYEOF
 )"
-          registration_status=0
-          register_network_alert threshold 5h "$critical" "$cycle_key" \
-            "*Codex 5h limit at ${five_h_pct}% remaining* (crossed ${critical}% threshold). Resets at ${five_h_reset}${pace_suffix}" \
-            "{\"limit_id\":\"${limit_id}\",\"remaining_pct\":${five_h_pct},\"reset_epoch\":${five_h_armed_reset_at},\"covered_thresholds\":${covered_json}}" \
-            "$scraped_at_epoch" "$five_h_armed_reset_at" true || registration_status=$?
-          if (( registration_status == 2 )); then
-        local notified="${notified_5h_thresholds}"
-        for t in "${thresholds[@]}"; do
-          if python3 - "$prev_5h_pct" "$critical" "$t" <<'PYEOF'
+        registration_status=0
+        register_network_alert threshold 5h "$critical" "$cycle_key" \
+          "*Codex 5h limit at ${five_h_pct}% remaining* (crossed ${critical}% threshold). Resets at ${five_h_reset}${pace_suffix}" \
+          "{\"limit_id\":\"${limit_id}\",\"remaining_pct\":${five_h_pct},\"reset_epoch\":${five_h_armed_reset_at},\"covered_thresholds\":${covered_json}}" \
+          "$scraped_at_epoch" "$five_h_armed_reset_at" true || registration_status=$?
+        if (( registration_status == 2 )); then
+          local notified="${notified_5h_thresholds}"
+          for t in "${thresholds[@]}"; do
+            if python3 - "$prev_5h_pct" "$critical" "$t" <<'PYEOF'
 import sys
 raise SystemExit(0 if float(sys.argv[2]) <= float(sys.argv[3]) < float(sys.argv[1]) else 1)
 PYEOF
-          then
-            [[ ",${notified}," == *",${t},"* ]] || notified="${notified:+${notified},}${t}"
-          fi
-        done
-        notified_5h_thresholds="$notified"
-        pending_5h_threshold=""
-        prev_5h_pct="$five_h_pct"
-          elif (( registration_status != 0 )); then
-            status=1
-            ALERT_PROCESSING_ERROR="alert journal registration failed"
-          fi
+            then
+              [[ ",${notified}," == *",${t},"* ]] || notified="${notified:+${notified},}${t}"
+            fi
+          done
+          notified_5h_thresholds="$notified"
+          pending_5h_threshold=""
+          prev_5h_pct="$five_h_pct"
+        elif (( registration_status != 0 )); then
+          status=1
+          ALERT_PROCESSING_ERROR="alert journal registration failed"
         fi
       fi
     else
@@ -1950,44 +1996,47 @@ PYEOF
     done
     if [[ -n "$critical" ]]; then
       pending_weekly_threshold="$critical"
-      if [[ "$critical" == "$original_pending" ]]; then
+      cycle_key="limit:${limit_id}|${weekly_armed_reset_at:+reset:${weekly_armed_reset_at}}"
+      [[ "$weekly_armed_reset_at" == 0 ]] && cycle_key="limit:${limit_id}|unarmed"
+      if [[ "$critical" == "$original_pending" ]] \
+        && journal_has_pending_selector threshold weekly "$critical"; then
+        : # The detector marker still has a durable occurrence to reconcile.
+      elif [[ "$critical" == "$original_pending" && "$due_weekly_reset_at" != 0 ]]; then
+        : # The due reset will expire and reconcile this threshold occurrence.
+      elif journal_has_pending_alert threshold weekly "$critical" "$cycle_key"; then
         :
       else
-        cycle_key="limit:${limit_id}|${weekly_armed_reset_at:+reset:${weekly_armed_reset_at}}"
-        [[ "$weekly_armed_reset_at" == 0 ]] && cycle_key="limit:${limit_id}|unarmed"
-        if journal_has_pending_alert threshold weekly "$critical" "$cycle_key"; then
-          :
-        else
-          covered_json="$(python3 - "$prev_weekly_pct" "$critical" "${thresholds[@]}" <<'PYEOF'
+        # See the 5h path above: detector state alone is not proof that the
+        # immutable network occurrence was successfully published.
+        covered_json="$(python3 - "$prev_weekly_pct" "$critical" "${thresholds[@]}" <<'PYEOF'
 import json
 import sys
 previous, critical = map(float, sys.argv[1:3])
 print(json.dumps([int(value) for value in sys.argv[3:] if critical <= float(value) < previous]))
 PYEOF
 )"
-          registration_status=0
-          register_network_alert threshold weekly "$critical" "$cycle_key" \
-            "*Codex weekly limit at ${weekly_pct}% remaining* (crossed ${critical}% threshold). Resets ${weekly_reset}${pace_suffix}" \
-            "{\"limit_id\":\"${limit_id}\",\"remaining_pct\":${weekly_pct},\"reset_epoch\":${weekly_armed_reset_at},\"covered_thresholds\":${covered_json}}" \
-            "$scraped_at_epoch" "$weekly_armed_reset_at" true || registration_status=$?
-          if (( registration_status == 2 )); then
-        local notified="${notified_weekly_thresholds}"
-        for t in "${thresholds[@]}"; do
-          if python3 - "$prev_weekly_pct" "$critical" "$t" <<'PYEOF'
+        registration_status=0
+        register_network_alert threshold weekly "$critical" "$cycle_key" \
+          "*Codex weekly limit at ${weekly_pct}% remaining* (crossed ${critical}% threshold). Resets ${weekly_reset}${pace_suffix}" \
+          "{\"limit_id\":\"${limit_id}\",\"remaining_pct\":${weekly_pct},\"reset_epoch\":${weekly_armed_reset_at},\"covered_thresholds\":${covered_json}}" \
+          "$scraped_at_epoch" "$weekly_armed_reset_at" true || registration_status=$?
+        if (( registration_status == 2 )); then
+          local notified="${notified_weekly_thresholds}"
+          for t in "${thresholds[@]}"; do
+            if python3 - "$prev_weekly_pct" "$critical" "$t" <<'PYEOF'
 import sys
 raise SystemExit(0 if float(sys.argv[2]) <= float(sys.argv[3]) < float(sys.argv[1]) else 1)
 PYEOF
-          then
-            [[ ",${notified}," == *",${t},"* ]] || notified="${notified:+${notified},}${t}"
-          fi
-        done
-        notified_weekly_thresholds="$notified"
-        pending_weekly_threshold=""
-        prev_weekly_pct="$weekly_pct"
-          elif (( registration_status != 0 )); then
-            status=1
-            ALERT_PROCESSING_ERROR="alert journal registration failed"
-          fi
+            then
+              [[ ",${notified}," == *",${t},"* ]] || notified="${notified:+${notified},}${t}"
+            fi
+          done
+          notified_weekly_thresholds="$notified"
+          pending_weekly_threshold=""
+          prev_weekly_pct="$weekly_pct"
+        elif (( registration_status != 0 )); then
+          status=1
+          ALERT_PROCESSING_ERROR="alert journal registration failed"
         fi
       fi
     else

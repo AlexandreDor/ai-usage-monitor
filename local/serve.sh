@@ -251,7 +251,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             raw = parse_qs(split.query, keep_blank_values=True, max_num_fields=20)
             if any(len(values) != 1 for values in raw.values()):
                 raise AnalyticsError("query parameters must not be repeated")
-            allowed = {"range", "from_date", "to_date", "source", "sources", "model", "models", "reset_type", "reset_offset", "reset_limit"}
+            allowed = {"range", "from_date", "to_date", "source", "sources", "model", "models", "reset_type", "reset_offset", "reset_limit", "breakdown_offset"}
             if set(raw) - allowed:
                 raise AnalyticsError("unknown query parameter")
             params = {key: values[0] for key, values in raw.items()}
