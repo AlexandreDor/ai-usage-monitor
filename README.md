@@ -526,6 +526,13 @@ running with Gist credentials.
 - `local/assets/`: dashboard and Analytics frontend.
 - `tests/run.sh`: dependency-free shell, Python, and Node test suite.
 - `npm run test:browser`: Playwright and axe-core browser tests.
+- `npm run test:performance`: Chromium idle-rendering budgets for the live
+  dashboard and Analytics page. Each page is sampled for two seconds after a
+  short warm-up; the test checks infinite animations, paint and raster work,
+  compositor draws, and renderer task time. A JSON summary is stored with the
+  Playwright test artifacts under `test-results/`. These metrics detect
+  continuous client rendering, but do not represent a hardware-specific GPU
+  utilization percentage.
 
 Runtime files are private local state under `local/runtime/` and are ignored by
 Git. The SQLite archive is not an off-machine backup; back it up separately if

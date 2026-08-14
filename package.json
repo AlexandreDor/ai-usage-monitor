@@ -2,7 +2,8 @@
   "name": "codex-usage-monitor-tests",
   "private": true,
   "scripts": {
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "test:performance": "playwright test tests/browser/client-performance.spec.js --workers=1"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.10.2",
