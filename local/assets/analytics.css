@@ -216,7 +216,6 @@ input { display: block; min-height: 36px; margin-top: 4px; padding: 7px 10px; }
 
 .metric-card small { color: var(--muted); line-height: 1.35; }
 .metric-label { color: var(--muted); font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
-.assumed-zero-card strong { color: var(--amber); }
 .cost-card strong { color: #86efac; }
 .metric-card .period-value { font-size: 1rem; line-height: 1.35; letter-spacing: 0; }
 

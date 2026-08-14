@@ -364,8 +364,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await page.goto('/analytics.html');
 
   await expect(page.locator('#total-tokens')).toHaveText('1.73M');
-  await expect(page.locator('#assumed-zero-tokens')).toHaveText('100');
-  await expect(page.locator('#assumed-zero-tokens')).toHaveAttribute('title', '100 tokens');
+  await expect(page.locator('#assumed-zero-tokens')).toHaveCount(0);
   await expect(page.locator('#estimated-cost')).toHaveText('€9.68');
   await expect(page.locator('#allocation-total-cost')).toHaveText('€9.68');
   await expect(page.locator('#estimated-cost')).toHaveAttribute('title', 'Converted from USD using fixed rate: 1 USD = €0.86');
@@ -375,7 +374,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#random-reset-count')).toHaveText('1');
   await expect(page.locator('#random-reset-impact')).toHaveText('30.004 pts gained · 0 pts lost vs ideal pace');
   await expect(page.locator('#end-week-reset-count')).toHaveText('1');
-  await expect(page.locator('.metric-card')).toHaveCount(11);
+  await expect(page.locator('.metric-card')).toHaveCount(10);
   await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#limits-chart-card #token-metric-toggle')).toHaveCount(1);
   await expect(page.locator('#toggle-token-overlay')).toHaveAttribute('aria-pressed', 'true');

@@ -49,7 +49,6 @@ The local Analytics page provides:
 - mouse and touch exploration by nearest time slice, grouping visible series
   while preserving percentage, token, and currency units;
 - cost allocation by application, provider, and model;
-- a distinct total for tokens associated with models that have no catalog price;
 - server-side pagination of the application, provider, and model breakdown in
   fixed groups of 50 rows;
 - USD estimates from the local pricing catalog and optional EUR display
@@ -61,8 +60,8 @@ Analytics data stays in the local SQLite archive and is not synchronized to the
 Gist. Cost values are estimates, not billing statements. Reasoning tokens are a
 subset of output tokens and are not counted twice. Models without a catalog
 price remain visible and are valued at zero with a warning. Their tokens are
-reported separately and never added to the estimated cost; breakdown pagination
-does not change the period-wide token or cost totals.
+never added to the estimated cost; breakdown pagination does not change the
+period-wide token or cost totals.
 
 ### Alerts
 

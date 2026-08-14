@@ -690,9 +690,6 @@ function render(payload) {
   byId('reasoning-tokens').textContent = formatTokens(fields.reasoning);
   byId('total-tokens').textContent = formatTokens(total);
   byId('total-tokens').title = t('billableTokensTitle', { value: formatFullTokens(total) });
-  const assumedZeroTokens = safeNumber(summary.assumed_zero_tokens);
-  byId('assumed-zero-tokens').textContent = formatTokens(assumedZeroTokens);
-  byId('assumed-zero-tokens').title = t('tokenValue', { value: formatFullTokens(assumedZeroTokens) });
   byId('token-detail').textContent = `${formatTokens(fields.input)} ${t('input').toLowerCase()} · ${formatTokens(fields.cacheRead + fields.cacheWrite)} ${t('cache').toLowerCase()} · ${formatTokens(fields.output)} ${t('output').toLowerCase()}`;
   setCost(byId('estimated-cost'), summary.estimated_cost_usd);
   setCost(byId('allocation-total-cost'), summary.estimated_cost_usd);
