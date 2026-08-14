@@ -39,8 +39,8 @@
         fresh: 'FRESH',
         stale: 'STALE',
         dataUnavailable: 'Data unavailable',
-        dataAge: 'FRESH — data age: {age}',
-        staleDataAge: 'STALE — data age: {age}; collection delayed by {overdue}',
+        dataAge: 'data age: {age}',
+        staleDataAge: 'data age: {age}; collection delayed by {overdue}',
         refreshFailedWithData: 'Refresh failed; showing the last valid data. {message}',
         refreshFailedWithoutData: 'Refresh failed; no valid data is available. {message}',
         lessThanMinute: 'less than a minute',
@@ -97,7 +97,7 @@
         githubLink: 'GitHub repository',
         eyebrow: 'Local intelligence',
         heading: 'Advanced Analytics',
-        intro: 'Long-range limits, token consumption and API-equivalent cost—kept on this machine.',
+        intro: 'Long-range limits, token consumption and API-equivalent cost, kept on this machine.',
         filtersAria: 'Analytics filters',
         dateRange: 'Date range',
         applications: 'Applications',
@@ -145,7 +145,7 @@
         endWeekResets: 'End-of-week resets',
         endWeekImpactHint: 'Unused quota lost at reset',
         selectedPeriod: 'Selected period',
-        granularityUnknown: '—',
+        granularityUnknown: '-',
         codexLimits: 'Codex limits',
         longTermAvailability: 'Long-term availability',
         overlayTokens: 'Overlay tokens',
@@ -265,8 +265,8 @@
         fresh: 'À JOUR',
         stale: 'PÉRIMÉ',
         dataUnavailable: 'Données indisponibles',
-        dataAge: 'À JOUR — âge des données : {age}',
-        staleDataAge: 'PÉRIMÉ — âge des données : {age} ; collecte en retard de {overdue}',
+        dataAge: 'âge des données : {age}',
+        staleDataAge: 'âge des données : {age} ; collecte en retard de {overdue}',
         refreshFailedWithData: 'Échec du rafraîchissement ; dernières données valides affichées. {message}',
         refreshFailedWithoutData: 'Échec du rafraîchissement ; aucune donnée valide disponible. {message}',
         lessThanMinute: 'moins d’une minute',
@@ -323,7 +323,7 @@
         githubLink: 'Dépôt GitHub',
         eyebrow: 'Intelligence locale',
         heading: 'Analytics avancées',
-        intro: 'Limites à long terme, consommation de tokens et coût équivalent API — conservés sur cette machine.',
+        intro: 'Limites à long terme, consommation de tokens et coût équivalent API, conservés sur cette machine.',
         filtersAria: 'Filtres des analytics',
         dateRange: 'Période',
         applications: 'Applications',
@@ -371,7 +371,7 @@
         endWeekResets: 'Réinitialisations de fin de semaine',
         endWeekImpactHint: 'Quota inutilisé perdu à la réinitialisation',
         selectedPeriod: 'Période sélectionnée',
-        granularityUnknown: '—',
+        granularityUnknown: '-',
         codexLimits: 'Limites Codex',
         longTermAvailability: 'Disponibilité à long terme',
         overlayTokens: 'Superposer les tokens',
@@ -634,7 +634,7 @@
     },
     formatCurrency(value) {
       const usd = Number(value);
-      if (!Number.isFinite(usd)) return '—';
+      if (!Number.isFinite(usd)) return '-';
       const amount = preferences.currency === 'EUR' ? usd * USD_TO_EUR_RATE : usd;
       const fractionDigits = Math.abs(amount) < 1 ? 4 : 2;
       return new Intl.NumberFormat(locale(), {

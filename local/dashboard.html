@@ -19,7 +19,10 @@
     <div class="dashboard-status-line">
       <span class="badge" id="mode-badge">LOCAL</span>
       <span id="last-updated">-</span>
-      <span id="freshness-status" role="status" aria-live="polite" aria-atomic="true">Data unavailable</span>
+      <span id="freshness-status" role="status" aria-live="polite" aria-atomic="true">
+        <span class="badge" id="freshness-badge" hidden></span>
+        <span id="freshness-detail">Data unavailable</span>
+      </span>
     </div>
     <nav class="dashboard-links" data-i18n-aria-label="dashboard.navigationAria" aria-label="Dashboard navigation">
       <a class="nav-link external-link" href="https://github.com/AlexandreDor/ai-usage-monitor" target="_blank" rel="noopener noreferrer"><span data-i18n="dashboard.githubLink">GitHub repository</span> <span aria-hidden="true">↗</span></a>

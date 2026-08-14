@@ -114,16 +114,21 @@ function scheduleFreshnessUpdate(classification = null) {
 }
 
 function renderFreshness() {
-  const element = document.getElementById('freshness-status');
+  const badge = document.getElementById('freshness-badge');
+  const detail = document.getElementById('freshness-detail');
   if (!dashboardData) {
     document.body.dataset.freshness = 'unavailable';
-    element.textContent = t('dataUnavailable');
+    badge.hidden = true;
+    badge.textContent = '';
+    detail.textContent = t('dataUnavailable');
     stopFreshnessUpdate();
     return;
   }
   const state = classifySnapshotFreshness(dashboardData);
   document.body.dataset.freshness = state.status;
-  element.textContent = state.status === 'stale'
+  badge.hidden = false;
+  badge.textContent = t(state.status);
+  detail.textContent = state.status === 'stale'
     ? t('staleDataAge', {
       age: formatElapsedDuration(state.ageSeconds),
       overdue: formatElapsedDuration(state.lateBySeconds),
