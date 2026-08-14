@@ -525,7 +525,16 @@ running with Gist credentials.
 - `local/alerts.py`: durable network delivery journal.
 - `local/assets/`: dashboard and Analytics frontend.
 - `tests/run.sh`: dependency-free shell, Python, and Node test suite.
-- `npm run test:browser`: Playwright and axe-core browser tests.
+- `npm run test:browser`: Playwright and axe-core browser tests, excluding the
+  dedicated performance benchmarks.
+- `npm run test:performance`: Chromium idle-rendering budgets for the live
+  dashboard and Analytics page. Each page is sampled three times for two seconds
+  after a short warm-up; the median is checked for paint and raster work,
+  compositor draws, and renderer task time, while any infinite animation fails
+  the test. A JSON summary with every sample is stored with the Playwright test
+  artifacts under `test-results/`. These metrics detect continuous client
+  rendering, but do not represent a hardware-specific GPU utilization
+  percentage.
 
 Runtime files are private local state under `local/runtime/` and are ignored by
 Git. The SQLite archive is not an off-machine backup; back it up separately if
