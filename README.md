@@ -21,6 +21,8 @@ reset probabilities from the independent Codex Forecast service.
   one tooltip for every visible quota series at that time.
 - Automatic refresh based on the monitor collection interval.
 - Local and optional Gist-backed external modes.
+- Independent source, freshness, and refresh-error indicators. The last valid
+  values stay visible when collection or publication is delayed.
 - English and French interfaces.
 - EUR and USD display preferences shared across both pages.
 - Optional global 24-hour and 6-hour reset probabilities from
@@ -138,6 +140,16 @@ live checks do not write `history.json`, SQLite, Forecast or token samples, or
 the optional Gist. Hiding or closing every dashboard tab restores the regular
 cadence after at most 90 seconds. A regular `LOOP_INTERVAL` shorter than or
 equal to the active interval keeps its existing complete-cycle behavior.
+
+The live dashboard calculates snapshot freshness directly from `scraped_at` and
+`sample_interval_seconds`. It marks data stale once its age exceeds the greater
+of two collection intervals or one interval plus 60 seconds. The source remains
+`LOCAL` or `EXTERNAL`, while refresh failures appear separately and preserve the
+last valid values. The accessible status reports both total data age and, when
+stale, time past the expected update threshold. A recent successful snapshot
+clears the stale and error states automatically. This browser-side check needs
+no Analytics API or additional endpoint; in external mode it can therefore also
+identify an interrupted Gist publication.
 
 ## Monitor Commands
 

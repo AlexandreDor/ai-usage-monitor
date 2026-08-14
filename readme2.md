@@ -172,6 +172,16 @@ chmod +x monitor.sh serve.sh
 
 Important: `serve.sh` only hosts an explicit allowlist containing the two dashboards, their local assets, the favicon, `data.json`, `history.json`, and the read-only `/api/analytics` response. The raw SQLite archive and files such as `.env`, `.alert_state`, `alert-deliveries.json`, `health.json`, `dashboard-heartbeat`, locks, logs, and directory listings are never served. A visible local dashboard sends a bodyless heartbeat that the server records privately; `serve.sh` never starts a collection, so `monitor.sh --loop` must also be running for adaptive refreshes.
 
+The live dashboard keeps source, freshness, and refresh failures independent.
+`LOCAL` or `EXTERNAL` identifies where the last valid snapshot came from. Its
+age is calculated in the browser from `scraped_at` and
+`sample_interval_seconds`; it becomes `STALE` after the greater of two
+collection intervals or one interval plus 60 seconds. Old values remain visible
+with their total age and accumulated delay, while a failed refresh is announced
+separately. A recent successful snapshot restores the normal state
+automatically. This check does not call Analytics or require another endpoint,
+and can reveal either a stopped local monitor or an interrupted Gist update.
+
 The compact global reset forecast on the live dashboard comes from [Codex Forecast](https://codex.lunarwerx.com/), an independent third-party service not affiliated with OpenAI. `monitor.sh` fetches its 24-hour and 6-hour probabilities once per full collection cycle, adds them to `data.json` and rolling `history.json`, and archives valid observations in SQLite for both live and long-term graphs. Intermediate dashboard-triggered quota checks preserve the previous valid Forecast value. The browser never contacts Codex Forecast directly. Forecast failures are warnings only: quota snapshots, alerts and Analytics continue normally, no placeholder observation is stored, and the dashboard shows the current forecast as unavailable.
 
 ### LAN security

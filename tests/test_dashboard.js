@@ -53,6 +53,7 @@ const timeoutDelays = [];
 const timeoutCallbacks = [];
 const documentObject = {
   visibilityState: 'visible',
+  body: { dataset: {} },
   getElementById: element,
   addEventListener: (name, callback) => documentListeners.set(name, callback),
 };
@@ -116,7 +117,10 @@ function evaluate(expression) {
   evaluate('dashboardData = null; mainFailure = null; lastObservedScrapedAt = null; resetRefreshRetry()');
   fetchQueue = [new Error('data unavailable')];
   await evaluate('refresh()');
-  if (evaluate('dashboardMode') !== 'error') fail('local data failure did not set the visual error mode');
+  if (evaluate('dashboardSource') !== 'local') fail('local data failure did not preserve the source mode');
+  if (element('mode-badge').textContent !== 'LOCAL') fail('local source badge was replaced by an error mode');
+  if (documentObject.body.dataset.freshness !== 'unavailable') fail('missing initial data did not remain unavailable');
+  if (!element('error-banner').textContent.includes('no valid data is available')) fail('initial failure did not explain that no valid data exists');
   if (timeoutDelays[timeoutDelays.length - 1] !== 5000) fail('initial local failure did not retry after five seconds');
 
   evaluate('resetRefreshRetry()');
@@ -152,7 +156,7 @@ function evaluate(expression) {
   if (recoveredDelay < 124000 || recoveredDelay > 126000) fail('new snapshot did not restore the active refresh deadline');
   if (evaluate('refreshRetryDelayMs') !== 5000) fail('new snapshot did not reset retry backoff');
 
-  evaluate(`dashboardMode = 'local'; scheduleRefresh({scraped_at: new Date().toISOString(), sample_interval_seconds: 900})`);
+  evaluate(`renderSource('local'); scheduleRefresh({scraped_at: new Date().toISOString(), sample_interval_seconds: 900})`);
   const configuredDelay = timeoutDelays[timeoutDelays.length - 1];
   if (configuredDelay < 124000 || configuredDelay > 126000) fail('local refresh did not use the configured active interval');
   const scheduledRefresh = timeoutCallbacks[timeoutCallbacks.length - 1];
@@ -214,6 +218,38 @@ function evaluate(expression) {
   }
   if (evaluate(`formatParisDateTime('invalid')`) !== '-') fail('invalid timestamp did not use fallback');
   if (evaluate('formatParisUnixTimestamp(0)') !== '-') fail('invalid reset timestamp did not use fallback');
+
+  if (evaluate('normalizedSampleIntervalSeconds(undefined)') !== 900) fail('missing sample interval did not use the fallback');
+  if (evaluate('normalizedSampleIntervalSeconds(30)') !== 60) fail('short sample interval did not use the Analytics minimum');
+  if (evaluate('normalizedSampleIntervalSeconds(86401)') !== 900) fail('oversized sample interval did not use the fallback');
+  const thresholdAt = Date.parse('2026-08-03T12:00:00Z');
+  context.thresholdAt = thresholdAt;
+  let freshness = evaluate(`classifySnapshotFreshness(
+    {scraped_at:'2026-08-03T12:00:00Z', sample_interval_seconds:60},
+    thresholdAt + 120000
+  )`);
+  if (freshness.status !== 'fresh' || freshness.ageSeconds !== 120) fail('exact freshness threshold was not fresh');
+  freshness = evaluate(`classifySnapshotFreshness(
+    {scraped_at:'2026-08-03T12:00:00Z', sample_interval_seconds:60},
+    thresholdAt + 121000
+  )`);
+  if (freshness.status !== 'stale' || freshness.lateBySeconds !== 1) fail('stale threshold or overdue age is incorrect');
+  freshness = evaluate(`classifySnapshotFreshness(
+    {scraped_at:'2026-08-03T12:00:00Z', sample_interval_seconds:60},
+    thresholdAt - 60000
+  )`);
+  if (freshness.status !== 'fresh' || freshness.ageSeconds !== 0) fail('future timestamp did not clamp its age to zero');
+  if (evaluate(`formatElapsedDuration(59)`) !== 'less than a minute') fail('sub-minute duration is incorrect');
+  if (evaluate(`formatElapsedDuration(60)`) !== '1 min') fail('minute duration is incorrect');
+  if (evaluate(`formatElapsedDuration(3660)`) !== '1 h 1 min') fail('hour duration is incorrect');
+  if (evaluate(`formatElapsedDuration(90000)`) !== '1 d 1 h') fail('day duration is incorrect');
+  let rejectedInvalidTimestamp = false;
+  try {
+    evaluate(`classifySnapshotFreshness({scraped_at:'invalid'})`);
+  } catch (_error) {
+    rejectedInvalidTimestamp = true;
+  }
+  if (!rejectedInvalidTimestamp) fail('invalid collection timestamp was accepted');
 
   const points = evaluate(`normalizeHistory([
     {scraped_at:'2026-08-01T00:00:00Z', weekly_pct:90, weekly_reset_at:1786147200},
