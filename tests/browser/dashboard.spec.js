@@ -278,6 +278,7 @@ const analyticsPayload = {
     summary: { input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 25000, output_tokens: 200000, reasoning_tokens: 50000, events: 2, estimated_cost_usd: 11.25, assumed_zero_tokens: 100 },
     series: [{ at: '2026-08-04T00:00:00Z', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 25000, output_tokens: 200000, reasoning_tokens: 50000, estimated_cost_usd: 11.25 }],
     breakdown: [{ source: 'codex', provider: 'openai', model: 'gpt-5.6-sol', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 25000, output_tokens: 200000, estimated_cost_usd: 11.25, pricing_status: 'priced' }],
+    breakdown_pagination: { total: 1, offset: 0, limit: 50 },
   },
   resets: { total: 2, weekly_total: 2, weekly_summary: { random: { count: 1, gained_vs_ideal_pct_points: 30.004, lost_vs_ideal_pct_points: 0 }, end_of_week: { count: 1, unused_pct_points: 5 } }, offset: 0, limit: 10, items: [{ window: 'weekly', category: 'random', reset_at: '2026-08-04T08:00:00Z', observed_at: '2026-08-04T08:15:00Z', observation_delay_seconds: 900, before_pct: 28, after_pct: 100, forecast_chance_24h_pct: 64, forecast_chance_6h_pct: 22, forecast_sample_at: '2026-08-04T07:45:00Z', ideal_weekly_pace_pct: 58.004, pace_delta_pct_points: 30.004, unused_pct_points: 0 }] },
   baselines: { hermes: [{ tokens: 42 }] },
@@ -336,6 +337,20 @@ const enhancedAnalyticsPayload = {
   },
 };
 
+const paginatedBreakdown = Array.from({ length: 55 }, (_value, index) => ({
+  source: 'opencode',
+  provider: 'fixture-provider',
+  model: `fixture-model-${String(index).padStart(2, '0')}`,
+  input_tokens: index + 1,
+  cache_read_tokens: 0,
+  cache_write_tokens: 0,
+  output_tokens: 0,
+  reasoning_tokens: 0,
+  total_tokens: index + 1,
+  estimated_cost_usd: 0,
+  pricing_status: 'assumed-zero',
+}));
+
 test('renders advanced analytics and remains local', async ({ page }) => {
   const externalRequests = [];
   const analyticsQueries = [];
@@ -349,6 +364,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await page.goto('/analytics.html');
 
   await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+  await expect(page.locator('#assumed-zero-tokens')).toHaveCount(0);
   await expect(page.locator('#estimated-cost')).toHaveText('€9.68');
   await expect(page.locator('#allocation-total-cost')).toHaveText('€9.68');
   await expect(page.locator('#estimated-cost')).toHaveAttribute('title', 'Converted from USD using fixed rate: 1 USD = €0.86');
@@ -400,7 +416,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('.back-link[href="dashboard.html"]')).toHaveCount(1);
   await expect(page.locator('.analytics-nav .external-link')).toHaveAttribute('href', 'https://github.com/AlexandreDor/ai-usage-monitor');
   await expect(page.locator('.analytics-nav .external-link')).toHaveAttribute('rel', 'noopener noreferrer');
-  await expect(page.locator('#assumed-zero-tokens, #period-label, #granularity-label')).toHaveCount(0);
+  await expect(page.locator('#period-label, #granularity-label')).toHaveCount(0);
   const chartBounds = await page.evaluate(() => ({
     limitsMin: limitsChart.options.scales.x.min,
     limitsMax: limitsChart.options.scales.x.max,
@@ -565,6 +581,147 @@ test('renders detailed analytics, reset markers and cost mode by default', async
 
   await page.locator('#resets-next').click();
   await expect(page.locator('#reset-page-label')).toContainText('51–55');
+});
+
+test('paginates the model breakdown with keyboard controls and keeps localization in place', async ({ page }) => {
+  const queries = [];
+  await page.route('**/api/analytics?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    queries.push(query);
+    const requestedOffset = Number(query.get('breakdown_offset') || 0);
+    const offset = Math.min(requestedOffset, 50);
+    return route.fulfill({
+      json: {
+        ...analyticsPayload,
+        tokens: {
+          ...analyticsPayload.tokens,
+          breakdown: paginatedBreakdown.slice(offset, offset + 50),
+          breakdown_pagination: { total: 55, offset, limit: 50 },
+        },
+      },
+    });
+  });
+  await page.goto('/analytics.html');
+
+  await expect(page.locator('#breakdown-pagination')).toBeVisible();
+  await expect(page.locator('#breakdown-pagination')).toHaveAttribute('aria-label', 'Model breakdown pagination');
+  await expect(page.locator('#breakdown-page-label')).toHaveText('1–50 of 55');
+  await expect(page.locator('#breakdown-body tr')).toHaveCount(50);
+  await page.locator('#breakdown-next').focus();
+  await page.keyboard.press('Enter');
+  await expect.poll(() => queries.at(-1)?.get('breakdown_offset')).toBe('50');
+  await expect(page.locator('#breakdown-page-label')).toHaveText('51–55 of 55');
+  await expect(page.locator('#breakdown-body tr')).toHaveCount(5);
+  await expect(page.locator('#breakdown-next')).toBeDisabled();
+  await expect(page.locator('#breakdown-next')).toBeFocused();
+
+  await page.locator('#language-toggle').click();
+  await expect(page.locator('#breakdown-page-label')).toHaveText('51–55 sur 55');
+  await expect(page.locator('#breakdown-pagination')).toHaveAttribute('aria-label', 'Pagination de la ventilation par modèle');
+  await page.locator('#breakdown-previous').focus();
+  await page.keyboard.press('Space');
+  await expect.poll(() => queries.at(-1)?.get('breakdown_offset')).toBe('0');
+  await expect(page.locator('#breakdown-page-label')).toHaveText('1–50 sur 55');
+  await expect(page.locator('#breakdown-previous')).toBeFocused();
+
+  await page.locator('#breakdown-next').click();
+  await expect.poll(() => queries.at(-1)?.get('breakdown_offset')).toBe('50');
+  await page.locator('#source-filter [data-filter-value="codex"]').click();
+  await expect.poll(() => queries.at(-1)?.get('breakdown_offset')).toBe('0');
+});
+
+test('keeps the newest breakdown response when pagination requests finish out of order', async ({ page }) => {
+  const queries = [];
+  let releaseDelayedResponse;
+  let delayedResponseFinished = false;
+  const delayedResponse = new Promise(resolve => { releaseDelayedResponse = resolve; });
+  await page.route('**/api/analytics?*', async route => {
+    const query = new URL(route.request().url()).searchParams;
+    queries.push(query);
+    const offset = Number(query.get('breakdown_offset') || 0);
+    if (offset === 50) await delayedResponse;
+    await route.fulfill({
+      json: {
+        ...analyticsPayload,
+        tokens: {
+          ...analyticsPayload.tokens,
+          breakdown: paginatedBreakdown.slice(offset, offset + 50),
+          breakdown_pagination: { total: 55, offset, limit: 50 },
+        },
+      },
+    });
+    if (offset === 50) delayedResponseFinished = true;
+  });
+  await page.goto('/analytics.html');
+
+  await page.locator('#breakdown-next').click();
+  await expect.poll(() => queries.some(query => query.get('breakdown_offset') === '50')).toBe(true);
+  await page.locator('#source-filter [data-filter-value="codex"]').click();
+  await expect.poll(() => queries.at(-1)?.get('breakdown_offset')).toBe('0');
+  await expect(page.locator('#breakdown-page-label')).toHaveText('1–50 of 55');
+
+  releaseDelayedResponse();
+  await expect.poll(() => delayedResponseFinished).toBe(true);
+  await expect(page.locator('#breakdown-page-label')).toHaveText('1–50 of 55');
+  await expect(page.locator('#breakdown-body tr').first()).toContainText('fixture-model-00');
+});
+
+test('retries a failed breakdown page without skipping it', async ({ page }) => {
+  const requestedOffsets = [];
+  let pageTwoAttempts = 0;
+  await page.route('**/api/analytics?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    const offset = Number(query.get('breakdown_offset') || 0);
+    requestedOffsets.push(offset);
+    if (offset === 50 && ++pageTwoAttempts === 1) {
+      return route.fulfill({ status: 500, json: { error: 'temporary pagination failure' } });
+    }
+    return route.fulfill({
+      json: {
+        ...analyticsPayload,
+        tokens: {
+          ...analyticsPayload.tokens,
+          breakdown: paginatedBreakdown.slice(offset, offset + 50),
+          breakdown_pagination: { total: 55, offset, limit: 50 },
+        },
+      },
+    });
+  });
+  await page.goto('/analytics.html');
+
+  await page.locator('#breakdown-next').click();
+  await expect(page.locator('#analytics-error')).toContainText('temporary pagination failure');
+  await page.locator('#breakdown-next').click();
+  await expect.poll(() => requestedOffsets.slice(-2)).toEqual([50, 50]);
+  await expect(page.locator('#breakdown-page-label')).toHaveText('51–55 of 55');
+});
+
+test('keeps a filter reset on the first page when its request fails', async ({ page }) => {
+  await page.route('**/api/analytics?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    const offset = Number(query.get('breakdown_offset') || 0);
+    const sources = query.get('sources');
+    if (offset === 0 && sources === 'opencode,hermes') {
+      return route.fulfill({ status: 500, json: { error: 'temporary filter failure' } });
+    }
+    return route.fulfill({
+      json: {
+        ...analyticsPayload,
+        tokens: {
+          ...analyticsPayload.tokens,
+          breakdown: paginatedBreakdown.slice(offset, offset + 50),
+          breakdown_pagination: { total: 55, offset, limit: 50 },
+        },
+      },
+    });
+  });
+  await page.goto('/analytics.html');
+  await page.locator('#breakdown-next').click();
+  await expect(page.locator('#breakdown-page-label')).toHaveText('51–55 of 55');
+
+  await page.locator('#source-filter [data-filter-value="codex"]').click();
+  await expect(page.locator('#analytics-error')).toContainText('temporary filter failure');
+  await expect.poll(() => page.evaluate(() => new URLSearchParams(queryString()).get('breakdown_offset'))).toBe('0');
 });
 
 test('groups visible Analytics units and excludes missing values and reset markers', async ({ page }) => {
