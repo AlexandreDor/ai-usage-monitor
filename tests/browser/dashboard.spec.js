@@ -630,6 +630,100 @@ test('paginates the model breakdown with keyboard controls and keeps localizatio
   await expect.poll(() => queries.at(-1)?.get('breakdown_offset')).toBe('0');
 });
 
+test('keeps the newest breakdown response when pagination requests finish out of order', async ({ page }) => {
+  const queries = [];
+  let releaseDelayedResponse;
+  let delayedResponseFinished = false;
+  const delayedResponse = new Promise(resolve => { releaseDelayedResponse = resolve; });
+  await page.route('**/api/analytics?*', async route => {
+    const query = new URL(route.request().url()).searchParams;
+    queries.push(query);
+    const offset = Number(query.get('breakdown_offset') || 0);
+    if (offset === 50) await delayedResponse;
+    await route.fulfill({
+      json: {
+        ...analyticsPayload,
+        tokens: {
+          ...analyticsPayload.tokens,
+          breakdown: paginatedBreakdown.slice(offset, offset + 50),
+          breakdown_pagination: { total: 55, offset, limit: 50 },
+        },
+      },
+    });
+    if (offset === 50) delayedResponseFinished = true;
+  });
+  await page.goto('/analytics.html');
+
+  await page.locator('#breakdown-next').click();
+  await expect.poll(() => queries.some(query => query.get('breakdown_offset') === '50')).toBe(true);
+  await page.locator('#source-filter [data-filter-value="codex"]').click();
+  await expect.poll(() => queries.at(-1)?.get('breakdown_offset')).toBe('0');
+  await expect(page.locator('#breakdown-page-label')).toHaveText('1–50 of 55');
+
+  releaseDelayedResponse();
+  await expect.poll(() => delayedResponseFinished).toBe(true);
+  await expect(page.locator('#breakdown-page-label')).toHaveText('1–50 of 55');
+  await expect(page.locator('#breakdown-body tr').first()).toContainText('fixture-model-00');
+});
+
+test('retries a failed breakdown page without skipping it', async ({ page }) => {
+  const requestedOffsets = [];
+  let pageTwoAttempts = 0;
+  await page.route('**/api/analytics?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    const offset = Number(query.get('breakdown_offset') || 0);
+    requestedOffsets.push(offset);
+    if (offset === 50 && ++pageTwoAttempts === 1) {
+      return route.fulfill({ status: 500, json: { error: 'temporary pagination failure' } });
+    }
+    return route.fulfill({
+      json: {
+        ...analyticsPayload,
+        tokens: {
+          ...analyticsPayload.tokens,
+          breakdown: paginatedBreakdown.slice(offset, offset + 50),
+          breakdown_pagination: { total: 55, offset, limit: 50 },
+        },
+      },
+    });
+  });
+  await page.goto('/analytics.html');
+
+  await page.locator('#breakdown-next').click();
+  await expect(page.locator('#analytics-error')).toContainText('temporary pagination failure');
+  await page.locator('#breakdown-next').click();
+  await expect.poll(() => requestedOffsets.slice(-2)).toEqual([50, 50]);
+  await expect(page.locator('#breakdown-page-label')).toHaveText('51–55 of 55');
+});
+
+test('keeps a filter reset on the first page when its request fails', async ({ page }) => {
+  await page.route('**/api/analytics?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    const offset = Number(query.get('breakdown_offset') || 0);
+    const sources = query.get('sources');
+    if (offset === 0 && sources === 'opencode,hermes') {
+      return route.fulfill({ status: 500, json: { error: 'temporary filter failure' } });
+    }
+    return route.fulfill({
+      json: {
+        ...analyticsPayload,
+        tokens: {
+          ...analyticsPayload.tokens,
+          breakdown: paginatedBreakdown.slice(offset, offset + 50),
+          breakdown_pagination: { total: 55, offset, limit: 50 },
+        },
+      },
+    });
+  });
+  await page.goto('/analytics.html');
+  await page.locator('#breakdown-next').click();
+  await expect(page.locator('#breakdown-page-label')).toHaveText('51–55 of 55');
+
+  await page.locator('#source-filter [data-filter-value="codex"]').click();
+  await expect(page.locator('#analytics-error')).toContainText('temporary filter failure');
+  await expect.poll(() => page.evaluate(() => new URLSearchParams(queryString()).get('breakdown_offset'))).toBe('0');
+});
+
 test('groups visible Analytics units and excludes missing values and reset markers', async ({ page }) => {
   const payload = {
     ...enhancedAnalyticsPayload,

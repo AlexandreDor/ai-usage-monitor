@@ -143,10 +143,17 @@ pagination_page() {
     --now 1785866400
 }
 
+legacy_breakdown="$(python3 "$ROOT_DIR/local/analytics.py" \
+  --database "$pagination_database" \
+  --pricing "$ROOT_DIR/local/pricing.json" \
+  --params '{"range":"24h"}' \
+  --now 1785866400)"
 page_one="$(pagination_page 0)"
 page_two="$(pagination_page 50)"
 page_three="$(pagination_page 100)"
 page_clamped="$(pagination_page 9999)"
+assert_eq 105 "$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tokens"]["breakdown"]))' <<<"$legacy_breakdown")" "legacy token breakdown was paginated without opting in"
+assert_eq false "$(python3 -c 'import json,sys; print(str("breakdown_pagination" in json.load(sys.stdin)["tokens"]).lower())' <<<"$legacy_breakdown")" "legacy token breakdown exposed pagination metadata"
 assert_eq 50 "$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tokens"]["breakdown"]))' <<<"$page_one")" "first token breakdown page size"
 assert_eq 50 "$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tokens"]["breakdown"]))' <<<"$page_two")" "second token breakdown page size"
 assert_eq 5 "$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tokens"]["breakdown"]))' <<<"$page_three")" "last token breakdown page size"
@@ -161,6 +168,30 @@ for page in "$page_one" "$page_two" "$page_three"; do
 done
 python3 "$ROOT_DIR/local/analytics.py" --database "$pagination_database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"range":"24h","breakdown_offset":"-1"}' --now 1785866400 >/dev/null 2>&1 && fail "negative token breakdown offset accepted"
 python3 "$ROOT_DIR/local/analytics.py" --database "$pagination_database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"range":"24h","breakdown_offset":"invalid"}' --now 1785866400 >/dev/null 2>&1 && fail "non-integer token breakdown offset accepted"
+
+oversized_database="${TEST_ROOT}/analytics-oversized-pricing.sqlite3"
+python3 - "$ROOT_DIR" "$oversized_database" <<'PY'
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "local"))
+from storage import connect_database
+
+with connect_database(Path(sys.argv[2])) as connection:
+    connection.executemany(
+        """INSERT INTO token_usage_events
+           (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+           VALUES (?, 'opencode', ?, 'shared-model', 1, ?)""",
+        [
+            (1785859200 + index, f"provider-{index:04d}", f"oversized-{index:04d}")
+            for index in range(2001)
+        ],
+    )
+PY
+if oversized_error="$(python3 "$ROOT_DIR/local/analytics.py" --database "$oversized_database" --pricing "$ROOT_DIR/local/pricing.json" --params '{"range":"24h","breakdown_offset":"0"}' --now 1785866400 2>&1)"; then
+  fail "oversized token pricing breakdown accepted"
+fi
+assert_contains "$oversized_error" "token pricing breakdown exceeds the 2000-group processing limit" "oversized token pricing breakdown error"
 
 filtered="$(python3 "$ROOT_DIR/local/analytics.py" \
   --database "$database" \

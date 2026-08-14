@@ -17,6 +17,7 @@ const state = {
   resetType: 'all',
   resetOffset: 0,
   breakdownOffset: 0,
+  breakdownLimit: BREAKDOWN_PAGE_SIZE,
   fromDate: '',
   toDate: '',
   tokenOverlay: true,
@@ -32,6 +33,7 @@ let limitDatasets = [];
 let tokenDatasets = [];
 let lastPayload = null;
 let currentPeriod = {};
+let refreshSequence = 0;
 
 function byId(id) { return document.getElementById(id); }
 function safeNumber(value) {
@@ -529,6 +531,7 @@ function renderBreakdown(items, paginationData) {
   const limit = Math.max(1, safeNumber(paginationData.limit) || BREAKDOWN_PAGE_SIZE);
   const offset = safeNumber(paginationData.offset);
   state.breakdownOffset = offset;
+  state.breakdownLimit = limit;
   pagination.hidden = total <= limit;
   byId('breakdown-previous').setAttribute('aria-disabled', String(offset === 0));
   byId('breakdown-next').setAttribute('aria-disabled', String(offset + limit >= total));
@@ -736,7 +739,9 @@ function refreshSchedule(payload = lastPayload) {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(refresh, Math.max(1000, nextUpdate - now));
 }
-async function refresh() {
+async function refresh({ restoreBreakdownOffsetOnError = false } = {}) {
+  const sequence = ++refreshSequence;
+  const displayedBreakdownOffset = safeNumber(lastPayload?.tokens?.breakdown_pagination?.offset);
   clearTimeout(refreshTimer);
   const loading = byId('analytics-loading');
   if (loading) loading.hidden = false;
@@ -749,13 +754,17 @@ async function refresh() {
       error.status = response.status;
       throw error;
     }
+    if (sequence !== refreshSequence) return;
     render(payload);
   } catch (error) {
+    if (sequence !== refreshSequence) return;
+    if (restoreBreakdownOffsetOnError) state.breakdownOffset = displayedBreakdownOffset;
     const message = error instanceof Error ? error.message : t('unableToLoadAnalytics');
     const localOnly = !lastPayload || error?.status === 503 || /not available|cannot be read|local mode/i.test(message);
     setMessage('analytics-local-only', localOnly ? t('localOnly') : '');
     setMessage('analytics-error', lastPayload ? `${message} · ${t('showingLastData')}` : message);
   } finally {
+    if (sequence !== refreshSequence) return;
     if (loading) loading.hidden = true;
     refreshSchedule();
   }
@@ -823,13 +832,13 @@ byId('resets-previous').addEventListener('click', () => { state.resetOffset = Ma
 byId('resets-next').addEventListener('click', () => { state.resetOffset += RESET_PAGE_SIZE; refresh(); });
 byId('breakdown-previous').addEventListener('click', event => {
   if (event.currentTarget.getAttribute('aria-disabled') === 'true') return;
-  state.breakdownOffset = Math.max(0, state.breakdownOffset - BREAKDOWN_PAGE_SIZE);
-  refresh();
+  state.breakdownOffset = Math.max(0, state.breakdownOffset - state.breakdownLimit);
+  refresh({ restoreBreakdownOffsetOnError: true });
 });
 byId('breakdown-next').addEventListener('click', event => {
   if (event.currentTarget.getAttribute('aria-disabled') === 'true') return;
-  state.breakdownOffset += BREAKDOWN_PAGE_SIZE;
-  refresh();
+  state.breakdownOffset += state.breakdownLimit;
+  refresh({ restoreBreakdownOffsetOnError: true });
 });
 byId('toggle-token-overlay').addEventListener('click', () => {
   if (!limitPoints.length || !tokenPoints.length) return;
