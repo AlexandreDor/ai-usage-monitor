@@ -3,6 +3,7 @@
 const ANALYTICS_REFRESH_MS = 900_000;
 const RESET_PAGE_SIZE = 50;
 const PARIS_ZONE = 'Europe/Paris';
+const EMPTY_VALUE = '-';
 const PRICE_WARNING_PATTERN = /^No catalog price; assumed zero: (.+)$/u;
 const GPT_56_MODELS = Object.freeze(['gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra']);
 const state = {
@@ -60,11 +61,11 @@ function formatTokens(value) { return numberFormatter({ notation: 'compact', max
 function formatFullTokens(value) { return numberFormatter().format(safeNumber(value)); }
 function formatDate(value) {
   const timestamp = timestampMs(value);
-  return timestamp === null ? '—' : dateFormatter().format(new Date(timestamp));
+  return timestamp === null ? EMPTY_VALUE : dateFormatter().format(new Date(timestamp));
 }
 function formatShortDate(value) {
   const timestamp = timestampMs(value);
-  return timestamp === null ? '—' : shortDateFormatter().format(new Date(timestamp));
+  return timestamp === null ? EMPTY_VALUE : shortDateFormatter().format(new Date(timestamp));
 }
 function timestampMs(value) {
   if (typeof value === 'number' && Number.isFinite(value)) return value > 1e12 ? value : value * 1000;
@@ -92,7 +93,7 @@ function formatSignedPoints(value) {
 function formatPoints(value) { return `${Math.round(safeNumber(value) * 1000) / 1000} ${t('points')}`; }
 function formatPercent(value) {
   const number = finiteNumber(value);
-  return number === null ? '—' : `${Math.round(number * 10) / 10}%`;
+  return number === null ? EMPTY_VALUE : `${Math.round(number * 10) / 10}%`;
 }
 function formatChartValue(value, kind) {
   if (kind === 'percent') return formatPercent(value);
@@ -124,7 +125,7 @@ function clearRows(body) {
 }
 function cell(row, value, className = '') {
   const element = document.createElement('td');
-  element.textContent = value === null || value === undefined ? '—' : String(value);
+  element.textContent = value === null || value === undefined ? EMPTY_VALUE : String(value);
   if (className) element.className = className;
   row.appendChild(element);
   return element;
@@ -133,7 +134,7 @@ function pillCell(row, value) {
   const element = cell(row, '');
   const pill = document.createElement('span');
   pill.className = 'source-pill';
-  pill.textContent = value === null || value === undefined ? '—' : String(value);
+  pill.textContent = value === null || value === undefined ? EMPTY_VALUE : String(value);
   element.appendChild(pill);
   return element;
 }
@@ -500,7 +501,7 @@ function renderBreakdown(items) {
   byId('breakdown-empty').hidden = values.length > 0;
   for (const item of values) {
     const row = document.createElement('tr');
-    pillCell(row, item.source || '—');
+    pillCell(row, item.source || EMPTY_VALUE);
     cell(row, item.provider || 'unknown');
     cell(row, item.model || 'unknown');
     cell(row, formatTokens(item.input_tokens));
@@ -512,7 +513,7 @@ function renderBreakdown(items) {
     const cost = cell(row, '', item.pricing_status === 'assumed-zero' ? 'pricing-unknown' : '');
     setCost(cost, item.estimated_cost_usd);
     if (item.pricing_status === 'assumed-zero') cost.title = t('pricingUnknownTitle');
-    cell(row, item.pricing_status || '—', item.pricing_status === 'assumed-zero' ? 'pricing-unknown' : '');
+    cell(row, item.pricing_status || EMPTY_VALUE, item.pricing_status === 'assumed-zero' ? 'pricing-unknown' : '');
     body.appendChild(row);
   }
 }
@@ -528,7 +529,7 @@ function renderResets(data = {}) {
     pillCell(row, item.category === 'random' ? t('random') : item.category === 'end_of_week' ? t('endOfWeek') : t('scheduled'));
     cell(row, formatDate(item.reset_at));
     cell(row, formatDate(item.observed_at));
-    cell(row, `${item.before_pct ?? '—'}% → ${item.after_pct ?? '—'}%`);
+    cell(row, `${item.before_pct ?? EMPTY_VALUE}% → ${item.after_pct ?? EMPTY_VALUE}%`);
     const forecast24h = finiteNumber(item.forecast_chance_24h_pct);
     const forecast6h = finiteNumber(item.forecast_chance_6h_pct);
     cell(
@@ -584,7 +585,7 @@ function renderCollectors(freshness = {}, baselines = {}, period = {}) {
       collector.last_success_at
         ? t('lastSuccess', { value: formatDate(collector.last_success_at) })
         : t('noSuccessfulCollection'),
-      `${t('dataAge')}: ${age === null ? '—' : formatDuration(age)}`,
+      `${t('dataAge')}: ${age === null ? EMPTY_VALUE : formatDuration(age)}`,
     ];
     if (collector.last_error) lines.push(`${t('lastError')}: ${collector.last_error}`);
     detail.textContent = lines.join('\n');
@@ -677,8 +678,8 @@ function render(payload) {
   const pricing = payload.pricing || {};
   const currency = typeof CodexPreferences === 'object' ? CodexPreferences.get().currency : 'USD';
   byId('pricing-note').textContent = currency === 'EUR'
-    ? t('catalogConverted', { date: pricing.as_of || '—', rate: CodexPreferences.formatRate() })
-    : t('catalog', { date: pricing.as_of || '—', currency: pricing.currency || 'USD' });
+    ? t('catalogConverted', { date: pricing.as_of || EMPTY_VALUE, rate: CodexPreferences.formatRate() })
+    : t('catalog', { date: pricing.as_of || EMPTY_VALUE, currency: pricing.currency || 'USD' });
   const weeklySummary = payload.resets?.weekly_summary || { random: {}, end_of_week: {} };
   const random = weeklySummary.random || {};
   const endOfWeek = weeklySummary.end_of_week || {};
