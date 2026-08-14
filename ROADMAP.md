@@ -26,33 +26,6 @@ jusqu'à la stabilisation du socle.
 | M | Entre deux et quatre jours |
 | L | Une semaine ou plus |
 
-## P0 - Fiabilité critique
-
-### 1. Détecter les données périmées dans le dashboard principal
-
-Analytics expose déjà la fraîcheur de ses données et de ses collecteurs. Le
-dashboard principal considère encore un fichier JSON lisible comme valide quel
-que soit son âge.
-
-**Actions :**
-
-- Comparer `scraped_at` à `sample_interval_seconds`.
-- Afficher un avertissement après environ deux intervalles sans mise à jour.
-- Distinguer visuellement les états `LOCAL`, `EXTERNAL` et `STALE`.
-- Afficher l'âge réel des données dans une région `aria-live`.
-- Conserver le contexte `LOCAL` ou `EXTERNAL` des dernières valeurs valides et
-  annoncer séparément une erreur de rafraîchissement.
-
-**Critères de validation :**
-
-- Des données anciennes sont distinguées des données fraîches sans dépendre
-  uniquement de la couleur.
-- Le dashboard indique depuis combien de temps la collecte est arrêtée.
-- Une nouvelle collecte réussie restaure automatiquement l'état normal.
-- Les états frais, périmés et en erreur sont couverts par les tests navigateur.
-
-**Effort : S**
-
 ## P1 - Robustesse et qualité
 
 ### 4. Alerter sur les mouvements de quota anormaux

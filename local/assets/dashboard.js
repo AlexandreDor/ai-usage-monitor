@@ -6,12 +6,15 @@ const REFRESH_INTERVAL_MS = 900_000;
 const DEFAULT_ACTIVE_REFRESH_INTERVAL_MS = 300_000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const REFRESH_RETRY_INITIAL_MS = 5_000;
+const MIN_SAMPLE_INTERVAL_SECONDS = 60;
+const MAX_SAMPLE_INTERVAL_SECONDS = 86_400;
 const DECIMATION_THRESHOLD = 1000;
 const DECIMATION_SAMPLES = 600;
 const PARIS_TIME_ZONE = 'Europe/Paris';
 
 let chart = null;
 let refreshTimer = null;
+let freshnessTimer = null;
 let heartbeatTimer = null;
 let heartbeatInFlight = false;
 let dashboardActiveIntervalMs = DEFAULT_ACTIVE_REFRESH_INTERVAL_MS;
@@ -21,7 +24,7 @@ let dashboardData = null;
 let dashboardHistory = null;
 let historyFailure = null;
 let mainFailure = null;
-let dashboardMode = null;
+let dashboardSource = null;
 
 function t(key, values = {}) {
   return typeof CodexPreferences === 'object' ? CodexPreferences.t(`dashboard.${key}`, values) : key;
@@ -39,6 +42,94 @@ function validPct(value) {
 
 function displayText(value, fallback = '-', maxLength = 200) {
   return typeof value === 'string' && value.length <= maxLength ? value : fallback;
+}
+
+function normalizedSampleIntervalSeconds(rawValue) {
+  const value = Number(rawValue);
+  if (!Number.isInteger(value) || value < 1 || value > MAX_SAMPLE_INTERVAL_SECONDS) {
+    return REFRESH_INTERVAL_MS / 1000;
+  }
+  return Math.max(MIN_SAMPLE_INTERVAL_SECONDS, value);
+}
+
+function classifySnapshotFreshness(data, now = Date.now()) {
+  const scrapedAtMs = Date.parse(displayText(data?.scraped_at, ''));
+  if (!Number.isFinite(scrapedAtMs)) throw new Error(t('invalidScrapedAt'));
+  const intervalSeconds = normalizedSampleIntervalSeconds(data?.sample_interval_seconds);
+  const staleAfterSeconds = Math.max(intervalSeconds * 2, intervalSeconds + 60);
+  const ageSeconds = Math.floor(Math.max(0, Number(now) - scrapedAtMs) / 1000);
+  const lateBySeconds = Math.max(0, ageSeconds - staleAfterSeconds);
+  return {
+    status: ageSeconds > staleAfterSeconds ? 'stale' : 'fresh',
+    ageSeconds,
+    staleAfterSeconds,
+    lateBySeconds,
+    scrapedAtMs,
+    intervalSeconds,
+  };
+}
+
+function formatElapsedDuration(seconds) {
+  const value = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (value < 60) return t('lessThanMinute');
+  const minutes = Math.floor(value / 60);
+  if (minutes < 60) return t('durationMinutes', { minutes });
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (hours < 24) {
+    return remainingMinutes
+      ? t('durationHoursMinutes', { hours, minutes: remainingMinutes })
+      : t('durationHours', { hours });
+  }
+  const days = Math.floor(hours / 24);
+  const remainingHours = hours % 24;
+  return remainingHours
+    ? t('durationDaysHours', { days, hours: remainingHours })
+    : t('durationDays', { days });
+}
+
+function renderSource(source) {
+  if (source !== 'local' && source !== 'external') return;
+  dashboardSource = source;
+  document.body.dataset.dashboardSource = source;
+  document.getElementById('mode-badge').textContent = t(source);
+}
+
+function stopFreshnessUpdate() {
+  clearTimeout(freshnessTimer);
+  freshnessTimer = null;
+}
+
+function scheduleFreshnessUpdate(classification = null) {
+  stopFreshnessUpdate();
+  if (!dashboardData || document.visibilityState !== 'visible') return;
+  const state = classification || classifySnapshotFreshness(dashboardData);
+  const now = Date.now();
+  const ageMs = Math.max(0, now - state.scrapedAtMs);
+  const nextMinuteDelay = 60_000 - (ageMs % 60_000);
+  const staleDelay = state.status === 'fresh'
+    ? state.scrapedAtMs + (state.staleAfterSeconds + 1) * 1000 - now
+    : Number.POSITIVE_INFINITY;
+  freshnessTimer = setTimeout(renderFreshness, Math.max(1, Math.min(nextMinuteDelay, staleDelay)));
+}
+
+function renderFreshness() {
+  const element = document.getElementById('freshness-status');
+  if (!dashboardData) {
+    document.body.dataset.freshness = 'unavailable';
+    element.textContent = t('dataUnavailable');
+    stopFreshnessUpdate();
+    return;
+  }
+  const state = classifySnapshotFreshness(dashboardData);
+  document.body.dataset.freshness = state.status;
+  element.textContent = state.status === 'stale'
+    ? t('staleDataAge', {
+      age: formatElapsedDuration(state.ageSeconds),
+      overdue: formatElapsedDuration(state.lateBySeconds),
+    })
+    : t('dataAge', { age: formatElapsedDuration(state.ageSeconds) });
+  scheduleFreshnessUpdate(state);
 }
 
 function isLocalDashboard() {
@@ -139,11 +230,18 @@ function startDashboardHeartbeat() {
 function handleDashboardVisibility() {
   if (document.visibilityState === 'visible') {
     startDashboardHeartbeat();
+    renderFreshness();
     void refresh();
   } else {
     stopDashboardHeartbeat();
+    stopFreshnessUpdate();
     clearTimeout(refreshTimer);
   }
+}
+
+function handleDashboardPageHide() {
+  stopDashboardHeartbeat();
+  stopFreshnessUpdate();
 }
 
 function formatParisDateTime(value, includeYear = true) {
@@ -261,7 +359,10 @@ function renderForecast(data) {
 function setMainError(message = '') {
   const element = document.getElementById('error-banner');
   mainFailure = message || null;
-  element.textContent = message ? `${t('warningPrefix')}: ${displayText(message, t('warningFallback'))}` : '';
+  const safeMessage = displayText(message, t('warningFallback'));
+  element.textContent = message
+    ? `${t('warningPrefix')}: ${t(dashboardData ? 'refreshFailedWithData' : 'refreshFailedWithoutData', { message: safeMessage })}`
+    : '';
   element.hidden = !message;
 }
 
@@ -472,10 +573,11 @@ function renderHistoryFailure(message) {
   setHistoryError(message);
 }
 
-function renderData(data, { schedule = true } = {}) {
+function renderData(data, { schedule = true, clearError = true } = {}) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     throw new Error(t('invalidDashboardData'));
   }
+  classifySnapshotFreshness(data);
   dashboardData = data;
   setBar('five-h-bar', 'five-h-pct', data.five_h_pct);
   setBar('weekly-bar', 'weekly-pct', data.weekly_pct);
@@ -486,7 +588,8 @@ function renderData(data, { schedule = true } = {}) {
   document.getElementById('last-updated').textContent = t('lastScraped', {
     value: formatParisDateTime(displayText(data.scraped_at, '')),
   });
-  setMainError();
+  renderFreshness();
+  if (clearError) setMainError();
   if (schedule) scheduleRefresh(data);
 }
 
@@ -497,9 +600,9 @@ async function fetchJson(url, missingMessage) {
 }
 
 async function fetchLocal() {
-  dashboardMode = 'local';
-  document.getElementById('mode-badge').textContent = t(dashboardMode);
   const data = await fetchJson('data.json', t('dataNotFound'));
+  classifySnapshotFreshness(data);
+  renderSource('local');
   renderData(data);
 
   try {
@@ -510,14 +613,15 @@ async function fetchLocal() {
 }
 
 async function fetchGist() {
-  dashboardMode = 'external';
-  document.getElementById('mode-badge').textContent = t(dashboardMode);
   const response = await fetch(`https://api.github.com/gists/${encodeURIComponent(GIST_ID)}?_=${Date.now()}`);
   if (!response.ok) throw new Error(t('githubApiError', { status: response.status }));
   const gist = await response.json();
   const dataContent = gist?.files?.['data.json']?.content;
   if (!dataContent) throw new Error(t('gistDataNotFound'));
-  renderData(JSON.parse(dataContent));
+  const data = JSON.parse(dataContent);
+  classifySnapshotFreshness(data);
+  renderSource('external');
+  renderData(data);
 
   try {
     const historyContent = gist?.files?.['history.json']?.content;
@@ -533,16 +637,16 @@ async function refresh() {
     await (GIST_ID ? fetchGist() : fetchLocal());
   } catch (error) {
     setMainError(error instanceof Error ? error.message : t('unableToLoadData'));
-    dashboardMode = 'error';
-    document.getElementById('mode-badge').textContent = t(dashboardMode);
+    renderFreshness();
     scheduleRefresh();
   }
 }
 
 function refreshLocalizedDashboard() {
-  if (dashboardMode) document.getElementById('mode-badge').textContent = t(dashboardMode);
-  if (dashboardData) renderData(dashboardData, { schedule: false });
-  else if (mainFailure) setMainError(mainFailure);
+  if (dashboardSource) renderSource(dashboardSource);
+  if (dashboardData) renderData(dashboardData, { schedule: false, clearError: false });
+  else renderFreshness();
+  if (mainFailure) setMainError(mainFailure);
   if (dashboardHistory) {
     try {
       renderHistory(dashboardHistory);
@@ -557,6 +661,8 @@ function refreshLocalizedDashboard() {
 if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(refreshLocalizedDashboard);
 document.addEventListener('visibilitychange', handleDashboardVisibility);
 window.addEventListener('pageshow', handleDashboardVisibility);
-window.addEventListener('pagehide', stopDashboardHeartbeat);
+window.addEventListener('pagehide', handleDashboardPageHide);
+renderSource(isLocalDashboard() ? 'local' : 'external');
+renderFreshness();
 startDashboardHeartbeat();
 refresh();
