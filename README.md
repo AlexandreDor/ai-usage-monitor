@@ -838,7 +838,7 @@ finally:
 PY
 
 sudo systemctl stop codex-usage-monitor.service codex-usage-dashboard.service
-install -d -m 700 "$SAFETY_DIR"
+mkdir -m 700 -- "$SAFETY_DIR"
 if [[ -e "$DB" ]]; then
   mv -- "$DB" "$SAFETY_DIR/$DB_NAME"
 fi

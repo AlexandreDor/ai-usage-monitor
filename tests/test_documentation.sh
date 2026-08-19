@@ -67,7 +67,7 @@ for required in \
   "CODEX_BIN=/absolute/path/to/codex" \
   "command -v codex" \
   "set -euo pipefail" \
-  "install -d -m 700 \"\$SAFETY_DIR\"" \
+  "mkdir -m 700 -- \"\$SAFETY_DIR\"" \
   "\${DB_NAME}.restore-safety.\${STAMP}" \
   "mv -- \"\$DB\"" \
   "# BEGIN SQLITE_BACKUP_EXAMPLE" \
@@ -143,8 +143,26 @@ extract_example() {
 
 BACKUP_EXAMPLE="${TEST_ROOT}/sqlite-backup-example.py"
 RESTORE_EXAMPLE="${TEST_ROOT}/sqlite-restore-example.py"
+RESTORE_SAFETY_EXAMPLE="${TEST_ROOT}/sqlite-restore-safety-example.sh"
 extract_example '# BEGIN SQLITE_BACKUP_EXAMPLE' '# END SQLITE_BACKUP_EXAMPLE' "$BACKUP_EXAMPLE"
 extract_example '# BEGIN SQLITE_RESTORE_EXAMPLE' '# END SQLITE_RESTORE_EXAMPLE' "$RESTORE_EXAMPLE"
+
+extract_restore_safety_example() {
+  local output="$1"
+  local start_pattern="^mkdir -m 700 -- \"\\\$SAFETY_DIR\"\$"
+  sed -n "/${start_pattern}/,/^done$/p" "$README" > "$output"
+  [[ -s "$output" ]] || fail "could not extract documented restore safety commands"
+}
+
+extract_restore_safety_example "$RESTORE_SAFETY_EXAMPLE"
+
+run_restore_safety() {
+  local database="$1" safety_dir="$2"
+  DB="$database" \
+    DB_NAME="$(basename -- "$database")" \
+    SAFETY_DIR="$safety_dir" \
+    bash -euo pipefail "$RESTORE_SAFETY_EXAMPLE"
+}
 
 make_sqlite_fixture() {
   python3 - "$1" "$2" <<'PY'
@@ -207,6 +225,60 @@ for journal_mode in DELETE WAL; do
     fail "restore example accepted corrupt ${journal_mode} candidate"
   fi
   [[ ! -e "$corrupt_restore" ]] || fail "corrupt ${journal_mode} candidate created a destination"
+
+  safety_parent="${TEST_ROOT}/restore safety ${journal_mode}"
+  mkdir -p "$safety_parent"
+  active_database="${safety_parent}/active database ${journal_mode}.sqlite3"
+  safety_dir="${safety_parent}/active database ${journal_mode}.sqlite3.restore-safety.fixed"
+  printf 'original active %s\n' "$journal_mode" > "$active_database"
+  printf 'original wal %s\n' "$journal_mode" > "$active_database-wal"
+  printf 'original shm %s\n' "$journal_mode" > "$active_database-shm"
+
+  run_restore_safety "$active_database" "$safety_dir"
+  assert_eq 700 "$(stat -c '%a' "$safety_dir")" "restore safety mode for ${journal_mode}"
+  assert_eq "original active ${journal_mode}" \
+    "$(<"$safety_dir/$(basename -- "$active_database")")" \
+    "initial safety copy for ${journal_mode}"
+  assert_eq "original wal ${journal_mode}" \
+    "$(<"$safety_dir/$(basename -- "$active_database-wal")")" \
+    "initial WAL safety copy for ${journal_mode}"
+  assert_eq "original shm ${journal_mode}" \
+    "$(<"$safety_dir/$(basename -- "$active_database-shm")")" \
+    "initial SHM safety copy for ${journal_mode}"
+  [[ ! -e "$active_database" && ! -e "$active_database-wal" && ! -e "$active_database-shm" ]] \
+    || fail "restore safety example did not move ${journal_mode} active files"
+
+  printf 'replacement active %s\n' "$journal_mode" > "$active_database"
+  printf 'replacement wal %s\n' "$journal_mode" > "$active_database-wal"
+  printf 'replacement shm %s\n' "$journal_mode" > "$active_database-shm"
+  if run_restore_safety "$active_database" "$safety_dir"; then
+    fail "restore safety example accepted an existing directory for ${journal_mode}"
+  fi
+  assert_eq "original active ${journal_mode}" \
+    "$(<"$safety_dir/$(basename -- "$active_database")")" \
+    "existing safety copy for ${journal_mode} changed after collision"
+  assert_eq "original wal ${journal_mode}" \
+    "$(<"$safety_dir/$(basename -- "$active_database-wal")")" \
+    "existing WAL safety copy for ${journal_mode} changed after collision"
+  assert_eq "original shm ${journal_mode}" \
+    "$(<"$safety_dir/$(basename -- "$active_database-shm")")" \
+    "existing SHM safety copy for ${journal_mode} changed after collision"
+  assert_eq "replacement active ${journal_mode}" "$(<"$active_database")" \
+    "active ${journal_mode} database moved despite safety collision"
+  assert_eq "replacement wal ${journal_mode}" "$(<"$active_database-wal")" \
+    "active ${journal_mode} WAL moved despite safety collision"
+  assert_eq "replacement shm ${journal_mode}" "$(<"$active_database-shm")" \
+    "active ${journal_mode} SHM moved despite safety collision"
+
+  safety_file="${safety_parent}/safety target file"
+  printf 'do-not-overwrite\n' > "$safety_file"
+  if run_restore_safety "$active_database" "$safety_file"; then
+    fail "restore safety example accepted a file collision for ${journal_mode}"
+  fi
+  assert_eq 'do-not-overwrite' "$(<"$safety_file")" \
+    "safety target file changed for ${journal_mode}"
+  assert_eq "replacement active ${journal_mode}" "$(<"$active_database")" \
+    "active ${journal_mode} database moved for file collision"
 done
 
 printf 'PASS: documentation consistency tests\n'
