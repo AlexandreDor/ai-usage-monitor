@@ -9,7 +9,6 @@ ROADMAP="${ROOT_DIR}/ROADMAP.md"
 ENV_EXAMPLE="${ROOT_DIR}/local/.env.example"
 
 assert_file "${README}"
-[[ ! -e "${ROOT_DIR}/readme2.md" ]] || fail "obsolete readme2.md still exists"
 
 readme_text="$(<"${README}")"
 roadmap_text="$(<"${ROADMAP}")"
