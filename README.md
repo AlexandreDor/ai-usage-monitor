@@ -150,10 +150,32 @@ The live dashboard calculates snapshot freshness directly from `scraped_at` and
 of two collection intervals or one interval plus 60 seconds. The source remains
 `LOCAL` or `EXTERNAL`, while refresh failures appear separately and preserve the
 last valid values. The accessible status reports both total data age and, when
-stale, time past the expected update threshold. A recent successful snapshot
-clears the stale and error states automatically. This browser-side check needs
-no Analytics API or additional endpoint; in external mode it can therefore also
-identify an interrupted Gist publication.
+stale, time past the expected update threshold. A valid fetch clears a refresh
+error; only a sufficiently recent snapshot clears the stale state. This
+browser-side check needs no Analytics API or additional endpoint; in external
+mode it can therefore also identify an interrupted Gist publication.
+
+## Freshness and availability states
+
+The live dashboard keeps three concerns independent:
+
+- `LOCAL` or `EXTERNAL` identifies the source of the last valid snapshot; it is
+  not a freshness state.
+- A valid snapshot is `FRESH`/`À JOUR` until its age is greater than
+  `max(2 * sample_interval, sample_interval + 60)` seconds, then it is
+  `STALE`/`PÉRIMÉ`. Before the first valid value, data is unavailable rather
+  than fresh or stale.
+- A refresh error is reported separately. Existing valid values remain visible
+  while the error is present. A valid fetch clears the refresh error; only a
+  sufficiently recent snapshot changes `STALE` back to `FRESH`.
+
+Analytics reports limits freshness separately from each local token collector.
+For either one, `unknown` means that no valid sample exists yet; otherwise the
+same age rule yields `fresh` or `stale`. A collector can additionally report
+the business status `disabled`, `unavailable`, or `error` when applicable.
+These statuses describe the collector and do not change the limits status.
+Forecast has its own availability: a failed or stale Forecast value is hidden
+or shown as unavailable, without making quota limits or Analytics unavailable.
 
 ## Monitor Commands
 
@@ -205,8 +227,28 @@ chmod 600 local/.env
 
 Blank optional values disable the corresponding integration. Unsupported keys
 are ignored with a warning, while invalid values for supported keys are
-rejected. Environment variables can also provide values; values loaded from
-`local/.env` take precedence in the current monitor implementation.
+rejected. Environment variables can also provide values; the monitor currently
+parses `local/.env` after the inherited environment, so values in `.env` take
+precedence. `CODEX_BIN_OVERRIDE` is the documented process-only exception and
+is applied after `.env`. `serve.sh` has a separate, narrow priority chain:
+
+- pricing catalog: `DASHBOARD_PRICING_FILE` (process) → `TOKEN_PRICING_FILE`
+  (process) → `TOKEN_PRICING_FILE` in `local/.env` → `local/pricing.json`;
+- Analytics database: `DASHBOARD_ANALYTICS_DATABASE` (process only) →
+  `local/runtime/usage-history.sqlite3`;
+- active refresh interval: `DASHBOARD_ACTIVE_INTERVAL_SECONDS` (process) →
+  the same key in `local/.env` → `300`.
+
+`DASHBOARD_ANALYTICS_DATABASE` has no `.env` fallback, and
+`DASHBOARD_PRICING_FILE` is process-only. `DASHBOARD_ACTIVE_INTERVAL_SECONDS`
+is also read from `local/.env` when no process value is supplied; these are
+`serve.sh`-specific paths and timing controls, not a shared configuration
+module.
+
+There is deliberately no `local/config.py` yet. If configuration is
+centralised in a future change, update this README and `local/.env.example`
+together with the implementation; do not infer a new configuration contract
+from a roadmap item.
 
 ### Minimal configuration
 
@@ -390,7 +432,7 @@ The static dashboard reads a configured Gist ID from `GIST_ID` near the top of
 `local/assets/dashboard.js`:
 
 ```javascript
-const GIST_ID = 'your-gist-id';
+let GIST_ID = 'your-gist-id';
 ```
 
 Leave `GIST_ID` empty for local mode. Hosting the static files is intentionally
@@ -404,13 +446,16 @@ These variables are normally unnecessary:
 | Variable | Default | Description |
 |---|---:|---|
 | `TELEGRAM_API_URL` | `https://api.telegram.org` | Telegram-compatible HTTP(S) API base URL, mainly for tests. |
-| `DASHBOARD_ANALYTICS_DATABASE` | `local/runtime/usage-history.sqlite3` | Environment-only absolute database path override for `serve.sh`. |
-| `DASHBOARD_PRICING_FILE` | `TOKEN_PRICING_FILE`, then `local/pricing.json` | Environment-only absolute pricing path override for `serve.sh`. |
+| `DASHBOARD_ANALYTICS_DATABASE` | `local/runtime/usage-history.sqlite3` | Process-only absolute database path override for `serve.sh`; no `.env` fallback. |
+| `DASHBOARD_PRICING_FILE` | See the priority chain above | Process-only absolute pricing path override for `serve.sh`. |
 | `CODEX_BIN_OVERRIDE` | empty | Environment-only override that takes precedence over `CODEX_BIN` during monitor initialization. |
 
-These three variables are process-environment overrides and are not read from
-`local/.env`. `GIST_ID` is a constant in `local/assets/dashboard.js`, while
-`serve.sh --port` and `--bind` are command-line options rather than `.env` keys.
+`DASHBOARD_ANALYTICS_DATABASE`, `DASHBOARD_PRICING_FILE`, and
+`CODEX_BIN_OVERRIDE` are process-only overrides and are not read from
+`local/.env`. `TELEGRAM_API_URL` remains an application key that can be read
+from `.env`. `GIST_ID` is a mutable static client variable in
+`local/assets/dashboard.js`, while `serve.sh --port` and `--bind` are
+command-line options rather than `.env` keys.
 
 HTTP endpoint overrides must not contain credentials, query strings, or control
 characters. Use HTTPS for real services.
@@ -496,23 +541,329 @@ the pricing catalog.
 
 ## Deployment
 
-For persistent use, run these two processes under a supervisor such as systemd,
-tmux, or another process manager:
+The monitor and dashboard server are deliberately separate processes. The
+server records recent visible-dashboard activity, and a monitor already running
+in `--loop` mode reacts to it; `serve.sh` never starts a collection itself. The
+examples below are manual deployment recipes, not the packaged systemd units
+planned for P2.16.
+
+### LXC Ubuntu/Debian
+
+Any current Ubuntu or Debian LXC works; no particular Proxmox template name is
+part of this project. Create an unprivileged container according to your host's
+policy, give it a stable LAN address if needed, and install the dependencies
+inside it:
 
 ```bash
-./local/monitor.sh --loop 900
-./local/serve.sh
+apt update
+apt install -y bash ca-certificates curl git python3 tzdata util-linux
+
+git clone https://github.com/AlexandreDor/ai-usage-monitor.git
+cd ai-usage-monitor/local
+cp .env.example .env
+chmod 600 .env
+./monitor.sh --check
 ```
 
-The monitor and dashboard server remain separate processes. The server records
-recent visible-dashboard activity, and a monitor already running in `--loop`
-mode reacts to it; the server never starts a collection itself. Use
-`--bind 0.0.0.0` only behind a trusted firewall or proper reverse proxy because
-the built-in server has no authentication or TLS.
+Install the Codex CLI using its current upstream instructions and authenticate
+as the same Unix account that will run the monitor. Verify that account's
+authentication with `codex login status` and `codex /status`; authentication in
+the host or in another account is not implicitly available inside the LXC.
+Keep the working tree and the runtime archive at
+`/path/to/ai-usage-monitor/local/runtime/`, whose default SQLite archive is
+`usage-history.sqlite3`.
 
-For a static external dashboard, publish `local/dashboard.html`, `local/assets/`,
-and `local/images/favicon.png`, configure `GIST_ID`, and keep the local monitor
-running with Gist credentials.
+The built-in server has no authentication or TLS. Keep its default
+`127.0.0.1` bind for local-only access. For a trusted LAN, choose an explicit
+container address, for example `./serve.sh --bind 192.0.2.20 --port 8080`, and
+allow TCP 8080 only from the trusted subnet in both the container/host firewall
+and any Proxmox network policy. Never forward it directly to the internet.
+Run `./monitor.sh --loop` and `./serve.sh` under the same account, for example
+with the systemd recipe below.
+
+### systemd (manual units)
+
+Create two separate units so collection and HTTP serving can be restarted and
+diagnosed independently. Replace `codex-monitor` and the home path with the
+actual account; the `User`, `HOME`, and `WorkingDirectory` values below all
+refer to that same account and checkout. Do not ask systemd to interpret
+`.env`: the application parses it as data and validates its permissions.
+
+```ini
+# /etc/systemd/system/codex-usage-monitor.service
+[Unit]
+Description=Codex Usage Monitor collection loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex-monitor
+Environment=HOME=/home/codex-monitor
+WorkingDirectory=/home/codex-monitor/ai-usage-monitor/local
+ExecStart=/usr/bin/env bash /home/codex-monitor/ai-usage-monitor/local/monitor.sh --loop
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```ini
+# /etc/systemd/system/codex-usage-dashboard.service
+[Unit]
+Description=Codex Usage Monitor dashboard server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex-monitor
+Environment=HOME=/home/codex-monitor
+WorkingDirectory=/home/codex-monitor/ai-usage-monitor/local
+ExecStart=/usr/bin/env bash /home/codex-monitor/ai-usage-monitor/local/serve.sh --port 8080
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The dashboard unit above stays on `127.0.0.1`. If LAN access is intentional,
+make it explicit in that unit, for example by changing only its command to
+`ExecStart=/usr/bin/env bash /home/codex-monitor/ai-usage-monitor/local/serve.sh --bind 192.0.2.20 --port 8080`,
+then restrict port 8080 with the host firewall. Do not use an unauthenticated
+`0.0.0.0` bind without that firewall decision.
+
+Install, start, and inspect both units as follows:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now codex-usage-monitor.service codex-usage-dashboard.service
+sudo systemctl status codex-usage-monitor.service codex-usage-dashboard.service
+sudo journalctl -u codex-usage-monitor.service -f
+sudo journalctl -u codex-usage-dashboard.service -f
+
+# After a checkout or configuration update:
+sudo systemctl restart codex-usage-monitor.service codex-usage-dashboard.service
+sudo systemctl status codex-usage-monitor.service codex-usage-dashboard.service
+```
+
+Use `./monitor.sh --check` as the service account when diagnosing
+authentication, paths, or Analytics sources. Keep `local/.env` owned by that
+account and mode `600`; a systemd unit must not duplicate its values in a
+second environment file.
+
+If Codex was installed in a user-only directory that is not in systemd's
+`PATH`, obtain its absolute path as the service account and put that value in
+`local/.env`:
+
+```bash
+sudo -u codex-monitor -H bash -lc 'command -v codex'
+# If the command printed /absolute/path/to/codex, set this in local/.env:
+CODEX_BIN=/absolute/path/to/codex
+```
+
+Alternatively install the CLI globally in a directory present in the service
+account's `PATH`. Do not add a user-specific package-manager path to the
+generic unit above.
+
+### GitHub Pages and Gist (static external dashboard)
+
+The monitor can publish only the sanitized live snapshot and rolling quota /
+Forecast history to a GitHub Gist. Create a Gist containing `data.json` and
+`history.json`, put its real hexadecimal ID in `GITHUB_GIST_ID`, and set the
+matching `GITHUB_PAT` in `local/.env`. Keep the monitor running locally so the
+Gist continues to receive updates. Analytics SQLite data, token data,
+credentials, and health state are never published.
+
+GitHub Pages accepts a branch source of `/(root)` or `/docs`; it does not accept
+`/local`. Use a separate publication copy or a `/docs` tree in a Pages
+repository, rather than publishing the working `local/` directory in place.
+For a separate Pages checkout, clone the Pages repository first, then create
+the publication copy. The placeholder below is for your Pages repository, not
+the monitor project:
+
+```bash
+cd /path/to
+git clone https://github.com/<github-account>/<pages-repository>.git pages-copy
+cd /path/to/ai-usage-monitor
+mkdir -p ../pages-copy/docs/assets ../pages-copy/docs/images
+cp local/dashboard.html ../pages-copy/docs/index.html
+cp local/analytics.html ../pages-copy/docs/analytics.html
+cp -R local/assets/. ../pages-copy/docs/assets/
+cp local/images/favicon.png ../pages-copy/docs/images/favicon.png
+
+cd ../pages-copy
+# Edit docs/assets/dashboard.js now and set the real Gist ID before staging:
+# let GIST_ID = '0123456789abcdef0123456789abcdef';
+${EDITOR:-vi} docs/assets/dashboard.js
+git add docs
+git commit -m 'Publish Codex usage dashboard'
+git push
+```
+
+Select that repository's branch and `/docs` directory in Settings → Pages.
+The published copy must retain `index.html`, the complete `assets/` directory,
+and `images/favicon.png`. The editor step above must leave this mutable value
+near the top of the copied file:
+
+```javascript
+let GIST_ID = '0123456789abcdef0123456789abcdef';
+```
+
+Do not commit a personal token. Only the static live quota page works in this
+external mode: Advanced Analytics requires the local `serve.sh` API and the
+local SQLite archive. A Pages browser cannot provide Analytics merely by
+having access to the Gist.
+
+## Backup/Restore SQLite
+
+The default archive is
+`local/runtime/usage-history.sqlite3`. It is private local state, not an
+off-machine backup. The monitor currently opens SQLite with
+`PRAGMA journal_mode=DELETE`; P1.7 plans WAL and migration backups but neither
+is implemented yet. The procedure below is written for both modes.
+
+### Create a coherent backup
+
+Use Python's standard-library `sqlite3.Connection.backup()` API rather than
+copying the main file while another process writes. `backup()` reads a source
+correctly even when it is in WAL mode and creates an autonomous destination
+database; the destination does not need the source's `-wal` or `-shm` sidecars.
+The example refuses to overwrite an existing `BACKUP` path, checks the
+temporary destination, and installs it with mode `600`:
+
+```bash
+cd /path/to/ai-usage-monitor
+DB=local/runtime/usage-history.sqlite3
+BACKUP=/secure/off-machine/codex-usage-history-$(date -u +%Y%m%dT%H%M%SZ).sqlite3
+python3 - "$DB" "$BACKUP" <<'PY'
+# BEGIN SQLITE_BACKUP_EXAMPLE
+import os
+import sqlite3
+import sys
+import tempfile
+from pathlib import Path
+
+source_path, destination_path = map(Path, sys.argv[1:])
+if not source_path.is_file() or source_path.is_symlink():
+    raise SystemExit(f"archive is not a regular file: {source_path}")
+if destination_path.exists() or destination_path.is_symlink():
+    raise SystemExit(f"backup destination already exists: {destination_path}")
+destination_path.parent.mkdir(parents=True, exist_ok=True)
+fd, temporary_name = tempfile.mkstemp(
+    prefix=f".{destination_path.name}.", suffix=".tmp",
+    dir=destination_path.parent,
+)
+os.close(fd)
+temporary_path = Path(temporary_name)
+try:
+    source_uri = source_path.resolve().as_uri() + "?mode=ro"
+    with sqlite3.connect(source_uri, uri=True) as source, sqlite3.connect(temporary_path) as target:
+        source.execute("PRAGMA query_only = ON")
+        source.backup(target)
+        result = target.execute("PRAGMA quick_check").fetchone()
+        if not result or result[0] != "ok":
+            raise SystemExit(f"backup quick_check failed: {result!r}")
+        target.commit()
+    os.chmod(temporary_path, 0o600)
+    os.replace(temporary_path, destination_path)
+finally:
+    temporary_path.unlink(missing_ok=True)
+# END SQLITE_BACKUP_EXAMPLE
+PY
+chmod 600 "$BACKUP"
+```
+
+Run `PRAGMA quick_check` on any restored or transferred artifact before using
+it. Do not transfer or retain source sidecars alongside this backup artifact:
+the `backup()` destination is autonomous.
+
+### Restore safely
+
+The restore is fail-fast. It first creates and verifies a new autonomous file
+next to the active database, before stopping services or touching the active
+file. A corrupt candidate therefore leaves the active database intact. Once
+the candidate is valid, stop at least both services and ensure no other process
+has the archive open. Move the active database and any active `${DB}-wal` /
+`${DB}-shm` sidecars into a new mode-`700` safety directory, then move the
+validated autonomous file into place:
+
+```bash
+set -euo pipefail
+
+DB=/path/to/ai-usage-monitor/local/runtime/usage-history.sqlite3
+BACKUP=/secure/off-machine/codex-usage-history-20260819T120000Z.sqlite3
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+RESTORE_TEMP="${DB}.restore.${STAMP}"
+DB_DIR=$(dirname -- "$DB")
+DB_NAME=$(basename -- "$DB")
+SAFETY_DIR="${DB_DIR}/${DB_NAME}.restore-safety.${STAMP}"
+
+python3 - "$BACKUP" "$RESTORE_TEMP" <<'PY'
+# BEGIN SQLITE_RESTORE_EXAMPLE
+import sqlite3
+import sys
+import os
+import tempfile
+from pathlib import Path
+
+backup_path, destination_path = map(Path, sys.argv[1:])
+if not backup_path.is_file() or backup_path.is_symlink():
+    raise SystemExit(f"backup is not a regular file: {backup_path}")
+if destination_path.exists() or destination_path.is_symlink():
+    raise SystemExit(f"restore destination already exists: {destination_path}")
+destination_path.parent.mkdir(parents=True, exist_ok=True)
+fd, temporary_name = tempfile.mkstemp(
+    prefix=f".{destination_path.name}.", suffix=".tmp",
+    dir=destination_path.parent,
+)
+os.close(fd)
+temporary_path = Path(temporary_name)
+try:
+    source_uri = backup_path.resolve().as_uri() + "?mode=ro"
+    with sqlite3.connect(source_uri, uri=True) as source, sqlite3.connect(temporary_path) as target:
+        source.execute("PRAGMA query_only = ON")
+        source.backup(target)
+        result = target.execute("PRAGMA quick_check").fetchone()
+        if not result or result[0] != "ok":
+            raise SystemExit(f"restore quick_check failed: {result!r}")
+        target.commit()
+    os.chmod(temporary_path, 0o600)
+    os.replace(temporary_path, destination_path)
+finally:
+    temporary_path.unlink(missing_ok=True)
+# END SQLITE_RESTORE_EXAMPLE
+PY
+
+sudo systemctl stop codex-usage-monitor.service codex-usage-dashboard.service
+install -d -m 700 "$SAFETY_DIR"
+if [[ -e "$DB" ]]; then
+  mv -- "$DB" "$SAFETY_DIR/$DB_NAME"
+fi
+for sidecar in "$DB-wal" "$DB-shm"; do
+  if [[ -e "$sidecar" ]]; then
+    mv -- "$sidecar" "$SAFETY_DIR/$(basename -- "$sidecar")"
+  fi
+done
+mv -- "$RESTORE_TEMP" "$DB"
+chmod 600 "$DB"
+sudo systemctl start codex-usage-monitor.service codex-usage-dashboard.service
+sudo systemctl status codex-usage-monitor.service codex-usage-dashboard.service
+```
+
+The restore script never installs `BACKUP-wal` or `BACKUP-shm`: the validated
+artifact is autonomous, and only sidecars belonging to the old active database
+are moved into the safety directory. Keep that mode-`700` directory until a
+successful monitor collection and Analytics query have validated the restore.
+If any command fails, `set -euo pipefail` stops the procedure; before the active
+file is moved, the active database is untouched, and after a move it remains
+recoverable in the safety directory. Automatic recovery may rename a corrupt
+archive to `usage-history.sqlite3.corrupt.*` before rebuilding it from rolling
+history. Those files are forensic recovery copies on the same machine, not a
+scheduled or off-machine backup; retain a separate backup set for disaster
+recovery and migration rollback.
 
 ## Project Internals
 

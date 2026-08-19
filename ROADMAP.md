@@ -159,21 +159,6 @@ en partie sur l'attribut `title`.
 
 **Effort : M**
 
-### 15. Mettre la documentation en cohérence
-
-**Actions :**
-
-- Remplacer les URL de clonage génériques par l'URL canonique du dépôt.
-- Vérifier les procédures LXC, systemd et GitHub Pages avec les noms et chemins
-  actuels.
-- Supprimer ou synchroniser la liste d'idées du README avec la section P3 afin
-  d'éviter deux feuilles de route divergentes.
-- Expliquer les états de fraîcheur.
-- Documenter la sauvegarde et la restauration de SQLite, y compris le mode WAL.
-- Maintenir la référence de configuration avec les changements de `config.py`.
-
-**Effort : S**
-
 ### 16. Préparer le packaging et les releases
 
 **Actions :**
@@ -230,7 +215,7 @@ retirées de cette liste car elles sont déjà implémentées.
 4. Finaliser WAL et les sauvegardes SQLite.
 5. Terminer l'accessibilité du dashboard.
 6. Renforcer la CI.
-7. Corriger la documentation et préparer les releases.
+7. Préparer les releases et le packaging.
 8. Réduire progressivement le script monolithique.
 9. Ajouter les évolutions P3 selon les besoins utilisateurs.
 
