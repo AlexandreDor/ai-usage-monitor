@@ -70,6 +70,8 @@ for required in \
   "mkdir -m 700 -- \"\$SAFETY_DIR\"" \
   "\${DB_NAME}.restore-safety.\${STAMP}" \
   "mv -- \"\$DB\"" \
+  "# BEGIN SQLITE_BACKUP_SHELL_EXAMPLE" \
+  "# END SQLITE_BACKUP_SHELL_EXAMPLE" \
   "# BEGIN SQLITE_BACKUP_EXAMPLE" \
   "# END SQLITE_BACKUP_EXAMPLE" \
   "# BEGIN SQLITE_RESTORE_EXAMPLE" \
@@ -142,9 +144,11 @@ extract_example() {
 }
 
 BACKUP_EXAMPLE="${TEST_ROOT}/sqlite-backup-example.py"
+BACKUP_SHELL_EXAMPLE="${TEST_ROOT}/sqlite-backup-example.sh"
 RESTORE_EXAMPLE="${TEST_ROOT}/sqlite-restore-example.py"
 RESTORE_SAFETY_EXAMPLE="${TEST_ROOT}/sqlite-restore-safety-example.sh"
 extract_example '# BEGIN SQLITE_BACKUP_EXAMPLE' '# END SQLITE_BACKUP_EXAMPLE' "$BACKUP_EXAMPLE"
+extract_example '# BEGIN SQLITE_BACKUP_SHELL_EXAMPLE' '# END SQLITE_BACKUP_SHELL_EXAMPLE' "$BACKUP_SHELL_EXAMPLE"
 extract_example '# BEGIN SQLITE_RESTORE_EXAMPLE' '# END SQLITE_RESTORE_EXAMPLE' "$RESTORE_EXAMPLE"
 
 extract_restore_safety_example() {
@@ -162,6 +166,21 @@ run_restore_safety() {
     DB_NAME="$(basename -- "$database")" \
     SAFETY_DIR="$safety_dir" \
     bash -euo pipefail "$RESTORE_SAFETY_EXAMPLE"
+}
+
+run_backup_wrapper() {
+  local source_database="$1" existing_backup="$2" run_script="${TEST_ROOT}/sqlite-backup-wrapper.sh"
+  {
+    printf 'cd %q\n' "$ROOT_DIR"
+    printf 'DB=%q\n' "$source_database"
+    printf 'BACKUP=%q\n' "$existing_backup"
+    sed \
+      -e '/^cd \/path\/to\/ai-usage-monitor$/d' \
+      -e '/^DB=local\/runtime\/usage-history\.sqlite3$/d' \
+      -e '/^BACKUP=/d' \
+      "$BACKUP_SHELL_EXAMPLE"
+  } > "$run_script"
+  bash "$run_script"
 }
 
 make_sqlite_fixture() {
@@ -215,6 +234,14 @@ for journal_mode in DELETE WAL; do
 
   existing_backup="${TEST_ROOT}/existing-${journal_mode}.sqlite3"
   printf 'do-not-overwrite\n' > "$existing_backup"
+  existing_backup_mode="$(stat -c '%a' "$existing_backup")"
+  if run_backup_wrapper "$source_database" "$existing_backup" >/dev/null 2>&1; then
+    fail "backup shell wrapper accepted an existing ${journal_mode} destination"
+  fi
+  assert_eq 'do-not-overwrite' "$(<"$existing_backup")" \
+    "existing ${journal_mode} backup changed through shell wrapper"
+  assert_eq "$existing_backup_mode" "$(stat -c '%a' "$existing_backup")" \
+    "existing ${journal_mode} backup mode changed through shell wrapper"
   if python3 "$BACKUP_EXAMPLE" "$source_database" "$existing_backup" >/dev/null 2>&1; then
     fail "backup example overwrote an existing ${journal_mode} destination"
   fi

@@ -735,6 +735,9 @@ The example refuses to overwrite an existing `BACKUP` path, checks the
 temporary destination, and installs it with mode `600`:
 
 ```bash
+# BEGIN SQLITE_BACKUP_SHELL_EXAMPLE
+set -euo pipefail
+
 cd /path/to/ai-usage-monitor
 DB=local/runtime/usage-history.sqlite3
 BACKUP=/secure/off-machine/codex-usage-history-$(date -u +%Y%m%dT%H%M%SZ).sqlite3
@@ -774,6 +777,7 @@ finally:
 # END SQLITE_BACKUP_EXAMPLE
 PY
 chmod 600 "$BACKUP"
+# END SQLITE_BACKUP_SHELL_EXAMPLE
 ```
 
 Run `PRAGMA quick_check` on any restored or transferred artifact before using
