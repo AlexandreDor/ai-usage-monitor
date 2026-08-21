@@ -61,7 +61,7 @@ assert_eq 2 "$(<"${FAKE_CURL_COUNT_DIR}/telegram")" "Telegram was not retried"
 assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.status)" "aggregate delivery state"
 
 # Permanent client errors are attempted once and never replayed.
-rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE"
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-permanent"
 export FAKE_CURL_DISCORD_STATUS=400
 unset FAKE_CURL_TELEGRAM_STATUS_SEQUENCE
@@ -172,5 +172,104 @@ assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.1.status)" \
   "post-reset threshold was not delivered"
 assert_eq 2 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" \
   "terminal reset was replayed instead of sending the new threshold"
+
+# ALERTS_ENABLED=0 suppresses new network and anomaly deliveries while
+# retaining local detector evidence and advancing the threshold baseline.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-disabled"
+export FAKE_CURL_STATUS=204 FAKE_CURL_EXIT=0
+ALERTS_ENABLED=0
+ALERT_THRESHOLDS=75
+check_thresholds 70 100 later unknown '' '' 2000000700 >/dev/null
+[[ ! -e "$FAKE_CURL_LOG" ]] || fail "disabled alert emitted an HTTP request"
+assert_eq 70 "$(awk -F= '$1 == "prev_5h_pct" {print $2}' "$STATE_FILE")" \
+  "disabled threshold did not advance its baseline"
+assert_eq 0 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["alerts"]))' "$ALERT_DELIVERIES_FILE")" \
+  "disabled threshold was queued"
+
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE"
+ALERT_THRESHOLDS=0
+observe_quota_anomalies '{"scraped_at_epoch":2000000800,"five_h_pct":40,"weekly_pct":50,"five_h_reset_at":2000010000,"weekly_reset_at":2000010000,"limit_id":"disabled-group"}'
+observe_quota_anomalies '{"scraped_at_epoch":2000000801,"five_h_pct":60,"weekly_pct":50,"five_h_reset_at":2000010000,"weekly_reset_at":2000010000,"limit_id":"disabled-group"}'
+check_thresholds 60 50 later later 2000010000 2000010000 2000000801 disabled-group >/dev/null
+assert_eq 2000000801 "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+connection = sqlite3.connect(sys.argv[1])
+print(connection.execute("SELECT journaled_at FROM quota_anomalies").fetchone()[0])
+PYEOF
+)" "disabled anomaly was not acknowledged locally"
+assert_eq 0 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["alerts"]))' "$ALERT_DELIVERIES_FILE")" \
+  "disabled anomaly was queued"
+
+# A delivery that was already pending before the pause remains pending and
+# resumes after re-enabling without being treated as an unconfigured channel.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-disabled-pending"
+export FAKE_CURL_STATUS=503 FAKE_CURL_DISCORD_STATUS=503 FAKE_CURL_DISCORD_EXIT=0
+unset FAKE_CURL_DISCORD_STATUS_SEQUENCE
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=75
+check_thresholds 70 100 later unknown '' '' 2000000900 >/dev/null 2>&1 || true
+assert_eq pending "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.status)" \
+  "initial pending delivery was not recorded"
+pending_requests="$(wc -l < "$FAKE_CURL_LOG")"
+ALERTS_ENABLED=0
+check_thresholds 60 100 later unknown '' '' 2000000901 >/dev/null
+assert_eq pending "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.status)" \
+  "disabled cycle changed a pending delivery"
+assert_eq "$pending_requests" "$(wc -l < "$FAKE_CURL_LOG")" \
+  "disabled cycle transmitted a pending delivery"
+ALERTS_ENABLED=1
+export FAKE_CURL_STATUS=204
+export FAKE_CURL_DISCORD_STATUS=204
+check_thresholds 60 100 later unknown '' '' 2000000902 >/dev/null
+assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.status)" \
+  "pending delivery did not resume after re-enabling"
+
+# A pending delivery whose expiry passes during the pause gets one delivery
+# attempt on the first resumed cycle before ordinary expiry is restored.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-disabled-expiry"
+export FAKE_CURL_DISCORD_STATUS=503 FAKE_CURL_DISCORD_EXIT=0
+pause_reset=2000001100
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=75
+check_thresholds 70 100 later unknown "$pause_reset" '' 2000001000 >/dev/null 2>&1 || true
+assert_eq pending "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.status)" \
+  "expiring delivery was not queued"
+ALERTS_ENABLED=0
+check_thresholds 70 100 later unknown "$pause_reset" '' "$((pause_reset + 1))" >/dev/null
+assert_eq pending "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.status)" \
+  "disabled expiry discarded the pending delivery"
+ALERTS_ENABLED=1
+export FAKE_CURL_DISCORD_STATUS=204
+check_thresholds 100 100 unknown unknown '' '' "$((pause_reset + 2))" >/dev/null
+assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.status)" \
+  "expired pending delivery was not attempted after re-enabling"
+assert_eq 2 "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.attempt_count)" \
+  "resumed delivery did not make its second attempt"
+assert_eq 0 "$(awk -F= '$1 == "alerts_disabled_since" {print $2}' "$STATE_FILE")" \
+  "disabled interval marker was not cleared after resuming"
+
+# Legacy detector state is migrated into the durable journal even while
+# alerting is disabled; it predates the pause and must remain deliverable.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-disabled-migration"
+export FAKE_CURL_DISCORD_STATUS=204
+migration_reset=2000002200
+ALERTS_ENABLED=0
+ALERT_THRESHOLDS=75
+printf '%s\n' \
+  'state_version=4' 'prev_5h_pct=80' 'prev_weekly_pct=100' \
+  "five_h_armed_reset_at=${migration_reset}" 'weekly_armed_reset_at=0' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=75' 'pending_weekly_threshold=' > "$STATE_FILE"
+check_thresholds 70 100 later unknown "$migration_reset" '' 2000002100 >/dev/null
+assert_eq pending "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.status)" \
+  "legacy pending alert was cleared instead of migrated while disabled"
+assert_eq threshold "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.kind)" \
+  "legacy migration did not preserve the pending threshold"
 
 printf 'PASS: monitor network tests\n'

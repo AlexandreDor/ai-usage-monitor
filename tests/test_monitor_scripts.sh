@@ -211,4 +211,21 @@ check_thresholds 40 100 later unknown '' '' "$now"
 assert_eq 4 "$(state_value state_version)" "alert state was not upgraded to version 4"
 assert_eq 1 "$(state_value script_tracking_initialized)" "script tracking was not initialized"
 
+# ALERTS_ENABLED=0 journals script actions and advances their baseline without
+# executing the configured hook or replaying the disabled crossing later.
+reset_case
+ALERTS_ENABLED=0
+# shellcheck disable=SC2034
+ALERT_SCRIPT_1="$HOOK_ONE"
+# shellcheck disable=SC2034
+ALERT_SCRIPT_1_EVENTS='5h:50'
+validate_config
+check_thresholds 80 100 later unknown "$((now + 300))" '' "$now"
+check_thresholds 40 100 later unknown "$((now + 300))" '' "$((now + 1))"
+[[ ! -e "$HOOK_LOG" ]] || fail "disabled alert script executed"
+assert_eq 40 "$(state_value script_prev_5h_pct)" "disabled script baseline did not advance"
+ALERTS_ENABLED=1
+check_thresholds 30 100 later unknown "$((now + 300))" '' "$((now + 2))"
+[[ ! -e "$HOOK_LOG" ]] || fail "disabled-period script action replayed after re-enable"
+
 printf 'PASS: monitor alert script tests\n'
