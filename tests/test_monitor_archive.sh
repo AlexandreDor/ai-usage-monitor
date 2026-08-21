@@ -76,13 +76,13 @@ with sqlite3.connect(sys.argv[1]) as connection:
     print(int(connection.execute("SELECT value FROM metadata WHERE key = 'history_json_migrated'").fetchone()[0] == "1"))
 PYEOF
 )" "migration marker missing"
-assert_eq 3 "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+assert_eq 4 "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
 import sqlite3
 import sys
 with sqlite3.connect(sys.argv[1]) as connection:
     print(connection.execute("PRAGMA user_version").fetchone()[0])
 PYEOF
-)" "archive schema was not migrated to v3"
+)" "archive schema was not migrated to v4"
 
 # Forecast samples from rolling history are imported without persisting display
 # thresholds, and quota-only cycles do not fabricate Forecast observations.

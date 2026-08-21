@@ -28,39 +28,6 @@ jusqu'à la stabilisation du socle.
 
 ## P1 - Robustesse et qualité
 
-### 4. Alerter sur les mouvements de quota anormaux
-
-Le monitor reconnaît déjà les resets planifiés et certains resets hebdomadaires
-anticipés. Il ne signale pas encore les variations incohérentes qui ne
-correspondent pas à un reset identifiable.
-
-**Actions :**
-
-- Détecter une augmentation du quota sans reset ni changement de groupe de
-  limites.
-- Détecter un déplacement significatif de la date de reset sans remontée du
-  quota.
-- Signaler une date de reset qui recule dans le passé, oscille de manière
-  répétée ou disparaît alors que la fenêtre était disponible.
-- Généraliser aux anomalies la segmentation par `limit_id` déjà utilisée pour
-  les resets hebdomadaires anticipés.
-- Ajouter des tolérances et, lorsque nécessaire, une confirmation sur deux
-  relevés pour éviter les faux positifs.
-- Dédupliquer les alertes et conserver dans SQLite leur type, leur date de
-  détection ainsi que les valeurs avant et après.
-
-**Critères de validation :**
-
-- Un reset planifié, un reset hebdomadaire anticipé reconnu ou un changement de
-  `limit_id` ne produit pas d'alerte d'anomalie.
-- Une hausse isolée du quota et un déplacement isolé de la date sont signalés
-  avec une explication compréhensible.
-- Une oscillation ne déclenche pas la même alerte à chaque cycle.
-- Les anomalies des fenêtres 5 heures et hebdomadaire sont couvertes par des
-  tests.
-
-**Effort : M**
-
 ### 6. Centraliser la configuration partagée
 
 La configuration est validée par le monitor et `serve.sh` sait déjà relire le

@@ -34,14 +34,15 @@ import sqlite3
 import sys
 
 sys.path.insert(0, sys.argv[1])
+import storage
 from storage import ArchiveSchemaError, connect_database
 
 with connect_database(Path(sys.argv[2])) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
     assert connection.execute("SELECT limit_id FROM snapshots").fetchone()[0] == "v1"
-    assert connection.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()[0] == "3"
+    assert connection.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()[0] == "4"
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"reset_events", "token_usage_events", "collector_state", "collector_runs", "forecast_samples"} <= tables
+    assert {"reset_events", "token_usage_events", "collector_state", "collector_runs", "forecast_samples", "quota_anomalies", "anomaly_detector_state"} <= tables
 
 v2 = Path(sys.argv[2]).with_name("v2.sqlite3")
 with connect_database(v2) as connection:
@@ -49,10 +50,25 @@ with connect_database(v2) as connection:
     connection.execute("PRAGMA user_version = 2")
     connection.execute("UPDATE metadata SET value = '2' WHERE key = 'schema_version'")
 with connect_database(v2) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
-    assert connection.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()[0] == "3"
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert connection.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()[0] == "4"
     assert connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='forecast_samples'"
+    ).fetchone()
+
+v3 = Path(sys.argv[2]).with_name("v3.sqlite3")
+with sqlite3.connect(v3) as connection:
+    for statement in storage._V3_SCHEMA_STATEMENTS:
+        connection.execute(statement)
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES ('schema_version', '3')"
+    )
+    connection.execute("PRAGMA user_version = 3")
+with connect_database(v3) as connection:
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert connection.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()[0] == "4"
+    assert connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='quota_anomalies'"
     ).fetchone()
 
 partial_v3 = Path(sys.argv[2]).with_name("partial-v3.sqlite3")
@@ -94,7 +110,7 @@ try:
 except ArchiveSchemaError:
     pass
 else:
-    raise AssertionError("partial legacy archive was promoted to schema v3")
+    raise AssertionError("partial legacy archive was promoted to schema v4")
 PYEOF
 
 # An existing but empty Codex directory is optional in auto mode.

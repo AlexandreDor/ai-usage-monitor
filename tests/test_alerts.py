@@ -61,6 +61,25 @@ class AlertJournalTests(unittest.TestCase):
         with self.assertRaises(alerts.JournalError):
             alerts.register(self.document, changed)
 
+    def test_anomaly_registration_preserves_before_and_after_values(self):
+        request_value = {
+            "kind": "anomaly", "window": "weekly", "selector": "reset_shift",
+            "cycle_key": "limit:default|anomaly:abc123",
+            "message": "weekly reset date moved by 45 minutes",
+            "event_data": {
+                "limit_id": "default", "reset_epoch": 2000,
+                "before_pct": 40, "after_pct": 40,
+                "before_reset_at": 5000, "after_reset_at": 2000,
+                "detected_at_epoch": 1000,
+            },
+            "created_at": 1000, "expires_at": 0,
+            "channels": ["discord"], "replace_pending_thresholds": False,
+            "expire_threshold_cycle": None,
+        }
+        item = alerts.register(self.document, request_value)
+        self.assertEqual("anomaly", item["kind"])
+        self.assertEqual(5000, item["event_data"]["before_reset_at"])
+
     def test_more_critical_threshold_supersedes_pending_atomically(self):
         old = alerts.register(self.document, request("50"))
         new = alerts.register(self.document, request("25", created=101))

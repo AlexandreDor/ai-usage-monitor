@@ -24,8 +24,12 @@ RETENTION_SECONDS = 30 * 24 * 60 * 60
 MAX_RECONCILED_TERMINAL = 500
 MAX_RETRY_DELAY = 24 * 60 * 60
 
-KINDS = {"threshold", "reset"}
+KINDS = {"threshold", "reset", "anomaly"}
 WINDOWS = {"5h", "weekly"}
+ANOMALY_TYPES = {
+    "quota_increase", "reset_shift", "reset_in_past", "reset_missing",
+    "reset_oscillation",
+}
 CHANNELS = {"discord", "telegram"}
 CHANNEL_STATUSES = {"pending", "delivered", "failed"}
 ALERT_STATUSES = CHANNEL_STATUSES
@@ -140,8 +144,25 @@ def _validate_alert(item: Any) -> None:
         if (not isinstance(covered, list) or len(set(covered)) != len(covered)
                 or any(not _is_int(value) or value > 100 for value in covered)):
             raise JournalError("invalid covered_thresholds")
-    elif set(event) != {"limit_id", "reset_epoch"}:
-        raise JournalError("invalid reset event_data")
+    elif item["kind"] == "reset":
+        if set(event) != {"limit_id", "reset_epoch"}:
+            raise JournalError("invalid reset event_data")
+    else:
+        if item["selector"] not in ANOMALY_TYPES:
+            raise JournalError("invalid anomaly selector")
+        if set(event) != {
+            "limit_id", "reset_epoch", "before_pct", "after_pct",
+            "before_reset_at", "after_reset_at", "detected_at_epoch",
+        }:
+            raise JournalError("invalid anomaly event_data")
+        for key in ("before_pct", "after_pct"):
+            value = event[key]
+            if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                    or not math.isfinite(value) or not 0 <= value <= 100):
+                raise JournalError(f"invalid anomaly {key}")
+        for key in ("before_reset_at", "after_reset_at", "detected_at_epoch"):
+            if not _is_int(event[key]):
+                raise JournalError(f"invalid anomaly {key}")
     if not _is_int(item["created_at"]) or not _is_int(item["expires_at"]):
         raise JournalError("invalid alert timestamps")
     if item["expires_at"] and item["expires_at"] < item["created_at"]:
