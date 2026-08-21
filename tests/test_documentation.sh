@@ -55,6 +55,7 @@ for required in \
   "P1.7" \
   "usage-history.sqlite3.corrupt.*" \
   "git clone https://github.com/<github-account>/<pages-repository>.git pages-copy" \
+  "cp local/dashboard.html ../pages-copy/docs/dashboard.html" \
   "cp local/analytics.html ../pages-copy/docs/analytics.html" \
   "git add docs" \
   "git commit -m 'Publish Codex usage dashboard'" \
@@ -68,6 +69,10 @@ for required in \
   "command -v codex" \
   "set -euo pipefail" \
   "mkdir -m 700 -- \"\$SAFETY_DIR\"" \
+  "RESTORE_INSTALLED=1" \
+  "ROLLBACK_REQUIRED=0" \
+  "trap restore_cleanup EXIT" \
+  "STORAGE=/path/to/ai-usage-monitor/local/storage.py" \
   "\${DB_NAME}.restore-safety.\${STAMP}" \
   "mv -- \"\$DB\"" \
   "# BEGIN SQLITE_BACKUP_SHELL_EXAMPLE" \
@@ -75,7 +80,9 @@ for required in \
   "# BEGIN SQLITE_BACKUP_EXAMPLE" \
   "# END SQLITE_BACKUP_EXAMPLE" \
   "# BEGIN SQLITE_RESTORE_EXAMPLE" \
-  "# END SQLITE_RESTORE_EXAMPLE"; do
+  "# END SQLITE_RESTORE_EXAMPLE" \
+  "# BEGIN SQLITE_RESTORE_CLEANUP_EXAMPLE" \
+  "# END SQLITE_RESTORE_CLEANUP_EXAMPLE"; do
   assert_contains "$readme_text" "$required" "documentation invariant missing: $required"
 done
 
@@ -129,6 +136,22 @@ pages_end = text.index("Select that repository's branch and `/docs` directory", 
 pages_section = text[pages_start:pages_end]
 if pages_section.index("${EDITOR:-vi} docs/assets/dashboard.js") > pages_section.index("git add docs"):
     raise SystemExit("Pages GIST_ID edit occurs after git add")
+if "cp local/dashboard.html ../pages-copy/docs/index.html" not in pages_section:
+    raise SystemExit("Pages publication omits index.html")
+if "cp local/dashboard.html ../pages-copy/docs/dashboard.html" not in pages_section:
+    raise SystemExit("Pages publication omits dashboard.html required by Analytics")
+
+restore_start = text.index("DB=/path/to/ai-usage-monitor/local/runtime/usage-history.sqlite3")
+restore_end = text.index("The restore script never installs", restore_start)
+restore_section = text[restore_start:restore_end]
+if restore_section.index('mkdir -m 700 -- "$SAFETY_DIR"') > restore_section.index("systemctl stop"):
+    raise SystemExit("restore stops services before reserving the safety directory")
+if restore_section.index("trap restore_cleanup EXIT") > restore_section.index(
+    "\nsudo systemctl stop codex-usage-monitor.service codex-usage-dashboard.service\n"
+):
+    raise SystemExit("restore stops services before installing its cleanup trap")
+if restore_section.index("ROLLBACK_REQUIRED=0") < restore_section.index("systemctl status"):
+    raise SystemExit("restore disables rollback before service status checks")
 PY
 
 extract_example() {
@@ -146,15 +169,20 @@ extract_example() {
 BACKUP_EXAMPLE="${TEST_ROOT}/sqlite-backup-example.py"
 BACKUP_SHELL_EXAMPLE="${TEST_ROOT}/sqlite-backup-example.sh"
 RESTORE_EXAMPLE="${TEST_ROOT}/sqlite-restore-example.py"
+RESTORE_CLEANUP_EXAMPLE="${TEST_ROOT}/sqlite-restore-cleanup-example.sh"
 RESTORE_SAFETY_EXAMPLE="${TEST_ROOT}/sqlite-restore-safety-example.sh"
 extract_example '# BEGIN SQLITE_BACKUP_EXAMPLE' '# END SQLITE_BACKUP_EXAMPLE' "$BACKUP_EXAMPLE"
 extract_example '# BEGIN SQLITE_BACKUP_SHELL_EXAMPLE' '# END SQLITE_BACKUP_SHELL_EXAMPLE' "$BACKUP_SHELL_EXAMPLE"
 extract_example '# BEGIN SQLITE_RESTORE_EXAMPLE' '# END SQLITE_RESTORE_EXAMPLE' "$RESTORE_EXAMPLE"
+extract_example '# BEGIN SQLITE_RESTORE_CLEANUP_EXAMPLE' '# END SQLITE_RESTORE_CLEANUP_EXAMPLE' "$RESTORE_CLEANUP_EXAMPLE"
 
 extract_restore_safety_example() {
   local output="$1"
-  local start_pattern="^mkdir -m 700 -- \"\\\$SAFETY_DIR\"\$"
-  sed -n "/${start_pattern}/,/^done$/p" "$README" > "$output"
+  awk '
+    $0 == "if [[ -e \"$DB\" || -L \"$DB\" ]]; then" { inside = 1 }
+    inside { print }
+    inside && $0 == "done" { exit }
+  ' "$README" > "$output"
   [[ -s "$output" ]] || fail "could not extract documented restore safety commands"
 }
 
@@ -162,10 +190,13 @@ extract_restore_safety_example "$RESTORE_SAFETY_EXAMPLE"
 
 run_restore_safety() {
   local database="$1" safety_dir="$2"
-  DB="$database" \
+  {
+    printf "mkdir -m 700 -- \"\$SAFETY_DIR\"\n"
+    cat "$RESTORE_SAFETY_EXAMPLE"
+  } | DB="$database" \
     DB_NAME="$(basename -- "$database")" \
     SAFETY_DIR="$safety_dir" \
-    bash -euo pipefail "$RESTORE_SAFETY_EXAMPLE"
+    bash -euo pipefail 2>/dev/null
 }
 
 run_backup_wrapper() {
@@ -184,16 +215,24 @@ run_backup_wrapper() {
 }
 
 make_sqlite_fixture() {
-  python3 - "$1" "$2" <<'PY'
+  python3 - "$ROOT_DIR" "$1" "$2" <<'PY'
+from pathlib import Path
 import sqlite3
 import sys
 
-database, journal_mode = sys.argv[1:]
+root, database, journal_mode = sys.argv[1:]
+sys.path.insert(0, str(Path(root) / "local"))
+from storage import connect_database
+
+with connect_database(Path(database)) as connection:
+    connection.execute(
+        "INSERT OR REPLACE INTO metadata(key, value) VALUES('test_fixture', ?)",
+        (journal_mode,),
+    )
+    connection.commit()
 with sqlite3.connect(database) as connection:
     connection.execute(f"PRAGMA journal_mode={journal_mode}")
     connection.execute("PRAGMA wal_autocheckpoint=0")
-    connection.execute("CREATE TABLE sample(value TEXT NOT NULL)")
-    connection.executemany("INSERT INTO sample(value) VALUES (?)", [(f"{journal_mode}-value",), ("shared-value",)])
     connection.commit()
 PY
 }
@@ -207,8 +246,11 @@ database, expected = sys.argv[1:]
 with sqlite3.connect(database) as connection:
     result = connection.execute("PRAGMA quick_check").fetchone()
     assert result == ("ok",), result
-    values = [row[0] for row in connection.execute("SELECT value FROM sample ORDER BY rowid")]
-    assert values == [f"{expected}-value", "shared-value"], values
+    assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+    value = connection.execute(
+        "SELECT value FROM metadata WHERE key = 'test_fixture'"
+    ).fetchone()
+    assert value == (expected,), value
 PY
 }
 
@@ -226,7 +268,7 @@ for journal_mode in DELETE WAL; do
   [[ ! -e "${backup_database}-wal" && ! -e "${backup_database}-shm" ]] \
     || fail "backup ${journal_mode} retained non-autonomous sidecars"
 
-  python3 "$RESTORE_EXAMPLE" "$backup_database" "$restore_database"
+  python3 "$RESTORE_EXAMPLE" "$backup_database" "$restore_database" "$ROOT_DIR/local/storage.py"
   verify_sqlite_artifact "$restore_database" "$journal_mode"
   assert_eq 600 "$(stat -c '%a' "$restore_database")" "restore mode for ${journal_mode}"
   [[ ! -e "${restore_database}-wal" && ! -e "${restore_database}-shm" ]] \
@@ -247,11 +289,78 @@ for journal_mode in DELETE WAL; do
   fi
   assert_eq 'do-not-overwrite' "$(<"$existing_backup")" "existing ${journal_mode} backup changed"
 
+  existing_restore="${TEST_ROOT}/existing-restore-${journal_mode}.sqlite3"
+  printf 'do-not-overwrite\n' > "$existing_restore"
+  if python3 "$RESTORE_EXAMPLE" "$backup_database" "$existing_restore" "$ROOT_DIR/local/storage.py" >/dev/null 2>&1; then
+    fail "restore example overwrote an existing ${journal_mode} destination"
+  fi
+  assert_eq 'do-not-overwrite' "$(<"$existing_restore")" \
+    "existing ${journal_mode} restore destination changed"
+
+  race_backup="${TEST_ROOT}/race-${journal_mode}.sqlite3"
+  python3 "$BACKUP_EXAMPLE" "$source_database" "$race_backup" >/dev/null 2>&1 &
+  first_pid=$!
+  python3 "$BACKUP_EXAMPLE" "$source_database" "$race_backup" >/dev/null 2>&1 &
+  second_pid=$!
+  race_successes=0
+  if wait "$first_pid"; then
+    race_successes=$((race_successes + 1))
+  fi
+  if wait "$second_pid"; then
+    race_successes=$((race_successes + 1))
+  fi
+  assert_eq 1 "$race_successes" "concurrent ${journal_mode} backups did not enforce no-clobber"
+  verify_sqlite_artifact "$race_backup" "$journal_mode"
+
   printf 'not a sqlite database\n' > "$corrupt_database"
-  if python3 "$RESTORE_EXAMPLE" "$corrupt_database" "$corrupt_restore" >/dev/null 2>&1; then
+  if python3 "$RESTORE_EXAMPLE" "$corrupt_database" "$corrupt_restore" "$ROOT_DIR/local/storage.py" >/dev/null 2>&1; then
     fail "restore example accepted corrupt ${journal_mode} candidate"
   fi
   [[ ! -e "$corrupt_restore" ]] || fail "corrupt ${journal_mode} candidate created a destination"
+
+  unrelated_database="${TEST_ROOT}/unrelated-${journal_mode}.sqlite3"
+  unrelated_restore="${TEST_ROOT}/unrelated-restore-${journal_mode}.sqlite3"
+  python3 - "$unrelated_database" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    connection.execute("CREATE TABLE unrelated(value TEXT)")
+PY
+  if python3 "$RESTORE_EXAMPLE" "$unrelated_database" "$unrelated_restore" "$ROOT_DIR/local/storage.py" >/dev/null 2>&1; then
+    fail "restore example accepted unrelated ${journal_mode} SQLite database"
+  fi
+  [[ ! -e "$unrelated_restore" ]] || fail "unrelated ${journal_mode} database created a destination"
+
+  obsolete_database="${TEST_ROOT}/obsolete-${journal_mode}.sqlite3"
+  obsolete_restore="${TEST_ROOT}/obsolete-restore-${journal_mode}.sqlite3"
+  python3 - "$obsolete_database" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    connection.execute("PRAGMA user_version = 2")
+    connection.commit()
+PY
+  if python3 "$RESTORE_EXAMPLE" "$obsolete_database" "$obsolete_restore" "$ROOT_DIR/local/storage.py" >/dev/null 2>&1; then
+    fail "restore example accepted obsolete schema ${journal_mode} candidate"
+  fi
+  [[ ! -e "$obsolete_restore" ]] || fail "obsolete ${journal_mode} candidate created a destination"
+
+  unsupported_database="${TEST_ROOT}/unsupported-${journal_mode}.sqlite3"
+  unsupported_restore="${TEST_ROOT}/unsupported-restore-${journal_mode}.sqlite3"
+  python3 - "$unsupported_database" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    connection.execute("PRAGMA user_version = 4")
+    connection.commit()
+PY
+  if python3 "$RESTORE_EXAMPLE" "$unsupported_database" "$unsupported_restore" "$ROOT_DIR/local/storage.py" >/dev/null 2>&1; then
+    fail "restore example accepted unsupported schema ${journal_mode} candidate"
+  fi
+  [[ ! -e "$unsupported_restore" ]] || fail "unsupported ${journal_mode} candidate created a destination"
 
   safety_parent="${TEST_ROOT}/restore safety ${journal_mode}"
   mkdir -p "$safety_parent"
@@ -307,5 +416,93 @@ for journal_mode in DELETE WAL; do
   assert_eq "replacement active ${journal_mode}" "$(<"$active_database")" \
     "active ${journal_mode} database moved for file collision"
 done
+
+reservation_example="${TEST_ROOT}/restore-reservation-example.sh"
+awk '
+  $0 == "mkdir -m 700 -- \"$SAFETY_DIR\"" { inside = 1 }
+  inside { print }
+  inside && $0 == "MONITOR_WAS_ACTIVE=0" { exit }
+' "$README" > "$reservation_example"
+[[ -s "$reservation_example" ]] || fail "could not extract safety reservation commands"
+reservation_dir="${TEST_ROOT}/already-reserved"
+reservation_log="${TEST_ROOT}/reservation-services.log"
+mkdir -m 700 "$reservation_dir"
+reservation_script="${TEST_ROOT}/run-reservation-collision.sh"
+{
+  printf '%s\n' 'set -euo pipefail'
+  printf 'SAFETY_DIR=%q\n' "$reservation_dir"
+  printf 'systemctl() { printf "%%s\\n" "$*" >> %q; }\n' "$reservation_log"
+  printf '%s\n' 'sudo() { "$@"; }'
+  cat "$reservation_example"
+} > "$reservation_script"
+if bash "$reservation_script" >/dev/null 2>&1; then
+  fail "safety directory collision was accepted before stopping services"
+fi
+[[ ! -e "$reservation_log" ]] || fail "service inspection ran before safety directory reservation"
+
+cleanup_database="${TEST_ROOT}/cleanup-active.sqlite3"
+cleanup_safety="${TEST_ROOT}/cleanup-safety"
+cleanup_log="${TEST_ROOT}/cleanup-services.log"
+cleanup_temp="${TEST_ROOT}/cleanup-restore-temp.sqlite3"
+mkdir -m 700 "$cleanup_safety"
+printf 'old database\n' > "$cleanup_database"
+printf 'old wal\n' > "$cleanup_database-wal"
+printf 'old shm\n' > "$cleanup_database-shm"
+printf 'validated candidate\n' > "$cleanup_temp"
+cleanup_script="${TEST_ROOT}/run-restore-cleanup.sh"
+{
+  printf '%s\n' 'set -euo pipefail'
+  printf 'DB=%q\n' "$cleanup_database"
+  printf 'DB_DIR=%q\n' "$(dirname -- "$cleanup_database")"
+  printf 'DB_NAME=%q\n' "$(basename -- "$cleanup_database")"
+  printf 'SAFETY_DIR=%q\n' "$cleanup_safety"
+  printf 'RESTORE_TEMP=%q\n' "$cleanup_temp"
+  printf 'MONITOR_WAS_ACTIVE=1\nDASHBOARD_WAS_ACTIVE=1\nRESTORE_INSTALLED=0\nRESTORE_ID=\x27\x27\nROLLBACK_REQUIRED=1\n'
+  printf 'systemctl() {\n'
+  printf '  printf "%%s\\n" "$*" >> %q\n' "$cleanup_log"
+  printf "  if [[ \"\$1\" == status ]]; then return 1; fi\n"
+  printf '}\n'
+  printf '%s\n' 'sudo() { "$@"; }'
+  cat "$RESTORE_CLEANUP_EXAMPLE"
+  printf '%s\n' 'trap restore_cleanup EXIT'
+  awk '
+    $0 == "sudo systemctl stop codex-usage-monitor.service codex-usage-dashboard.service" { inside = 1 }
+    inside { print }
+    inside && $0 == "trap - EXIT" { exit }
+  ' "$README"
+} > "$cleanup_script"
+if bash "$cleanup_script" >/dev/null 2>&1; then
+  fail "restore cleanup hid a service status failure"
+fi
+assert_eq 'old database' "$(<"$cleanup_database")" \
+  "restore cleanup did not restore active database"
+assert_eq 'old wal' "$(<"$cleanup_database-wal")" \
+  "restore cleanup did not restore WAL sidecar"
+assert_eq 'old shm' "$(<"$cleanup_database-shm")" \
+  "restore cleanup did not restore SHM sidecar"
+[[ ! -e "$cleanup_temp" ]] || fail "restore cleanup retained temporary candidate"
+cleanup_log_text="$(<"$cleanup_log")"
+assert_contains "$cleanup_log_text" "stop codex-usage-monitor.service codex-usage-dashboard.service" \
+  "rollback did not stop database-using services"
+assert_contains "$cleanup_log_text" "start codex-usage-monitor.service" \
+  "initially active monitor service was not restarted"
+assert_contains "$cleanup_log_text" "start codex-usage-dashboard.service" \
+  "initially active dashboard service was not restarted"
+python3 - "$cleanup_log" <<'PY'
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+status = next(i for i, line in enumerate(lines) if line.startswith("status "))
+rollback_stop = next(
+    i for i, line in enumerate(lines[status + 1 :], status + 1)
+    if line.startswith("stop ")
+)
+monitor_restart = next(
+    i for i, line in enumerate(lines[rollback_stop + 1 :], rollback_stop + 1)
+    if line == "start codex-usage-monitor.service"
+)
+if not rollback_stop < monitor_restart:
+    raise SystemExit("rollback restarted a service before stopping it")
+PY
 
 printf 'PASS: documentation consistency tests\n'

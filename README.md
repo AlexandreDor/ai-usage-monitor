@@ -562,13 +562,14 @@ git clone https://github.com/AlexandreDor/ai-usage-monitor.git
 cd ai-usage-monitor/local
 cp .env.example .env
 chmod 600 .env
-./monitor.sh --check
 ```
 
 Install the Codex CLI using its current upstream instructions and authenticate
 as the same Unix account that will run the monitor. Verify that account's
 authentication with `codex login status` and `codex /status`; authentication in
-the host or in another account is not implicitly available inside the LXC.
+the host or in another account is not implicitly available inside the LXC. Once
+Codex is installed and authenticated, run `./monitor.sh --check` from the
+`ai-usage-monitor/local` directory.
 Keep the working tree and the runtime archive at
 `/path/to/ai-usage-monitor/local/runtime/`, whose default SQLite archive is
 `usage-history.sqlite3`.
@@ -690,6 +691,7 @@ git clone https://github.com/<github-account>/<pages-repository>.git pages-copy
 cd /path/to/ai-usage-monitor
 mkdir -p ../pages-copy/docs/assets ../pages-copy/docs/images
 cp local/dashboard.html ../pages-copy/docs/index.html
+cp local/dashboard.html ../pages-copy/docs/dashboard.html
 cp local/analytics.html ../pages-copy/docs/analytics.html
 cp -R local/assets/. ../pages-copy/docs/assets/
 cp local/images/favicon.png ../pages-copy/docs/images/favicon.png
@@ -704,9 +706,11 @@ git push
 ```
 
 Select that repository's branch and `/docs` directory in Settings → Pages.
-The published copy must retain `index.html`, the complete `assets/` directory,
-and `images/favicon.png`. The editor step above must leave this mutable value
-near the top of the copied file:
+The published copy must retain `index.html`, `dashboard.html`, the complete
+`assets/` directory, and `images/favicon.png`. Keeping both dashboard filenames
+ensures that the Analytics back link resolves, even though Analytics data itself
+remains unavailable without the local server. The editor step above must leave
+this mutable value near the top of the copied file:
 
 ```javascript
 let GIST_ID = '0123456789abcdef0123456789abcdef';
@@ -771,7 +775,11 @@ try:
             raise SystemExit(f"backup quick_check failed: {result!r}")
         target.commit()
     os.chmod(temporary_path, 0o600)
-    os.replace(temporary_path, destination_path)
+    try:
+        os.link(temporary_path, destination_path)
+    except FileExistsError:
+        raise SystemExit(f"backup destination already exists: {destination_path}")
+    temporary_path.unlink()
 finally:
     temporary_path.unlink(missing_ok=True)
 # END SQLITE_BACKUP_EXAMPLE
@@ -786,38 +794,43 @@ the `backup()` destination is autonomous.
 
 ### Restore safely
 
-The restore is fail-fast. It first creates and verifies a new autonomous file
-next to the active database, before stopping services or touching the active
-file. A corrupt candidate therefore leaves the active database intact. Once
-the candidate is valid, stop at least both services and ensure no other process
-has the archive open. Move the active database and any active `${DB}-wal` /
-`${DB}-shm` sidecars into a new mode-`700` safety directory, then move the
-validated autonomous file into place:
+The restore is fail-fast. It first creates and verifies a new autonomous schema
+v3 archive next to the active database, before stopping services or touching
+the active file. A corrupt, unrelated, or obsolete-schema candidate therefore
+leaves the active database intact. Once the candidate is valid, stop at least
+both services and ensure no other process has the archive open. The procedure
+reserves the safety directory before stopping services, preserves their
+previous active state, and keeps an exit trap armed until every required start
+and status check succeeds:
 
 ```bash
 set -euo pipefail
 
 DB=/path/to/ai-usage-monitor/local/runtime/usage-history.sqlite3
 BACKUP=/secure/off-machine/codex-usage-history-20260819T120000Z.sqlite3
+STORAGE=/path/to/ai-usage-monitor/local/storage.py
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 RESTORE_TEMP="${DB}.restore.${STAMP}"
 DB_DIR=$(dirname -- "$DB")
 DB_NAME=$(basename -- "$DB")
 SAFETY_DIR="${DB_DIR}/${DB_NAME}.restore-safety.${STAMP}"
 
-python3 - "$BACKUP" "$RESTORE_TEMP" <<'PY'
+python3 - "$BACKUP" "$RESTORE_TEMP" "$STORAGE" <<'PY'
 # BEGIN SQLITE_RESTORE_EXAMPLE
+import importlib.util
 import sqlite3
 import sys
 import os
 import tempfile
 from pathlib import Path
 
-backup_path, destination_path = map(Path, sys.argv[1:])
+backup_path, destination_path, storage_path = map(Path, sys.argv[1:])
 if not backup_path.is_file() or backup_path.is_symlink():
     raise SystemExit(f"backup is not a regular file: {backup_path}")
 if destination_path.exists() or destination_path.is_symlink():
     raise SystemExit(f"restore destination already exists: {destination_path}")
+if not storage_path.is_file() or storage_path.is_symlink():
+    raise SystemExit(f"storage module is not a regular file: {storage_path}")
 destination_path.parent.mkdir(parents=True, exist_ok=True)
 fd, temporary_name = tempfile.mkstemp(
     prefix=f".{destination_path.name}.", suffix=".tmp",
@@ -834,40 +847,127 @@ try:
         if not result or result[0] != "ok":
             raise SystemExit(f"restore quick_check failed: {result!r}")
         target.commit()
+    spec = importlib.util.spec_from_file_location("codex_usage_storage", storage_path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"could not load storage module: {storage_path}")
+    storage = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(storage)
+    with storage.connect_database(temporary_path, read_only=True):
+        pass
     os.chmod(temporary_path, 0o600)
-    os.replace(temporary_path, destination_path)
+    try:
+        os.link(temporary_path, destination_path)
+    except FileExistsError:
+        raise SystemExit(f"restore destination already exists: {destination_path}")
+    temporary_path.unlink()
 finally:
     temporary_path.unlink(missing_ok=True)
 # END SQLITE_RESTORE_EXAMPLE
 PY
 
-sudo systemctl stop codex-usage-monitor.service codex-usage-dashboard.service
 mkdir -m 700 -- "$SAFETY_DIR"
-if [[ -e "$DB" ]]; then
+MONITOR_WAS_ACTIVE=0
+DASHBOARD_WAS_ACTIVE=0
+if sudo systemctl is-active --quiet codex-usage-monitor.service; then
+  MONITOR_WAS_ACTIVE=1
+fi
+if sudo systemctl is-active --quiet codex-usage-dashboard.service; then
+  DASHBOARD_WAS_ACTIVE=1
+fi
+RESTORE_INSTALLED=0
+RESTORE_ID=''
+ROLLBACK_REQUIRED=1
+
+# BEGIN SQLITE_RESTORE_CLEANUP_EXAMPLE
+restore_cleanup() {
+  local result=$?
+  local current_id
+  trap - EXIT
+  if (( result != 0 && ROLLBACK_REQUIRED == 1 )); then
+    # Stop every database-using service before removing the replacement or
+    # putting the old database back. This also covers a partial restart.
+    sudo systemctl stop codex-usage-monitor.service codex-usage-dashboard.service || result=1
+    if (( RESTORE_INSTALLED == 1 )); then
+      if [[ -L "$DB" ]]; then
+        result=1
+      elif [[ -e "$DB" ]]; then
+        current_id=$(stat -c '%d:%i' -- "$DB" 2>/dev/null) || current_id=''
+        if [[ -n "$RESTORE_ID" && "$current_id" == "$RESTORE_ID" ]]; then
+          rm -f -- "$DB" || result=1
+        else
+          result=1
+        fi
+      fi
+    fi
+    rm -f -- "$RESTORE_TEMP" || result=1
+    for name in "$DB_NAME" "$DB_NAME-wal" "$DB_NAME-shm"; do
+      safety_path="$SAFETY_DIR/$name"
+      target_path="$DB_DIR/$name"
+      if [[ -e "$safety_path" || -L "$safety_path" ]]; then
+        if [[ -e "$target_path" || -L "$target_path" ]]; then
+          # Never overwrite a path that appeared outside this procedure.
+          result=1
+        else
+          mv -- "$safety_path" "$target_path" || result=1
+        fi
+      fi
+    done
+  else
+    rm -f -- "$RESTORE_TEMP" || result=1
+  fi
+  if (( MONITOR_WAS_ACTIVE == 1 )); then
+    sudo systemctl start codex-usage-monitor.service || result=1
+  fi
+  if (( DASHBOARD_WAS_ACTIVE == 1 )); then
+    sudo systemctl start codex-usage-dashboard.service || result=1
+  fi
+  exit "$result"
+}
+# END SQLITE_RESTORE_CLEANUP_EXAMPLE
+trap restore_cleanup EXIT
+
+sudo systemctl stop codex-usage-monitor.service codex-usage-dashboard.service
+if [[ -e "$DB" || -L "$DB" ]]; then
   mv -- "$DB" "$SAFETY_DIR/$DB_NAME"
 fi
 for sidecar in "$DB-wal" "$DB-shm"; do
-  if [[ -e "$sidecar" ]]; then
+  if [[ -e "$sidecar" || -L "$sidecar" ]]; then
     mv -- "$sidecar" "$SAFETY_DIR/$(basename -- "$sidecar")"
   fi
 done
-mv -- "$RESTORE_TEMP" "$DB"
+if ! ln -- "$RESTORE_TEMP" "$DB"; then
+  exit 1
+fi
+RESTORE_INSTALLED=1
+RESTORE_ID=$(stat -c '%d:%i' -- "$DB")
+rm -- "$RESTORE_TEMP"
 chmod 600 "$DB"
-sudo systemctl start codex-usage-monitor.service codex-usage-dashboard.service
-sudo systemctl status codex-usage-monitor.service codex-usage-dashboard.service
+if (( MONITOR_WAS_ACTIVE == 1 )); then
+  sudo systemctl start codex-usage-monitor.service
+  sudo systemctl status codex-usage-monitor.service
+fi
+if (( DASHBOARD_WAS_ACTIVE == 1 )); then
+  sudo systemctl start codex-usage-dashboard.service
+  sudo systemctl status codex-usage-dashboard.service
+fi
+ROLLBACK_REQUIRED=0
+trap - EXIT
 ```
 
 The restore script never installs `BACKUP-wal` or `BACKUP-shm`: the validated
 artifact is autonomous, and only sidecars belonging to the old active database
 are moved into the safety directory. Keep that mode-`700` directory until a
 successful monitor collection and Analytics query have validated the restore.
-If any command fails, `set -euo pipefail` stops the procedure; before the active
-file is moved, the active database is untouched, and after a move it remains
-recoverable in the safety directory. Automatic recovery may rename a corrupt
-archive to `usage-history.sqlite3.corrupt.*` before rebuilding it from rolling
-history. Those files are forensic recovery copies on the same machine, not a
-scheduled or off-machine backup; retain a separate backup set for disaster
-recovery and migration rollback.
+If any command fails, the exit trap first stops both services, removes only the
+replacement it installed, restores old database files only into absent paths,
+and restarts exactly the services that were active before the restore. An
+unexpected path collision remains a manual recovery condition rather than
+being overwritten. The mode-`700` safety directory is retained after success
+for manual validation. Automatic recovery may rename a corrupt archive to
+`usage-history.sqlite3.corrupt.*` before rebuilding it from rolling history.
+Those files are forensic recovery copies on the same machine, not a scheduled
+or off-machine backup; retain a separate backup set for disaster recovery and
+migration rollback.
 
 ## Project Internals
 
