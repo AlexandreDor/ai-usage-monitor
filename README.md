@@ -344,9 +344,18 @@ Scripts receive:
 | `CODEX_BIN` | `codex` | Executable name or path | Codex CLI command used by the monitor. |
 | `MONITOR_DEBUG` | `0` | `0` or `1` | Enables bounded sanitized Codex and HTTP diagnostics. |
 
-The SQLite archive retains detailed quota, Forecast, reset, and token data for
-Analytics. Existing schema v1 and v2 archives migrate transactionally to v3 on
+The SQLite archive retains detailed quota, Forecast, reset, anomaly, and token
+data for Analytics. Existing schema v1, v2, and v3 archives migrate
+transactionally to v4 on
 their next writable monitor or `--check` run.
+The detector tolerates quota noise up to 5 percentage points and reset-date
+movement up to 30 minutes; a disappeared reset date is confirmed after two
+valid observations. Planned deadline crossings and the recognized weekly
+refill pattern are excluded. Anomaly rows remain local even when no channel is
+configured, and an interrupted journal registration is retried on a later
+cycle. Journaled anomaly records and inactive detector state follow
+`ARCHIVE_RETENTION_DAYS`; an anomaly still awaiting journal registration is
+retained until it can be delivered.
 The rolling JSON history is separate and retains samples according to their
 actual timestamps. Changing the collection interval does not change the time
 span requested by `HISTORY_RETENTION_HOURS`; only the defensive entry and size
@@ -795,7 +804,7 @@ the `backup()` destination is autonomous.
 ### Restore safely
 
 The restore is fail-fast. It first reserves a new mode-`700` safety directory,
-before creating and verifying an autonomous schema v3 archive next to the
+before creating and verifying an autonomous schema v4 archive next to the
 active database. A safety-directory collision therefore creates no candidate;
 a corrupt, unrelated, or obsolete-schema candidate also leaves the active
 database intact. Once the candidate is valid, stop at least both services and

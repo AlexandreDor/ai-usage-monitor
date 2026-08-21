@@ -8,8 +8,8 @@ import os
 from pathlib import Path
 
 
-SCHEMA_VERSION = "3"
-SCHEMA_VERSION_NUMBER = 3
+SCHEMA_VERSION = "4"
+SCHEMA_VERSION_NUMBER = 4
 SQLITE_BUSY_TIMEOUT_MS = 10_000
 
 
@@ -67,6 +67,18 @@ _V3_TABLE_COLUMNS = {
     "forecast_samples": {
         "scraped_at_epoch", "generated_at_epoch", "chance_24h_pct",
         "chance_6h_pct",
+    },
+}
+
+_V4_TABLE_COLUMNS = {
+    **_V3_TABLE_COLUMNS,
+    "quota_anomalies": {
+        "anomaly_id", "dedupe_key", "anomaly_type", "window", "limit_id",
+        "detected_at_epoch", "before_pct", "after_pct", "before_reset_at",
+        "after_reset_at", "message", "journaled_at",
+    },
+    "anomaly_detector_state": {
+        "limit_id", "window", "state_json", "updated_at_epoch",
     },
 }
 
@@ -161,6 +173,41 @@ _V3_SCHEMA_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_forecast_samples_scraped_at ON forecast_samples(scraped_at_epoch)",
 )
 
+_V4_SCHEMA_STATEMENTS = (
+    *_V3_SCHEMA_STATEMENTS,
+    """
+    CREATE TABLE IF NOT EXISTS quota_anomalies (
+        anomaly_id TEXT PRIMARY KEY,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        anomaly_type TEXT NOT NULL CHECK(anomaly_type IN (
+            'quota_increase', 'reset_shift', 'reset_in_past',
+            'reset_missing', 'reset_oscillation'
+        )),
+        window TEXT NOT NULL CHECK(window IN ('5h', 'weekly')),
+        limit_id TEXT NOT NULL,
+        detected_at_epoch INTEGER NOT NULL,
+        before_pct REAL,
+        after_pct REAL,
+        before_reset_at INTEGER,
+        after_reset_at INTEGER,
+        message TEXT NOT NULL,
+        journaled_at INTEGER
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_quota_anomalies_pending ON quota_anomalies(journaled_at, detected_at_epoch)",
+    "CREATE INDEX IF NOT EXISTS idx_quota_anomalies_window_time ON quota_anomalies(window, detected_at_epoch)",
+    """
+    CREATE TABLE IF NOT EXISTS anomaly_detector_state (
+        limit_id TEXT NOT NULL,
+        window TEXT NOT NULL CHECK(window IN ('5h', 'weekly')),
+        state_json TEXT NOT NULL,
+        updated_at_epoch INTEGER NOT NULL,
+        PRIMARY KEY(limit_id, window)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_anomaly_detector_state_updated ON anomaly_detector_state(updated_at_epoch)",
+)
+
 
 def _table_names(connection: sqlite3.Connection) -> set[str]:
     return {
@@ -226,7 +273,7 @@ def _set_schema_metadata(connection: sqlite3.Connection) -> None:
 
 
 def create_schema(connection: sqlite3.Connection) -> None:
-    """Create the archive or migrate an explicitly recognized archive to v3."""
+    """Create the archive or migrate an explicitly recognized archive to v4."""
     raw_version = connection.execute("PRAGMA user_version").fetchone()
     try:
         version = int(raw_version[0]) if raw_version else 0
@@ -236,30 +283,33 @@ def create_schema(connection: sqlite3.Connection) -> None:
     tables = _table_names(connection)
     fresh = version == 0 and not tables
     legacy_without_pragma = version == 0 and {"metadata", "snapshots"}.issubset(tables)
-    if version not in (0, 1, 2, SCHEMA_VERSION_NUMBER):
+    if version not in (0, 1, 2, 3, SCHEMA_VERSION_NUMBER):
         raise ArchiveSchemaError(
-            f"unsupported archive schema version {version}; expected 1, 2 or {SCHEMA_VERSION_NUMBER}"
+            f"unsupported archive schema version {version}; expected 1, 2, 3 or {SCHEMA_VERSION_NUMBER}"
         )
     if version == 0 and not fresh and not legacy_without_pragma:
         raise ArchiveSchemaError("archive has tables but no recognized schema version")
 
     if version == 1 or legacy_without_pragma:
         _validate_tables(connection, _V1_TABLE_COLUMNS, version=1)
-        _validate_existing_tables(connection, _V3_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+        _validate_existing_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
     elif version == 2:
         _validate_tables(connection, _V2_TABLE_COLUMNS, version=2)
-        _validate_existing_tables(connection, _V3_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+        _validate_existing_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+    elif version == 3:
+        _validate_tables(connection, _V3_TABLE_COLUMNS, version=3)
+        _validate_existing_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
     elif version == SCHEMA_VERSION_NUMBER:
-        _validate_tables(connection, _V3_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+        _validate_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
 
     started_transaction = not connection.in_transaction
     if started_transaction:
         connection.execute("BEGIN IMMEDIATE")
     try:
-        if fresh or version in (0, 1, 2):
-            for statement in _V3_SCHEMA_STATEMENTS:
+        if fresh or version in (0, 1, 2, 3):
+            for statement in _V4_SCHEMA_STATEMENTS:
                 connection.execute(statement)
-            connection.execute("PRAGMA user_version = 3")
+            connection.execute("PRAGMA user_version = 4")
         elif version == SCHEMA_VERSION_NUMBER:
             # Keep indexes repairable without silently accepting a partial table schema.
             connection.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_scraped_at ON snapshots(scraped_at_epoch)")
@@ -268,8 +318,11 @@ def create_schema(connection: sqlite3.Connection) -> None:
             connection.execute("CREATE INDEX IF NOT EXISTS idx_token_events_source_model_time ON token_usage_events(source, model, occurred_at_epoch)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_token_events_provider_time ON token_usage_events(provider, occurred_at_epoch)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_forecast_samples_scraped_at ON forecast_samples(scraped_at_epoch)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_quota_anomalies_pending ON quota_anomalies(journaled_at, detected_at_epoch)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_quota_anomalies_window_time ON quota_anomalies(window, detected_at_epoch)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_anomaly_detector_state_updated ON anomaly_detector_state(updated_at_epoch)")
         _set_schema_metadata(connection)
-        _validate_tables(connection, _V3_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+        _validate_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
         if started_transaction:
             # Validate the post-migration layout before making it durable.
             check_integrity(connection)
@@ -309,7 +362,7 @@ def connect_database(database_path: Path, *, read_only: bool = False) -> sqlite3
                 raise ArchiveSchemaError(
                     f"read-only analytics requires archive schema v{SCHEMA_VERSION_NUMBER}; found v{version}"
                 )
-            _validate_tables(connection, _V3_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+            _validate_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
             return connection
         except Exception:
             connection.close()

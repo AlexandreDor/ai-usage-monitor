@@ -250,7 +250,7 @@ database, expected = sys.argv[1:]
 with sqlite3.connect(database) as connection:
     result = connection.execute("PRAGMA quick_check").fetchone()
     assert result == ("ok",), result
-    assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+    assert connection.execute("PRAGMA user_version").fetchone() == (4,)
     value = connection.execute(
         "SELECT value FROM metadata WHERE key = 'test_fixture'"
     ).fetchone()
@@ -358,7 +358,7 @@ import sqlite3
 import sys
 
 with sqlite3.connect(sys.argv[1]) as connection:
-    connection.execute("PRAGMA user_version = 4")
+    connection.execute("PRAGMA user_version = 5")
     connection.commit()
 PY
   if python3 "$RESTORE_EXAMPLE" "$unsupported_database" "$unsupported_restore" "$ROOT_DIR/local/storage.py" >/dev/null 2>&1; then

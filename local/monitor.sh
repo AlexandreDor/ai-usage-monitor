@@ -33,6 +33,7 @@ RUNTIME_DIR="${SCRIPT_DIR}/runtime"
 STATE_FILE="${RUNTIME_DIR}/.alert_state"
 ALERT_DELIVERIES_FILE="${RUNTIME_DIR}/alert-deliveries.json"
 ALERTS_PY="${SCRIPT_DIR}/alerts.py"
+ANOMALIES_PY="${SCRIPT_DIR}/anomalies.py"
 HISTORY_PY="${SCRIPT_DIR}/history.py"
 DATA_FILE="${RUNTIME_DIR}/data.json"
 HISTORY_FILE="${RUNTIME_DIR}/history.json"
@@ -1091,6 +1092,67 @@ PYEOF
   echo "[ALERT] Detected: $message"
 }
 
+# Register anomaly rows that were durably written by the detector.  The
+# SQLite journal is acknowledged only after alerts.py has accepted the
+# occurrence (or after the existing no-channel compatibility seam succeeds).
+journal_quota_anomalies() {
+  local now="$1" pending_file line anomaly_id anomaly_type window limit_id detected
+  local before_pct after_pct before_reset after_reset message event_data registration_status
+  pending_file="$(mktemp "${RUNTIME_DIR}/.anomalies-pending.XXXXXX")" || return 1
+  if ! python3 "$ANOMALIES_PY" pending --database "$ARCHIVE_FILE" > "$pending_file"; then
+    rm -f "$pending_file"
+    return 1
+  fi
+  while IFS=$'\x1f' read -r anomaly_id anomaly_type window limit_id detected before_pct after_pct before_reset after_reset message; do
+    [[ -n "$anomaly_id" ]] || continue
+    message="$(printf '%s' "$message" | base64 --decode)" || { rm -f "$pending_file"; return 1; }
+    event_data="$(python3 - "$limit_id" "$after_reset" "$before_pct" "$after_pct" \
+      "$before_reset" "$detected" <<'PYEOF'
+import json
+import sys
+limit_id, reset_epoch, before, after, before_reset, detected = sys.argv[1:]
+print(json.dumps({
+    "limit_id": limit_id,
+    "reset_epoch": int(reset_epoch or 0),
+    "before_pct": float(before), "after_pct": float(after),
+    "before_reset_at": int(before_reset or 0),
+    "after_reset_at": int(reset_epoch or 0),
+    "detected_at_epoch": int(detected),
+}, separators=(",", ":")))
+PYEOF
+    )" || { rm -f "$pending_file"; return 1; }
+    registration_status=0
+    register_network_alert anomaly "$window" "$anomaly_type" \
+      "limit:${limit_id}|anomaly:${anomaly_id}" "$message" "$event_data" \
+      "$detected" 0 false "" || registration_status=$?
+    if (( registration_status == 0 || registration_status == 2 )); then
+      if ! python3 "$ANOMALIES_PY" journal --database "$ARCHIVE_FILE" \
+        "$anomaly_id" --at "$now"; then
+        rm -f "$pending_file"
+        return 1
+      fi
+    else
+      rm -f "$pending_file"
+      return 1
+    fi
+  done < <(python3 - "$pending_file" <<'PYEOF'
+import base64
+import json
+import pathlib
+import sys
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    item = json.loads(line)
+    print(*(
+        item["anomaly_id"], item["anomaly_type"], item["window"], item["limit_id"],
+        item["detected_at_epoch"], item["before_pct"], item["after_pct"],
+        item["before_reset_at"] or 0, item["after_reset_at"] or 0,
+        base64.b64encode(item["message"].encode()).decode(),
+    ), sep="\x1f")
+PYEOF
+  )
+  rm -f "$pending_file"
+}
+
 deliver_due_alerts() {
   local now="$1" configured due_file alert_id channel message attempt cycle_limit
   local classification outcome error_class retryable retry_delay next_attempt used_retry_after record_payload
@@ -1437,6 +1499,10 @@ reconcile_alert_deliveries() {
         [[ "$pending_weekly_threshold" == "$selector" ]] && pending_weekly_threshold=""
         [[ -n "$remaining" ]] && prev_weekly_pct="$remaining"
       fi
+    elif [[ "$kind" == anomaly ]]; then
+      # Detector state is durable in SQLite and was acknowledged at journal
+      # registration time; anomaly delivery has no threshold/reset baseline.
+      continue
     elif [[ "$window" == 5h ]]; then
       last_notified_5h_reset_at="$reset_epoch"
       if [[ "$five_h_armed_reset_at" == "$reset_epoch" ]]; then
@@ -1718,6 +1784,13 @@ check_thresholds() {
     || ! reconcile_alert_deliveries "$scraped_at_epoch"; then
     ALERT_PROCESSING_ERROR="alert expiration failed"
     return 1
+  fi
+
+  # Full cycles have already processed this row while archiving; live cycles
+  # use the same idempotent detector command without adding a snapshot row.
+  if ! journal_quota_anomalies "$scraped_at_epoch"; then
+    status=1
+    ALERT_PROCESSING_ERROR="quota anomaly journal registration failed"
   fi
 
   if (( ${#ALERT_SCRIPT_RULE_INDICES[@]} == 0 )); then
@@ -2236,6 +2309,11 @@ archive_snapshot() {
     --retention-days "$ARCHIVE_RETENTION_DAYS"
 }
 
+observe_quota_anomalies() {
+  local json="$1"
+  printf '%s\n' "$json" | python3 "$ANOMALIES_PY" observe --database "$ARCHIVE_FILE"
+}
+
 collect_token_usage() {
   python3 "$SCRIPT_DIR/token_usage.py" \
     --database "$ARCHIVE_FILE" \
@@ -2312,6 +2390,10 @@ run_cycle() {
     limit_id=$(json_get_field "$json" "limit_id")
     scraped_at=$(json_get_field "$json" "scraped_at")
     scraped_at_epoch=$(timestamp_to_epoch "$scraped_at") || scraped_at_epoch=$(date -u +%s)
+    if ! observe_quota_anomalies "$public_json"; then
+      status=1
+      append_cycle_error "Quota anomaly detector failed"
+    fi
     check_thresholds "$five_h" "$weekly" "$five_h_reset" "$weekly_reset" \
       "$five_h_reset_at" "$weekly_reset_at" "$scraped_at_epoch" "$limit_id" \
       || { status=1; append_cycle_error "${ALERT_PROCESSING_ERROR:-alert processing failed}"; }

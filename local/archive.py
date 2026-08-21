@@ -20,14 +20,17 @@ from storage import (
     connect_database,
     is_corruption_error,
 )
+from anomalies import (
+    RANDOM_WEEKLY_RESET_FULL_REFILL_PCT,
+    RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT,
+    RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS,
+    process_snapshot,
+)
 
 RECENT_SECONDS = 24 * 60 * 60
 MEDIUM_SECONDS = 7 * 24 * 60 * 60
 MEDIUM_BUCKET_SECONDS = 30 * 60
 OLD_BUCKET_SECONDS = 60 * 60
-RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT = 20
-RANDOM_WEEKLY_RESET_FULL_REFILL_PCT = 98
-RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS = 30 * 60
 MAX_RETENTION_DAYS = 36500
 
 
@@ -299,6 +302,25 @@ def compact(connection: sqlite3.Connection, retention_days: int) -> None:
         connection.execute(
             "DELETE FROM forecast_samples WHERE scraped_at_epoch < ?", (cutoff,)
         )
+        # An anomaly that has not reached the alert journal is still owed to
+        # the user, even if it is older than the normal archive horizon.  Once
+        # journaled, it follows the same retention boundary as other derived
+        # archive events.  Keep the currently active detector group so a
+        # returning/slowly sampled limit does not lose its baseline.
+        connection.execute(
+            "DELETE FROM quota_anomalies "
+            "WHERE journaled_at IS NOT NULL AND detected_at_epoch < ?",
+            (cutoff,),
+        )
+        active_row = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'anomaly_active_limit_id'"
+        ).fetchone()
+        active_limit = active_row[0] if active_row else None
+        connection.execute(
+            "DELETE FROM anomaly_detector_state "
+            "WHERE updated_at_epoch < ? AND limit_id IS NOT ?",
+            (cutoff, active_limit),
+        )
 
 
 def rebuild_reset_events(connection: sqlite3.Connection) -> None:
@@ -423,6 +445,9 @@ def ingest(
             insert_snapshot(connection, snapshot)
             compact(connection, retention_days)
             rebuild_reset_events(connection)
+            # Detector state is compact and independent from snapshots.  The
+            # same call is idempotent when a live cycle replays this sample.
+            process_snapshot(connection, snapshot)
     finally:
         connection.close()
     os.chmod(database_path, 0o600)
