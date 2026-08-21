@@ -144,7 +144,11 @@ if "cp local/dashboard.html ../pages-copy/docs/dashboard.html" not in pages_sect
 restore_start = text.index("DB=/path/to/ai-usage-monitor/local/runtime/usage-history.sqlite3")
 restore_end = text.index("The restore script never installs", restore_start)
 restore_section = text[restore_start:restore_end]
-if restore_section.index('mkdir -m 700 -- "$SAFETY_DIR"') > restore_section.index("systemctl stop"):
+reservation = restore_section.index('mkdir -m 700 -- "$SAFETY_DIR"')
+candidate = restore_section.index('python3 - "$BACKUP" "$RESTORE_TEMP" "$STORAGE"')
+if reservation > candidate:
+    raise SystemExit("restore creates a candidate before reserving the safety directory")
+if reservation > restore_section.index("systemctl stop"):
     raise SystemExit("restore stops services before reserving the safety directory")
 if restore_section.index("trap restore_cleanup EXIT") > restore_section.index(
     "\nsudo systemctl stop codex-usage-monitor.service codex-usage-dashboard.service\n"
@@ -426,10 +430,19 @@ awk '
 [[ -s "$reservation_example" ]] || fail "could not extract safety reservation commands"
 reservation_dir="${TEST_ROOT}/already-reserved"
 reservation_log="${TEST_ROOT}/reservation-services.log"
+reservation_active="${TEST_ROOT}/reserved-active.sqlite3"
+reservation_temp="${TEST_ROOT}/reserved-restore-temp.sqlite3"
 mkdir -m 700 "$reservation_dir"
+printf 'active database must remain\n' > "$reservation_active"
 reservation_script="${TEST_ROOT}/run-reservation-collision.sh"
 {
   printf '%s\n' 'set -euo pipefail'
+  printf 'DB=%q\n' "$reservation_active"
+  printf 'BACKUP=%q\n' "$backup_database"
+  printf 'STORAGE=%q\n' "$ROOT_DIR/local/storage.py"
+  printf 'RESTORE_TEMP=%q\n' "$reservation_temp"
+  printf 'DB_DIR=%q\n' "$(dirname -- "$reservation_active")"
+  printf 'DB_NAME=%q\n' "$(basename -- "$reservation_active")"
   printf 'SAFETY_DIR=%q\n' "$reservation_dir"
   printf 'systemctl() { printf "%%s\\n" "$*" >> %q; }\n' "$reservation_log"
   printf '%s\n' 'sudo() { "$@"; }'
@@ -438,6 +451,9 @@ reservation_script="${TEST_ROOT}/run-reservation-collision.sh"
 if bash "$reservation_script" >/dev/null 2>&1; then
   fail "safety directory collision was accepted before stopping services"
 fi
+[[ ! -e "$reservation_temp" ]] || fail "safety collision created a restore candidate"
+assert_eq 'active database must remain' "$(<"$reservation_active")" \
+  "safety collision changed the active database"
 [[ ! -e "$reservation_log" ]] || fail "service inspection ran before safety directory reservation"
 
 cleanup_database="${TEST_ROOT}/cleanup-active.sqlite3"

@@ -794,14 +794,14 @@ the `backup()` destination is autonomous.
 
 ### Restore safely
 
-The restore is fail-fast. It first creates and verifies a new autonomous schema
-v3 archive next to the active database, before stopping services or touching
-the active file. A corrupt, unrelated, or obsolete-schema candidate therefore
-leaves the active database intact. Once the candidate is valid, stop at least
-both services and ensure no other process has the archive open. The procedure
-reserves the safety directory before stopping services, preserves their
-previous active state, and keeps an exit trap armed until every required start
-and status check succeeds:
+The restore is fail-fast. It first reserves a new mode-`700` safety directory,
+before creating and verifying an autonomous schema v3 archive next to the
+active database. A safety-directory collision therefore creates no candidate;
+a corrupt, unrelated, or obsolete-schema candidate also leaves the active
+database intact. Once the candidate is valid, stop at least both services and
+ensure no other process has the archive open. The procedure preserves the
+services' previous active state and keeps an exit trap armed until every
+required start and status check succeeds:
 
 ```bash
 set -euo pipefail
@@ -814,6 +814,8 @@ RESTORE_TEMP="${DB}.restore.${STAMP}"
 DB_DIR=$(dirname -- "$DB")
 DB_NAME=$(basename -- "$DB")
 SAFETY_DIR="${DB_DIR}/${DB_NAME}.restore-safety.${STAMP}"
+
+mkdir -m 700 -- "$SAFETY_DIR"
 
 python3 - "$BACKUP" "$RESTORE_TEMP" "$STORAGE" <<'PY'
 # BEGIN SQLITE_RESTORE_EXAMPLE
@@ -865,7 +867,6 @@ finally:
 # END SQLITE_RESTORE_EXAMPLE
 PY
 
-mkdir -m 700 -- "$SAFETY_DIR"
 MONITOR_WAS_ACTIVE=0
 DASHBOARD_WAS_ACTIVE=0
 if sudo systemctl is-active --quiet codex-usage-monitor.service; then
