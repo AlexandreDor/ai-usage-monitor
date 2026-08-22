@@ -223,10 +223,11 @@ input { display: block; min-height: 36px; margin-top: 4px; padding: 7px 10px; }
 .analytics-card { min-width: 0; padding: 24px; }
 .analytics-card.wide { grid-column: 1 / -1; }
 #limits-chart-card { order: 1; }
-#tokens-chart-card { order: 2; }
-#reset-history-card { order: 3; }
-#allocation-card { order: 4; }
-#freshness-panel { order: 5; }
+#weekly-limit-value-card { order: 2; }
+#tokens-chart-card { order: 3; }
+#reset-history-card { order: 4; }
+#allocation-card { order: 5; }
+#freshness-panel { order: 6; }
 .compact-heading { margin-bottom: 12px; }
 .freshness-summary { color: var(--muted); font-size: .75rem; text-align: right; }
 
@@ -249,6 +250,16 @@ input { display: block; min-height: 36px; margin-top: 4px; padding: 7px 10px; }
 .chart-wrap canvas { max-height: none; }
 .empty-state { color: var(--muted); padding: 28px 0; text-align: center; font-size: .88rem; }
 .chart-summary { color: var(--muted); min-height: 1.4em; margin-top: 10px; font-size: .78rem; line-height: 1.5; }
+.chart-description,
+.quality-legend { color: var(--muted); margin: -8px 0 12px; font-size: .78rem; line-height: 1.5; }
+.quality-legend { margin-top: 0; }
+.weekly-value-table td:nth-child(6),
+.weekly-value-table td:nth-child(7) { min-width: 120px; }
+.weekly-value-table .quality-good { color: #86efac; }
+.weekly-value-table .quality-low_confidence { color: #fde68a; }
+.weekly-value-table .quality-volatile { color: #fca5a5; }
+.weekly-value-table .quality-unavailable,
+.weekly-value-table .value-unavailable { color: var(--muted); }
 .chart-data-details { margin-top: 12px; color: var(--muted); font-size: .76rem; }
 .chart-data-details summary { cursor: pointer; }
 .chart-data-table { margin-top: 8px; font-size: .74rem; }

@@ -126,69 +126,6 @@ en partie sur l'attribut `title`.
 
 **Effort : M**
 
-### 18. Estimer la valeur implicite de la limite hebdomadaire dans Analytics
-
-Analytics doit afficher l'évolution de la valeur totale estimée de la limite
-hebdomadaire à partir de la consommation observée, valorisée aux prix API, et
-de la part de quota consommée ou perdue sur une fenêtre glissante d'une heure.
-La formule conceptuelle est : **valeur totale implicite = coût API moyen ou
-observé sur la fenêtre glissante de 1 h / fraction de la limite hebdomadaire
-consommée sur cette même fenêtre**. Le pourcentage de quota doit être converti
-en fraction avant le calcul (par exemple, 2 % devient 0,02) et l'unité monétaire
-doit rester explicite.
-Dans la table Analytics « Reset history » / « Previous limit resets », ajouter
-deux colonnes explicitement en dollars : « Estimated cycle cost ($) », qui
-indique l'équivalent en coût API estimé de la consommation effectivement
-observée pendant le cycle terminé, et « Extrapolated 100% value ($) », qui
-indique la valeur extrapolée à 100 % lorsque le reset a eu lieu alors qu'il
-restait du quota. Cette extrapolation suit la formule conceptuelle **coût
-estimé du cycle / fraction de quota consommée avant reset**.
-
-**Actions :**
-
-- Alimenter Analytics avec le coût API moyen ou observé et la part de quota
-  consommée ou perdue correspondants à la même fenêtre glissante d'une heure.
-- Tracer dans un graphique l'évolution de l'estimation et indiquer sa devise,
-  sa fenêtre d'observation ainsi que, lorsque c'est possible, son niveau de
-  confiance ou sa qualité de données.
-- Segmenter les observations par `limit_id` et invalider la comparaison lors
-  d'un reset ou d'un changement de limite, plutôt que de relier des fenêtres
-  incomparables.
-- Enrichir la table « Reset history » / « Previous limit resets » avec les
-  colonnes « Estimated cycle cost ($) » et « Extrapolated 100% value ($) » ;
-  calculer la seconde à partir du coût du cycle et de la fraction consommée
-  avant reset, en la présentant surtout lorsqu'un quota restait disponible.
-- Prévoir un seuil minimal de données et un traitement des pics ou du bruit
-  afin que l'estimation reste lisible sans masquer une incertitude réelle.
-- Refuser la division par zéro et gérer les coûts, pourcentages, prix ou
-  relevés manquants ou invalides ; afficher clairement l'indisponibilité ou
-  l'incertitude et sa cause au lieu d'une valeur trompeuse.
-- Si la fraction consommée est nulle, si les données ou les prix sont
-  incomplets, ou si le reset ou le `limit_id` est ambigu, afficher une valeur
-  indisponible ou qualifiée plutôt qu'une extrapolation trompeuse.
-
-**Critères de validation :**
-
-- Le graphique Analytics montre la tendance de la valeur totale implicite avec
-  une unité monétaire et une fenêtre glissante d'une heure clairement
-  identifiables.
-- Le calcul vérifié sur des valeurs connues applique bien la conversion du
-  pourcentage en fraction et la formule documentée, sans mélange de fenêtres ou
-  de `limit_id`.
-- La table « Reset history » / « Previous limit resets » expose les deux
-  colonnes en dollars ; « Estimated cycle cost ($) » correspond à la
-  consommation observée du cycle terminé et « Extrapolated 100% value ($) »
-  applique bien **coût estimé du cycle / fraction de quota consommée avant
-  reset** lorsqu'un quota restait disponible.
-- Un dénominateur nul, des données insuffisantes, un reset ou changement de
-  `limit_id`, des prix absents et des relevés invalides rendent l'estimation
-  indisponible ou explicitement incertaine, avec un message compréhensible.
-- Les pics et le bruit ne produisent pas de valeur présentée comme fiable sans
-  signalement ; les cas de fenêtre vide, de transition de limite et de données
-  périmées sont couverts par des tests.
-
-**Effort : M**
-
 ### 16. Préparer le packaging et les releases
 
 **Actions :**
@@ -245,11 +182,9 @@ retirées de cette liste car elles sont déjà implémentées.
 4. Finaliser WAL et les sauvegardes SQLite.
 5. Terminer l'accessibilité du dashboard.
 6. Renforcer la CI.
-7. Ajouter dans Analytics l'estimation de la valeur implicite de la limite
-   hebdomadaire.
-8. Préparer les releases et le packaging.
-9. Réduire progressivement le script monolithique.
-10. Ajouter les évolutions P3 selon les besoins utilisateurs.
+7. Préparer les releases et le packaging.
+8. Réduire progressivement le script monolithique.
+9. Ajouter les évolutions P3 selon les besoins utilisateurs.
 
 ## Définition globale de terminé
 
@@ -270,8 +205,6 @@ Le programme restant est terminé lorsque :
   légitimes ;
 - le monitor et le serveur partagent une configuration non exécutable ;
 - SQLite est sauvegardé avant migration et fonctionne de manière fiable en WAL ;
-- Analytics présente une estimation explicitement qualifiée de la valeur
-  implicite de la limite hebdomadaire sur une fenêtre glissante d'une heure ;
 - les tests shell, Python, HTTP et navigateur passent en CI ;
 - la distribution comprend une version, un changelog, des unités systemd et des
   archives vérifiables.

@@ -155,6 +155,29 @@
         </details>
       </article>
 
+      <article class="card analytics-card wide" id="weekly-limit-value-card">
+        <div class="section-heading chart-heading">
+          <div>
+            <span class="section-kicker" data-i18n="analytics.weeklyLimitValueKicker">Weekly limit value</span>
+            <h2 data-i18n="analytics.weeklyLimitValueTitle">Implicit weekly limit value</h2>
+          </div>
+          <div class="chart-heading-actions">
+            <span class="sample-count" id="weekly-limit-value-window" data-i18n="analytics.weeklyLimitValueWindow">Rolling window · 1 h · USD</span>
+          </div>
+        </div>
+        <p class="chart-description" data-i18n="analytics.weeklyLimitValueDescription">API-equivalent Codex cost divided by the weekly quota fraction consumed in the same rolling one-hour window.</p>
+        <p class="quality-legend" id="weekly-limit-value-quality" data-i18n="analytics.weeklyLimitValueQualityLegend">Quality: good · low confidence · volatile. The table includes the reason for every unavailable point.</p>
+        <div class="chart-wrap" id="weekly-limit-value-chart-wrap"><canvas id="weekly-limit-value-chart" class="time-slice-chart" role="img" aria-describedby="weekly-limit-value-summary weekly-limit-value-table-caption"></canvas></div>
+        <p class="empty-state" id="weekly-limit-value-empty" data-i18n="analytics.noWeeklyLimitValue" hidden>No comparable weekly limit value is available in this period.</p>
+        <p class="chart-summary" id="weekly-limit-value-summary" role="status" aria-live="polite"></p>
+        <details class="chart-data-details">
+          <summary data-i18n="analytics.showWeeklyLimitValueTable">Show weekly limit value table</summary>
+          <div class="table-scroll">
+            <table class="chart-data-table weekly-value-table"><caption id="weekly-limit-value-table-caption" data-i18n="analytics.weeklyLimitValueTableCaption">Implicit weekly limit value data</caption><thead><tr><th data-i18n="analytics.date">Date</th><th data-i18n="analytics.observedCostUsd">Observed cost ($)</th><th data-i18n="analytics.quotaConsumed">Quota consumed</th><th data-i18n="analytics.rawValueUsd">Raw value ($)</th><th data-i18n="analytics.smoothedValueUsd">Smoothed value ($)</th><th data-i18n="analytics.quality">Quality</th><th data-i18n="analytics.explanation">Explanation</th></tr></thead><tbody id="weekly-limit-value-data-body"></tbody></table>
+          </div>
+        </details>
+      </article>
+
       <article class="card analytics-card wide" id="tokens-chart-card" hidden>
         <div class="section-heading chart-heading">
           <div><span class="section-kicker" data-i18n="analytics.localConsumption">Local consumption</span><h2 data-i18n="analytics.tokensOverTime">Tokens over time</h2></div>
@@ -203,7 +226,7 @@
         <div class="table-scroll">
           <table class="reset-table">
             <caption class="sr-only" data-i18n="analytics.resetCaption">Detected limit resets</caption>
-            <thead><tr><th data-i18n="analytics.window">Window</th><th data-i18n="analytics.category">Category</th><th data-i18n="analytics.scheduledReset">Scheduled reset</th><th data-i18n="analytics.firstObservation">First observation</th><th data-i18n="analytics.beforeAfter">Before → after</th><th data-i18n="analytics.forecastBeforeReset">Forecast before reset</th></tr></thead>
+            <thead><tr><th data-i18n="analytics.window">Window</th><th data-i18n="analytics.category">Category</th><th data-i18n="analytics.scheduledReset">Scheduled reset</th><th data-i18n="analytics.firstObservation">First observation</th><th data-i18n="analytics.beforeAfter">Before → after</th><th data-i18n="analytics.estimatedCycleCostUsd">Estimated cycle cost ($)</th><th data-i18n="analytics.extrapolatedValueUsd">Extrapolated 100% value ($)</th><th data-i18n="analytics.forecastBeforeReset">Forecast before reset</th></tr></thead>
             <tbody id="resets-body"></tbody>
           </table>
         </div>

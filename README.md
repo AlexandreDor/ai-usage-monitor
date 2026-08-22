@@ -46,6 +46,28 @@ The local Analytics page provides:
 - filtering by application and model, with GPT-5.6 models selected by default
   when available;
 - quota, token, and API-equivalent cost charts;
+- implicit weekly-limit value estimates from Codex-only API-equivalent cost in
+  a rolling one-hour window. The estimator converts the observed quota drop
+  from percentage points to a fraction (for example, 2 % → 0.02), then uses
+  `observed Codex cost / consumed fraction`; it is independent of the source
+  and model filters used by the token charts;
+- a short median of the current and two previous valid values for the trend,
+  with `good`, `low confidence`, and `volatile` quality states. Windows shorter
+  or longer than 45–75 minutes, quota resets or limit/deadline transitions,
+  increases or sub-0.5-point drops, stale/incomplete observations, missing
+  positive prices, invalid counters, and zero cost are shown as unavailable
+  with a reason rather than silently extrapolated;
+- weekly reset rows include `Estimated cycle cost ($)` for the complete
+  observable Codex cycle and `Extrapolated 100% value ($)` when quota remained.
+  Five-hour resets are explicitly `N/A`; a first/partial or ambiguous cycle,
+  missing prices, stale reset boundaries, and a fully consumed cycle (where
+  extrapolation does not apply) retain an explanatory unavailable status. A
+  reset boundary is accepted only when both nearby snapshots are within
+  `max(3600, 2 * sample_interval_seconds)`;
+- the current weekly-value estimate is also qualified as `stale_data` when the
+  latest limit snapshot is older than `max(2 * sample_interval_seconds,
+  sample_interval_seconds + 60)`. Historical points remain in the series, while
+  the dashboard explicitly announces that the current estimate is unavailable;
 - mouse and touch exploration by nearest time slice, grouping visible series
   while preserving percentage, token, and currency units;
 - cost allocation by application, provider, and model;
