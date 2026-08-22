@@ -249,12 +249,25 @@ cp local/.env.example local/.env
 chmod 600 local/.env
 ```
 
-Blank optional values disable the corresponding integration. Unsupported keys
-are ignored with a warning, while invalid values for supported keys are
-rejected. Environment variables can also provide values; the monitor currently
-parses `local/.env` after the inherited environment, so values in `.env` take
-precedence. `CODEX_BIN_OVERRIDE` is the documented process-only exception and
-is applied after `.env`. `serve.sh` has a separate, narrow priority chain:
+`local/config.py` parses and validates the monitor and server configuration as
+data. It never evaluates shell syntax, expands variables, follows a `.env`
+symlink, or exposes secret values in diagnostics. Existing files are secured
+to mode `600` and must be regular files owned by the current user. Blank
+optional values disable their integration; a blank required value is invalid
+and does not silently fall back to a default. Unsupported keys are ignored
+with a warning, while invalid values for supported keys are rejected.
+
+For every shared option the priority is CLI option → process environment →
+`local/.env` → default. The monitor's `--loop SECONDS` is the CLI override for
+`LOOP_INTERVAL`; `serve.sh --bind` and `--port` are the corresponding network
+options. The shared pricing catalog and dashboard active interval use the same
+reader and validators in both programs. The process-only aliases are:
+
+- `CODEX_BIN_OVERRIDE` for the monitor's `CODEX_BIN`;
+- `DASHBOARD_PRICING_FILE` for the server's pricing catalog;
+- `DASHBOARD_ANALYTICS_DATABASE` for the server's SQLite path.
+
+The server's pricing chain is therefore:
 
 - pricing catalog: `DASHBOARD_PRICING_FILE` (process) → `TOKEN_PRICING_FILE`
   (process) → `TOKEN_PRICING_FILE` in `local/.env` → `local/pricing.json`;
@@ -265,14 +278,7 @@ is applied after `.env`. `serve.sh` has a separate, narrow priority chain:
 
 `DASHBOARD_ANALYTICS_DATABASE` has no `.env` fallback, and
 `DASHBOARD_PRICING_FILE` is process-only. `DASHBOARD_ACTIVE_INTERVAL_SECONDS`
-is also read from `local/.env` when no process value is supplied; these are
-`serve.sh`-specific paths and timing controls, not a shared configuration
-module.
-
-There is deliberately no `local/config.py` yet. If configuration is
-centralised in a future change, update this README and `local/.env.example`
-together with the implementation; do not infer a new configuration contract
-from a roadmap item.
+is shared and may be supplied by either process environment or `.env`.
 
 ### Minimal configuration
 

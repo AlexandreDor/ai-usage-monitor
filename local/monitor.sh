@@ -30,6 +30,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/.env"
+CONFIG_PY="${SCRIPT_DIR}/config.py"
 RUNTIME_DIR="${SCRIPT_DIR}/runtime"
 STATE_FILE="${RUNTIME_DIR}/.alert_state"
 ALERT_DELIVERIES_FILE="${RUNTIME_DIR}/alert-deliveries.json"
@@ -43,7 +44,6 @@ HEALTH_FILE="${RUNTIME_DIR}/health.json"
 HEARTBEAT_FILE="${RUNTIME_DIR}/dashboard-heartbeat"
 LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
 DEFAULT_INTERVAL_SECONDS=900
-DEFAULT_DASHBOARD_ACTIVE_INTERVAL_SECONDS=300
 DASHBOARD_HEARTBEAT_MAX_AGE_SECONDS=90
 DASHBOARD_HEARTBEAT_POLL_SECONDS=5
 INVALID_ALERT_SCRIPT_CONFIG=0
@@ -91,103 +91,16 @@ cli_error() {
   return 2
 }
 
-load_config() {
-  local line key value
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%$'\r'}"
-    [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
-
-    if [[ "$line" != *=* ]]; then
-      echo "[WARN] Ignoring malformed configuration line." >&2
-      continue
-    fi
-
-    key="${line%%=*}"
-    value="${line#*=}"
-    if [[ ! "$key" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
-      echo "[WARN] Ignoring invalid configuration key." >&2
-      continue
-    fi
-
-    case "$key" in
-      ALERTS_ENABLED|ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_ENABLED|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DASHBOARD_ACTIVE_INTERVAL_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
-        if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
-          value="${value:1:${#value}-2}"
-        fi
-        printf -v "$key" '%s' "$value"
-        ;;
-      *)
-        if [[ "$key" =~ ^ALERT_SCRIPT_([1-9]|[1-9][0-9])(_EVENTS)?$ ]]; then
-          if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
-            value="${value:1:${#value}-2}"
-          fi
-          printf -v "$key" '%s' "$value"
-        else
-          echo "[WARN] Ignoring unsupported configuration key: $key" >&2
-          [[ "$key" == ALERT_SCRIPT_* ]] && INVALID_ALERT_SCRIPT_CONFIG=1
-        fi
-        ;;
-    esac
-  done < "$ENV_FILE"
-}
 
 # ============================================================================
-# Validation
+# Shared configuration transport
 # ============================================================================
 config_error() {
   printf '[ERROR] %s\n' "$1" >&2
   return 1
 }
 
-validate_integer() {
-  local name="$1" value="$2" minimum="$3" maximum="$4" normalized
-  [[ "$value" =~ ^[0-9]+$ ]] || { config_error "$name must be an integer between $minimum and $maximum."; return 1; }
-  normalized="$value"
-  while [[ "$normalized" == 0* && ${#normalized} -gt 1 ]]; do normalized="${normalized#0}"; done
-  (( ${#normalized} <= ${#maximum} )) || { config_error "$name must be between $minimum and $maximum."; return 1; }
-  (( 10#$normalized >= minimum && 10#$normalized <= maximum )) || { config_error "$name must be between $minimum and $maximum."; return 1; }
-}
 
-validate_number() {
-  local name="$1" value="$2" minimum="$3" maximum="$4"
-  python3 - "$name" "$value" "$minimum" "$maximum" <<'PYEOF'
-import math
-import sys
-
-name, raw, minimum, maximum = sys.argv[1:]
-try:
-    value = float(raw)
-except ValueError:
-    sys.stderr.write(f"[ERROR] {name} must be a number between {minimum} and {maximum}.\n")
-    raise SystemExit(1)
-if not math.isfinite(value) or not float(minimum) <= value <= float(maximum):
-    sys.stderr.write(f"[ERROR] {name} must be between {minimum} and {maximum}.\n")
-    raise SystemExit(1)
-PYEOF
-}
-
-has_control_characters() {
-  [[ "$1" =~ [[:cntrl:]] ]]
-}
-
-validate_thresholds() {
-  python3 - "$ALERT_THRESHOLDS" <<'PYEOF'
-import sys
-
-parts = sys.argv[1].split(",")
-if not parts or any(not part.strip() for part in parts):
-    sys.stderr.write("[ERROR] ALERT_THRESHOLDS must be a comma-separated list of integers from 0 to 100.\n")
-    raise SystemExit(1)
-try:
-    values = [int(part.strip()) for part in parts]
-except ValueError:
-    sys.stderr.write("[ERROR] ALERT_THRESHOLDS must contain integers only.\n")
-    raise SystemExit(1)
-if not values or any(value < 0 or value > 100 for value in values):
-    sys.stderr.write("[ERROR] ALERT_THRESHOLDS values must be between 0 and 100.\n")
-    raise SystemExit(1)
-PYEOF
-}
 
 ALERT_SCRIPT_RULE_INDICES=()
 ALERT_SCRIPT_RULE_PATHS=()
@@ -203,161 +116,130 @@ alert_scripts_configured() {
   return 1
 }
 
-validate_alert_scripts() {
-  local invalid=0 index path_name events_name path events raw_event event window selector pair action_id variable_name
-  local -A seen_pairs=()
-  local -a configured_events=()
-  ALERT_SCRIPT_RULE_INDICES=()
-  ALERT_SCRIPT_RULE_PATHS=()
-  ALERT_SCRIPT_RULE_EVENTS=()
-  ALERT_SCRIPT_RULE_IDS=()
 
+
+# Compatibility seams used by sourced-script tests and local integrations.  A
+# real monitor initialization uses the resolved transport in initialize();
+# these wrappers deliberately call the same Python parser and validator rather
+# than maintaining a second policy in Bash.
+load_config() {
+  local transport_file warning_file record key encoded value
+  [[ -f "$ENV_FILE" ]] || return 0
+  transport_file="$(mktemp "${TMPDIR:-/tmp}/codex-monitor-env.XXXXXX")" || {
+    config_error "Unable to create a private configuration transport."
+    return 1
+  }
+  warning_file="$(mktemp "${TMPDIR:-/tmp}/codex-monitor-warning.XXXXXX")" || {
+    rm -f -- "$transport_file"
+    config_error "Unable to create a private configuration transport."
+    return 1
+  }
+  if ! python3 "$CONFIG_PY" --profile monitor --parse-env --env-file "$ENV_FILE" \
+      >"$transport_file" 2>"$warning_file"; then
+    cat "$warning_file" >&2
+    rm -f -- "$transport_file" "$warning_file"
+    return 1
+  fi
+  cat "$warning_file" >&2
+  if grep -Fq 'ALERT_SCRIPT_' "$warning_file"; then
+    INVALID_ALERT_SCRIPT_CONFIG=1
+  fi
+  while IFS= read -r -d '' record; do
+    key="${record%%$'\t'*}"
+    encoded="${record#*$'\t'}"
+    value="$(printf '%s' "$encoded" | base64 --decode)" || {
+      rm -f -- "$transport_file" "$warning_file"
+      config_error "Invalid configuration transport."
+      return 1
+    }
+    [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+    printf -v "$key" '%s' "$value"
+  done <"$transport_file"
+  rm -f -- "$transport_file" "$warning_file"
+}
+
+validate_config() {
+  local key variable_name transport_file record encoded value rule_index
   if [[ "${INVALID_ALERT_SCRIPT_CONFIG:-0}" == 1 ]]; then
-    config_error "Alert script indices must be integers from 1 to 99." || true
-    invalid=1
+    config_error "Alert script indices must be integers from 1 to 99."
+    return 1
   fi
   while IFS= read -r variable_name; do
     case "$variable_name" in
       ALERT_SCRIPT_TIMEOUT_SECONDS|ALERT_SCRIPT_RULE_*) ;;
-      *)
-        if [[ ! "$variable_name" =~ ^ALERT_SCRIPT_([1-9]|[1-9][0-9])(_EVENTS)?$ ]]; then
-          config_error "Unsupported alert script variable: ${variable_name}." || true
-          invalid=1
-        fi
+      ALERT_SCRIPT_[1-9]|ALERT_SCRIPT_[1-9][0-9]|ALERT_SCRIPT_[1-9]_EVENTS|ALERT_SCRIPT_[1-9][0-9]_EVENTS) ;;
+      ALERT_SCRIPT_*)
+        config_error "Alert script indices must be integers from 1 to 99."
+        return 1
         ;;
     esac
-  done < <(compgen -A variable ALERT_SCRIPT_)
-
-  validate_integer ALERT_SCRIPT_TIMEOUT_SECONDS "$ALERT_SCRIPT_TIMEOUT_SECONDS" 1 1800 || invalid=1
-  for (( index = 1; index <= 99; index++ )); do
-    path_name="ALERT_SCRIPT_${index}"
-    events_name="ALERT_SCRIPT_${index}_EVENTS"
-    path="${!path_name:-}"
-    events="${!events_name:-}"
-    if [[ -z "$path" && -z "$events" ]]; then
-      continue
-    fi
-    if [[ -z "$path" || -z "$events" ]]; then
-      config_error "${path_name} and ${events_name} must either both be set or both be empty." || true
-      invalid=1
-      continue
-    fi
-    if has_control_characters "$path"; then
-      config_error "${path_name} must not contain control characters." || true
-      invalid=1
-      continue
-    fi
-    if [[ "$path" != /* || ! -f "$path" || ! -x "$path" ]]; then
-      config_error "${path_name} must be an absolute path to an executable regular file." || true
-      invalid=1
-      continue
-    fi
-
-    IFS=',' read -r -a configured_events <<< "$events"
-    if (( ${#configured_events[@]} == 0 )) || [[ "$events" == ,* || "$events" == *, || "$events" == *,,* ]]; then
-      config_error "${events_name} must contain at least one event." || true
-      invalid=1
-      continue
-    fi
-    for raw_event in "${configured_events[@]}"; do
-      event="${raw_event#"${raw_event%%[![:space:]]*}"}"
-      event="${event%"${event##*[![:space:]]}"}"
-      if [[ ! "$event" =~ ^(5h|weekly):(reset|[0-9]+)$ ]]; then
-        config_error "${events_name} contains an invalid event: ${event:-<empty>}." || true
-        invalid=1
-        continue
+  done < <(compgen -A variable ALERT_SCRIPT_ || true)
+  local -a config_keys=(
+    ALERTS_ENABLED ALERT_THRESHOLDS ALERT_SCRIPT_TIMEOUT_SECONDS ARCHIVE_RETENTION_DAYS
+    CODEX_BIN CODEX_DATA_DIR CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD
+    CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD CODEX_FORECAST_ENABLED CODEX_STATUS_TIMEOUT_SECONDS
+    CURL_CONNECT_TIMEOUT_SECONDS CURL_MAX_TIME_SECONDS CURL_RETRIES CURL_RETRY_DELAY_SECONDS
+    DASHBOARD_ACTIVE_INTERVAL_SECONDS DISCORD_WEBHOOK GITHUB_API_URL GITHUB_GIST_ID GITHUB_PAT
+    HERMES_DB_PATH HISTORY_RETENTION_HOURS LOOP_INTERVAL MONITOR_DEBUG OPENCODE_DB_PATH
+    TELEGRAM_API_URL TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID TOKEN_PRICING_FILE TOKEN_USAGE_SOURCES
+  )
+  transport_file="$(mktemp "${TMPDIR:-/tmp}/codex-monitor-validated.XXXXXX")" || {
+    config_error "Unable to create a private configuration transport."
+    return 1
+  }
+  if ! {
+    for key in "${config_keys[@]}"; do
+      if [[ -v "$key" ]]; then
+        printf '%s' "${!key}" | base64 | tr -d '\n' | {
+          IFS= read -r encoded || true
+          printf '%s\t%s\0' "$key" "$encoded"
+        }
       fi
-      window="${event%%:*}"
-      selector="${event#*:}"
-      if [[ "$selector" != reset ]] && ! validate_integer "${events_name} threshold" "$selector" 0 100; then
-        invalid=1
-        continue
-      fi
-      if [[ "$selector" != reset ]]; then
-        selector="$((10#$selector))"
-        event="${window}:${selector}"
-      fi
-      pair="${path}"$'\034'"${event}"
-      if [[ -n "${seen_pairs[$pair]:-}" ]]; then
-        config_error "Duplicate alert script action for ${path} and ${event}." || true
-        invalid=1
-        continue
-      fi
-      seen_pairs[$pair]=1
-      action_id="$(python3 - "$path" "$event" <<'PYEOF'
-import hashlib
-import sys
-print(hashlib.sha256((sys.argv[1] + "\0" + sys.argv[2]).encode()).hexdigest()[:24])
-PYEOF
-)"
-      ALERT_SCRIPT_RULE_INDICES+=("$index")
-      ALERT_SCRIPT_RULE_PATHS+=("$path")
-      ALERT_SCRIPT_RULE_EVENTS+=("$event")
-      ALERT_SCRIPT_RULE_IDS+=("$action_id")
     done
-  done
-  (( invalid == 0 ))
-}
-
-validate_config() {
-  local invalid=0 secret path_value
-  [[ "$ALERTS_ENABLED" == 0 || "$ALERTS_ENABLED" == 1 ]] || { config_error "ALERTS_ENABLED must be 0 or 1." || true; invalid=1; }
-  validate_integer LOOP_INTERVAL "$LOOP_INTERVAL" 1 86400 || invalid=1
-  validate_integer DASHBOARD_ACTIVE_INTERVAL_SECONDS "$DASHBOARD_ACTIVE_INTERVAL_SECONDS" 30 86400 || invalid=1
-  validate_integer CODEX_STATUS_TIMEOUT_SECONDS "$CODEX_STATUS_TIMEOUT_SECONDS" 5 300 || invalid=1
-  validate_integer ARCHIVE_RETENTION_DAYS "$ARCHIVE_RETENTION_DAYS" 0 36500 || invalid=1
-  validate_number HISTORY_RETENTION_HOURS "$HISTORY_RETENTION_HOURS" 0.25 8760 || invalid=1
-  validate_integer CURL_CONNECT_TIMEOUT_SECONDS "$CURL_CONNECT_TIMEOUT_SECONDS" 1 60 || invalid=1
-  validate_integer CURL_MAX_TIME_SECONDS "$CURL_MAX_TIME_SECONDS" 1 600 || invalid=1
-  validate_integer CURL_RETRIES "$CURL_RETRIES" 0 5 || invalid=1
-  validate_integer CURL_RETRY_DELAY_SECONDS "$CURL_RETRY_DELAY_SECONDS" 0 60 || invalid=1
-  validate_integer CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD "$CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD" 0 100 || invalid=1
-  validate_integer CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD "$CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD" 0 100 || invalid=1
-  validate_thresholds || invalid=1
-  validate_alert_scripts || invalid=1
-
-  if (( CURL_CONNECT_TIMEOUT_SECONDS > CURL_MAX_TIME_SECONDS )); then
-    config_error "CURL_CONNECT_TIMEOUT_SECONDS cannot exceed CURL_MAX_TIME_SECONDS." || true
-    invalid=1
+    while IFS= read -r variable_name; do
+      if [[ "$variable_name" =~ ^ALERT_SCRIPT_([1-9]|[1-9][0-9])(_EVENTS)?$ ]]; then
+        printf '%s' "${!variable_name}" | base64 | tr -d '\n' | {
+          IFS= read -r encoded || true
+          printf '%s\t%s\0' "$variable_name" "$encoded"
+        }
+      fi
+    done < <(compgen -A variable ALERT_SCRIPT_ || true)
+  } | python3 "$CONFIG_PY" --profile monitor --validate-nul --script-dir "$SCRIPT_DIR" >"$transport_file"; then
+    rm -f -- "$transport_file"
+    return 1
   fi
-  if [[ -n "$GITHUB_PAT" || -n "$GITHUB_GIST_ID" ]] && [[ -z "$GITHUB_PAT" || -z "$GITHUB_GIST_ID" ]]; then
-    config_error "GITHUB_PAT and GITHUB_GIST_ID must either both be set or both be empty." || true
-    invalid=1
-  fi
-  if [[ -n "$TELEGRAM_BOT_TOKEN" || -n "$TELEGRAM_CHAT_ID" ]] && [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
-    config_error "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must either both be set or both be empty." || true
-    invalid=1
-  fi
-  [[ -z "$GITHUB_GIST_ID" || "$GITHUB_GIST_ID" =~ ^[A-Fa-f0-9]+$ ]] || { config_error "GITHUB_GIST_ID has an invalid format." || true; invalid=1; }
-  [[ -z "$DISCORD_WEBHOOK" || "$DISCORD_WEBHOOK" =~ ^https://(discord\.com|discordapp\.com)/api/webhooks/[0-9]+/[A-Za-z0-9._-]+$ ]] || { config_error "DISCORD_WEBHOOK must be an official Discord HTTPS webhook URL." || true; invalid=1; }
-  [[ -z "$TELEGRAM_BOT_TOKEN" || "$TELEGRAM_BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || { config_error "TELEGRAM_BOT_TOKEN has an invalid format." || true; invalid=1; }
-  [[ -z "$TELEGRAM_CHAT_ID" || "$TELEGRAM_CHAT_ID" =~ ^-?[1-9][0-9]*$ ]] || { config_error "TELEGRAM_CHAT_ID must be a non-zero numeric chat ID." || true; invalid=1; }
-  [[ "$MONITOR_DEBUG" == 0 || "$MONITOR_DEBUG" == 1 ]] || { config_error "MONITOR_DEBUG must be 0 or 1." || true; invalid=1; }
-  [[ "$CODEX_FORECAST_ENABLED" == 0 || "$CODEX_FORECAST_ENABLED" == 1 ]] || { config_error "CODEX_FORECAST_ENABLED must be 0 or 1." || true; invalid=1; }
-  [[ "$GITHUB_API_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || { config_error "GITHUB_API_URL is not a valid HTTP(S) base URL." || true; invalid=1; }
-  [[ "$TELEGRAM_API_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || { config_error "TELEGRAM_API_URL is not a valid HTTP(S) base URL." || true; invalid=1; }
-  [[ "$TOKEN_USAGE_SOURCES" == auto || "$TOKEN_USAGE_SOURCES" == none || "$TOKEN_USAGE_SOURCES" =~ ^(codex|opencode|hermes)(,(codex|opencode|hermes))*$ ]] || { config_error "TOKEN_USAGE_SOURCES must be auto, none, or a comma-separated list of codex,opencode,hermes." || true; invalid=1; }
-
-  for path_value in "$TOKEN_PRICING_FILE" "$CODEX_DATA_DIR" "$OPENCODE_DB_PATH" "$HERMES_DB_PATH"; do
-    if [[ "$path_value" != /* ]] || has_control_characters "$path_value"; then
-      config_error "Token analytics paths must be absolute and contain no control characters." || true
-      invalid=1
-      break
-    fi
-  done
-  if [[ ! -f "$TOKEN_PRICING_FILE" || ! -r "$TOKEN_PRICING_FILE" || -L "$TOKEN_PRICING_FILE" ]]; then
-    config_error "TOKEN_PRICING_FILE must be a readable regular file, not a symbolic link." || true
-    invalid=1
-  fi
-
-  for secret in "$GITHUB_PAT" "$DISCORD_WEBHOOK" "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID"; do
-    if has_control_characters "$secret"; then
-      config_error "Credentials and channel identifiers must not contain control characters." || true
-      invalid=1
-      break
-    fi
-  done
-  (( invalid == 0 ))
+  ALERT_SCRIPT_RULE_INDICES=()
+  ALERT_SCRIPT_RULE_PATHS=()
+  ALERT_SCRIPT_RULE_EVENTS=()
+  ALERT_SCRIPT_RULE_IDS=()
+  while IFS= read -r -d '' record; do
+    key="${record%%$'\t'*}"
+    encoded="${record#*$'\t'}"
+    value="$(printf '%s' "$encoded" | base64 --decode)" || {
+      rm -f -- "$transport_file"
+      config_error "Invalid configuration transport."
+      return 1
+    }
+    case "$key" in
+      ALERT_SCRIPT_RULE_INDEX_*)
+        rule_index="${key##*_}"
+        ALERT_SCRIPT_RULE_INDICES[rule_index]="$value"
+        ;;
+      ALERT_SCRIPT_RULE_PATH_*)
+        rule_index="${key##*_}"
+        ALERT_SCRIPT_RULE_PATHS[rule_index]="$value"
+        ;;
+      ALERT_SCRIPT_RULE_EVENT_*)
+        rule_index="${key##*_}"
+        ALERT_SCRIPT_RULE_EVENTS[rule_index]="$value"
+        ;;
+      ALERT_SCRIPT_RULE_ID_*)
+        rule_index="${key##*_}"
+        ALERT_SCRIPT_RULE_IDS[rule_index]="$value"
+        ;;
+    esac
+  done <"$transport_file"
+  rm -f -- "$transport_file"
 }
 
 check_requirements() {
@@ -408,52 +290,56 @@ PYEOF
 }
 
 initialize() {
-  local codex_bin_override="${CODEX_BIN_OVERRIDE:-}"
+  local interval_override="${1:-}" transport_file record key encoded value rule_index
   umask 077
-  if [[ -f "$ENV_FILE" ]]; then
-    if [[ -L "$ENV_FILE" || ! -O "$ENV_FILE" ]]; then
-      config_error ".env must be a regular file owned by the current user."
+  transport_file="$(mktemp "${TMPDIR:-/tmp}/codex-monitor-config.XXXXXX")" || {
+    config_error "Unable to create a private configuration transport."
+    return 1
+  }
+  local -a config_args=(--profile monitor --env-file "$ENV_FILE" --script-dir "$SCRIPT_DIR")
+  if [[ -n "$interval_override" ]]; then
+    config_args+=(--loop "$interval_override")
+  fi
+  if ! python3 "$CONFIG_PY" "${config_args[@]}" >"$transport_file"; then
+    rm -f -- "$transport_file"
+    return 1
+  fi
+  ALERT_SCRIPT_RULE_INDICES=()
+  ALERT_SCRIPT_RULE_PATHS=()
+  ALERT_SCRIPT_RULE_EVENTS=()
+  ALERT_SCRIPT_RULE_IDS=()
+  while IFS= read -r -d '' record; do
+    key="${record%%$'\t'*}"
+    encoded="${record#*$'\t'}"
+    [[ "$key" =~ ^[A-Z][A-Z0-9_]*$|^ALERT_SCRIPT_RULE_(INDEX|PATH|EVENT|ID)_[0-9]+$ ]] || continue
+    value="$(printf '%s' "$encoded" | base64 --decode)" || {
+      rm -f -- "$transport_file"
+      config_error "Invalid configuration transport."
       return 1
-    fi
-    chmod 600 "$ENV_FILE"
-    load_config
-  fi
-
-  if [[ -n "$codex_bin_override" ]]; then
-    CODEX_BIN="$codex_bin_override"
-  fi
-
-  ALERT_THRESHOLDS="${ALERT_THRESHOLDS:-75,50,25,10,5}"
-  ALERTS_ENABLED="${ALERTS_ENABLED-1}"
-  ALERT_SCRIPT_TIMEOUT_SECONDS="${ALERT_SCRIPT_TIMEOUT_SECONDS:-30}"
-  ARCHIVE_RETENTION_DAYS="${ARCHIVE_RETENTION_DAYS:-365}"
-  HISTORY_RETENTION_HOURS="${HISTORY_RETENTION_HOURS:-192}"
-  LOOP_INTERVAL="${LOOP_INTERVAL:-$DEFAULT_INTERVAL_SECONDS}"
-  DASHBOARD_ACTIVE_INTERVAL_SECONDS="${DASHBOARD_ACTIVE_INTERVAL_SECONDS:-$DEFAULT_DASHBOARD_ACTIVE_INTERVAL_SECONDS}"
-  CODEX_STATUS_TIMEOUT_SECONDS="${CODEX_STATUS_TIMEOUT_SECONDS:-20}"
-  CURL_CONNECT_TIMEOUT_SECONDS="${CURL_CONNECT_TIMEOUT_SECONDS:-5}"
-  CURL_MAX_TIME_SECONDS="${CURL_MAX_TIME_SECONDS:-20}"
-  CURL_RETRIES="${CURL_RETRIES:-2}"
-  CURL_RETRY_DELAY_SECONDS="${CURL_RETRY_DELAY_SECONDS:-1}"
-  MONITOR_DEBUG="${MONITOR_DEBUG:-0}"
-  CODEX_FORECAST_ENABLED="${CODEX_FORECAST_ENABLED:-1}"
-  CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD="${CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD:-50}"
-  CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD="${CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD:-25}"
-  DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}"
-  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-  TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
-  GITHUB_PAT="${GITHUB_PAT:-}"
-  GITHUB_GIST_ID="${GITHUB_GIST_ID:-}"
-  GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
-  TELEGRAM_API_URL="${TELEGRAM_API_URL:-https://api.telegram.org}"
-  TOKEN_USAGE_SOURCES="${TOKEN_USAGE_SOURCES:-auto}"
-  TOKEN_PRICING_FILE="${TOKEN_PRICING_FILE:-${SCRIPT_DIR}/pricing.json}"
-  CODEX_DATA_DIR="${CODEX_DATA_DIR:-${HOME}/.codex}"
-  OPENCODE_DB_PATH="${OPENCODE_DB_PATH:-${XDG_DATA_HOME:-${HOME}/.local/share}/opencode/opencode.db}"
-  HERMES_DB_PATH="${HERMES_DB_PATH:-${HOME}/.hermes/state.db}"
+    }
+    case "$key" in
+      ALERT_SCRIPT_RULE_INDEX_*)
+        rule_index="${key##*_}"
+        ALERT_SCRIPT_RULE_INDICES[rule_index]="$value"
+        ;;
+      ALERT_SCRIPT_RULE_PATH_*)
+        rule_index="${key##*_}"
+        ALERT_SCRIPT_RULE_PATHS[rule_index]="$value"
+        ;;
+      ALERT_SCRIPT_RULE_EVENT_*)
+        rule_index="${key##*_}"
+        ALERT_SCRIPT_RULE_EVENTS[rule_index]="$value"
+        ;;
+      ALERT_SCRIPT_RULE_ID_*)
+        rule_index="${key##*_}"
+        ALERT_SCRIPT_RULE_IDS[rule_index]="$value"
+        ;;
+      *) printf -v "$key" '%s' "$value" ;;
+    esac
+  done <"$transport_file"
+  rm -f -- "$transport_file"
 
   check_requirements || return 1
-  validate_config || return 1
   mkdir -p "$RUNTIME_DIR"
   chmod 700 "$RUNTIME_DIR"
   [[ -w "$RUNTIME_DIR" ]] || { config_error "Runtime directory is not writable: $RUNTIME_DIR"; return 1; }
@@ -2685,7 +2571,7 @@ main() {
     return 2
   fi
 
-  initialize || return 1
+  initialize "$interval_override" || return 1
   if (( interval_was_set == 1 )); then
     interval="$interval_override"
   else
