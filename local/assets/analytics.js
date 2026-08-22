@@ -24,12 +24,14 @@ const state = {
   tokenMetric: 'cost',
 };
 let limitsChart = null;
+let weeklyLimitValueChart = null;
 let tokensChart = null;
 let refreshTimer = null;
 let limitPoints = [];
 let tokenPoints = [];
 let tokenSourcePoints = [];
 let limitDatasets = [];
+let weeklyLimitValueDatasets = [];
 let tokenDatasets = [];
 let lastPayload = null;
 let currentPeriod = {};
@@ -82,6 +84,14 @@ function formatCost(value) {
     ? CodexPreferences.formatCurrency(safeNumber(value))
     : `$${safeNumber(value).toFixed(safeNumber(value) < 1 ? 4 : 2)}`;
 }
+function formatUsd(value) {
+  const number = finiteNumber(value);
+  if (number === null || number < 0) return 'N/A';
+  return new Intl.NumberFormat(
+    typeof CodexPreferences === 'object' ? CodexPreferences.numberLocale() : 'en',
+    { style: 'currency', currency: 'USD', maximumFractionDigits: number < 1 ? 4 : 2 },
+  ).format(number);
+}
 function setCost(element, value) {
   if (!element) return;
   element.textContent = formatCost(value);
@@ -101,6 +111,7 @@ function formatPercent(value) {
 }
 function formatChartValue(value, kind) {
   if (kind === 'percent') return formatPercent(value);
+  if (kind === 'usd') return formatUsd(value);
   if (kind === 'cost') return formatCost(value);
   return t('tokenValue', { value: formatFullTokens(value) });
 }
@@ -400,6 +411,98 @@ function renderLimits(data = {}) {
   updateTokenOverlay();
 }
 
+function weeklyValueQuality(value) {
+  const key = `weeklyValueQuality_${String(value || 'unavailable').replace(/[^a-z_]/gu, '')}`;
+  return t(key);
+}
+function weeklyValueReason(value) {
+  const keys = {
+    ambiguous_limit: 'weeklyValueReasonAmbiguousLimit',
+    deadline_transition: 'weeklyValueReasonDeadlineTransition',
+    incomplete_cycle: 'weeklyValueReasonIncompleteCycle',
+    insufficient_quota_delta: 'weeklyValueReasonInsufficientDelta',
+    invalid_event: 'weeklyValueReasonInvalidEvent',
+    invalid_quota_pct: 'weeklyValueReasonInvalidQuota',
+    invalid_value: 'weeklyValueReasonInvalidValue',
+    missing_deadline: 'weeklyValueReasonMissingDeadline',
+    missing_limit_id: 'weeklyValueReasonMissingLimit',
+    limit_transition: 'weeklyValueReasonLimitTransition',
+    missing_price: 'weeklyValueReasonMissingPrice',
+    no_cost: 'weeklyValueReasonNoCost',
+    no_events: 'weeklyValueReasonNoEvents',
+    quota_increase: 'weeklyValueReasonQuotaIncrease',
+    reset_in_window: 'weeklyValueReasonResetInWindow',
+    fully_consumed: 'weeklyValueReasonFullyConsumed',
+    weekly_only: 'weeklyValueReasonWeeklyOnly',
+    stale_boundary: 'weeklyValueReasonStaleBoundary',
+    stale_data: 'weeklyValueReasonStaleData',
+    window_duration: 'weeklyValueReasonWindowDuration',
+    zero_consumed_fraction: 'weeklyValueReasonZeroConsumed',
+    zero_quota_delta: 'weeklyValueReasonZeroDelta',
+  };
+  return value ? t(keys[value] || 'weeklyValueUnavailable') : t('weeklyValueReasonIncompleteCycle');
+}
+function weeklyValuePointValid(point) {
+  return point && finiteNumber(point.value_usd) !== null && point.quality && point.quality !== 'unavailable';
+}
+function renderWeeklyLimitValueTable(points) {
+  const body = byId('weekly-limit-value-data-body');
+  clearRows(body);
+  for (const point of points) {
+    const row = document.createElement('tr');
+    cell(row, formatDate(point.at));
+    const observed = cell(row, formatUsd(point.observed_cost_usd), point.observed_cost_usd === null ? 'value-unavailable' : '');
+    const consumed = finiteNumber(point.quota_consumed_pct_points);
+    cell(row, consumed === null ? 'N/A' : formatPercent(consumed));
+    cell(row, formatUsd(point.raw_value_usd), point.raw_value_usd === null ? 'value-unavailable' : '');
+    cell(row, formatUsd(point.value_usd), point.value_usd === null ? 'value-unavailable' : '');
+    const quality = cell(row, weeklyValueQuality(point.quality), `quality-${point.quality || 'unavailable'}`);
+    if (point.dispersion_pct !== undefined && point.dispersion_pct !== null) quality.title = `${formatPercent(point.dispersion_pct)} ${t('weeklyValueDispersion')}`;
+    const reason = cell(row, point.reason ? weeklyValueReason(point.reason) : t('weeklyValueAvailable'));
+    if (point.reason) reason.className = 'value-unavailable';
+    body?.appendChild(row);
+  }
+}
+function renderWeeklyLimitValue(data = {}) {
+  const points = Array.isArray(data.series) ? data.series : [];
+  const valid = points.filter(weeklyValuePointValid);
+  byId('weekly-limit-value-empty').hidden = valid.length > 0;
+  byId('weekly-limit-value-chart-wrap').hidden = valid.length === 0 || typeof Chart !== 'function';
+  const unavailable = Object.values(data.unavailable_reasons || {}).reduce((total, value) => total + safeNumber(value), 0);
+  const currentNotice = data.current_status === 'stale_data'
+    ? ` · ${t('weeklyValueCurrentUnavailable')}`
+    : '';
+  byId('weekly-limit-value-summary').textContent = valid.length
+    ? `${t('weeklyLimitValueSummary', { valid: valid.length, unavailable, from: formatDate(valid[0].at), to: formatDate(valid[valid.length - 1].at) })}${currentNotice}`
+    : `${t('noWeeklyLimitValue')}${currentNotice}`;
+  renderWeeklyLimitValueTable(points);
+  weeklyLimitValueDatasets = [{
+    label: t('weeklyLimitValueTitle'),
+    data: valid.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.value_usd) })),
+    borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.10)',
+    fill: true, borderWidth: 2, pointRadius: 4, tension: 0.2, spanGaps: false,
+    pointBackgroundColor: valid.map(point => point.quality === 'volatile' ? '#fca5a5' : point.quality === 'low_confidence' ? '#fbbf24' : '#86efac'),
+    pointStyle: valid.map(point => point.quality === 'volatile' ? 'triangle' : point.quality === 'low_confidence' ? 'rectRot' : 'circle'),
+    valueKind: 'usd',
+  }];
+  if (typeof Chart !== 'function' || !valid.length) {
+    if (weeklyLimitValueChart) { weeklyLimitValueChart.destroy(); weeklyLimitValueChart = null; }
+    return;
+  }
+  if (weeklyLimitValueChart) {
+    weeklyLimitValueChart.data.datasets = weeklyLimitValueDatasets;
+    applyChartBounds(weeklyLimitValueChart.options, valid);
+    weeklyLimitValueChart.options.scales.y.ticks.callback = value => formatUsd(value);
+    weeklyLimitValueChart.update('none');
+    return;
+  }
+  const options = chartBase(valid);
+  options.scales.y.ticks.callback = value => formatUsd(value);
+  weeklyLimitValueChart = new Chart(byId('weekly-limit-value-chart').getContext('2d'), {
+    type: 'line', data: { datasets: weeklyLimitValueDatasets }, options,
+  });
+}
+
 function sourceSeries(tokens) {
   const candidate = tokens?.series_by_source ?? tokens?.series_by_application ?? tokens?.by_source_series;
   if (Array.isArray(candidate)) return candidate.filter(item => item && typeof item === 'object');
@@ -551,6 +654,20 @@ function renderResets(data = {}) {
     cell(row, formatDate(item.reset_at));
     cell(row, formatDate(item.observed_at));
     cell(row, `${item.before_pct ?? EMPTY_VALUE}% → ${item.after_pct ?? EMPTY_VALUE}%`);
+    const cycleUnavailable = item.estimated_cycle_cost_usd === null || item.estimated_cycle_cost_usd === undefined;
+    const cycleReason = cycleUnavailable ? weeklyValueReason(item.cycle_cost_reason) : '';
+    const cycleCost = cell(row, cycleUnavailable ? `N/A — ${cycleReason}` : formatUsd(item.estimated_cycle_cost_usd), cycleUnavailable ? 'value-unavailable' : '');
+    if (cycleUnavailable) {
+      cycleCost.title = cycleReason;
+      cycleCost.setAttribute('aria-label', `N/A: ${cycleReason}`);
+    }
+    const extrapolatedUnavailable = item.extrapolated_100_value_usd === null || item.extrapolated_100_value_usd === undefined;
+    const extrapolatedReason = extrapolatedUnavailable ? weeklyValueReason(item.cycle_cost_reason) : '';
+    const extrapolated = cell(row, extrapolatedUnavailable ? `N/A — ${extrapolatedReason}` : formatUsd(item.extrapolated_100_value_usd), extrapolatedUnavailable ? 'value-unavailable' : '');
+    if (extrapolatedUnavailable) {
+      extrapolated.title = extrapolatedReason;
+      extrapolated.setAttribute('aria-label', `N/A: ${extrapolatedReason}`);
+    }
     const forecast24h = finiteNumber(item.forecast_chance_24h_pct);
     const forecast6h = finiteNumber(item.forecast_chance_6h_pct);
     cell(
@@ -720,6 +837,7 @@ function render(payload) {
   const period = payload.period || {};
   currentPeriod = period;
   renderLimits(payload.limits || {});
+  renderWeeklyLimitValue(payload.weekly_limit_value || {});
   renderTokens(payload.tokens || {});
   renderBreakdown(payload.tokens?.breakdown || [], payload.tokens?.breakdown_pagination);
   renderResets(payload.resets || {});

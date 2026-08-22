@@ -22,7 +22,14 @@ assert_eq 76 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["chance_
 assert_eq 10 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["chance_6h_pct"])' <<<"$forecast")" "6-hour chance was not rounded"
 assert_eq '2026-08-12T17:17:44Z' "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["generated_at"])' <<<"$forecast")" "forecast timestamp was not normalized"
 
-snapshot='{"five_h_pct":80,"weekly_pct":60,"five_h_reset":"later","weekly_reset":"later","scraped_at":"2026-08-12T17:15:00Z","sample_interval_seconds":900,"history_window_hours":192,"limit_id":"test"}'
+snapshot_scraped_at="$(python3 - <<'PY'
+import datetime
+
+now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+print(now.isoformat().replace("+00:00", "Z"))
+PY
+)"
+snapshot=$(printf '{"five_h_pct":80,"weekly_pct":60,"five_h_reset":"later","weekly_reset":"later","scraped_at":"%s","sample_interval_seconds":900,"history_window_hours":192,"limit_id":"test"}' "$snapshot_scraped_at")
 enriched="$(enrich_snapshot_with_codex_forecast "$snapshot")"
 # The real sourced implementation is exercised here before a cycle-specific
 # stub with the same name is declared below.

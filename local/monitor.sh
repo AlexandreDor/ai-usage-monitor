@@ -14,6 +14,7 @@
 #   ./monitor.sh --loop --fail-fast  # exit after the first failed cycle
 #
 # Environment variables (set in .env or export):
+#   ALERTS_ENABLED      — global outbound alert switch, default: 1
 #   DISCORD_WEBHOOK     — Discord webhook URL (optional)
 #   TELEGRAM_BOT_TOKEN  — Telegram bot token from BotFather (optional)
 #   TELEGRAM_CHAT_ID    — Telegram numeric chat ID (optional)
@@ -33,6 +34,7 @@ RUNTIME_DIR="${SCRIPT_DIR}/runtime"
 STATE_FILE="${RUNTIME_DIR}/.alert_state"
 ALERT_DELIVERIES_FILE="${RUNTIME_DIR}/alert-deliveries.json"
 ALERTS_PY="${SCRIPT_DIR}/alerts.py"
+ANOMALIES_PY="${SCRIPT_DIR}/anomalies.py"
 HISTORY_PY="${SCRIPT_DIR}/history.py"
 DATA_FILE="${RUNTIME_DIR}/data.json"
 HISTORY_FILE="${RUNTIME_DIR}/history.json"
@@ -108,7 +110,7 @@ load_config() {
     fi
 
     case "$key" in
-      ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_ENABLED|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DASHBOARD_ACTIVE_INTERVAL_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
+      ALERTS_ENABLED|ALERT_THRESHOLDS|ALERT_SCRIPT_TIMEOUT_SECONDS|ARCHIVE_RETENTION_DAYS|CODEX_BIN|CODEX_DATA_DIR|CODEX_FORECAST_24H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD|CODEX_FORECAST_ENABLED|CODEX_STATUS_TIMEOUT_SECONDS|CURL_CONNECT_TIMEOUT_SECONDS|CURL_MAX_TIME_SECONDS|CURL_RETRIES|CURL_RETRY_DELAY_SECONDS|DASHBOARD_ACTIVE_INTERVAL_SECONDS|DISCORD_WEBHOOK|GITHUB_API_URL|GITHUB_GIST_ID|GITHUB_PAT|HERMES_DB_PATH|HISTORY_RETENTION_HOURS|LOOP_INTERVAL|MONITOR_DEBUG|OPENCODE_DB_PATH|TELEGRAM_API_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TOKEN_PRICING_FILE|TOKEN_USAGE_SOURCES)
         if (( ${#value} >= 2 )) && { [[ "$value" == \"*\" ]] || [[ "$value" == \'*\' ]]; }; then
           value="${value:1:${#value}-2}"
         fi
@@ -299,6 +301,7 @@ PYEOF
 
 validate_config() {
   local invalid=0 secret path_value
+  [[ "$ALERTS_ENABLED" == 0 || "$ALERTS_ENABLED" == 1 ]] || { config_error "ALERTS_ENABLED must be 0 or 1." || true; invalid=1; }
   validate_integer LOOP_INTERVAL "$LOOP_INTERVAL" 1 86400 || invalid=1
   validate_integer DASHBOARD_ACTIVE_INTERVAL_SECONDS "$DASHBOARD_ACTIVE_INTERVAL_SECONDS" 30 86400 || invalid=1
   validate_integer CODEX_STATUS_TIMEOUT_SECONDS "$CODEX_STATUS_TIMEOUT_SECONDS" 5 300 || invalid=1
@@ -395,7 +398,8 @@ PYEOF
     missing=1
   fi
 
-  if alert_scripts_configured && ! command -v timeout &>/dev/null; then
+  if [[ "${ALERTS_ENABLED:-1}" == 1 ]] && alert_scripts_configured \
+    && ! command -v timeout &>/dev/null; then
     echo "[ERROR] 'timeout' is required when alert scripts are configured." >&2
     missing=1
   fi
@@ -420,6 +424,7 @@ initialize() {
   fi
 
   ALERT_THRESHOLDS="${ALERT_THRESHOLDS:-75,50,25,10,5}"
+  ALERTS_ENABLED="${ALERTS_ENABLED-1}"
   ALERT_SCRIPT_TIMEOUT_SECONDS="${ALERT_SCRIPT_TIMEOUT_SECONDS:-30}"
   ARCHIVE_RETENTION_DAYS="${ARCHIVE_RETENTION_DAYS:-365}"
   HISTORY_RETENTION_HOURS="${HISTORY_RETENTION_HOURS:-192}"
@@ -945,6 +950,7 @@ PYEOF
 send_discord() {
   local message="$1"
   local payload
+  [[ "${ALERTS_ENABLED:-1}" == 1 ]] || return 0
   if [[ -z "${DISCORD_WEBHOOK:-}" ]]; then return; fi
 
   payload="$(python3 - "$message" <<'PYEOF'
@@ -968,6 +974,7 @@ PYEOF
 
 send_telegram() {
   local message="$1"
+  [[ "${ALERTS_ENABLED:-1}" == 1 ]] || return 0
   if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then return; fi
 
   local response_file
@@ -985,6 +992,10 @@ send_telegram() {
 send_alert() {
   local message="$1"
   local configured=0 delivered=0
+  if [[ "${ALERTS_ENABLED:-1}" != 1 ]]; then
+    echo "[INFO] Alert suppressed while ALERTS_ENABLED=0."
+    return 0
+  fi
   echo "[ALERT] Detected: $message"
   if [[ -n "${DISCORD_WEBHOOK:-}" ]]; then
     ((configured += 1))
@@ -1009,6 +1020,7 @@ send_alert() {
 # records the result before deciding whether another attempt is allowed.
 alert_http_attempt() {
   local channel="$1" message="$2" response_file headers_file error_file payload status="000" curl_status=0
+  [[ "${ALERTS_ENABLED:-1}" == 1 ]] || return 1
   response_file="$(mktemp "${RUNTIME_DIR}/.${channel}-response.XXXXXX")" || return 1
   headers_file="$(mktemp "${RUNTIME_DIR}/.${channel}-headers.XXXXXX")" || { rm -f "$response_file"; return 1; }
   error_file="$(mktemp "${RUNTIME_DIR}/.${channel}-error.XXXXXX")" || { rm -f "$response_file" "$headers_file"; return 1; }
@@ -1063,6 +1075,10 @@ register_network_alert() {
   local kind="$1" window="$2" selector="$3" cycle_key="$4" message="$5"
   local event_data="$6" created_at="$7" expires_at="$8" replace="${9:-false}" expire_cycle="${10:-}"
   local channels request
+  if [[ "${ALERTS_ENABLED:-1}" != 1 ]]; then
+    echo "[INFO] Alert suppressed while ALERTS_ENABLED=0: $message"
+    return 2
+  fi
   channels="$(configured_alert_channels_json)" || return 1
   if [[ "$channels" == "[]" ]]; then
     # send_alert is retained as a no-channel compatibility seam for embedders
@@ -1091,9 +1107,71 @@ PYEOF
   echo "[ALERT] Detected: $message"
 }
 
+# Register anomaly rows that were durably written by the detector.  The
+# SQLite journal is acknowledged only after alerts.py has accepted the
+# occurrence (or after the existing no-channel compatibility seam succeeds).
+journal_quota_anomalies() {
+  local now="$1" pending_file line anomaly_id anomaly_type window limit_id detected
+  local before_pct after_pct before_reset after_reset message event_data registration_status
+  pending_file="$(mktemp "${RUNTIME_DIR}/.anomalies-pending.XXXXXX")" || return 1
+  if ! python3 "$ANOMALIES_PY" pending --database "$ARCHIVE_FILE" > "$pending_file"; then
+    rm -f "$pending_file"
+    return 1
+  fi
+  while IFS=$'\x1f' read -r anomaly_id anomaly_type window limit_id detected before_pct after_pct before_reset after_reset message; do
+    [[ -n "$anomaly_id" ]] || continue
+    message="$(printf '%s' "$message" | base64 --decode)" || { rm -f "$pending_file"; return 1; }
+    event_data="$(python3 - "$limit_id" "$after_reset" "$before_pct" "$after_pct" \
+      "$before_reset" "$detected" <<'PYEOF'
+import json
+import sys
+limit_id, reset_epoch, before, after, before_reset, detected = sys.argv[1:]
+print(json.dumps({
+    "limit_id": limit_id,
+    "reset_epoch": int(reset_epoch or 0),
+    "before_pct": float(before), "after_pct": float(after),
+    "before_reset_at": int(before_reset or 0),
+    "after_reset_at": int(reset_epoch or 0),
+    "detected_at_epoch": int(detected),
+}, separators=(",", ":")))
+PYEOF
+    )" || { rm -f "$pending_file"; return 1; }
+    registration_status=0
+    register_network_alert anomaly "$window" "$anomaly_type" \
+      "limit:${limit_id}|anomaly:${anomaly_id}" "$message" "$event_data" \
+      "$detected" 0 false "" || registration_status=$?
+    if (( registration_status == 0 || registration_status == 2 )); then
+      if ! python3 "$ANOMALIES_PY" journal --database "$ARCHIVE_FILE" \
+        "$anomaly_id" --at "$now"; then
+        rm -f "$pending_file"
+        return 1
+      fi
+    else
+      rm -f "$pending_file"
+      return 1
+    fi
+  done < <(python3 - "$pending_file" <<'PYEOF'
+import base64
+import json
+import pathlib
+import sys
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    item = json.loads(line)
+    print(*(
+        item["anomaly_id"], item["anomaly_type"], item["window"], item["limit_id"],
+        item["detected_at_epoch"], item["before_pct"], item["after_pct"],
+        item["before_reset_at"] or 0, item["after_reset_at"] or 0,
+        base64.b64encode(item["message"].encode()).decode(),
+    ), sep="\x1f")
+PYEOF
+  )
+  rm -f "$pending_file"
+}
+
 deliver_due_alerts() {
   local now="$1" configured due_file alert_id channel message attempt cycle_limit
   local classification outcome error_class retryable retry_delay next_attempt used_retry_after record_payload
+  [[ "${ALERTS_ENABLED:-1}" == 1 ]] || return 0
   due_file="$(mktemp "${RUNTIME_DIR}/.alerts-due.XXXXXX")" || return 1
   configured="$(configured_alert_channels_json)" || { rm -f "$due_file"; return 1; }
   if ! printf '{"configured_channels":%s}\n' "$configured" \
@@ -1333,6 +1411,7 @@ persist_alert_state() {
     "notified_weekly_thresholds=${notified_weekly_thresholds}" \
     "pending_5h_threshold=${pending_5h_threshold}" \
     "pending_weekly_threshold=${pending_weekly_threshold}" \
+    "alerts_disabled_since=${alerts_disabled_since}" \
     "script_tracking_initialized=${script_tracking_initialized}" \
     "script_prev_5h_pct=${script_prev_5h_pct}" \
     "script_prev_weekly_pct=${script_prev_weekly_pct}" \
@@ -1358,6 +1437,10 @@ run_alert_script() {
   local path="${ALERT_SCRIPT_RULE_PATHS[$rule_position]}" working_directory exit_code=0 event_label
   working_directory="$(dirname "$path")"
   event_label="${window}:${threshold:-reset}"
+  if [[ "${ALERTS_ENABLED:-1}" != 1 ]]; then
+    echo "[INFO] Script rule ${rule_index} for ${event_label} suppressed while ALERTS_ENABLED=0."
+    return 0
+  fi
   echo "[ACTION] Script rule ${rule_index} for ${event_label}: ${path}"
   (
     cd "$working_directory" || exit 125
@@ -1437,6 +1520,10 @@ reconcile_alert_deliveries() {
         [[ "$pending_weekly_threshold" == "$selector" ]] && pending_weekly_threshold=""
         [[ -n "$remaining" ]] && prev_weekly_pct="$remaining"
       fi
+    elif [[ "$kind" == anomaly ]]; then
+      # Detector state is durable in SQLite and was acknowledged at journal
+      # registration time; anomaly delivery has no threshold/reset baseline.
+      continue
     elif [[ "$window" == 5h ]]; then
       last_notified_5h_reset_at="$reset_epoch"
       if [[ "$five_h_armed_reset_at" == "$reset_epoch" ]]; then
@@ -1623,6 +1710,7 @@ check_thresholds() {
   local notified_weekly_thresholds=""
   local pending_5h_threshold=""
   local pending_weekly_threshold=""
+  local alerts_disabled_since=0
   local script_tracking_initialized=0
   local script_prev_5h_pct=100
   local script_prev_weekly_pct=100
@@ -1633,9 +1721,10 @@ check_thresholds() {
   local attempted_script_5h_reset_actions=""
   local attempted_script_weekly_reset_actions=""
   local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold
-  local original_pending cycle_key covered_json registration_status
+  local original_pending cycle_key covered_json registration_status disabled_notified
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 initialize_script_baseline=0
   local observed_weekly_reset=0 weekly_observation_valid=0 process_weekly_sample=1 state_loaded=0
+  local resumed_after_disabled=0 resume_delivery_attempted=0
   local -a script_thresholds=()
   ALERT_PROCESSING_ERROR=""
   if [[ -f "$STATE_FILE" ]]; then
@@ -1661,6 +1750,9 @@ check_thresholds() {
           ;;
         pending_5h_threshold|pending_weekly_threshold)
           [[ -z "$state_value" || "$state_value" =~ ^[0-9]+$ ]] && printf -v "$state_key" '%s' "$state_value"
+          ;;
+        alerts_disabled_since)
+          [[ "$state_value" =~ ^[0-9]+$ ]] && alerts_disabled_since="$state_value"
           ;;
         observed_weekly_limit_id|weekly_armed_limit_id)
           printf -v "$state_key" '%s' "$state_value"
@@ -1689,6 +1781,12 @@ check_thresholds() {
     return 1
   fi
 
+  if [[ "${ALERTS_ENABLED:-1}" == 0 ]]; then
+    (( alerts_disabled_since > 0 )) || alerts_disabled_since="$scraped_at_epoch"
+  elif (( alerts_disabled_since > 0 )); then
+    resumed_after_disabled=1
+  fi
+
   mapfile -t thresholds < <(load_thresholds)
   pace="$(weekly_pace_vs_ideal "$weekly_pct" "$weekly_reset_at" "$scraped_at_epoch")"
   pace_suffix=""
@@ -1714,10 +1812,19 @@ check_thresholds() {
     ALERT_PROCESSING_ERROR="alert reconciliation failed"
     return 1
   fi
-  if ! python3 "$ALERTS_PY" expire "$ALERT_DELIVERIES_FILE" --now "$scraped_at_epoch" \
-    || ! reconcile_alert_deliveries "$scraped_at_epoch"; then
-    ALERT_PROCESSING_ERROR="alert expiration failed"
-    return 1
+  if [[ "${ALERTS_ENABLED:-1}" == 1 && "$resumed_after_disabled" == 0 ]]; then
+    if ! python3 "$ALERTS_PY" expire "$ALERT_DELIVERIES_FILE" --now "$scraped_at_epoch" \
+      || ! reconcile_alert_deliveries "$scraped_at_epoch"; then
+      ALERT_PROCESSING_ERROR="alert expiration failed"
+      return 1
+    fi
+  fi
+
+  # Full cycles have already processed this row while archiving; live cycles
+  # use the same idempotent detector command without adding a snapshot row.
+  if ! journal_quota_anomalies "$scraped_at_epoch"; then
+    status=1
+    ALERT_PROCESSING_ERROR="quota anomaly journal registration failed"
   fi
 
   if (( ${#ALERT_SCRIPT_RULE_INDICES[@]} == 0 )); then
@@ -1798,7 +1905,12 @@ check_thresholds() {
     if (( reset_age <= 5 * 60 * 60 && last_notified_5h_reset_at != five_h_armed_reset_at )); then
       cycle_key="limit:${limit_id}|reset:${five_h_armed_reset_at}"
       if journal_has_pending_alert reset 5h reset "$cycle_key"; then
-        :
+        if [[ "${ALERTS_ENABLED:-1}" != 1 ]]; then
+          # Keep the queued delivery intact, but advance local detector state
+          # while notifications are disabled.  Re-enabling must not replay a
+          # reset that was observed during the disabled interval.
+          last_notified_5h_reset_at="$five_h_armed_reset_at"
+        fi
       elif journal_has_terminal_alert reset 5h reset "$cycle_key"; then
         # The delivery journal is authoritative if detector state was restored
         # from an older copy after the terminal occurrence was acknowledged.
@@ -1851,7 +1963,11 @@ check_thresholds() {
     if (( reset_age <= 7 * 24 * 60 * 60 && last_notified_weekly_reset_at != weekly_armed_reset_at )); then
       cycle_key="limit:${limit_id}|reset:${weekly_armed_reset_at}"
       if journal_has_pending_alert reset weekly reset "$cycle_key"; then
-        :
+        if [[ "${ALERTS_ENABLED:-1}" != 1 ]]; then
+          # See the 5-hour path: retain the old pending delivery, while
+          # acknowledging its reset locally for detector-state purposes.
+          last_notified_weekly_reset_at="$weekly_armed_reset_at"
+        fi
       elif journal_has_terminal_alert reset weekly reset "$cycle_key"; then
         # Recover from detector/journal divergence without replaying a reset or
         # keeping its expired deadline attached to the next threshold cycle.
@@ -1911,6 +2027,45 @@ check_thresholds() {
     && (( weekly_reset_at > scraped_at_epoch && weekly_reset_at <= scraped_at_epoch + 8 * 24 * 60 * 60 )); then
     weekly_armed_reset_at="$weekly_reset_at"
     weekly_armed_limit_id="$limit_id"
+  fi
+
+  # Suppressed observations still advance detector state.  This acknowledges
+  # every threshold crossed during the pause without creating a journal entry;
+  # any delivery that was already pending in the journal remains untouched.
+  if [[ "${ALERTS_ENABLED:-1}" != 1 ]]; then
+    if [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+      disabled_notified="${notified_5h_thresholds}"
+      for t in "${thresholds[@]}"; do
+        if python3 - "$prev_5h_pct" "$five_h_pct" "$t" <<'PYEOF'
+import sys
+raise SystemExit(0 if float(sys.argv[2]) <= float(sys.argv[3]) < float(sys.argv[1]) else 1)
+PYEOF
+        then
+          csv_contains "$disabled_notified" "$t" \
+            || disabled_notified="${disabled_notified:+${disabled_notified},}${t}"
+        fi
+      done
+      notified_5h_thresholds="$disabled_notified"
+      pending_5h_threshold=""
+      prev_5h_pct="$five_h_pct"
+    fi
+    if (( process_weekly_sample == 1 )) \
+      && [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+      disabled_notified="${notified_weekly_thresholds}"
+      for t in "${thresholds[@]}"; do
+        if python3 - "$prev_weekly_pct" "$weekly_pct" "$t" <<'PYEOF'
+import sys
+raise SystemExit(0 if float(sys.argv[2]) <= float(sys.argv[3]) < float(sys.argv[1]) else 1)
+PYEOF
+        then
+          csv_contains "$disabled_notified" "$t" \
+            || disabled_notified="${disabled_notified:+${disabled_notified},}${t}"
+        fi
+      done
+      notified_weekly_thresholds="$disabled_notified"
+      pending_weekly_threshold=""
+      prev_weekly_pct="$weekly_pct"
+    fi
   fi
 
   # The first observation uses 100% as its baseline. A multi-threshold drop emits
@@ -2060,6 +2215,7 @@ PYEOF
       NETWORK_DELIVERY_ERROR=1
       ALERT_PROCESSING_ERROR="alert state persistence failed"
     else
+      (( resumed_after_disabled == 1 )) && resume_delivery_attempted=1
       if ! deliver_due_alerts "$scraped_at_epoch"; then
         NETWORK_DELIVERY_ERROR=1
       fi
@@ -2159,6 +2315,11 @@ PYEOF
     fi
   fi
 
+  if (( resumed_after_disabled == 1 && resume_delivery_attempted == 1 )); then
+    # The first resumed cycle has had its chance to deliver old pending
+    # entries.  Subsequent cycles return to normal expire-before-deliver order.
+    alerts_disabled_since=0
+  fi
   if ! persist_alert_state; then
     echo "[ERROR] Could not persist alert state." >&2
     status=1
@@ -2234,6 +2395,11 @@ archive_snapshot() {
     --database "$ARCHIVE_FILE" \
     --history "$HISTORY_FILE" \
     --retention-days "$ARCHIVE_RETENTION_DAYS"
+}
+
+observe_quota_anomalies() {
+  local json="$1"
+  printf '%s\n' "$json" | python3 "$ANOMALIES_PY" observe --database "$ARCHIVE_FILE"
 }
 
 collect_token_usage() {
@@ -2312,6 +2478,10 @@ run_cycle() {
     limit_id=$(json_get_field "$json" "limit_id")
     scraped_at=$(json_get_field "$json" "scraped_at")
     scraped_at_epoch=$(timestamp_to_epoch "$scraped_at") || scraped_at_epoch=$(date -u +%s)
+    if ! observe_quota_anomalies "$public_json"; then
+      status=1
+      append_cycle_error "Quota anomaly detector failed"
+    fi
     check_thresholds "$five_h" "$weekly" "$five_h_reset" "$weekly_reset" \
       "$five_h_reset_at" "$weekly_reset_at" "$scraped_at_epoch" "$limit_id" \
       || { status=1; append_cycle_error "${ALERT_PROCESSING_ERROR:-alert processing failed}"; }
