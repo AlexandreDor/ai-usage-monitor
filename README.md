@@ -384,8 +384,8 @@ Scripts receive:
 
 The SQLite archive retains detailed quota, Forecast, reset, anomaly, and token
 data for Analytics. Existing schema v1, v2, and v3 archives migrate
-transactionally to v4 on
-their next writable monitor or `--check` run.
+transactionally to v4 on their next writable monitor cycle; `--check` does not
+open or migrate the archive.
 The detector tolerates quota noise up to 5 percentage points and reset-date
 movement up to 30 minutes; a disappeared reset date is confirmed after two
 valid observations. Planned deadline crossings and the recognized weekly
