@@ -89,17 +89,13 @@ assert_eq 35 "$CODEX_FORECAST_6H_HIGHLIGHT_THRESHOLD" "6-hour Forecast threshold
 assert_eq 120 "$DASHBOARD_ACTIVE_INTERVAL_SECONDS" "dashboard active interval was not loaded"
 
 python3 - "$MONITOR_PATH" "${ROOT_DIR}/local/.env.example" <<'PYEOF'
-import re
 import sys
 from pathlib import Path
 
-monitor = Path(sys.argv[1]).read_text(encoding="utf-8")
 example = Path(sys.argv[2]).read_text(encoding="utf-8")
-case = re.search(r'case "\$key" in(.*?)\n\s*\*\)', monitor, re.S)
-assert case is not None
-keys = set()
-for group in re.findall(r'\n\s*([A-Z][A-Z0-9_|]+)\)', case.group(1)):
-    keys.update(group.split('|'))
+sys.path.insert(0, str(Path(sys.argv[1]).parent))
+import config
+keys = set(config.MONITOR_KEYS)
 missing = sorted(key for key in keys if key not in example)
 if missing:
     raise SystemExit(f".env.example is missing accepted keys: {', '.join(missing)}")

@@ -121,12 +121,12 @@ import re
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
-start = text.index("`serve.sh` has a separate, narrow priority chain:")
-end = text.index("There is deliberately no `local/config.py` yet.", start)
+start = text.index("The server's pricing chain is therefore:")
+end = text.index("`DASHBOARD_ANALYTICS_DATABASE` has no `.env` fallback", start)
 section = re.sub(r"\s+", " ", text[start:end])
 expected = (
-    "`DASHBOARD_PRICING_FILE` (process) → `TOKEN_PRICING_FILE` (process) "
-    "→ `TOKEN_PRICING_FILE` in `local/.env` → `local/pricing.json`"
+    "`DASHBOARD_PRICING_FILE` (process) → `TOKEN_PRICING_FILE` "
+    "(process) → `TOKEN_PRICING_FILE` in `local/.env` → `local/pricing.json`"
 )
 if expected not in section:
     raise SystemExit("serve.sh pricing priority chain is incomplete or reordered")

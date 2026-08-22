@@ -4,7 +4,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ANALYTICS_DATABASE_PATH="${DASHBOARD_ANALYTICS_DATABASE:-${SCRIPT_DIR}/runtime/usage-history.sqlite3}"
+CONFIG_PY="${SCRIPT_DIR}/config.py"
+ANALYTICS_DATABASE_PATH="${DASHBOARD_ANALYTICS_DATABASE:-}"
 ANALYTICS_PRICING_PATH="${DASHBOARD_PRICING_FILE:-${TOKEN_PRICING_FILE:-}}"
 DASHBOARD_ACTIVE_INTERVAL="${DASHBOARD_ACTIVE_INTERVAL_SECONDS:-}"
 PORT=8080
@@ -68,77 +69,38 @@ while (($#)); do
   esac
 done
 
-# Reuse TOKEN_PRICING_FILE from the monitor's .env without sourcing arbitrary
-# shell code. An explicit environment override always wins.
-if [[ -e "${SCRIPT_DIR}/.env" && ( -L "${SCRIPT_DIR}/.env" || ! -O "${SCRIPT_DIR}/.env" ) ]]; then
-  echo "[ERROR] local/.env must be a regular file owned by the current user." >&2
-  exit 2
-fi
-if [[ -f "${SCRIPT_DIR}/.env" && ( -z "$ANALYTICS_PRICING_PATH" || -z "$DASHBOARD_ACTIVE_INTERVAL" ) ]]; then
-  while IFS= read -r env_line || [[ -n "$env_line" ]]; do
-    env_line="${env_line%$'\r'}"
-    [[ "$env_line" == *=* ]] || continue
-    env_key="${env_line%%=*}"
-    env_key="${env_key#"${env_key%%[![:space:]]*}"}"
-    env_key="${env_key%"${env_key##*[![:space:]]}"}"
-    env_value="${env_line#*=}"
-    env_value="${env_value#"${env_value%%[![:space:]]*}"}"
-    env_value="${env_value%"${env_value##*[![:space:]]}"}"
-    if (( ${#env_value} >= 2 )) && { [[ "$env_value" == \"*\" ]] || [[ "$env_value" == \'*\' ]]; }; then
-      env_value="${env_value:1:${#env_value}-2}"
-    fi
-    case "$env_key" in
-      TOKEN_PRICING_FILE)
-        [[ -n "$ANALYTICS_PRICING_PATH" ]] || ANALYTICS_PRICING_PATH="$env_value"
-        ;;
-      DASHBOARD_ACTIVE_INTERVAL_SECONDS)
-        [[ -n "$DASHBOARD_ACTIVE_INTERVAL" ]] || DASHBOARD_ACTIVE_INTERVAL="$env_value"
-        ;;
-    esac
-  done < "${SCRIPT_DIR}/.env"
-fi
-ANALYTICS_PRICING_PATH="${ANALYTICS_PRICING_PATH:-${SCRIPT_DIR}/pricing.json}"
-DASHBOARD_ACTIVE_INTERVAL="${DASHBOARD_ACTIVE_INTERVAL:-300}"
-
+# The shared Python resolver is the source of truth for the server.
 if ! command -v python3 &>/dev/null; then
   echo "[ERROR] python3 is required to serve the dashboard." >&2
   exit 1
 fi
-
-if [[ "$ANALYTICS_DATABASE_PATH" != /* ]] || [[ -e "$ANALYTICS_DATABASE_PATH" && -L "$ANALYTICS_DATABASE_PATH" ]]; then
-  echo "[ERROR] DASHBOARD_ANALYTICS_DATABASE must be an absolute path and not a symbolic link." >&2
+config_transport="$(mktemp "${TMPDIR:-/tmp}/codex-dashboard-config.XXXXXX")" || {
+  echo "[ERROR] Unable to create a private configuration transport." >&2
+  exit 1
+}
+config_transport_error=0
+if ! python3 "$CONFIG_PY" --profile serve --env-file "${SCRIPT_DIR}/.env" \
+    --script-dir "$SCRIPT_DIR" --bind "$BIND_ADDRESS" --port "$PORT" >"$config_transport"; then
+  rm -f -- "$config_transport"
   exit 2
 fi
-
-if [[ "$ANALYTICS_PRICING_PATH" != /* ]] || [[ ! -f "$ANALYTICS_PRICING_PATH" || ! -r "$ANALYTICS_PRICING_PATH" || -L "$ANALYTICS_PRICING_PATH" ]]; then
-  echo "[ERROR] TOKEN_PRICING_FILE must be an absolute readable regular file and not a symbolic link." >&2
-  exit 2
-fi
-
-if [[ ! "$PORT" =~ ^[0-9]+$ ]] || ((${#PORT} > 5)) || ((10#$PORT < 1 || 10#$PORT > 65535)); then
-  echo "[ERROR] Port must be an integer between 1 and 65535." >&2
-  exit 2
-fi
-
-if [[ ! "$DASHBOARD_ACTIVE_INTERVAL" =~ ^[0-9]+$ ]] \
-  || ((${#DASHBOARD_ACTIVE_INTERVAL} > 5)) \
-  || ((10#$DASHBOARD_ACTIVE_INTERVAL < 30 || 10#$DASHBOARD_ACTIVE_INTERVAL > 86400)); then
-  echo "[ERROR] DASHBOARD_ACTIVE_INTERVAL_SECONDS must be an integer between 30 and 86400." >&2
-  exit 2
-fi
-
-if ! python3 - "$BIND_ADDRESS" <<'PYEOF'
-import ipaddress
-import sys
-
-try:
-    ipaddress.ip_address(sys.argv[1])
-except ValueError:
-    print("[ERROR] Bind address must be a valid IPv4 or IPv6 address.", file=sys.stderr)
-    raise SystemExit(1)
-PYEOF
-then
-  exit 2
+while IFS= read -r -d '' config_record; do
+  config_key="${config_record%%$'\t'*}"
+  config_encoded="${config_record#*$'\t'}"
+  config_value="$(printf '%s' "$config_encoded" | base64 --decode)" || {
+    config_transport_error=1
+    break
+  }
+  case "$config_key" in
+    TOKEN_PRICING_FILE) ANALYTICS_PRICING_PATH="$config_value" ;;
+    DASHBOARD_ACTIVE_INTERVAL_SECONDS) DASHBOARD_ACTIVE_INTERVAL="$config_value" ;;
+    ANALYTICS_DATABASE_PATH|PORT|BIND_ADDRESS) printf -v "$config_key" '%s' "$config_value" ;;
+  esac
+done <"$config_transport"
+rm -f -- "$config_transport"
+if (( ${config_transport_error:-0} )); then
+  echo "[ERROR] Invalid configuration transport." >&2
+  exit 1
 fi
 
 DISPLAY_ADDRESS="$BIND_ADDRESS"
