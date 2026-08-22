@@ -78,6 +78,7 @@ config_transport="$(mktemp "${TMPDIR:-/tmp}/codex-dashboard-config.XXXXXX")" || 
   echo "[ERROR] Unable to create a private configuration transport." >&2
   exit 1
 }
+config_transport_error=0
 if ! python3 "$CONFIG_PY" --profile serve --env-file "${SCRIPT_DIR}/.env" \
     --script-dir "$SCRIPT_DIR" --bind "$BIND_ADDRESS" --port "$PORT" >"$config_transport"; then
   rm -f -- "$config_transport"
@@ -87,9 +88,8 @@ while IFS= read -r -d '' config_record; do
   config_key="${config_record%%$'\t'*}"
   config_encoded="${config_record#*$'\t'}"
   config_value="$(printf '%s' "$config_encoded" | base64 --decode)" || {
-    rm -f -- "$config_transport"
-    echo "[ERROR] Invalid configuration transport." >&2
-    exit 1
+    config_transport_error=1
+    break
   }
   case "$config_key" in
     TOKEN_PRICING_FILE) ANALYTICS_PRICING_PATH="$config_value" ;;
@@ -98,6 +98,10 @@ while IFS= read -r -d '' config_record; do
   esac
 done <"$config_transport"
 rm -f -- "$config_transport"
+if (( ${config_transport_error:-0} )); then
+  echo "[ERROR] Invalid configuration transport." >&2
+  exit 1
+fi
 
 DISPLAY_ADDRESS="$BIND_ADDRESS"
 if [[ "$BIND_ADDRESS" == *:* ]]; then

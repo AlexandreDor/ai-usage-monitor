@@ -123,7 +123,7 @@ alert_scripts_configured() {
 # these wrappers deliberately call the same Python parser and validator rather
 # than maintaining a second policy in Bash.
 load_config() {
-  local transport_file warning_file record key encoded value
+  local transport_file warning_file record key encoded value transport_error=0
   [[ -f "$ENV_FILE" ]] || return 0
   transport_file="$(mktemp "${TMPDIR:-/tmp}/codex-monitor-env.XXXXXX")" || {
     config_error "Unable to create a private configuration transport."
@@ -148,18 +148,21 @@ load_config() {
     key="${record%%$'\t'*}"
     encoded="${record#*$'\t'}"
     value="$(printf '%s' "$encoded" | base64 --decode)" || {
-      rm -f -- "$transport_file" "$warning_file"
-      config_error "Invalid configuration transport."
-      return 1
+      transport_error=1
+      break
     }
     [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
     printf -v "$key" '%s' "$value"
   done <"$transport_file"
   rm -f -- "$transport_file" "$warning_file"
+  if (( transport_error )); then
+    config_error "Invalid configuration transport."
+    return 1
+  fi
 }
 
 validate_config() {
-  local key variable_name transport_file record encoded value rule_index
+  local key variable_name transport_file record encoded value rule_index transport_error=0
   if [[ "${INVALID_ALERT_SCRIPT_CONFIG:-0}" == 1 ]]; then
     config_error "Alert script indices must be integers from 1 to 99."
     return 1
@@ -216,9 +219,8 @@ validate_config() {
     key="${record%%$'\t'*}"
     encoded="${record#*$'\t'}"
     value="$(printf '%s' "$encoded" | base64 --decode)" || {
-      rm -f -- "$transport_file"
-      config_error "Invalid configuration transport."
-      return 1
+      transport_error=1
+      break
     }
     case "$key" in
       ALERT_SCRIPT_RULE_INDEX_*)
@@ -240,6 +242,10 @@ validate_config() {
     esac
   done <"$transport_file"
   rm -f -- "$transport_file"
+  if (( transport_error )); then
+    config_error "Invalid configuration transport."
+    return 1
+  fi
 }
 
 check_requirements() {
@@ -290,7 +296,7 @@ PYEOF
 }
 
 initialize() {
-  local interval_override="${1:-}" transport_file record key encoded value rule_index
+  local interval_override="${1:-}" transport_file record key encoded value rule_index transport_error=0
   umask 077
   transport_file="$(mktemp "${TMPDIR:-/tmp}/codex-monitor-config.XXXXXX")" || {
     config_error "Unable to create a private configuration transport."
@@ -313,9 +319,8 @@ initialize() {
     encoded="${record#*$'\t'}"
     [[ "$key" =~ ^[A-Z][A-Z0-9_]*$|^ALERT_SCRIPT_RULE_(INDEX|PATH|EVENT|ID)_[0-9]+$ ]] || continue
     value="$(printf '%s' "$encoded" | base64 --decode)" || {
-      rm -f -- "$transport_file"
-      config_error "Invalid configuration transport."
-      return 1
+      transport_error=1
+      break
     }
     case "$key" in
       ALERT_SCRIPT_RULE_INDEX_*)
@@ -338,6 +343,10 @@ initialize() {
     esac
   done <"$transport_file"
   rm -f -- "$transport_file"
+  if (( transport_error )); then
+    config_error "Invalid configuration transport."
+    return 1
+  fi
 
   check_requirements || return 1
   mkdir -p "$RUNTIME_DIR"
@@ -997,7 +1006,7 @@ PYEOF
 # SQLite journal is acknowledged only after alerts.py has accepted the
 # occurrence (or after the existing no-channel compatibility seam succeeds).
 journal_quota_anomalies() {
-  local now="$1" pending_file line anomaly_id anomaly_type window limit_id detected
+  local now="$1" pending_file anomaly_id anomaly_type window limit_id detected
   local before_pct after_pct before_reset after_reset message event_data registration_status
   pending_file="$(mktemp "${RUNTIME_DIR}/.anomalies-pending.XXXXXX")" || return 1
   if ! python3 "$ANOMALIES_PY" pending --database "$ARCHIVE_FILE" > "$pending_file"; then
@@ -1371,7 +1380,7 @@ attempt_alert_script() {
 }
 
 reconcile_alert_deliveries() {
-  local now="$1" terminal_file line alert_id kind window reason selector remaining reset_epoch covered threshold ack_id
+  local now="$1" terminal_file alert_id kind window reason selector remaining reset_epoch covered threshold ack_id
   local -a ack_ids=()
   terminal_file="$(mktemp "${RUNTIME_DIR}/.alerts-terminal.XXXXXX")" || return 1
   if ! python3 "$ALERTS_PY" terminal-unacknowledged "$ALERT_DELIVERIES_FILE" > "$terminal_file"; then
