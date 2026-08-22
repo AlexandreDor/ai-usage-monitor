@@ -256,6 +256,7 @@ No integration is required. This is enough for local quota monitoring and
 automatically detected Analytics sources:
 
 ```dotenv
+ALERTS_ENABLED=1
 ALERT_THRESHOLDS=75,50,25,10,5
 HISTORY_RETENTION_HOURS=192
 ARCHIVE_RETENTION_DAYS=365
@@ -269,6 +270,7 @@ CODEX_FORECAST_ENABLED=1
 
 | Variable | Default | Accepted values | Description |
 |---|---:|---|---|
+| `ALERTS_ENABLED` | `1` | `0` or `1` | Global alert switch. `0` suppresses Discord, Telegram, and configured local alert scripts while quota collection, anomaly detection, SQLite persistence, and alert-state maintenance continue. |
 | `DISCORD_WEBHOOK` | empty | Official Discord HTTPS webhook URL | Enables Discord alerts. |
 | `TELEGRAM_BOT_TOKEN` | empty | Telegram bot token | Enables Telegram when `TELEGRAM_CHAT_ID` is also set. |
 | `TELEGRAM_CHAT_ID` | empty | Non-zero integer; negative group IDs are valid | Required with `TELEGRAM_BOT_TOKEN`. |
@@ -277,6 +279,18 @@ CODEX_FORECAST_ENABLED=1
 Discord and Telegram maintain separate delivery progress. Temporary failures
 such as timeouts, HTTP 408, 429, or 5xx remain pending. Successful channels are
 not replayed because another channel failed.
+
+Set `ALERTS_ENABLED=0` to pause outbound alerting. New threshold, reset, and
+anomaly events observed while disabled are acknowledged locally: they advance
+threshold/reset baselines, script tracking, and anomaly detector state, and
+durable anomaly rows are retained as journaled local evidence rather than
+queued for later delivery. Configured alert scripts are tracked without being
+executed. Deliveries that were already pending before the pause remain pending
+in `local/runtime/alert-deliveries.json`; they are not transmitted or marked as
+unconfigured while disabled and resume independently when `ALERTS_ENABLED=1`.
+Even if their expiry deadline passes during the pause, the first re-enabled
+cycle attempts those pre-existing deliveries before normal expiry handling is
+restored; later stale deliveries follow the usual expiration rules.
 
 Example:
 

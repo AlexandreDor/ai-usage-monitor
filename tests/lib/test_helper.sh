@@ -46,6 +46,7 @@ monitor_defaults() {
   for (( index = 1; index <= 99; index++ )); do
     unset "ALERT_SCRIPT_${index}" "ALERT_SCRIPT_${index}_EVENTS"
   done
+  ALERTS_ENABLED=1
   ALERT_THRESHOLDS=75,50,25,10,5
   ALERT_SCRIPT_TIMEOUT_SECONDS=30
   ARCHIVE_RETENTION_DAYS=365
