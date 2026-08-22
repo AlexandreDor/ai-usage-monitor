@@ -69,12 +69,13 @@ function evaluate(expression) { return vm.runInContext(expression, context); }
 
 evaluate(`renderWeeklyLimitValue({
   series: [
-    { at: '2026-08-01T00:00:00Z', observed_cost_usd: 1.5, quota_consumed_pct_points: 2, raw_value_usd: 75, value_usd: 75, quality: 'good', reason: null },
-    { at: '2026-08-01T01:00:00Z', observed_cost_usd: null, quota_consumed_pct_points: 0.2, raw_value_usd: null, value_usd: null, quality: 'unavailable', reason: 'insufficient_quota_delta' }
+    { at: '2026-08-01T00:00:00Z', window_start: '2026-07-31T22:00:00Z', window_seconds: 7200, observed_cost_usd: 1.5, quota_consumed_pct_points: 2, raw_value_usd: 75, value_usd: 75, quality: 'good', reason: null },
+    { at: '2026-08-01T02:00:00Z', window_start: '2026-08-01T00:00:00Z', window_seconds: 7200, observed_cost_usd: null, quota_consumed_pct_points: 0.2, raw_value_usd: null, value_usd: null, quality: 'unavailable', reason: 'insufficient_quota_delta' }
   ], unavailable_reasons: { insufficient_quota_delta: 1 }
 })`);
 if (element('weekly-limit-value-empty').hidden !== true) fail('valid weekly value series still showed the empty state');
 if (element('weekly-limit-value-data-body').children.length !== 2) fail('weekly value table did not include qualified rows');
+if (!element('weekly-limit-value-summary').textContent.includes('two-hour estimate')) fail('weekly value summary did not use the two-hour window');
 if (evaluate('weeklyLimitValueDatasets[0].data[0].y') !== 75) fail('weekly value chart lost the USD value');
 if (evaluate('formatUsd(75)') !== '$75.00') fail('weekly value formatting did not remain USD');
 if (evaluate("weeklyLimitValueDatasets[0].valueKind") !== 'usd') fail('weekly value chart did not declare USD formatting');

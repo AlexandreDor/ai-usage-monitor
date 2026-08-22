@@ -46,19 +46,21 @@ The local Analytics page provides:
 - filtering by application and model, with GPT-5.6 models selected by default
   when available;
 - quota, token, and API-equivalent cost charts;
-- implicit weekly-limit value estimates from Codex-only API-equivalent cost in
-  a rolling one-hour window. The estimator converts the observed quota drop
-  from percentage points to a fraction (for example, 2 % → 0.02), then uses
-  `observed Codex cost / consumed fraction`; it is independent of the source
-  and model filters used by the token charts;
+- implicit weekly-limit value estimates from all locally collected
+  API-equivalent token-event costs (Codex, OpenCode, and Hermes) in a rolling
+  two-hour window. The estimator converts the observed quota drop from
+  percentage points to a fraction (for example, 2 % → 0.02), then uses
+  `observed all-source cost / consumed fraction`; it is independent of the
+  source and model filters used by the token charts;
 - a short median of the current and two previous valid values for the trend,
-  with `good`, `low confidence`, and `volatile` quality states. Windows shorter
-  or longer than 45–75 minutes, quota resets or limit/deadline transitions,
+  with `good`, `low confidence`, and `volatile` quality states. Windows outside
+  1 h 45 min–2 h 15 min, quota resets or limit/deadline transitions,
   increases or sub-0.5-point drops, stale/incomplete observations, missing
   positive prices, invalid counters, and zero cost are shown as unavailable
   with a reason rather than silently extrapolated;
 - weekly reset rows include `Estimated cycle cost ($)` for the complete
-  observable Codex cycle and `Extrapolated 100% value ($)` when quota remained.
+  observable all-source cycle and `Extrapolated 100% value ($)` when quota
+  remained.
   Five-hour resets are explicitly `N/A`; a first/partial or ambiguous cycle,
   missing prices, stale reset boundaries, and a fully consumed cycle (where
   extrapolation does not apply) retain an explanatory unavailable status. A

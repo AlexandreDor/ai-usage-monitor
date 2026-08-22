@@ -274,7 +274,7 @@ const analyticsPayload = {
   available: { sources: ['codex', 'opencode'], models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'unknown-model'] },
   freshness: { limits_last_sample_at: '2026-08-04T09:45:00Z', collectors: { codex: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, opencode: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, hermes: { status: 'disabled', last_success_at: null } } },
   limits: { samples: 2, forecast_samples: 2, series: [{ at: '2026-08-03T00:00:00Z', five_h_pct: 80, weekly_pct: 60, ideal_weekly_pct: 65.5, forecast_chance_24h_pct: 60, forecast_chance_6h_pct: 20, forecast_generated_at: '2026-08-02T23:55:00Z', forecast_samples: 1 }, { at: '2026-08-04T00:00:00Z', five_h_pct: 55, weekly_pct: 52, ideal_weekly_pct: 51.2, forecast_chance_24h_pct: 70, forecast_chance_6h_pct: 30, forecast_generated_at: '2026-08-03T23:55:00Z', forecast_samples: 1 }] },
-  weekly_limit_value: { currency: 'USD', window_seconds: 3600, minimum_quota_delta_pct_points: 0.5, series: [{ at: '2026-08-04T00:00:00Z', window_start: '2026-08-03T23:00:00Z', window_seconds: 3600, limit_id: 'fixture', quota_consumed_pct_points: 2, consumed_fraction: 0.02, observed_cost_usd: 1.5, raw_value_usd: 75, value_usd: 75, quality: 'good', reason: null }], unavailable_reasons: {} },
+  weekly_limit_value: { currency: 'USD', window_seconds: 7200, minimum_quota_delta_pct_points: 0.5, series: [{ at: '2026-08-04T00:00:00Z', window_start: '2026-08-03T22:00:00Z', window_seconds: 7200, limit_id: 'fixture', quota_consumed_pct_points: 2, consumed_fraction: 0.02, observed_cost_usd: 1.5, raw_value_usd: 75, value_usd: 75, quality: 'good', reason: null }], unavailable_reasons: {} },
   tokens: {
     summary: { input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 25000, output_tokens: 200000, reasoning_tokens: 50000, events: 2, estimated_cost_usd: 11.25, assumed_zero_tokens: 100 },
     series: [{ at: '2026-08-04T00:00:00Z', input_tokens: 1000000, cache_read_tokens: 500000, cache_write_tokens: 25000, output_tokens: 200000, reasoning_tokens: 50000, estimated_cost_usd: 11.25 }],
@@ -381,7 +381,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#toggle-token-overlay')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#tokens-chart-card')).toBeHidden();
   await expect(page.locator('#weekly-limit-value-card')).toBeVisible();
-  await expect(page.locator('#weekly-limit-value-summary')).toContainText('1 valid one-hour estimate');
+  await expect(page.locator('#weekly-limit-value-summary')).toContainText('1 valid two-hour estimate');
   await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(1);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].data[0].y)).toBe(75);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].valueKind)).toBe('usd');

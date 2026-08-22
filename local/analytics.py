@@ -25,9 +25,9 @@ RANGES = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "
 SOURCES = ("codex", "opencode", "hermes")
 TOKEN_FIELDS = ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens")
 WEEKLY_WINDOW_SECONDS = 7 * 86400
-WEEKLY_VALUE_WINDOW_SECONDS = 3600
-WEEKLY_VALUE_MIN_WINDOW_SECONDS = 45 * 60
-WEEKLY_VALUE_MAX_WINDOW_SECONDS = 75 * 60
+WEEKLY_VALUE_WINDOW_SECONDS = 2 * 3600
+WEEKLY_VALUE_MIN_WINDOW_SECONDS = 1 * 3600 + 45 * 60
+WEEKLY_VALUE_MAX_WINDOW_SECONDS = 2 * 3600 + 15 * 60
 WEEKLY_VALUE_MIN_QUOTA_DELTA_POINTS = 0.5
 WEEKLY_VALUE_MAX_POINTS = 10_000
 WEEKLY_VALUE_STALE_REASON = "stale_data"
@@ -233,20 +233,20 @@ def _event_cost(row: sqlite3.Row | dict[str, Any], prices: dict[tuple[str, str],
     return amount, None
 
 
-def _load_codex_cost_events(
+def _load_cost_events(
     connection: sqlite3.Connection,
     prices: dict[tuple[str, str], dict[str, Any]],
     start: int,
     end: int,
 ) -> list[tuple[int, float | None, str | None, str | None]]:
-    """Load and price Codex events once for a set of interval calculations."""
+    """Load and price all locally collected token events for interval calculations."""
     if start >= end:
         return []
     rows = connection.execute(
         """SELECT occurred_at_epoch, provider, model, input_tokens,
                   cache_read_tokens, cache_write_tokens, output_tokens, quality
              FROM token_usage_events
-            WHERE source = 'codex' AND occurred_at_epoch >= ? AND occurred_at_epoch < ?
+            WHERE occurred_at_epoch >= ? AND occurred_at_epoch < ?
             ORDER BY occurred_at_epoch, id""",
         (start, end),
     ).fetchall()
@@ -303,7 +303,7 @@ def _interval_event_cost(
 
 
 def _event_index(events: list[tuple[int, float | None, str | None, str | None]]) -> tuple[list[int], list[float], dict[str, list[int]], list[int]]:
-    """Build prefix arrays so thousands of one-hour windows stay bounded."""
+    """Build prefix arrays so thousands of two-hour windows stay bounded."""
     epochs = [item[0] for item in events]
     prefix_cost = [0.0]
     prefix_reasons = {"invalid_event": [0], "missing_price": [0]}
@@ -419,10 +419,11 @@ def weekly_limit_value(
     now: int | None = None,
     sample_interval_seconds: int = 900,
 ) -> dict[str, Any]:
-    """Build the one-hour implicit weekly-limit value series.
+    """Build the two-hour implicit weekly-limit value series.
 
     This is intentionally independent of token source/model UI filters: it is
-    a Codex quota-wide metric, not a view of the currently selected breakdown.
+    a quota-wide metric based on all locally collected token events, not a view
+    of the currently selected breakdown.
     """
     rows = connection.execute(
         """SELECT scraped_at_epoch, weekly_pct, weekly_reset_at, limit_id,
@@ -437,7 +438,7 @@ def weekly_limit_value(
     candidate_count = len(end_rows)
     selected_rows = _sample_rows(end_rows, WEEKLY_VALUE_MAX_POINTS)
     row_epochs = _snapshot_epoch_index(rows)
-    events = _load_codex_cost_events(
+    events = _load_cost_events(
         connection,
         price_index(catalog),
         start - WEEKLY_VALUE_MAX_WINDOW_SECONDS,
@@ -612,7 +613,7 @@ def weekly_reset_cycle_metrics(
     catalog: dict[str, Any],
     reset_rows: Sequence[sqlite3.Row],
 ) -> dict[int, dict[str, Any]]:
-    """Calculate full-cycle Codex costs for weekly reset rows in one pass."""
+    """Calculate full-cycle costs from all local token events in one pass."""
     if not reset_rows:
         return {}
     target_epochs = sorted(
@@ -681,7 +682,7 @@ def weekly_reset_cycle_metrics(
         }
     first_start = min(row["reset_at_epoch"] for row in valid_resets)
     last_end = max(row["reset_at_epoch"] for row in valid_resets)
-    events = _load_codex_cost_events(connection, price_index(catalog), first_start, last_end)
+    events = _load_cost_events(connection, price_index(catalog), first_start, last_end)
     event_index = _event_index(events)
     previous_by_limit: dict[str, sqlite3.Row] = {}
     metrics: dict[int, dict[str, Any]] = {}
