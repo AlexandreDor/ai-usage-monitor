@@ -13,6 +13,7 @@ done
 
 if command -v node >/dev/null 2>&1; then
   node "$TEST_DIR/test_chart_interactions.js"
+  node "$TEST_DIR/test_analytics.js"
   node "$TEST_DIR/test_preferences.js"
   node "$TEST_DIR/test_dashboard.js"
 else
