@@ -91,6 +91,38 @@ class AnomalyDetectorTests(unittest.TestCase):
             self.observe(snapshot(epoch, five_reset=reset, weekly_reset=reset))
         self.assertEqual(2, len([row for row in self.rows("5h") if row[0] == "reset_oscillation"]))
 
+    def test_short_oscillations_are_ignored_without_blocking_later_alerts(self):
+        first = 1_700_000_000
+        for epoch, reset in (
+            (100, first), (200, first + 1), (300, first),
+            (400, first + 179), (500, first),
+        ):
+            self.observe(snapshot(epoch, five_reset=reset, weekly_reset=reset))
+        self.assertEqual([], [row for row in self.rows()
+                              if row[0] == "reset_oscillation"])
+
+        # The threshold is inclusive: exactly three minutes is reportable.
+        for epoch, reset in ((600, first + 180), (700, first)):
+            self.observe(snapshot(epoch, five_reset=reset, weekly_reset=reset))
+        self.assertEqual(2, len([row for row in self.rows()
+                                 if row[0] == "reset_oscillation"]))
+
+    def test_oscillation_message_formats_reset_dates_as_utc(self):
+        first = 1_700_000_000
+        for epoch, reset in ((100, first), (200, first + 300), (300, first)):
+            self.observe(snapshot(epoch, five_reset=reset, weekly_reset=reset))
+        messages = self.connection.execute(
+            "SELECT window, message FROM quota_anomalies "
+            "WHERE anomaly_type = 'reset_oscillation' ORDER BY window"
+        ).fetchall()
+        self.assertEqual(2, len(messages))
+        for window, message in messages:
+            with self.subTest(window=window):
+                self.assertIn("14/11/2023 - 22:13", message)
+                self.assertIn("14/11/2023 - 22:18", message)
+                self.assertNotIn(str(first), message)
+                self.assertNotIn(str(first + 300), message)
+
     def test_limit_change_starts_a_baseline(self):
         self.observe(snapshot(100, five=20, limit="group-a"))
         self.observe(snapshot(200, five=90, limit="group-b"))
