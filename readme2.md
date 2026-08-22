@@ -533,16 +533,6 @@ deliveries; rotating credentials for a configured channel lets its pending
 deliveries continue normally. Reconciled terminal entries are retained for 30
 days, with a defensive limit of 500 entries.
 
-Set `ALERTS_ENABLED=0` to pause outbound alerting. Threshold and reset events
-observed during the pause advance local baselines and script journals without
-being queued or executing scripts. Anomalies remain in SQLite as local
-evidence and are marked journaled/suppressed, so re-enabling does not replay
-the disabled interval. Deliveries that were already pending remain pending in
-the durable journal; they are neither transmitted nor marked unconfigured and
-resume when `ALERTS_ENABLED=1`. If a pending delivery's expiry deadline passes
-during the pause, the first enabled cycle attempts it before ordinary expiry
-handling resumes; later stale deliveries follow the normal expiration rules.
-
 ### Local alert scripts
 
 The monitor can also run trusted local executables for selected thresholds or
@@ -674,7 +664,6 @@ complete template also documents process-only overrides in a separate section.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `ALERTS_ENABLED` | No | `1` | `0` suppresses Discord, Telegram, and configured local scripts; collection, anomaly detection, SQLite persistence, and alert-state maintenance continue. |
 | `DISCORD_WEBHOOK` | No | — | Discord webhook URL |
 | `TELEGRAM_BOT_TOKEN` | No | — | Telegram bot token from BotFather |
 | `TELEGRAM_CHAT_ID` | No | — | Numeric Telegram chat ID |
