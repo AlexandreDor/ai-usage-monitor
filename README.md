@@ -48,13 +48,15 @@ The local Analytics page provides:
 - quota, token, and API-equivalent cost charts;
 - implicit weekly-limit value estimates from all locally collected
   API-equivalent token-event costs (Codex, OpenCode, and Hermes) in a rolling
-  two-hour window. The estimator converts the observed quota drop from
+  twelve-hour window, shown at one point per fixed six-hour UTC bucket. The
+  latest snapshot in the current bucket is retained so the current estimate
+  remains visible. The estimator converts the observed quota drop from
   percentage points to a fraction (for example, 2 % → 0.02), then uses
   `observed all-source cost / consumed fraction`; it is independent of the
   source and model filters used by the token charts;
 - a short median of the current and two previous valid values for the trend,
   with `good`, `low confidence`, and `volatile` quality states. Windows outside
-  1 h 45 min–2 h 15 min, quota resets or limit/deadline transitions,
+  11 h 45 min–12 h 15 min, quota resets or limit/deadline transitions,
   increases or sub-0.5-point drops, stale/incomplete observations, missing
   positive prices, invalid counters, and zero cost are shown as unavailable
   with a reason rather than silently extrapolated;
@@ -422,8 +424,18 @@ An explicitly selected source that cannot be read makes the collection cycle
 degraded. `none` disables token collection while quota monitoring continues.
 
 The default pricing catalog is `local/pricing.json`. Custom catalogs must use
-the supported schema and USD rates per million tokens. Unknown models are kept
-in reports and assigned zero estimated cost.
+the supported schema and USD rates per million tokens. Schema version 1 keeps
+one timeless rate set per entry; schema version 2 uses a strictly ordered
+`periods` array, where every period has an `effective_from` UTC timestamp and
+the four complete rate fields (`input_per_million`, `cache_read_per_million`,
+`cache_write_per_million`, and `output_per_million`). The first period starts
+at `1970-01-01T00:00:00Z` in the default catalog, so events before a later
+boundary retain their historical price. Analytics segments SQL aggregations at
+those boundaries and then merges the public rows; aliases and identifiers use
+the same periods. Unknown models are kept in reports and assigned zero
+estimated cost. The default Standard short-context rates are sourced from the
+[OpenAI API pricing page](https://developers.openai.com/api/docs/pricing) and
+its [API changelog](https://developers.openai.com/api/docs/changelog).
 
 Example with Codex and OpenCode only:
 
