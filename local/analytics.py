@@ -31,6 +31,11 @@ WEEKLY_VALUE_MAX_WINDOW_SECONDS = 2 * 3600 + 15 * 60
 WEEKLY_VALUE_MIN_QUOTA_DELTA_POINTS = 0.5
 WEEKLY_VALUE_MAX_POINTS = 10_000
 WEEKLY_VALUE_STALE_REASON = "stale_data"
+# Keep this aligned with anomalies.RESET_OSCILLATION_MIN_DELTA_SECONDS. A
+# smaller movement is collector jitter; a change of at least three minutes is
+# a real deadline transition. The strict comparison in the helper below keeps
+# the boundary semantics explicit.
+WEEKLY_RESET_DEADLINE_MIN_CHANGE_SECONDS = 3 * 60
 MAX_SERIES_POINTS = 10_000
 MAX_SERIES_GROUP_ROWS = 100_000
 MAX_RESET_MARKERS = 2_000
@@ -316,6 +321,15 @@ def _event_index(events: list[tuple[int, float | None, str | None, str | None]])
     return epochs, prefix_cost, prefix_reasons, prefix_polled
 
 
+def _weekly_deadlines_equivalent(left: Any, right: Any) -> bool:
+    """Return whether two weekly reset deadlines describe the same cycle."""
+    return (
+        isinstance(left, int)
+        and isinstance(right, int)
+        and abs(left - right) < WEEKLY_RESET_DEADLINE_MIN_CHANGE_SECONDS
+    )
+
+
 def _window_pair_reason(start_row: sqlite3.Row, end_row: sqlite3.Row, start_epoch: int, end_epoch: int) -> str | None:
     if end_epoch <= start_epoch:
         return "invalid_window"
@@ -336,7 +350,7 @@ def _window_pair_reason(start_row: sqlite3.Row, end_row: sqlite3.Row, start_epoc
         return "missing_deadline"
     if not isinstance(end_deadline, int):
         return "missing_deadline"
-    if end_deadline <= end_epoch or start_deadline != end_deadline:
+    if end_deadline <= end_epoch or not _weekly_deadlines_equivalent(start_deadline, end_deadline):
         return "deadline_transition"
     if start_epoch < start_deadline <= end_epoch:
         return "reset_in_window"
@@ -397,7 +411,10 @@ def _window_start(
             if _finite_quota_number(middle["weekly_pct"]) and (not isinstance(middle["limit_id"], str) or not middle["limit_id"]):
                 reason = "missing_limit_id"
                 break
-            if isinstance(middle["weekly_reset_at"], int) and middle["weekly_reset_at"] != deadline:
+            if (
+                isinstance(middle["weekly_reset_at"], int)
+                and not _weekly_deadlines_equivalent(middle["weekly_reset_at"], deadline)
+            ):
                 reason = "deadline_transition"
                 break
             if _finite_quota_number(middle["weekly_pct"]) and not isinstance(middle["weekly_reset_at"], int):
@@ -456,7 +473,10 @@ def weekly_limit_value(
     }
     series: list[dict[str, Any]] = []
     unavailable: dict[str, int] = {}
-    valid_by_segment: dict[tuple[str, int], list[float]] = {}
+    valid_by_segment: dict[tuple[int, str], list[float]] = {}
+    segment_number = 0
+    segment_limit_id: str | None = None
+    segment_deadline: int | None = None
     latest_archive = connection.execute(
         "SELECT scraped_at_epoch, sample_interval_seconds FROM snapshots ORDER BY scraped_at_epoch DESC LIMIT 1"
     ).fetchone()
@@ -521,7 +541,21 @@ def weekly_limit_value(
                         reason = "invalid_value"
                     else:
                         limit_id = str(start_row["limit_id"])
-                        segment = (limit_id, int(start_row["weekly_reset_at"]))
+                        start_deadline = int(start_row["weekly_reset_at"])
+                        # Compare each valid point with the current segment's
+                        # anchor instead of bucketing timestamps by rounded
+                        # intervals. This keeps small collector jitter in one
+                        # history while splitting a real change beyond the
+                        # tolerance, independent of arbitrary bucket edges.
+                        if (
+                            segment_limit_id != limit_id
+                            or segment_deadline is None
+                            or not _weekly_deadlines_equivalent(start_deadline, segment_deadline)
+                        ):
+                            segment_number += 1
+                            segment_limit_id = limit_id
+                            segment_deadline = start_deadline
+                        segment = (segment_number, limit_id)
                         previous = valid_by_segment.setdefault(segment, [])[-2:]
                         values = [*previous, raw]
                         smoothed = float(median(values))

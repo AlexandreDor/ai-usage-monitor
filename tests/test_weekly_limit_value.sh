@@ -97,7 +97,7 @@ root = Path(sys.argv[1])
 test_root = Path(sys.argv[2])
 sys.path.insert(0, str(root / "local"))
 from analytics import (_event_cost, _snapshot_limit_id_around_reset, _window_pair_reason,
-                       weekly_limit_value, weekly_reset_cycle_metrics)
+                       _window_start, weekly_limit_value, weekly_reset_cycle_metrics)
 from storage import connect_database
 from token_usage import load_pricing
 
@@ -142,12 +142,23 @@ with connect_database(boundary_db) as connection:
 start = snap(0, 98)
 end = snap(window, 98)
 assert _window_pair_reason(start, end, 0, window) is None
+end["weekly_reset_at"] += 179
+assert _window_pair_reason(start, end, 0, window) is None
+end["weekly_reset_at"] += 1
+assert _window_pair_reason(start, end, 0, window) == "deadline_transition"
+end["weekly_reset_at"] = start["weekly_reset_at"]
 assert _window_pair_reason(start, end, 0, 1 * 3600 + 45 * 60) is None
 assert _window_pair_reason(start, end, 0, 2 * 3600 + 15 * 60) is None
 assert _window_pair_reason(start, end, 0, 1 * 3600 + 44 * 60) == "window_duration"
 assert _window_pair_reason(start, end, 0, 2 * 3600 + 16 * 60) == "window_duration"
 end["weekly_pct"] = 97.8
 assert _window_pair_reason(start, end, 0, window) is None
+middle = snap(window // 2, 98, deadline=start["weekly_reset_at"] + 179)
+_, middle_reason = _window_start([start, middle, end], end, window, [0, window // 2, window])
+assert middle_reason is None
+middle["weekly_reset_at"] += 1
+_, middle_reason = _window_start([start, middle, end], end, window, [0, window // 2, window])
+assert middle_reason == "deadline_transition"
 end["weekly_pct"] = 96
 end["limit_id"] = "limit-b"
 assert _window_pair_reason(start, end, 0, window) == "limit_transition"
@@ -207,6 +218,32 @@ with connect_database(smooth_db) as connection:
     assert by_at[iso(9 * window)]["reason"] == "deadline_transition"
     assert by_at[iso(10 * window)]["reason"] == "missing_price"
     assert by_at[iso(11 * window)]["reason"] == "no_cost"
+
+jitter_smooth_db = test_root / "weekly-value-jitter-smoothing.sqlite3"
+with connect_database(jitter_smooth_db) as connection:
+    deadline = 20 * window
+    rows = [
+        (0, 100, deadline), (window, 99.5, deadline + 179),
+        (2 * window, 98, deadline), (3 * window, 96, deadline + 179),
+    ]
+    connection.executemany(
+        "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [(epoch, str(epoch), 80, None, None, weekly, None, row_deadline, 900, 192, "limit-a")
+         for epoch, weekly, row_deadline in rows],
+    )
+    connection.executemany(
+        "INSERT INTO token_usage_events (occurred_at_epoch, source, provider, model, input_tokens, external_id) VALUES (?, 'codex', 'openai', 'gpt-5.6-sol', ?, ?)",
+        [(window + window // 2, 400000, "jitter-1"),
+         (2 * window + window // 2, 800000, "jitter-2")],
+    )
+    connection.row_factory = __import__("sqlite3").Row
+    result = weekly_limit_value(
+        connection, load_pricing(root / "local/pricing.json"), 0, 3 * window + 1,
+        now=3 * window, sample_interval_seconds=900,
+    )
+    by_at = {point["at"]: point for point in result["series"]}
+    assert by_at[iso(2 * window)]["value_usd"] == 133.33333333, by_at[iso(2 * window)]
+    assert by_at[iso(3 * window)]["value_usd"] == 166.66666667, by_at[iso(3 * window)]
 
 long_db = test_root / "weekly-value-long.sqlite3"
 count = 10001
