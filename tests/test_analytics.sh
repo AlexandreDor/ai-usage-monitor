@@ -96,7 +96,7 @@ payload="$(python3 "$ROOT_DIR/local/analytics.py" \
   --pricing "$ROOT_DIR/local/pricing.json" \
   --params '{"range":"24h"}' \
   --now 1785866400)"
-assert_eq 21.75 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["summary"]["estimated_cost_usd"])' <<<"$payload")" "estimated cost including GPT-5.6 Sol provider aliases"
+assert_eq 21.875 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["summary"]["estimated_cost_usd"])' <<<"$payload")" "estimated cost including GPT-5.6 Sol provider aliases"
 assert_eq 900 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["period"]["granularity_seconds"])' <<<"$payload")" "24-hour analytics granularity"
 assert_eq 100 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tokens"]["summary"]["assumed_zero_tokens"])' <<<"$payload")" "unknown model token count"
 assert_eq priced "$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(item["pricing_status"] for item in data["tokens"]["breakdown"] if item["provider"] == "openai-codex"))' <<<"$payload")" "openai-codex GPT-5.6 Sol pricing"
@@ -244,44 +244,52 @@ from analytics import AnalyticsError, build_payload, price_index, token_analytic
 from storage import connect_database
 from token_usage import CollectorError, load_pricing
 
-boundary = 1787270400  # 2026-08-21T00:00:00Z
+terra_luna_boundary = 1785369600  # 2026-07-30T00:00:00Z
+sol_boundary = 1787270400  # 2026-08-21T00:00:00Z
 database = test_root / "temporal-pricing.sqlite3"
 with connect_database(database) as connection:
     events = [
-        (boundary - 1, "openai", "gpt-5.6-sol", 1_000_000, 0, "sol-before"),
-        (boundary, "openai", "gpt-5.6-sol", 1_000_000, 0, "sol-at"),
-        (boundary, "openai", "gpt-5.6-sol-pro", 1_000_000, 0, "sol-alias"),
-        (boundary, "openai-codex", "gpt-5.6-sol", 1_000_000, 0, "sol-identifier"),
-        (boundary - 1, "openai", "gpt-5.6-terra", 0, 1_000_000, "terra-before"),
-        (boundary, "openai", "gpt-5.6-terra", 0, 1_000_000, "terra-at"),
-        (boundary - 1, "openai", "gpt-5.6-luna", 0, 1_000_000, "luna-before"),
-        (boundary, "openai", "gpt-5.6-luna", 0, 1_000_000, "luna-at"),
+        # Calendar pricing boundaries are inclusive at exactly 00:00:00Z.
+        (terra_luna_boundary - 1, "openai", "gpt-5.6-terra", 1_000_000, 1_000_000, 1_000_000, 1_000_000, "terra-before"),
+        (terra_luna_boundary, "openai", "gpt-5.6-terra", 1_000_000, 1_000_000, 1_000_000, 1_000_000, "terra-at"),
+        (terra_luna_boundary - 1, "openai", "gpt-5.6-luna", 1_000_000, 1_000_000, 1_000_000, 1_000_000, "luna-before"),
+        (terra_luna_boundary, "openai", "gpt-5.6-luna", 1_000_000, 1_000_000, 1_000_000, 1_000_000, "luna-at"),
+        (sol_boundary - 1, "openai", "gpt-5.6-sol", 1_000_000, 1_000_000, 1_000_000, 1_000_000, "sol-before"),
+        (sol_boundary, "openai", "gpt-5.6-sol", 1_000_000, 1_000_000, 1_000_000, 1_000_000, "sol-at"),
+        (sol_boundary, "openai", "gpt-5.6-sol-pro", 1_000_000, 0, 0, 0, "sol-alias"),
+        (sol_boundary, "openai-codex", "gpt-5.6-sol", 1_000_000, 0, 0, 0, "sol-identifier"),
     ]
     connection.executemany(
         """INSERT INTO token_usage_events(
              occurred_at_epoch, source, provider, model, input_tokens,
-             cache_write_tokens, external_id
-           ) VALUES (?, 'codex', ?, ?, ?, ?, ?)""",
+             cache_read_tokens, cache_write_tokens, output_tokens, external_id
+           ) VALUES (?, 'codex', ?, ?, ?, ?, ?, ?, ?)""",
         events,
     )
 payload = build_payload(
     database,
     root / "local" / "pricing.json",
-    {"from_date": "2026-08-20", "to_date": "2026-08-22"},
-    now=boundary + 86400,
+    {"from_date": "2026-07-29", "to_date": "2026-08-22"},
+    now=sol_boundary + 86400,
 )
 assert payload["pricing"] == {
     "currency": "USD", "as_of": "2026-08-21", "valuation_mode": "effective_catalog"
 }
-assert payload["tokens"]["summary"]["estimated_cost_usd"] == 21.95, payload["tokens"]["summary"]
+assert payload["tokens"]["summary"]["estimated_cost_usd"] == 126.745, payload["tokens"]["summary"]
 breakdown = {(row["provider"], row["model"]): row["estimated_cost_usd"] for row in payload["tokens"]["breakdown"]}
-assert breakdown[("openai", "gpt-5.6-sol")] == 9.0, breakdown
+assert breakdown[("openai", "gpt-5.6-sol")] == 71.15, breakdown
 assert breakdown[("openai", "gpt-5.6-sol-pro")] == 4.0, breakdown
 assert breakdown[("openai-codex", "gpt-5.6-sol")] == 4.0, breakdown
-assert breakdown[("openai", "gpt-5.6-terra")] == 4.5, breakdown
-assert breakdown[("openai", "gpt-5.6-luna")] == 0.45, breakdown
-assert len(payload["tokens"]["series"]) == 2
-assert round(sum(row["estimated_cost_usd"] for row in payload["tokens"]["series"]), 8) == 21.95
+assert breakdown[("openai", "gpt-5.6-terra")] == 37.575, breakdown
+assert breakdown[("openai", "gpt-5.6-luna")] == 10.02, breakdown
+series = {row["at"]: row["estimated_cost_usd"] for row in payload["tokens"]["series"]}
+assert series == {
+    "2026-07-29T23:30:00Z": 29.225,
+    "2026-07-30T00:00:00Z": 18.37,
+    "2026-08-20T23:30:00Z": 41.75,
+    "2026-08-21T00:00:00Z": 37.4,
+}, series
+assert round(sum(series.values()), 8) == 126.745
 
 catalog = load_pricing(root / "local" / "pricing.json")
 v1 = {
