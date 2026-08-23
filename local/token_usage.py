@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import math
@@ -20,6 +21,17 @@ from storage import ArchiveCorruptionError, ArchiveSchemaError, connect_database
 
 SOURCES = ("codex", "opencode", "hermes")
 MAX_LABEL_LENGTH = 200
+MAX_PRICING_PERIODS = 64
+# Analytics adds the requested range's start/end to these boundaries when it
+# builds SQL segments.  Keep the catalog itself below that 256-boundary SQL
+# budget so every validated catalog remains queryable.
+MAX_PRICING_BOUNDARIES = 254
+PRICING_RATE_FIELDS = (
+    "input_per_million",
+    "cache_read_per_million",
+    "cache_write_per_million",
+    "output_per_million",
+)
 SESSION_ID_RE = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
     re.IGNORECASE,
@@ -67,20 +79,16 @@ def load_pricing(path: Path) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise CollectorError(f"invalid pricing catalog: {exc}") from exc
-    if not isinstance(value, dict) or value.get("schema_version") != 1:
-        raise CollectorError("pricing catalog schema_version must be 1")
+    schema_version = value.get("schema_version") if isinstance(value, dict) else None
+    if isinstance(schema_version, bool) or schema_version not in (1, 2):
+        raise CollectorError("pricing catalog schema_version must be 1 or 2")
     if value.get("currency") != "USD" or value.get("unknown_model_policy") != "assumed_zero":
         raise CollectorError("pricing catalog must use USD and assumed_zero")
     entries = value.get("entries")
     if not isinstance(entries, list):
         raise CollectorError("pricing catalog entries must be an array")
-    required = (
-        "input_per_million",
-        "cache_read_per_million",
-        "cache_write_per_million",
-        "output_per_million",
-    )
     seen: set[tuple[str, str]] = set()
+    pricing_boundaries: set[int] = set()
     for entry in entries:
         if not isinstance(entry, dict):
             raise CollectorError("pricing entry must be an object")
@@ -88,10 +96,27 @@ def load_pricing(path: Path) -> dict[str, Any]:
         if not all(key) or key in seen:
             raise CollectorError("pricing provider/model keys must be non-empty and unique")
         seen.add(key)
-        for field in required:
-            amount = entry.get(field)
-            if isinstance(amount, bool) or not isinstance(amount, (int, float)) or amount < 0 or not math.isfinite(amount):
-                raise CollectorError(f"pricing {field} must be a finite non-negative number")
+        if schema_version == 1:
+            _validate_pricing_rates(entry)
+        else:
+            periods = entry.get("periods")
+            if not isinstance(periods, list) or not periods or len(periods) > MAX_PRICING_PERIODS:
+                raise CollectorError(
+                    f"pricing periods must be a non-empty array of at most {MAX_PRICING_PERIODS} items"
+                )
+            previous_epoch: int | None = None
+            for period_index, period in enumerate(periods):
+                if not isinstance(period, dict):
+                    raise CollectorError("pricing period must be an object")
+                effective_from = period.get("effective_from")
+                epoch = _pricing_effective_epoch(effective_from)
+                if previous_epoch is not None and epoch <= previous_epoch:
+                    raise CollectorError("pricing period effective_from values must be strictly increasing")
+                if period_index == 0 and epoch > 0:
+                    raise CollectorError("the first pricing period must cover the history from 1970-01-01T00:00:00Z")
+                previous_epoch = epoch
+                pricing_boundaries.add(epoch)
+                _validate_pricing_rates(period)
         aliases = entry.get("aliases", [])
         if not isinstance(aliases, list) or not all(isinstance(item, str) for item in aliases):
             raise CollectorError("pricing aliases must be an array of strings")
@@ -103,7 +128,34 @@ def load_pricing(path: Path) -> dict[str, Any]:
             for item in identifiers
         ):
             raise CollectorError("pricing identifiers must be provider/model strings")
+    if len(pricing_boundaries) > MAX_PRICING_BOUNDARIES:
+        raise CollectorError(
+            f"pricing catalog has more than {MAX_PRICING_BOUNDARIES} effective boundaries"
+        )
     return value
+
+
+def _pricing_effective_epoch(value: Any) -> int:
+    """Parse a UTC ISO-8601 pricing boundary into an epoch second."""
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise CollectorError("pricing effective_from must be a UTC ISO-8601 timestamp")
+    try:
+        parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00")
+    except (TypeError, ValueError, OverflowError, OSError) as exc:
+        raise CollectorError("pricing effective_from must be a UTC ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != dt.timedelta(0):
+        raise CollectorError("pricing effective_from must be a UTC ISO-8601 timestamp")
+    timestamp_part = value[:-1].split("T", 1)[-1]
+    if "." in timestamp_part or "," in timestamp_part or parsed.microsecond:
+        raise CollectorError("pricing effective_from must use whole seconds")
+    return int(parsed.timestamp())
+
+
+def _validate_pricing_rates(period: dict[str, Any]) -> None:
+    for field in PRICING_RATE_FIELDS:
+        amount = period.get(field)
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)) or amount < 0 or not math.isfinite(amount):
+            raise CollectorError(f"pricing {field} must be a finite non-negative number")
 
 
 def read_state(connection: sqlite3.Connection, source: str, key: str) -> dict[str, Any] | None:

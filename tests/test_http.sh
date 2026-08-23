@@ -26,7 +26,8 @@ pricing_path = Path(sys.argv[3])
 catalog = json.loads((root / "local" / "pricing.json").read_text(encoding="utf-8"))
 for entry in catalog["entries"]:
     if entry["provider"] == "openai" and entry["model"] == "gpt-5.6-sol":
-        entry["input_per_million"] = 123.0
+        for period in entry["periods"]:
+            period["input_per_million"] = 123.0
         break
 else:
     raise AssertionError("fixture pricing entry not found")

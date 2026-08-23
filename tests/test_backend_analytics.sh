@@ -230,6 +230,7 @@ assert_eq 50 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resets"
 
 python3 - "$ROOT_DIR" "${TEST_ROOT}/concurrent.sqlite3" <<'PYEOF'
 from pathlib import Path
+import json
 import sys
 import threading
 import time
@@ -279,6 +280,60 @@ writer_thread.join()
 reader_thread.join()
 if errors:
     raise errors[0][1]
+
+# A paginated breakdown must select its public page before traversing pricing
+# periods. Keep the intermediate cap deliberately small so processing all 60
+# keys would fail, while the ten keys on offset 50 (two periods each) fit.
+pagination_db = Path(sys.argv[2]).with_name("pricing-pagination.sqlite3")
+catalog_path = Path(sys.argv[2]).with_name("pricing-pagination.json")
+boundary = 1787270400
+catalog = {
+    "schema_version": 2,
+    "currency": "USD",
+    "unknown_model_policy": "assumed_zero",
+    "entries": [{
+        "provider": "openai",
+        "model": "shared-model",
+        "aliases": [f"page-model-{index:03d}" for index in range(60)],
+        "periods": [
+            {"effective_from": "1970-01-01T00:00:00Z", "input_per_million": 5,
+             "cache_read_per_million": 0, "cache_write_per_million": 0, "output_per_million": 0},
+            {"effective_from": "2026-08-21T00:00:00Z", "input_per_million": 4,
+             "cache_read_per_million": 0, "cache_write_per_million": 0, "output_per_million": 0},
+        ],
+    }],
+}
+catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+with connect_database(pagination_db) as connection:
+    for index in range(60):
+        model = f"page-model-{index:03d}"
+        connection.executemany(
+            """INSERT INTO token_usage_events
+               (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+               VALUES (?, 'codex', 'openai', ?, 1000000, ?)""",
+            [(boundary - 1, model, f"page-before-{index}"),
+             (boundary, model, f"page-at-{index}")],
+        )
+
+import analytics
+from analytics import build_payload
+
+old_breakdown_limit = analytics.MAX_BREAKDOWN_PROCESSING_ROWS
+analytics.MAX_BREAKDOWN_PROCESSING_ROWS = 20
+try:
+    page_payload = build_payload(
+        pagination_db,
+        catalog_path,
+        {"from_date": "2026-08-20", "to_date": "2026-08-22", "breakdown_offset": "50"},
+        now=boundary + 86400,
+    )
+finally:
+    analytics.MAX_BREAKDOWN_PROCESSING_ROWS = old_breakdown_limit
+page = page_payload["tokens"]["breakdown"]
+assert len(page) == 10, page
+assert [row["model"] for row in page] == [f"page-model-{index:03d}" for index in range(50, 60)], page
+assert all(row["events"] == 2 and row["estimated_cost_usd"] == 9.0 for row in page), page
+assert page_payload["tokens"]["breakdown_pagination"] == {"total": 60, "offset": 50, "limit": 50}
 PYEOF
 
 printf 'PASS: backend migration, collector cursor and analytics API tests\n'

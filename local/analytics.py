@@ -17,6 +17,7 @@ from typing import Any, Iterable, Sequence
 from zoneinfo import ZoneInfo
 
 from storage import ArchiveCorruptionError, ArchiveSchemaError, connect_database
+from token_usage import MAX_PRICING_BOUNDARIES as MAX_CATALOG_PRICING_BOUNDARIES
 from token_usage import CollectorError, load_pricing
 
 
@@ -38,6 +39,12 @@ WEEKLY_VALUE_STALE_REASON = "stale_data"
 WEEKLY_RESET_DEADLINE_MIN_CHANGE_SECONDS = 3 * 60
 MAX_SERIES_POINTS = 10_000
 MAX_SERIES_GROUP_ROWS = 100_000
+MAX_PRICING_PROCESSING_ROWS = 100_000
+MAX_BREAKDOWN_PROCESSING_ROWS = 100_000
+# The catalog validator reserves two additional boundaries for each query's
+# requested start/end. Keep this local alias for callers/tests that tune the
+# SQL budget while sharing the catalog's effective-boundary limit.
+MAX_PRICING_BOUNDARIES = MAX_CATALOG_PRICING_BOUNDARIES + 2
 MAX_RESET_MARKERS = 2_000
 WEEKLY_RESET_BOUNDARY_MARGIN_SECONDS = 2 * 86400
 DEFAULT_RESET_PAGE_SIZE = 50
@@ -154,20 +161,83 @@ def period(connection: sqlite3.Connection, params: dict[str, str], now: int) -> 
     return start, end, label, granularity
 
 
-def price_index(catalog: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
-    result: dict[tuple[str, str], dict[str, Any]] = {}
+def _pricing_period_epoch(period: dict[str, Any]) -> int | None:
+    value = period.get("effective_from")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise AnalyticsError("pricing period effective_from is invalid")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+            raise ValueError
+        timestamp_part = value[:-1].split("T", 1)[-1]
+        if "." in timestamp_part or "," in timestamp_part or parsed.microsecond:
+            raise ValueError
+        return int(parsed.timestamp())
+    except (TypeError, ValueError, OverflowError, OSError) as exc:
+        raise AnalyticsError("pricing period effective_from is invalid") from exc
+
+
+def price_index(catalog: dict[str, Any]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    result: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for entry in catalog["entries"]:
         provider = entry["provider"].strip().lower()
+        raw_periods = entry.get("periods")
+        if not isinstance(raw_periods, list):
+            raw_periods = [entry]
+        periods = [
+            {**period, "_effective_from_epoch": _pricing_period_epoch(period)}
+            for period in raw_periods
+        ]
         for model in [entry["model"], *entry.get("aliases", [])]:
-            result[(provider, model.strip().lower())] = entry
+            result[(provider, model.strip().lower())] = periods
         for identifier in entry.get("identifiers", []):
             alias_provider, alias_model = identifier.split("/", 1)
-            result[(alias_provider.strip().lower(), alias_model.strip().lower())] = entry
+            result[(alias_provider.strip().lower(), alias_model.strip().lower())] = periods
     return result
 
 
-def cost_row(row: dict[str, Any], prices: dict[tuple[str, str], dict[str, Any]]) -> tuple[float, bool]:
-    price = prices.get((row["provider"].lower(), row["model"].lower()))
+def _row_value(row: sqlite3.Row | dict[str, Any], key: str) -> Any:
+    if isinstance(row, sqlite3.Row):
+        return row[key] if key in row.keys() else None
+    return row.get(key)
+
+
+def _price_at(
+    prices: dict[tuple[str, str], list[dict[str, Any]]],
+    provider: str,
+    model: str,
+    occurred_at_epoch: int | None,
+) -> dict[str, Any] | None:
+    periods = prices.get((provider.lower(), model.lower()))
+    if not periods:
+        return None
+    if isinstance(periods, dict):
+        return periods
+    if occurred_at_epoch is None or len(periods) == 1:
+        return periods[0]
+    selected = periods[0]
+    for period in periods[1:]:
+        effective_from = period.get("_effective_from_epoch")
+        if not isinstance(effective_from, int) or occurred_at_epoch < effective_from:
+            break
+        selected = period
+    return selected
+
+
+def cost_row(
+    row: dict[str, Any],
+    prices: dict[tuple[str, str], list[dict[str, Any]]],
+    *,
+    occurred_at_epoch: int | None = None,
+) -> tuple[float, bool]:
+    provider = str(row["provider"])
+    model = str(row["model"])
+    if occurred_at_epoch is None:
+        value = row.get("occurred_at_epoch")
+        occurred_at_epoch = int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    price = _price_at(prices, provider, model, occurred_at_epoch)
     if price is None:
         return 0.0, True
     amount = (
@@ -207,7 +277,10 @@ def _positive_price(entry: dict[str, Any] | None) -> bool:
     )
 
 
-def _event_cost(row: sqlite3.Row | dict[str, Any], prices: dict[tuple[str, str], dict[str, Any]]) -> tuple[float | None, str | None]:
+def _event_cost(
+    row: sqlite3.Row | dict[str, Any],
+    prices: dict[tuple[str, str], list[dict[str, Any]]],
+) -> tuple[float | None, str | None]:
     """Price one event for the weekly-value estimator.
 
     The regular token report deliberately treats unknown/zero-price entries as
@@ -218,7 +291,9 @@ def _event_cost(row: sqlite3.Row | dict[str, Any], prices: dict[tuple[str, str],
     model = row["model"] if isinstance(row, sqlite3.Row) else row.get("model")
     if not isinstance(provider, str) or not provider.strip() or not isinstance(model, str) or not model.strip():
         return None, "invalid_event"
-    price = prices.get((provider.lower(), model.lower()))
+    occurred_at = _row_value(row, "occurred_at_epoch")
+    occurred_epoch = int(occurred_at) if isinstance(occurred_at, (int, float)) and not isinstance(occurred_at, bool) else None
+    price = _price_at(prices, provider, model, occurred_epoch)
     if not _positive_price(price):
         return None, "missing_price"
     counters = []
@@ -240,7 +315,7 @@ def _event_cost(row: sqlite3.Row | dict[str, Any], prices: dict[tuple[str, str],
 
 def _load_cost_events(
     connection: sqlite3.Connection,
-    prices: dict[tuple[str, str], dict[str, Any]],
+    prices: dict[tuple[str, str], list[dict[str, Any]]],
     start: int,
     end: int,
 ) -> list[tuple[int, float | None, str | None, str | None]]:
@@ -814,6 +889,24 @@ def token_row(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
+def _pricing_segments(
+    prices: dict[tuple[str, str], list[dict[str, Any]]],
+    start: int,
+    end: int,
+) -> list[tuple[int, int]]:
+    """Return bounded SQL ranges split at every effective pricing boundary."""
+    boundaries = {start, end}
+    for periods in prices.values():
+        for period in periods:
+            effective_from = period.get("_effective_from_epoch")
+            if isinstance(effective_from, int) and start < effective_from < end:
+                boundaries.add(effective_from)
+    if len(boundaries) > MAX_PRICING_BOUNDARIES:
+        raise AnalyticsError(f"pricing catalog has more than {MAX_PRICING_BOUNDARIES - 2} effective boundaries")
+    ordered = sorted(boundaries)
+    return [(left, right) for left, right in zip(ordered, ordered[1:]) if left < right]
+
+
 def billable_total(row: dict[str, Any]) -> int:
     """Return tokens billed by the API-equivalent formula.
 
@@ -842,6 +935,9 @@ def token_analytics(
     models: Sequence[str],
     breakdown_offset: int | None,
 ) -> tuple[dict[str, Any], list[str]]:
+    """Aggregate token usage while preserving each effective pricing period."""
+    prices = price_index(catalog)
+    segments = _pricing_segments(prices, start, end)
     conditions, values = token_conditions(start, end, sources, models)
     sums = ", ".join(f"SUM({field}) AS {field}" for field in TOKEN_FIELDS)
     breakdown_total = int(scalar(
@@ -856,26 +952,95 @@ def token_analytics(
         if breakdown_total else 0
     )
     effective_breakdown_offset = min(breakdown_offset or 0, last_page_offset)
-    pricing_rows = connection.execute(
-        f"SELECT provider, model, {sums}, COUNT(*) AS events "
-        f"FROM token_usage_events WHERE {conditions} GROUP BY provider, model LIMIT ?",
-        [*values, MAX_BREAKDOWN_ROWS + 1],
-    )
-    if breakdown_offset is None:
-        breakdown_rows = connection.execute(
-            f"SELECT source, provider, model, {sums}, COUNT(*) AS events "
-            f"FROM token_usage_events WHERE {conditions} GROUP BY source, provider, model ORDER BY source, model",
-            values,
-        )
-    else:
-        breakdown_rows = connection.execute(
-            f"SELECT source, provider, model, {sums}, COUNT(*) AS events "
-            f"FROM token_usage_events WHERE {conditions} GROUP BY source, provider, model "
-            "ORDER BY source, provider, model LIMIT ? OFFSET ?",
+
+    def segmented_rows(
+        select: str,
+        group_by: str,
+        processing_limit: int,
+        error: str,
+        key_filter: Sequence[tuple[str, str, str]] | None = None,
+    ) -> Iterable[tuple[int, sqlite3.Row]]:
+        processed_rows = 0
+        for segment_start, segment_end in segments:
+            segment_conditions = f"{conditions} AND occurred_at_epoch >= ? AND occurred_at_epoch < ?"
+            segment_values = [*values, segment_start, segment_end]
+            if key_filter is not None:
+                if not key_filter:
+                    continue
+                key_conditions = " OR ".join(
+                    "(source = ? AND provider = ? AND model = ?)" for _ in key_filter
+                )
+                segment_conditions = f"{segment_conditions} AND ({key_conditions})"
+                segment_values.extend(value for key in key_filter for value in key)
+            remaining = max(0, processing_limit - processed_rows)
+            rows = connection.execute(
+                f"SELECT {select} FROM token_usage_events WHERE {segment_conditions} "
+                f"GROUP BY {group_by} LIMIT ?",
+                [*segment_values, remaining + 1],
+            ).fetchall()
+            if len(rows) > remaining:
+                raise AnalyticsError(error)
+            processed_rows += len(rows)
+            yield from ((segment_start, row) for row in rows)
+
+    def new_group() -> dict[str, Any]:
+        return {
+            **{field: 0 for field in TOKEN_FIELDS},
+            "events": 0,
+            "estimated_cost_usd": 0.0,
+            "assumed_zero": False,
+        }
+
+    pricing_groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for segment_start, raw in segmented_rows(
+        f"provider, model, {sums}, COUNT(*) AS events",
+        "provider, model",
+        MAX_PRICING_PROCESSING_ROWS,
+        f"token pricing breakdown exceeds the {MAX_PRICING_PROCESSING_ROWS}-row processing limit",
+    ):
+        item = token_row(raw)
+        key = (str(item["provider"]), str(item["model"]))
+        normalize_token_counts(item)
+        cost, assumed_zero = cost_row(item, prices, occurred_at_epoch=segment_start)
+        group = pricing_groups.setdefault(key, new_group())
+        if len(pricing_groups) > MAX_BREAKDOWN_ROWS:
+            raise AnalyticsError(f"token pricing breakdown exceeds the {MAX_BREAKDOWN_ROWS}-group processing limit")
+        for field in TOKEN_FIELDS:
+            group[field] += item[field]
+        group["events"] += int(item["events"])
+        group["estimated_cost_usd"] += cost
+        group["assumed_zero"] = group["assumed_zero"] or assumed_zero
+
+    breakdown_page_keys: tuple[tuple[str, str, str], ...] | None = None
+    if breakdown_offset is not None:
+        page_rows = connection.execute(
+            f"SELECT source, provider, model FROM token_usage_events WHERE {conditions} "
+            "GROUP BY source, provider, model ORDER BY source, model, provider LIMIT ? OFFSET ?",
             [*values, DEFAULT_BREAKDOWN_PAGE_SIZE, effective_breakdown_offset],
+        ).fetchall()
+        breakdown_page_keys = tuple(
+            (str(row["source"]), str(row["provider"]), str(row["model"])) for row in page_rows
         )
-    prices = price_index(catalog)
-    breakdown: list[dict[str, Any]] = []
+
+    breakdown_groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for segment_start, raw in segmented_rows(
+        f"source, provider, model, {sums}, COUNT(*) AS events",
+        "source, provider, model",
+        MAX_BREAKDOWN_PROCESSING_ROWS,
+        f"token breakdown exceeds the {MAX_BREAKDOWN_PROCESSING_ROWS}-row processing limit",
+        breakdown_page_keys,
+    ):
+        item = token_row(raw)
+        key = (str(item["source"]), str(item["provider"]), str(item["model"]))
+        normalize_token_counts(item)
+        cost, assumed_zero = cost_row(item, prices, occurred_at_epoch=segment_start)
+        group = breakdown_groups.setdefault(key, new_group())
+        for field in TOKEN_FIELDS:
+            group[field] += item[field]
+        group["events"] += int(item["events"])
+        group["estimated_cost_usd"] += cost
+        group["assumed_zero"] = group["assumed_zero"] or assumed_zero
+
     summary = {field: 0 for field in TOKEN_FIELDS}
     summary.update({
         "events": 0,
@@ -885,69 +1050,72 @@ def token_analytics(
         "total": 0,
     })
     unknown: list[str] = []
-    for pricing_row_count, raw in enumerate(pricing_rows, start=1):
-        if pricing_row_count > MAX_BREAKDOWN_ROWS:
-            raise AnalyticsError(f"token pricing breakdown exceeds the {MAX_BREAKDOWN_ROWS}-group processing limit")
-        item = token_row(raw)
-        normalize_token_counts(item)
+    for (provider, model), group in pricing_groups.items():
         for field in TOKEN_FIELDS:
-            summary[field] += item[field]
-        item["events"] = int(item["events"])
-        summary["events"] += item["events"]
-        cost, assumed_zero = cost_row(item, prices)
-        item["estimated_cost_usd"] = round(cost, 8)
-        item["cost_usd"] = item["estimated_cost_usd"]
-        item["pricing_status"] = "assumed-zero" if assumed_zero else "priced"
-        summary["estimated_cost_usd"] += cost
-        summary["total_tokens"] += item["total_tokens"]
-        if assumed_zero:
-            summary["assumed_zero_tokens"] += item["total_tokens"]
-            unknown.append(f"{item['provider']}/{item['model']}")
+            summary[field] += group[field]
+        summary["events"] += group["events"]
+        summary["estimated_cost_usd"] += group["estimated_cost_usd"]
+        total_tokens = billable_total(group)
+        summary["total_tokens"] += total_tokens
+        if group["assumed_zero"]:
+            summary["assumed_zero_tokens"] += total_tokens
+            unknown.append(f"{provider}/{model}")
 
-    for raw in breakdown_rows:
-        item = token_row(raw)
+    breakdown: list[dict[str, Any]] = []
+    breakdown_keys = sorted(
+        breakdown_groups,
+        key=lambda key: (key[0], key[2], key[1]),
+    )
+    for source, provider, model in breakdown_keys:
+        group = breakdown_groups[(source, provider, model)]
+        item = {field: group[field] for field in TOKEN_FIELDS}
+        item.update({"source": source, "provider": provider, "model": model, "events": group["events"]})
         normalize_token_counts(item)
-        item["events"] = int(item["events"])
-        cost, assumed_zero = cost_row(item, prices)
-        item["estimated_cost_usd"] = round(cost, 8)
+        item["estimated_cost_usd"] = round(group["estimated_cost_usd"], 8)
         item["cost_usd"] = item["estimated_cost_usd"]
-        item["pricing_status"] = "assumed-zero" if assumed_zero else "priced"
-        item["application"] = item["source"]
+        item["pricing_status"] = "assumed-zero" if group["assumed_zero"] else "priced"
+        item["application"] = source
         breakdown.append(item)
     summary["estimated_cost_usd"] = round(summary["estimated_cost_usd"], 8)
     summary["cost_usd"] = summary["estimated_cost_usd"]
     summary["total"] = summary["total_tokens"]
 
-    # Compute cost at model granularity before folding into time buckets. A
-    # single bucket can contain multiple providers/models with different
-    # prices, so pricing an already-summed row would be incorrect.
-    series_rows = connection.execute(
-        f"SELECT (occurred_at_epoch / ?) * ? AS bucket_epoch, source, provider, model, {sums} "
-        f"FROM token_usage_events WHERE {conditions} GROUP BY bucket_epoch, source, provider, model "
-        "ORDER BY bucket_epoch, source, provider, model LIMIT ?",
-        [granularity, granularity, *values, MAX_SERIES_GROUP_ROWS + 1],
-    )
-    buckets: dict[int, dict[str, Any]] = {}
-    by_source: dict[str, dict[int, dict[str, Any]]] = {}
-    for series_row_count, raw in enumerate(series_rows, start=1):
-        if series_row_count > MAX_SERIES_GROUP_ROWS:
-            raise AnalyticsError(f"token series exceeds the {MAX_SERIES_GROUP_ROWS}-group processing limit")
+    series_groups: dict[tuple[int, str, str, str], dict[str, Any]] = {}
+    for segment_start, raw in segmented_rows(
+        f"(occurred_at_epoch / {granularity}) * {granularity} AS bucket_epoch, source, provider, model, {sums}",
+        "bucket_epoch, source, provider, model",
+        MAX_SERIES_GROUP_ROWS,
+        f"token series exceeds the {MAX_SERIES_GROUP_ROWS}-group processing limit",
+    ):
         item = token_row(raw)
         bucket_epoch = int(item.pop("bucket_epoch"))
         source = str(item.pop("source"))
+        provider = str(item["provider"])
+        model = str(item["model"])
         normalize_token_counts(item)
-        cost, _assumed_zero = cost_row(item, prices)
+        cost, _assumed_zero = cost_row(item, prices, occurred_at_epoch=segment_start)
+        group = series_groups.setdefault((bucket_epoch, source, provider, model), {
+            **{field: 0 for field in TOKEN_FIELDS},
+            "estimated_cost_usd": 0.0,
+        })
+        for field in TOKEN_FIELDS:
+            group[field] += item[field]
+        group["estimated_cost_usd"] += cost
 
+    buckets: dict[int, dict[str, Any]] = {}
+    by_source: dict[str, dict[int, dict[str, Any]]] = {}
+    for (bucket_epoch, source, _provider, _model), group in series_groups.items():
         bucket = buckets.setdefault(bucket_epoch, {field: 0 for field in TOKEN_FIELDS})
-        bucket["estimated_cost_usd"] = bucket.get("estimated_cost_usd", 0.0) + cost
+        bucket["estimated_cost_usd"] = bucket.get("estimated_cost_usd", 0.0) + group["estimated_cost_usd"]
         bucket["cost_usd"] = bucket["estimated_cost_usd"]
-        source_buckets = by_source.setdefault(source, {})
-        source_bucket = source_buckets.setdefault(bucket_epoch, {field: 0 for field in TOKEN_FIELDS})
-        source_bucket["estimated_cost_usd"] = source_bucket.get("estimated_cost_usd", 0.0) + cost
+        source_bucket = by_source.setdefault(source, {}).setdefault(
+            bucket_epoch, {field: 0 for field in TOKEN_FIELDS}
+        )
+        source_bucket["estimated_cost_usd"] = source_bucket.get("estimated_cost_usd", 0.0) + group["estimated_cost_usd"]
         source_bucket["cost_usd"] = source_bucket["estimated_cost_usd"]
         for field in TOKEN_FIELDS:
-            bucket[field] += item[field]
-            source_bucket[field] += item[field]
+            bucket[field] += group[field]
+            source_bucket[field] += group[field]
 
     series = []
     for bucket_epoch in sorted(buckets):

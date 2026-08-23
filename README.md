@@ -422,8 +422,18 @@ An explicitly selected source that cannot be read makes the collection cycle
 degraded. `none` disables token collection while quota monitoring continues.
 
 The default pricing catalog is `local/pricing.json`. Custom catalogs must use
-the supported schema and USD rates per million tokens. Unknown models are kept
-in reports and assigned zero estimated cost.
+the supported schema and USD rates per million tokens. Schema version 1 keeps
+one timeless rate set per entry; schema version 2 uses a strictly ordered
+`periods` array, where every period has an `effective_from` UTC timestamp and
+the four complete rate fields (`input_per_million`, `cache_read_per_million`,
+`cache_write_per_million`, and `output_per_million`). The first period starts
+at `1970-01-01T00:00:00Z` in the default catalog, so events before a later
+boundary retain their historical price. Analytics segments SQL aggregations at
+those boundaries and then merges the public rows; aliases and identifiers use
+the same periods. Unknown models are kept in reports and assigned zero
+estimated cost. The default Standard short-context rates are sourced from the
+[OpenAI API pricing page](https://developers.openai.com/api/docs/pricing) and
+its [API changelog](https://developers.openai.com/api/docs/changelog).
 
 Example with Codex and OpenCode only:
 

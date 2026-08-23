@@ -96,8 +96,9 @@ import sys
 root = Path(sys.argv[1])
 test_root = Path(sys.argv[2])
 sys.path.insert(0, str(root / "local"))
-from analytics import (_event_cost, _snapshot_limit_id_around_reset, _window_pair_reason,
-                       _window_start, weekly_limit_value, weekly_reset_cycle_metrics)
+from analytics import (_event_cost, _load_cost_events, _snapshot_limit_id_around_reset,
+                       _window_pair_reason, _window_start, price_index, weekly_limit_value,
+                       weekly_reset_cycle_metrics)
 from storage import connect_database
 from token_usage import load_pricing
 
@@ -171,6 +172,27 @@ assert _event_cost({"provider": "openai", "model": "priced", "input_tokens": -1,
                     "cache_read_tokens": 0, "cache_write_tokens": 0, "output_tokens": 0},
                    {("openai", "priced"): {"input_per_million": 1, "cache_read_per_million": 1,
                                              "cache_write_per_million": 1, "output_per_million": 1}}) == (None, "invalid_event")
+
+pricing = price_index(load_pricing(root / "local/pricing.json"))
+pricing_boundary = 1787270400
+for occurred_at, expected in ((pricing_boundary - 1, 5.0), (pricing_boundary, 4.0)):
+    cost, reason = _event_cost(
+        {"provider": "openai", "model": "gpt-5.6-sol", "occurred_at_epoch": occurred_at,
+         "input_tokens": 1000000, "cache_read_tokens": 0, "cache_write_tokens": 0, "output_tokens": 0},
+        pricing,
+    )
+    assert (cost, reason) == (expected, None), (occurred_at, cost, reason)
+temporal_cost_db = test_root / "weekly-value-temporal-pricing.sqlite3"
+with connect_database(temporal_cost_db) as connection:
+    connection.executemany(
+        """INSERT INTO token_usage_events(
+             occurred_at_epoch, source, provider, model, input_tokens, external_id
+           ) VALUES (?, 'codex', 'openai', 'gpt-5.6-sol', ?, ?)""",
+        [(pricing_boundary - 1, 1000000, "weekly-old"), (pricing_boundary, 1000000, "weekly-new")],
+    )
+    connection.row_factory = __import__("sqlite3").Row
+    events = _load_cost_events(connection, pricing, pricing_boundary - 1, pricing_boundary + 1)
+    assert [item[1] for item in events] == [5.0, 4.0], events
 
 smooth_db = test_root / "weekly-value-smoothing.sqlite3"
 with connect_database(smooth_db) as connection:

@@ -229,4 +229,177 @@ if grep -Fq 'Traceback' "$extreme_date_error"; then
   fail "out-of-range custom date exposed a traceback"
 fi
 
+python3 - "$ROOT_DIR" "$TEST_ROOT" <<'PY'
+import copy
+import json
+from pathlib import Path
+import sys
+from datetime import datetime, timezone
+
+root = Path(sys.argv[1])
+test_root = Path(sys.argv[2])
+sys.path.insert(0, str(root / "local"))
+import analytics
+from analytics import AnalyticsError, build_payload, price_index, token_analytics
+from storage import connect_database
+from token_usage import CollectorError, load_pricing
+
+boundary = 1787270400  # 2026-08-21T00:00:00Z
+database = test_root / "temporal-pricing.sqlite3"
+with connect_database(database) as connection:
+    events = [
+        (boundary - 1, "openai", "gpt-5.6-sol", 1_000_000, 0, "sol-before"),
+        (boundary, "openai", "gpt-5.6-sol", 1_000_000, 0, "sol-at"),
+        (boundary, "openai", "gpt-5.6-sol-pro", 1_000_000, 0, "sol-alias"),
+        (boundary, "openai-codex", "gpt-5.6-sol", 1_000_000, 0, "sol-identifier"),
+        (boundary - 1, "openai", "gpt-5.6-terra", 0, 1_000_000, "terra-before"),
+        (boundary, "openai", "gpt-5.6-terra", 0, 1_000_000, "terra-at"),
+        (boundary - 1, "openai", "gpt-5.6-luna", 0, 1_000_000, "luna-before"),
+        (boundary, "openai", "gpt-5.6-luna", 0, 1_000_000, "luna-at"),
+    ]
+    connection.executemany(
+        """INSERT INTO token_usage_events(
+             occurred_at_epoch, source, provider, model, input_tokens,
+             cache_write_tokens, external_id
+           ) VALUES (?, 'codex', ?, ?, ?, ?, ?)""",
+        events,
+    )
+payload = build_payload(
+    database,
+    root / "local" / "pricing.json",
+    {"from_date": "2026-08-20", "to_date": "2026-08-22"},
+    now=boundary + 86400,
+)
+assert payload["pricing"] == {
+    "currency": "USD", "as_of": "2026-08-21", "valuation_mode": "effective_catalog"
+}
+assert payload["tokens"]["summary"]["estimated_cost_usd"] == 21.95, payload["tokens"]["summary"]
+breakdown = {(row["provider"], row["model"]): row["estimated_cost_usd"] for row in payload["tokens"]["breakdown"]}
+assert breakdown[("openai", "gpt-5.6-sol")] == 9.0, breakdown
+assert breakdown[("openai", "gpt-5.6-sol-pro")] == 4.0, breakdown
+assert breakdown[("openai-codex", "gpt-5.6-sol")] == 4.0, breakdown
+assert breakdown[("openai", "gpt-5.6-terra")] == 4.5, breakdown
+assert breakdown[("openai", "gpt-5.6-luna")] == 0.45, breakdown
+assert len(payload["tokens"]["series"]) == 2
+assert round(sum(row["estimated_cost_usd"] for row in payload["tokens"]["series"]), 8) == 21.95
+
+catalog = load_pricing(root / "local" / "pricing.json")
+v1 = {
+    "schema_version": 1, "currency": "USD", "unknown_model_policy": "assumed_zero",
+    "entries": [{"provider": "test", "model": "model", "input_per_million": 1,
+                 "cache_read_per_million": 1, "cache_write_per_million": 1,
+                 "output_per_million": 1}],
+}
+v1_path = test_root / "pricing-v1.json"
+v1_path.write_text(json.dumps(v1), encoding="utf-8")
+assert load_pricing(v1_path)["schema_version"] == 1
+invalid = copy.deepcopy(catalog)
+invalid["entries"][0]["periods"][1]["effective_from"] = invalid["entries"][0]["periods"][0]["effective_from"]
+bad_path = test_root / "pricing-invalid-periods.json"
+bad_path.write_text(json.dumps(invalid), encoding="utf-8")
+try:
+    load_pricing(bad_path)
+except CollectorError:
+    pass
+else:
+    raise AssertionError("non-increasing pricing periods were accepted")
+invalid_rate = copy.deepcopy(catalog)
+invalid_rate["entries"][0]["periods"][1]["output_per_million"] = -1
+bad_rate_path = test_root / "pricing-invalid-rate.json"
+bad_rate_path.write_text(json.dumps(invalid_rate), encoding="utf-8")
+try:
+    load_pricing(bad_rate_path)
+except CollectorError:
+    pass
+else:
+    raise AssertionError("negative pricing rate was accepted")
+
+fractional = copy.deepcopy(catalog)
+fractional["entries"][0]["periods"][1]["effective_from"] = "2026-08-21T00:00:00.001Z"
+fractional_path = test_root / "pricing-fractional-boundary.json"
+fractional_path.write_text(json.dumps(fractional), encoding="utf-8")
+try:
+    load_pricing(fractional_path)
+except CollectorError:
+    pass
+else:
+    raise AssertionError("fractional pricing boundary was accepted")
+try:
+    price_index(fractional)
+except AnalyticsError:
+    pass
+else:
+    raise AssertionError("analytics accepted a fractional pricing boundary")
+
+too_many_boundaries = {
+    "schema_version": 2,
+    "currency": "USD",
+    "unknown_model_policy": "assumed_zero",
+    "entries": [],
+}
+for entry_index in range(5):
+    periods = []
+    for period_index in range(64):
+        seconds = 0 if period_index == 0 else entry_index * 64 + period_index
+        effective = datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace("+00:00", "Z")
+        periods.append({
+            "effective_from": effective,
+            "input_per_million": 0,
+            "cache_read_per_million": 0,
+            "cache_write_per_million": 0,
+            "output_per_million": 0,
+        })
+    too_many_boundaries["entries"].append({
+        "provider": f"provider-{entry_index}",
+        "model": "model",
+        "periods": periods,
+    })
+too_many_path = test_root / "pricing-too-many-boundaries.json"
+too_many_path.write_text(json.dumps(too_many_boundaries), encoding="utf-8")
+try:
+    load_pricing(too_many_path)
+except CollectorError:
+    pass
+else:
+    raise AssertionError("catalog with too many effective boundaries was accepted")
+
+global_limit_catalog = {
+    "schema_version": 2,
+    "currency": "USD",
+    "unknown_model_policy": "assumed_zero",
+    "entries": [{
+        "provider": "test-provider",
+        "model": "test-model",
+        "periods": [
+            {"effective_from": "1970-01-01T00:00:00Z", "input_per_million": 1,
+             "cache_read_per_million": 0, "cache_write_per_million": 0, "output_per_million": 0},
+            {"effective_from": "1970-01-01T00:01:40Z", "input_per_million": 2,
+             "cache_read_per_million": 0, "cache_write_per_million": 0, "output_per_million": 0},
+        ],
+    }],
+}
+global_limit_database = test_root / "pricing-global-limit.sqlite3"
+with connect_database(global_limit_database) as connection:
+    connection.row_factory = __import__("sqlite3").Row
+    connection.executemany(
+        """INSERT INTO token_usage_events
+           (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+           VALUES (?, 'codex', 'test-provider', 'test-model', 1000000, ?)""",
+        [(50, "global-limit-before"), (150, "global-limit-after")],
+    )
+old_processing_limit = analytics.MAX_PRICING_PROCESSING_ROWS
+analytics.MAX_PRICING_PROCESSING_ROWS = 1
+try:
+    try:
+        with connect_database(global_limit_database, read_only=True) as connection:
+            connection.row_factory = __import__("sqlite3").Row
+            token_analytics(connection, global_limit_catalog, 0, 200, 60, (), (), None)
+    except AnalyticsError as exc:
+        assert "1-row processing limit" in str(exc), exc
+    else:
+        raise AssertionError("pricing intermediate row limit reset between segments")
+finally:
+    analytics.MAX_PRICING_PROCESSING_ROWS = old_processing_limit
+PY
+
 printf 'PASS: advanced analytics query tests\n'
