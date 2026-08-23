@@ -821,6 +821,11 @@ during recovery. The procedure below is written for both journal modes.
 For a controlled maintenance checkpoint, stop writers and run:
 
 ```bash
+# BEGIN SQLITE_CHECKPOINT_SHELL_EXAMPLE
+set -euo pipefail
+
+cd /path/to/ai-usage-monitor
+DB=local/runtime/usage-history.sqlite3
 python3 - "$DB" <<'PY'
 import sys
 from pathlib import Path
@@ -829,6 +834,7 @@ from local.storage import checkpoint_database
 status = checkpoint_database(Path(sys.argv[1]), mode="TRUNCATE")
 print("WAL checkpoint:", status)
 PY
+# END SQLITE_CHECKPOINT_SHELL_EXAMPLE
 ```
 
 The status tuple is `(busy, log_frames, checkpointed_frames)`. A non-zero
