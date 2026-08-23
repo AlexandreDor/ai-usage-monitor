@@ -26,9 +26,16 @@ RANGES = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "
 SOURCES = ("codex", "opencode", "hermes")
 TOKEN_FIELDS = ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens")
 WEEKLY_WINDOW_SECONDS = 7 * 86400
-WEEKLY_VALUE_WINDOW_SECONDS = 2 * 3600
-WEEKLY_VALUE_MIN_WINDOW_SECONDS = 1 * 3600 + 45 * 60
-WEEKLY_VALUE_MAX_WINDOW_SECONDS = 2 * 3600 + 15 * 60
+WEEKLY_VALUE_WINDOW_TARGET_SECONDS = 12 * 3600
+WEEKLY_VALUE_WINDOW_TOLERANCE_SECONDS = 15 * 60
+WEEKLY_VALUE_WINDOW_SECONDS = WEEKLY_VALUE_WINDOW_TARGET_SECONDS
+WEEKLY_VALUE_MIN_WINDOW_SECONDS = (
+    WEEKLY_VALUE_WINDOW_TARGET_SECONDS - WEEKLY_VALUE_WINDOW_TOLERANCE_SECONDS
+)
+WEEKLY_VALUE_MAX_WINDOW_SECONDS = (
+    WEEKLY_VALUE_WINDOW_TARGET_SECONDS + WEEKLY_VALUE_WINDOW_TOLERANCE_SECONDS
+)
+WEEKLY_VALUE_POINT_INTERVAL_SECONDS = 6 * 3600
 WEEKLY_VALUE_MIN_QUOTA_DELTA_POINTS = 0.5
 WEEKLY_VALUE_MAX_POINTS = 10_000
 WEEKLY_VALUE_STALE_REASON = "stale_data"
@@ -383,7 +390,7 @@ def _interval_event_cost(
 
 
 def _event_index(events: list[tuple[int, float | None, str | None, str | None]]) -> tuple[list[int], list[float], dict[str, list[int]], list[int]]:
-    """Build prefix arrays so thousands of two-hour windows stay bounded."""
+    """Build prefix arrays so thousands of twelve-hour windows stay bounded."""
     epochs = [item[0] for item in events]
     prefix_cost = [0.0]
     prefix_reasons = {"invalid_event": [0], "missing_price": [0]}
@@ -444,6 +451,29 @@ def _sample_rows(rows: list[sqlite3.Row], maximum: int) -> list[sqlite3.Row]:
         return rows
     last = len(rows) - 1
     return [rows[round(index * last / (maximum - 1))] for index in range(maximum)]
+
+
+def _cadence_rows(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    """Keep the last valid snapshot in each fixed UTC cadence bucket.
+
+    Snapshot rows are already ordered chronologically. Invalid epochs are
+    ignored so a malformed row cannot disturb bucket selection or ordering.
+    The final row seen in a bucket is therefore also the latest snapshot for
+    that bucket, including the currently active bucket.
+    """
+    selected: list[sqlite3.Row] = []
+    current_bucket: int | None = None
+    for row in rows:
+        epoch = row["scraped_at_epoch"] if isinstance(row, sqlite3.Row) else row.get("scraped_at_epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, int):
+            continue
+        bucket = epoch // WEEKLY_VALUE_POINT_INTERVAL_SECONDS
+        if bucket == current_bucket:
+            selected[-1] = row
+        else:
+            selected.append(row)
+            current_bucket = bucket
+    return selected
 
 
 def _window_start(
@@ -511,7 +541,7 @@ def weekly_limit_value(
     now: int | None = None,
     sample_interval_seconds: int = 900,
 ) -> dict[str, Any]:
-    """Build the two-hour implicit weekly-limit value series.
+    """Build the twelve-hour implicit weekly-limit value series.
 
     This is intentionally independent of token source/model UI filters: it is
     a quota-wide metric based on all locally collected token events, not a view
@@ -528,7 +558,9 @@ def weekly_limit_value(
     rows = [row for row in rows if isinstance(row["scraped_at_epoch"], int)]
     end_rows = [row for row in rows if start <= row["scraped_at_epoch"] < end]
     candidate_count = len(end_rows)
-    selected_rows = _sample_rows(end_rows, WEEKLY_VALUE_MAX_POINTS)
+    cadenced_rows = _cadence_rows(end_rows)
+    cadenced_count = len(cadenced_rows)
+    selected_rows = _sample_rows(cadenced_rows, WEEKLY_VALUE_MAX_POINTS)
     row_epochs = _snapshot_epoch_index(rows)
     events = _load_cost_events(
         connection,
@@ -651,8 +683,10 @@ def weekly_limit_value(
     return {
         "currency": "USD",
         "window_seconds": WEEKLY_VALUE_WINDOW_SECONDS,
+        "point_interval_seconds": WEEKLY_VALUE_POINT_INTERVAL_SECONDS,
         "minimum_quota_delta_pct_points": WEEKLY_VALUE_MIN_QUOTA_DELTA_POINTS,
         "candidate_points": candidate_count,
+        "cadenced_points": cadenced_count,
         "returned_points": len(series),
         "omitted_points": candidate_count - len(series),
         "points_reduced": candidate_count > len(series),

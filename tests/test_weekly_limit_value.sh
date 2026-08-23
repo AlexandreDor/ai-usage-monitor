@@ -5,7 +5,7 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test_helper.sh"
 
 database="${TEST_ROOT}/weekly-value.sqlite3"
-window_seconds=7200
+window_seconds=43200
 base_epoch=1000000000
 python3 - "$ROOT_DIR" "$database" <<'PY'
 from pathlib import Path
@@ -16,7 +16,7 @@ from storage import connect_database
 
 db = Path(sys.argv[2])
 with connect_database(db) as connection:
-    window = 7200
+    window = 43200
     base = 1000000000
 
     def snapshot(epoch, weekly, limit_id="limit-a", deadline=1000100000):
@@ -29,7 +29,7 @@ with connect_database(db) as connection:
     snapshot(base, 100, deadline=deadline)
     snapshot(base + window, 98, deadline=deadline)
     # Keep a close pre-reset boundary observation; reset-boundary rules remain
-    # tied to the local cadence even though value windows span two hours.
+    # tied to the local cadence even though value windows span twelve hours.
     snapshot(base + 2 * window - 900, 98, deadline=deadline)
     snapshot(base + 2 * window, 96, deadline=deadline)
     snapshot(base + 3 * window, 94, deadline=deadline)
@@ -43,7 +43,7 @@ with connect_database(db) as connection:
         ],
     )
     # The estimator includes every locally collected source: Codex (1.50 USD),
-    # OpenCode (150.00 USD), and Hermes (0.50 USD) in the first two-hour window.
+    # OpenCode (150.00 USD), and Hermes (0.50 USD) in the first twelve-hour window.
     connection.execute(
         """INSERT INTO token_usage_events
            (occurred_at_epoch, source, provider, model, input_tokens, external_id)
@@ -73,12 +73,13 @@ PY
 payload="$(python3 "$ROOT_DIR/local/analytics.py" \
   --database "$database" --pricing "$ROOT_DIR/local/pricing.json" \
   --params '{"range":"all","reset_type":"all"}' --now "$((base_epoch + 3 * window_seconds + 1000))")"
-assert_eq "$window_seconds" "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["weekly_limit_value"]["window_seconds"])' <<<"$payload")" "weekly value payload uses a two-hour window"
+assert_eq "$window_seconds" "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["weekly_limit_value"]["window_seconds"])' <<<"$payload")" "weekly value payload uses a twelve-hour window"
+assert_eq 21600 "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["weekly_limit_value"]["point_interval_seconds"])' <<<"$payload")" "weekly value payload exposes its six-hour point cadence"
 assert_eq 7600.0 "$(python3 -c 'import json,sys; d=json.load(sys.stdin)["weekly_limit_value"]; print(next(p["raw_value_usd"] for p in d["series"] if p["observed_cost_usd"] == 152.0))' <<<"$payload")" "all-source cost is divided by the quota fraction"
 assert_eq 0.02 "$(python3 -c 'import json,sys; d=json.load(sys.stdin)["weekly_limit_value"]; print(next(p["consumed_fraction"] for p in d["series"] if p["raw_value_usd"] == 75.0))' <<<"$payload")" "quota percentage converted to fraction"
 assert_eq 1.5 "$(python3 -c 'import json,sys; d=json.load(sys.stdin)["weekly_limit_value"]; print(next(p["observed_cost_usd"] for p in d["series"] if p["raw_value_usd"] == 75.0))' <<<"$payload")" "second interval cost remains correct"
-assert_eq 152.0 "$(python3 -c 'import json,sys; d=json.load(sys.stdin)["resets"]["items"]; print(next(p["estimated_cycle_cost_usd"] for p in d if p["reset_at"] == "2001-09-09T05:46:40Z"))' <<<"$payload")" "cycle cost includes every source"
-assert_eq 253.33333333 "$(python3 -c 'import json,sys; d=json.load(sys.stdin)["resets"]["items"]; print(next(p["extrapolated_100_value_usd"] for p in d if p["reset_at"] == "2001-09-09T05:46:40Z"))' <<<"$payload")" "cycle extrapolation with remaining quota"
+assert_eq 152.0 "$(python3 -c 'import json,sys; d=json.load(sys.stdin)["resets"]["items"]; print(next(p["estimated_cycle_cost_usd"] for p in d if p["reset_at"] == "2001-09-10T01:46:40Z"))' <<<"$payload")" "cycle cost includes every source"
+assert_eq 253.33333333 "$(python3 -c 'import json,sys; d=json.load(sys.stdin)["resets"]["items"]; print(next(p["extrapolated_100_value_usd"] for p in d if p["reset_at"] == "2001-09-10T01:46:40Z"))' <<<"$payload")" "cycle extrapolation with remaining quota"
 assert_eq weekly_only "$(python3 -c 'import json,sys; d=json.load(sys.stdin)["resets"]["items"]; print(next(p["cycle_cost_reason"] for p in d if p["window"] == "5h"))' <<<"$payload")" "5-hour cycle is not extrapolated"
 assert_eq incomplete_cycle "$(python3 -c 'import json,sys; d=json.load(sys.stdin)["resets"]["items"]; print(next(p["cycle_cost_reason"] for p in d if p["reset_at"] == "2001-09-09T01:46:40Z"))' <<<"$payload")" "first cycle is qualified"
 
@@ -96,13 +97,14 @@ import sys
 root = Path(sys.argv[1])
 test_root = Path(sys.argv[2])
 sys.path.insert(0, str(root / "local"))
-from analytics import (_event_cost, _load_cost_events, _snapshot_limit_id_around_reset,
-                       _window_pair_reason, _window_start, price_index, weekly_limit_value,
+from analytics import (_cadence_rows, _event_cost, _load_cost_events,
+                       _snapshot_limit_id_around_reset, _window_pair_reason,
+                       _window_start, price_index, weekly_limit_value,
                        weekly_reset_cycle_metrics)
 from storage import connect_database
 from token_usage import load_pricing
 
-window = 7200
+window = 43200
 
 def snap(epoch, weekly, limit_id="limit-a", deadline=999999999):
     return {
@@ -148,10 +150,10 @@ assert _window_pair_reason(start, end, 0, window) is None
 end["weekly_reset_at"] += 1
 assert _window_pair_reason(start, end, 0, window) == "deadline_transition"
 end["weekly_reset_at"] = start["weekly_reset_at"]
-assert _window_pair_reason(start, end, 0, 1 * 3600 + 45 * 60) is None
-assert _window_pair_reason(start, end, 0, 2 * 3600 + 15 * 60) is None
-assert _window_pair_reason(start, end, 0, 1 * 3600 + 44 * 60) == "window_duration"
-assert _window_pair_reason(start, end, 0, 2 * 3600 + 16 * 60) == "window_duration"
+assert _window_pair_reason(start, end, 0, 11 * 3600 + 45 * 60) is None
+assert _window_pair_reason(start, end, 0, 12 * 3600 + 15 * 60) is None
+assert _window_pair_reason(start, end, 0, 11 * 3600 + 44 * 60) == "window_duration"
+assert _window_pair_reason(start, end, 0, 12 * 3600 + 16 * 60) == "window_duration"
 end["weekly_pct"] = 97.8
 assert _window_pair_reason(start, end, 0, window) is None
 middle = snap(window // 2, 98, deadline=start["weekly_reset_at"] + 179)
@@ -267,25 +269,70 @@ with connect_database(jitter_smooth_db) as connection:
     assert by_at[iso(2 * window)]["value_usd"] == 133.33333333, by_at[iso(2 * window)]
     assert by_at[iso(3 * window)]["value_usd"] == 166.66666667, by_at[iso(3 * window)]
 
+cadence_db = test_root / "weekly-value-cadence.sqlite3"
+cadence_end = 4 * 21600
+with connect_database(cadence_db) as connection:
+    connection.executemany(
+        "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [(index * 900, str(index * 900), 80, None, None, 100 - index * 0.1, None,
+          999999999, 900, 192, "limit-cadence") for index in range(96)],
+    )
+    connection.executemany(
+        """INSERT INTO token_usage_events
+           (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+           VALUES (?, 'codex', 'openai', 'gpt-5.6-sol', 1000000, ?)""",
+        [(30000, "cadence-cost-1"), (50000, "cadence-cost-2")],
+    )
+    connection.row_factory = __import__("sqlite3").Row
+    result = weekly_limit_value(
+        connection, load_pricing(root / "local/pricing.json"), 0, cadence_end,
+        now=cadence_end, sample_interval_seconds=900,
+    )
+    assert result["candidate_points"] == 96
+    assert result["cadenced_points"] == 4
+    assert result["returned_points"] == 4
+    assert result["omitted_points"] == 92
+    assert result["point_interval_seconds"] == 21600
+    epochs = [
+        int(__import__("datetime").datetime.fromisoformat(point["at"].replace("Z", "+00:00")).timestamp())
+        for point in result["series"]
+    ]
+    assert epochs == sorted(epochs)
+    assert len({epoch // 21600 for epoch in epochs}) == len(epochs)
+    assert epochs[-1] == 95 * 900, epochs
+
 long_db = test_root / "weekly-value-long.sqlite3"
 count = 10001
 base = 2000000000
 with connect_database(long_db) as connection:
     connection.executemany(
         "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [(base + i * 60, str(base + i * 60), 80, None, None, 100 - (i % 50), None,
-          base + count * 60 + 100000, 60, 192, "limit-long") for i in range(count)],
+        [(base + i * 21600, str(base + i * 21600), 80, None, None, 100 - (i % 50), None,
+          base + count * 21600 + 100000, 21600, 192, "limit-long") for i in range(count)],
     )
     connection.row_factory = __import__("sqlite3").Row
     result = weekly_limit_value(
-        connection, load_pricing(root / "local/pricing.json"), base, base + (count - 1) * 60 + 1,
-        now=base + (count - 1) * 60 + 1, sample_interval_seconds=60,
+        connection, load_pricing(root / "local/pricing.json"), base, base + (count - 1) * 21600 + 1,
+        now=base + (count - 1) * 21600 + 1, sample_interval_seconds=21600,
     )
     assert result["candidate_points"] == count
+    assert result["cadenced_points"] == count
+    assert result["point_interval_seconds"] == 21600
     assert result["returned_points"] == 10000
     assert result["omitted_points"] == 1 and result["points_reduced"] is True
-    assert result["series"][-1]["at"] == f"{__import__('datetime').datetime.fromtimestamp(base + (count - 1) * 60, __import__('datetime').timezone.utc).isoformat().replace('+00:00', 'Z')}"
+    assert result["series"][-1]["at"] == f"{__import__('datetime').datetime.fromtimestamp(base + (count - 1) * 21600, __import__('datetime').timezone.utc).isoformat().replace('+00:00', 'Z')}"
     assert result["series"][-1]["window_seconds"] == window
+
+cadence_rows = [
+    {"scraped_at_epoch": 0, "marker": "first"},
+    {"scraped_at_epoch": 900, "marker": "latest-first-bucket"},
+    {"scraped_at_epoch": "invalid", "marker": "ignored"},
+    {"scraped_at_epoch": 21600, "marker": "second-bucket"},
+    {"scraped_at_epoch": 22500, "marker": "latest-second-bucket"},
+]
+cadenced = _cadence_rows(cadence_rows)
+assert [row["marker"] for row in cadenced] == ["latest-first-bucket", "latest-second-bucket"], cadenced
+assert [row["scraped_at_epoch"] // 21600 for row in cadenced] == [0, 1], cadenced
 PY
 
 printf 'PASS: weekly limit value analytics tests\n'
