@@ -234,6 +234,7 @@ with connect_database(Path(database)) as connection:
         (journal_mode,),
     )
     connection.commit()
+connection.close()
 with sqlite3.connect(database) as connection:
     connection.execute(f"PRAGMA journal_mode={journal_mode}")
     connection.execute("PRAGMA wal_autocheckpoint=0")

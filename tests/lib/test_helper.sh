@@ -39,6 +39,7 @@ use_test_runtime() {
   LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
   ENV_FILE="${TEST_ROOT}/.env"
   mkdir -p "$RUNTIME_DIR"
+  chmod 700 "$RUNTIME_DIR"
 }
 
 monitor_defaults() {

@@ -28,30 +28,6 @@ jusqu'à la stabilisation du socle.
 
 ## P1 - Robustesse et qualité
 
-### 7. Finaliser la durabilité et la concurrence SQLite
-
-La migration v1 vers v2, le rejet des versions inconnues, `quick_check`,
-`busy_timeout` et un test de lecture/écriture concurrente sont en place. La base
-utilise encore le journal `DELETE` et aucune sauvegarde pré-migration n'est
-créée.
-
-**Actions :**
-
-- Sauvegarder une base existante avant toute migration susceptible de
-  l'altérer.
-- Passer progressivement du journal `DELETE` à `WAL`.
-- Gérer explicitement les erreurs `locked` avec des retries bornés.
-- Nettoyer les fichiers WAL de manière contrôlée lors des opérations de
-  récupération ou de maintenance.
-
-**Critères de validation :**
-
-- Une migration conserve les snapshots et laisse une sauvegarde récupérable.
-- Les lectures Analytics restent disponibles pendant les écritures du monitor.
-- Les scénarios de verrouillage, checkpoint et récupération WAL sont testés.
-
-**Effort : M**
-
 ### 12. Compléter les contrôles de qualité de la CI
 
 La CI exécute déjà les tests shell, Python, HTTP et navigateur ainsi que
@@ -152,12 +128,11 @@ retirées de cette liste car elles sont déjà implémentées.
 
 1. Ajouter la détection des données périmées au dashboard principal.
 2. Détecter les anomalies de quota.
-3. Finaliser WAL et les sauvegardes SQLite.
-4. Terminer l'accessibilité du dashboard.
-5. Renforcer la CI.
-6. Préparer les releases et le packaging.
-7. Réduire progressivement le script monolithique.
-8. Ajouter les évolutions P3 selon les besoins utilisateurs.
+3. Terminer l'accessibilité du dashboard.
+4. Renforcer la CI.
+5. Préparer les releases et le packaging.
+6. Réduire progressivement le script monolithique.
+7. Ajouter les évolutions P3 selon les besoins utilisateurs.
 
 ## Définition globale de terminé
 
@@ -176,7 +151,6 @@ Le programme restant est terminé lorsque :
 - le dashboard principal détecte et annonce les données périmées ;
 - les mouvements de quota anormaux sont détectés sans confondre les resets
   légitimes ;
-- SQLite est sauvegardé avant migration et fonctionne de manière fiable en WAL ;
 - les tests shell, Python, HTTP et navigateur passent en CI ;
 - la distribution comprend une version, un changelog, des unités systemd et des
   archives vérifiables.

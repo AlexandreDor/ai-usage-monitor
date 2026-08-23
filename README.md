@@ -790,9 +790,50 @@ having access to the Gist.
 
 The default archive is
 `local/runtime/usage-history.sqlite3`. It is private local state, not an
-off-machine backup. The monitor currently opens SQLite with
-`PRAGMA journal_mode=DELETE`; P1.7 plans WAL and migration backups but neither
-is implemented yet. The procedure below is written for both modes.
+off-machine backup. Current monitor and Analytics connections use
+`PRAGMA journal_mode=WAL`, so a read-only Analytics connection can continue
+querying while a monitor transaction is writing. Archives created by older
+releases used `PRAGMA journal_mode=DELETE`; opening a recognized v1, v2, or v3
+archive first creates a unique adjacent `*.pre-migration.*` backup, verifies it
+with `PRAGMA quick_check`, and only then migrates the active archive. A failed
+backup aborts migration and leaves the legacy schema untouched. If activation
+or a later migration step fails after WAL activation, SQLite may already have
+changed the journal mode while the schema migration has not been committed;
+the pre-migration backup remains the recovery point.
+
+The archive directory and its adjacent backups must be a real directory owned
+by the current user with no group/other write bit; the monitor runtime is
+created with mode `700`. Writable storage and corruption recovery reject an
+unsafe parent before creating or moving any database artifact.
+
+This is the SQLite durability and concurrency work tracked as P1.7.
+
+Busy/locked archive writes use a bounded retry policy (five attempts, a
+250-ms busy timeout per attempt, and short exponential backoff; about two
+seconds worst case). Corruption, schema, and other operational errors are not
+retried. Individual `execute`/`commit` calls are retryable; scripts are not
+automatically replayed because they may be partially applied, and production
+paths do not depend on that behavior. WAL maintenance is explicit: use the
+checkpoint helper before
+treating sidecars as disposable, and preserve `-wal` and `-shm` as a pair
+during recovery. The procedure below is written for both journal modes.
+
+For a controlled maintenance checkpoint, stop writers and run:
+
+```bash
+python3 - "$DB" <<'PY'
+import sys
+from pathlib import Path
+from local.storage import checkpoint_database
+
+status = checkpoint_database(Path(sys.argv[1]), mode="TRUNCATE")
+print("WAL checkpoint:", status)
+PY
+```
+
+The status tuple is `(busy, log_frames, checkpointed_frames)`. A non-zero
+`busy` value means that another connection is still active; keep both sidecars
+and retry after all writers/readers have closed.
 
 ### Create a coherent backup
 
