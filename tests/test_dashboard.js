@@ -16,8 +16,13 @@ function element(id) {
       id,
       hidden: false,
       textContent: '',
+      innerHTML: '',
       title: '',
       value: 0,
+      attributes: new Map(),
+      setAttribute: function setAttribute(name, value) { this.attributes.set(name, String(value)); },
+      getAttribute: function getAttribute(name) { return this.attributes.get(name) ?? null; },
+      removeAttribute: function removeAttribute(name) { this.attributes.delete(name); },
       classList: {
         add: (...names) => names.forEach(name => classes.add(name)),
         remove: (...names) => names.forEach(name => classes.delete(name)),
@@ -300,6 +305,38 @@ function evaluate(expression) {
   if (element('last-updated').textContent !== 'Last scraped 03/08/2026 19:30') fail('last update is not formatted in Paris time');
   if (element('five-h-reset').textContent !== '03/08/2026 19:35') fail('five-hour reset is not formatted in Paris time');
   if (element('weekly-reset').textContent !== '03/01/2026 13:34') fail('weekly reset is not formatted in Paris time');
+  if (element('five-h-bar').getAttribute('aria-label') !== '5-hour remaining quota') fail('5-hour gauge label is incomplete');
+  if (element('five-h-bar').getAttribute('aria-valuetext') !== '80% remaining') fail('5-hour gauge value text is incorrect');
+  if (element('weekly-bar').getAttribute('aria-label') !== 'Weekly remaining quota') fail('weekly gauge label is incomplete');
+  if (element('weekly-bar').getAttribute('aria-valuetext') !== '70% remaining') fail('weekly gauge value text is incorrect');
+
+  evaluate(`renderData({
+    five_h_pct: 80,
+    weekly_pct: 70,
+    scraped_at: '2026-08-03T17:30:01Z',
+    weekly_reset_at: 1786147200,
+  }, { schedule: false })`);
+  if (!element('weekly-pace-actual').textContent.includes('Actual remaining: 70%')) fail('actual weekly pace is not visible');
+  if (!element('weekly-pace-ideal').textContent.includes('Ideal remaining:')) fail('ideal weekly pace is not visible');
+  if (!element('weekly-pace-delta').textContent.includes('above')) fail('weekly pace direction is not visible');
+
+  evaluate(`renderHistory([
+    {scraped_at:'2026-08-02T00:00:00Z', five_h_pct:70, weekly_pct:60, weekly_reset_at:1786147200},
+    {scraped_at:'2026-08-01T00:00:00Z', five_h_pct:80, weekly_pct:90, weekly_reset_at:1786147200},
+    {scraped_at:'2026-08-01T00:00:00Z', five_h_pct:81, weekly_pct:91, weekly_reset_at:1786147200},
+  ])`);
+  if (!element('history-summary').textContent.includes('2 samples')) fail('history summary does not use normalized samples');
+  if ((element('history-table-body').innerHTML.match(/<tr>/g) || []).length !== 2) fail('history table did not deduplicate rows');
+  if (!element('history-table-body').innerHTML.includes('81%')) fail('history table is missing the latest deduplicated value');
+
+  evaluate(`renderData({
+    five_h_pct: null,
+    weekly_pct: null,
+    scraped_at: '2026-08-03T17:30:01Z',
+  }, { schedule: false })`);
+  if (element('five-h-bar').getAttribute('aria-valuetext') !== 'Remaining quota unavailable') fail('unavailable 5-hour gauge was not announced');
+  if (element('weekly-bar').getAttribute('aria-valuetext') !== 'Remaining quota unavailable') fail('unavailable weekly gauge was not announced');
+  if (element('weekly-pace-delta').textContent !== 'Weekly pace unavailable') fail('unavailable pace was not announced');
 
   evaluate(`renderForecast({
     sample_interval_seconds: 900,
@@ -359,6 +396,9 @@ function evaluate(expression) {
   await evaluate('fetchLocal()');
   if (destroyed !== 1) fail('empty history did not destroy the previous chart');
   if (element('history-error').hidden) fail('empty history error is not visible');
+  if (!element('history-summary').textContent.includes('History unavailable')) fail('empty history summary is not explicit');
+  if (element('history-table-body').innerHTML !== '') fail('empty history left stale table rows');
+  if (evaluate('document.body.dataset.historyState') !== 'unavailable') fail('empty history state is not distinct');
 
   evaluate('chart = null');
   context.Chart = function BrokenChart() { throw new Error('graph exploded'); };
@@ -370,6 +410,14 @@ function evaluate(expression) {
   if (element('five-h-pct').textContent !== '42%') fail('chart failure prevented main data rendering');
   if (element('history-error').hidden) fail('chart failure was not isolated and reported');
   if (!element('error-banner').hidden) fail('chart failure polluted the main error state');
+  if (!element('history-summary').textContent.includes('1 sample')) fail('chart failure discarded the valid history summary');
+  if ((element('history-table-body').innerHTML.match(/<tr>/g) || []).length !== 1) fail('chart failure discarded the valid history table');
+  if (evaluate('document.body.dataset.historyState') !== 'chart-unavailable') fail('chart failure state is not distinct');
+
+  evaluate(`CodexPreferences.set({ language: 'fr' })`);
+  if (!element('history-summary').textContent.includes('échantillon')) fail('history summary was not translated without refetch');
+  if (element('five-h-bar').getAttribute('aria-label') !== 'Quota restant sur 5 heures') fail('gauge label was not translated without refetch');
+  if (!element('weekly-pace-actual').textContent.includes('Restant réel')) fail('pace detail was not translated without refetch');
 
   console.log('PASS: dashboard JavaScript tests');
 })().catch(error => {

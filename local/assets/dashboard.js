@@ -22,7 +22,9 @@ let refreshRetryDelayMs = REFRESH_RETRY_INITIAL_MS;
 let lastObservedScrapedAt = null;
 let dashboardData = null;
 let dashboardHistory = null;
+let dashboardHistoryPoints = null;
 let historyFailure = null;
+let historyFailureKey = null;
 let mainFailure = null;
 let dashboardSource = null;
 
@@ -42,6 +44,26 @@ function validPct(value) {
 
 function displayText(value, fallback = '-', maxLength = 200) {
   return typeof value === 'string' && value.length <= maxLength ? value : fallback;
+}
+
+function setElementAttribute(element, name, value) {
+  if (!element) return;
+  if (typeof element.setAttribute === 'function') element.setAttribute(name, String(value));
+  else element[name] = String(value);
+}
+
+function removeElementAttribute(element, name) {
+  if (!element) return;
+  if (typeof element.removeAttribute === 'function') element.removeAttribute(name);
+  else delete element[name];
+}
+
+function formatPercent(value) {
+  const pct = validPct(value);
+  if (pct === null) return t('notAvailable');
+  return `${new Intl.NumberFormat(currentLocale(), {
+    maximumFractionDigits: 1,
+  }).format(pct)}%`;
 }
 
 function normalizedSampleIntervalSeconds(rawValue) {
@@ -293,13 +315,18 @@ function idealWeeklyRemaining(sampledAt, resetTimestamp) {
 
 function renderWeeklyPaceDelta(data) {
   const element = document.getElementById('weekly-pace-delta');
+  const actualElement = document.getElementById('weekly-pace-actual');
+  const idealElement = document.getElementById('weekly-pace-ideal');
   const actual = validPct(data.weekly_pct);
   const ideal = idealWeeklyRemaining(data.scraped_at, data.weekly_reset_at);
   element.classList.remove('ahead', 'behind');
 
+  actualElement.textContent = t('paceActual', { value: formatPercent(actual) });
+  idealElement.textContent = t('paceIdeal', { value: formatPercent(ideal) });
+
   if (actual === null || ideal === null) {
-    element.textContent = '--';
-    element.title = t('weeklyPaceUnavailable');
+    element.textContent = t('weeklyPaceUnavailable');
+    element.title = '';
     return;
   }
 
@@ -310,19 +337,31 @@ function renderWeeklyPaceDelta(data) {
     : null;
   const direction = pointDifference === 0 ? t('onPace') : pointDifference > 0 ? t('above') : t('below');
   const sign = pointDifference > 0 ? '+' : '';
-  const relativeLabel = relativeDifference === null ? '' : ` / ${relativeDifference.toFixed(1)}% ${direction}`;
-
-  element.textContent = `${sign}${pointDifference.toFixed(1)} ${t('points')}${relativeLabel}`;
-  element.title = `${t('actualRemaining')}: ${actual.toFixed(1)}% / ${t('idealRemaining')}: ${ideal.toFixed(1)}%`;
+  element.textContent = relativeDifference === null
+    ? t('paceDeltaPoints', { sign, value: pointDifference.toFixed(1), direction })
+    : t('paceDelta', {
+      sign,
+      value: pointDifference.toFixed(1),
+      relative: relativeDifference.toFixed(1),
+      direction,
+    });
+  element.title = '';
   element.classList.add(pointDifference >= 0 ? 'ahead' : 'behind');
 }
 
-function setBar(barId, pctId, pct) {
+function setBar(barId, pctId, pct, labelKey = null) {
   const safePct = validPct(pct);
   const bar = document.getElementById(barId);
   const value = document.getElementById(pctId);
+  const accessibleLabelKey = labelKey || (barId === 'five-h-bar' ? 'fiveHourQuotaLabel' : 'weeklyQuotaLabel');
   bar.value = safePct ?? 0;
-  value.textContent = safePct === null ? '--' : `${safePct}%`;
+  setElementAttribute(bar, 'aria-label', t(accessibleLabelKey));
+  setElementAttribute(bar, 'aria-valuetext', safePct === null
+    ? t('quotaUnavailable')
+    : t('quotaRemaining', { value: formatPercent(safePct) }));
+  if (safePct === null) removeElementAttribute(bar, 'aria-valuenow');
+  else setElementAttribute(bar, 'aria-valuenow', safePct);
+  value.textContent = safePct === null ? t('notAvailable') : formatPercent(safePct);
   value.classList.toggle('unavailable', safePct === null);
 }
 
@@ -379,17 +418,30 @@ function setHistoryError(message = '') {
   element.hidden = !message;
 }
 
+function setHistoryState(state) {
+  document.body.dataset.historyState = state;
+}
+
+function setHistoryCanvasVisible(visible) {
+  const canvas = document.getElementById('history-chart');
+  canvas.hidden = !visible;
+  if (visible) {
+    setElementAttribute(canvas, 'aria-describedby', 'history-summary history-table-caption');
+  }
+}
+
 function destroyChart(title = t('historyUnavailable')) {
   if (chart) {
     chart.destroy();
     chart = null;
   }
   document.getElementById('history-label').textContent = title;
+  setHistoryCanvasVisible(false);
 }
 
 function normalizeHistory(history) {
-  if (!Array.isArray(history)) throw new Error(t('invalidHistory'));
-  if (history.length === 0) throw new Error(t('historyEmpty'));
+  if (!Array.isArray(history)) throw historyError('invalidHistory');
+  if (history.length === 0) throw historyError('historyEmpty');
 
   const byTimestamp = new Map();
   for (const item of history) {
@@ -412,8 +464,14 @@ function normalizeHistory(history) {
   }
 
   const points = [...byTimestamp.values()].sort((a, b) => a.timestamp - b.timestamp);
-  if (points.length === 0) throw new Error(t('historyNoValidSamples'));
+  if (points.length === 0) throw historyError('historyNoValidSamples');
   return points;
+}
+
+function historyError(key) {
+  const error = new Error(t(key));
+  error.historyKey = key;
+  return error;
 }
 
 function historyTitle(points) {
@@ -422,6 +480,51 @@ function historyTitle(points) {
   return points.length === 1
     ? t('historyTitleSingle', { start })
     : t('historyTitleRange', { start, end });
+}
+
+function historyPointValue(value) {
+  return value === null || value === undefined ? t('notAvailable') : formatPercent(value);
+}
+
+function renderHistoryAlternatives(points) {
+  const summary = document.getElementById('history-summary');
+  const tableBody = document.getElementById('history-table-body');
+  if (!points || points.length === 0) {
+    summary.textContent = t('historyUnavailable');
+    tableBody.innerHTML = '';
+    return;
+  }
+
+  const latest = points[points.length - 1];
+  const latestIdeal = idealWeeklyRemaining(latest.timestamp, latest.weeklyReset);
+  const summaryKey = points.length === 1 ? 'historySummarySingle' : 'historySummaryMany';
+  summary.textContent = t(summaryKey, {
+    samples: points.length,
+    from: formatParisDateTime(points[0].timestamp),
+    to: formatParisDateTime(latest.timestamp),
+    fiveHour: `${t('historyFiveHour')}: ${historyPointValue(latest.fiveHour)}`,
+    weekly: `${t('historyWeekly')}: ${historyPointValue(latest.weekly)}`,
+    ideal: `${t('historyIdeal')}: ${historyPointValue(latestIdeal)}`,
+    forecast24h: `${t('historyForecast24h')}: ${historyPointValue(latest.forecast24h)}`,
+    forecast6h: `${t('historyForecast6h')}: ${historyPointValue(latest.forecast6h)}`,
+  });
+
+  tableBody.innerHTML = points.map(point => {
+    const ideal = idealWeeklyRemaining(point.timestamp, point.weeklyReset);
+    return `<tr><th scope="row">${formatParisDateTime(point.timestamp)}</th>`
+      + `<td>${historyPointValue(point.fiveHour)}</td>`
+      + `<td>${historyPointValue(point.weekly)}</td>`
+      + `<td>${historyPointValue(ideal)}</td>`
+      + `<td>${historyPointValue(point.forecast24h)}</td>`
+      + `<td>${historyPointValue(point.forecast6h)}</td></tr>`;
+  }).join('');
+}
+
+function renderHistoryUnavailable(message) {
+  document.getElementById('history-summary').textContent = t('historyUnavailableWithReason', {
+    reason: displayText(message, t('unableToLoadHistory')),
+  });
+  document.getElementById('history-table-body').innerHTML = '';
 }
 
 function chartDatasets(points) {
@@ -504,12 +607,18 @@ function chartTimeBounds(points) {
 }
 
 function renderHistory(history) {
+  dashboardHistory = null;
+  dashboardHistoryPoints = null;
   const points = normalizeHistory(history);
   dashboardHistory = history;
+  dashboardHistoryPoints = points;
   historyFailure = null;
+  historyFailureKey = null;
   const datasets = chartDatasets(points);
   const timeBounds = chartTimeBounds(points);
   document.getElementById('history-label').textContent = historyTitle(points);
+  renderHistoryAlternatives(points);
+  setHistoryState('valid');
 
   if (chart) {
     const xScale = chart.options.scales.x;
@@ -523,10 +632,11 @@ function renderHistory(history) {
     chart.data.datasets = datasets;
     chart.update('none');
     setHistoryError();
+    setHistoryCanvasVisible(true);
     return;
   }
 
-  if (typeof Chart !== 'function') throw new Error(t('chartFailed'));
+  if (typeof Chart !== 'function') throw historyError('chartFailed');
   const context = document.getElementById('history-chart').getContext('2d');
   let options = {
     responsive: true,
@@ -565,18 +675,38 @@ function renderHistory(history) {
       formatValue: value => `${new Intl.NumberFormat(currentLocale(), { maximumFractionDigits: 1 }).format(value)}%`,
     });
   }
-  chart = new Chart(context, {
-    type: 'line',
-    data: { datasets },
-    options,
-  });
+  try {
+    chart = new Chart(context, {
+      type: 'line',
+      data: { datasets },
+      options,
+    });
+  } catch (error) {
+    chart = null;
+    const chartError = historyError('chartFailed');
+    chartError.cause = error;
+    throw chartError;
+  }
   setHistoryError();
+  setHistoryCanvasVisible(true);
 }
 
-function renderHistoryFailure(message) {
+function renderHistoryFailure(message, key = null, { preserveValidHistory = false } = {}) {
   historyFailure = message;
-  dashboardHistory = null;
-  destroyChart();
+  historyFailureKey = key;
+  const hasValidHistory = preserveValidHistory
+    && Array.isArray(dashboardHistoryPoints)
+    && dashboardHistoryPoints.length > 0;
+  if (hasValidHistory) {
+    setHistoryState('chart-unavailable');
+    destroyChart(historyTitle(dashboardHistoryPoints));
+  } else {
+    dashboardHistory = null;
+    dashboardHistoryPoints = null;
+    setHistoryState('unavailable');
+    destroyChart();
+    renderHistoryUnavailable(message);
+  }
   setHistoryError(message);
 }
 
@@ -586,8 +716,8 @@ function renderData(data, { schedule = true, clearError = true } = {}) {
   }
   classifySnapshotFreshness(data);
   dashboardData = data;
-  setBar('five-h-bar', 'five-h-pct', data.five_h_pct);
-  setBar('weekly-bar', 'weekly-pct', data.weekly_pct);
+  setBar('five-h-bar', 'five-h-pct', data.five_h_pct, 'fiveHourQuotaLabel');
+  setBar('weekly-bar', 'weekly-pct', data.weekly_pct, 'weeklyQuotaLabel');
   renderForecast(data);
   document.getElementById('five-h-reset').textContent = formatParisUnixTimestamp(data.five_h_reset_at);
   document.getElementById('weekly-reset').textContent = formatParisUnixTimestamp(data.weekly_reset_at);
@@ -602,7 +732,11 @@ function renderData(data, { schedule = true, clearError = true } = {}) {
 
 async function fetchJson(url, missingMessage) {
   const response = await fetch(`${url}?_=${Date.now()}`);
-  if (!response.ok) throw new Error(response.status === 404 ? missingMessage : `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(response.status === 404 ? missingMessage : `HTTP ${response.status}`);
+    if (response.status === 404 && missingMessage === t('historyNotFound')) error.historyKey = 'historyNotFound';
+    return Promise.reject(error);
+  }
   return response.json();
 }
 
@@ -615,7 +749,11 @@ async function fetchLocal() {
   try {
     renderHistory(await fetchJson('history.json', t('historyNotFound')));
   } catch (error) {
-    renderHistoryFailure(error instanceof Error ? error.message : t('unableToLoadHistory'));
+    renderHistoryFailure(
+      error instanceof Error ? error.message : t('unableToLoadHistory'),
+      error instanceof Error ? error.historyKey || null : null,
+      { preserveValidHistory: error instanceof Error && error.historyKey === 'chartFailed' },
+    );
   }
 }
 
@@ -632,10 +770,14 @@ async function fetchGist() {
 
   try {
     const historyContent = gist?.files?.['history.json']?.content;
-    if (!historyContent) throw new Error(t('gistHistoryNotFound'));
+    if (!historyContent) throw historyError('gistHistoryNotFound');
     renderHistory(JSON.parse(historyContent));
   } catch (error) {
-    renderHistoryFailure(error instanceof Error ? error.message : t('unableToLoadHistory'));
+    renderHistoryFailure(
+      error instanceof Error ? error.message : t('unableToLoadHistory'),
+      error instanceof Error ? error.historyKey || null : null,
+      { preserveValidHistory: error instanceof Error && error.historyKey === 'chartFailed' },
+    );
   }
 }
 
@@ -654,14 +796,20 @@ function refreshLocalizedDashboard() {
   if (dashboardData) renderData(dashboardData, { schedule: false, clearError: false });
   else renderFreshness();
   if (mainFailure) setMainError(mainFailure);
-  if (dashboardHistory) {
+  if (dashboardHistory && dashboardHistoryPoints) {
     try {
       renderHistory(dashboardHistory);
     } catch (error) {
-      renderHistoryFailure(error instanceof Error ? error.message : t('unableToLoadHistory'));
+      renderHistoryFailure(
+        error instanceof Error ? error.message : t('unableToLoadHistory'),
+        error instanceof Error ? error.historyKey || null : null,
+        { preserveValidHistory: true },
+      );
     }
   } else if (historyFailure) {
-    setHistoryError(historyFailure);
+    const localizedFailure = historyFailureKey ? t(historyFailureKey) : historyFailure;
+    renderHistoryUnavailable(localizedFailure);
+    setHistoryError(localizedFailure);
   }
 }
 

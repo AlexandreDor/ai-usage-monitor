@@ -66,6 +66,17 @@ test('works offline and exposes no critical accessibility violations', async ({ 
 
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   await expect(page.locator('#weekly-pct')).toHaveText('36%');
+  await expect(page.locator('#five-hour-title')).toHaveText('5-Hour Limit');
+  await expect(page.locator('#weekly-title')).toHaveText('Weekly Limit');
+  await expect(page.locator('.limit-card').first()).toHaveAttribute('aria-labelledby', 'five-hour-title');
+  await expect(page.locator('.limit-card').last()).toHaveAttribute('aria-labelledby', 'weekly-title');
+  await expect(page.locator('#five-h-bar')).toHaveAttribute('aria-label', '5-hour remaining quota');
+  await expect(page.locator('#five-h-bar')).toHaveAttribute('aria-valuetext', '72% remaining');
+  await expect(page.locator('#weekly-bar')).toHaveAttribute('aria-label', 'Weekly remaining quota');
+  await expect(page.locator('#weekly-bar')).toHaveAttribute('aria-valuetext', '36% remaining');
+  await expect(page.locator('#weekly-pace-actual')).toHaveText('Actual remaining: 36%');
+  await expect(page.locator('#weekly-pace-ideal')).toHaveText('Ideal remaining: Unavailable');
+  await expect(page.locator('#weekly-pace-delta')).toHaveText('Weekly pace unavailable');
   await expect(page.locator('#freshness-status')).toHaveAttribute('role', 'status');
   await expect(page.locator('#freshness-status')).toHaveAttribute('aria-live', 'polite');
   await expect(page.locator('#freshness-status')).toHaveAttribute('aria-atomic', 'true');
@@ -87,6 +98,16 @@ test('works offline and exposes no critical accessibility violations', async ({ 
   await expect(page.locator('.dashboard-links .external-link')).toHaveAttribute('href', 'https://github.com/AlexandreDor/ai-usage-monitor');
   await expect(page.locator('.dashboard-links a').first()).toHaveAttribute('href', 'https://github.com/AlexandreDor/ai-usage-monitor');
   await expect(page.locator('.dashboard-links a').last()).toHaveAttribute('href', 'analytics.html');
+  await expect(page.locator('#history-summary')).toContainText('1 sample from');
+  await expect(page.locator('#history-table-body tr')).toHaveCount(1);
+  await expect(page.locator('#history-chart')).toHaveAttribute('role', 'img');
+  await expect(page.locator('#history-chart')).toHaveAttribute('aria-describedby', 'history-summary history-table-caption');
+  await expect(page.locator('#history-chart')).not.toHaveAttribute('tabindex');
+  const historyOrder = await page.locator('.history-card').evaluate(card => [
+    ...card.children,
+  ].map(child => child.id));
+  expect(historyOrder.indexOf('history-chart')).toBeLessThan(historyOrder.indexOf('history-summary'));
+  expect(historyOrder.indexOf('history-summary')).toBeLessThan(historyOrder.indexOf('history-details'));
   expect(externalRequests).toEqual([]);
   await expect(page.locator('body')).not.toContainText('—');
 
@@ -212,7 +233,13 @@ test('keeps metrics visible when Chart.js is unavailable', async ({ page }) => {
 
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   await expect(page.locator('#history-error')).toContainText('Chart.js failed to load');
+  await expect(page.locator('body')).toHaveAttribute('data-history-state', 'chart-unavailable');
+  await expect(page.locator('#history-summary')).toContainText('1 sample from');
+  await expect(page.locator('#history-table-body tr')).toHaveCount(1);
+  await expect(page.locator('#history-chart')).toBeHidden();
   await expect(page.locator('#error-banner')).toBeHidden();
+  const results = await new AxeBuilder({ page }).analyze();
+  expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
 });
 
 test('clears a previous chart when history becomes empty', async ({ page }) => {
@@ -226,6 +253,43 @@ test('clears a previous chart when history becomes empty', async ({ page }) => {
   await page.evaluate(() => refresh());
   await expect(page.locator('#history-error')).toContainText('History is empty');
   await expect(page.locator('#history-label')).toHaveText('History unavailable');
+  await expect(page.locator('body')).toHaveAttribute('data-history-state', 'unavailable');
+  await expect(page.locator('#history-summary')).toContainText('History unavailable');
+  await expect(page.locator('#history-table-body tr')).toHaveCount(0);
+  const results = await new AxeBuilder({ page }).analyze();
+  expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+});
+
+test('shows weekly pace values and direction as text', async ({ page }) => {
+  const accessibleSnapshot = { ...snapshot, weekly_reset_at: 1786147200 };
+  await page.clock.install({ time: DASHBOARD_NOW });
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
+  await page.route('**/data.json?*', route => route.fulfill({ json: accessibleSnapshot }));
+  await page.route('**/history.json?*', route => route.fulfill({ json: [accessibleSnapshot] }));
+  await page.goto('/dashboard.html');
+
+  await expect(page.locator('#weekly-pace-actual')).toHaveText('Actual remaining: 36%');
+  await expect(page.locator('#weekly-pace-ideal')).toContainText('Ideal remaining:');
+  await expect(page.locator('#weekly-pace-delta')).toContainText('below');
+  await expect(page.locator('#weekly-pace-delta')).toHaveAttribute('title', '');
+  await expect(page.locator('body')).not.toContainText('—');
+});
+
+test('opens and closes the history table with keyboard focus', async ({ page }) => {
+  await mockUsage(page);
+  await page.goto('/dashboard.html');
+
+  const summary = page.locator('#history-details summary');
+  await summary.focus();
+  await expect(page.locator('#history-details summary')).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#history-details')).toHaveAttribute('open', '');
+  await expect(page.locator('#history-table')).toBeVisible();
+  await page.keyboard.press('Space');
+  await expect(page.locator('#history-details')).not.toHaveAttribute('open');
+  await expect(page.locator('#history-details summary')).toBeFocused();
+  const focusStyle = await summary.evaluate(element => getComputedStyle(element).outlineStyle);
+  expect(focusStyle).not.toBe('none');
 });
 
 test('explores the nearest dashboard time slice across the full chart height', async ({ page }) => {

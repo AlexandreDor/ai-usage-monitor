@@ -17,6 +17,13 @@ reset probabilities from the independent Codex Forecast service.
 - Current remaining quota for the active 5-hour and weekly windows.
 - Reset dates and weekly pace compared with ideal consumption.
 - Rolling history chart generated from local quota and Forecast snapshots.
+- Accessible quota gauges expose localized names and value text for the 5-hour
+  and weekly remaining windows; the weekly card also writes the actual and
+  ideal remaining values and its above/below direction in the page text.
+- The history card announces a localized sample summary and provides a
+  keyboard-operable details/table alternative. The summary and table remain
+  available when Chart.js is unavailable or fails to render; invalid or empty
+  history is announced separately and clears stale rows.
 - Mouse and touch exploration by nearest time slice, with a vertical cursor and
   one tooltip for every visible quota series at that time.
 - Automatic refresh based on the monitor collection interval.
