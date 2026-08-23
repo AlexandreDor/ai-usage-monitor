@@ -292,6 +292,35 @@ assert series == {
 assert round(sum(series.values()), 8) == 126.745
 
 catalog = load_pricing(root / "local" / "pricing.json")
+rate_fields = ("input_per_million", "cache_read_per_million", "cache_write_per_million", "output_per_million")
+expected_periods = {
+    "gpt-5.6-sol": [
+        ("1970-01-01T00:00:00Z", 5.0, 0.5, 6.25, 30.0),
+        ("2026-08-21T00:00:00Z", 4.0, 0.4, 5.0, 20.0),
+    ],
+    "gpt-5.6-terra": [
+        ("1970-01-01T00:00:00Z", 2.5, 0.25, 3.125, 15.0),
+        ("2026-07-30T00:00:00Z", 2.0, 0.2, 2.5, 12.0),
+    ],
+    "gpt-5.6-luna": [
+        ("1970-01-01T00:00:00Z", 1.0, 0.1, 1.25, 6.0),
+        ("2026-07-30T00:00:00Z", 0.2, 0.02, 0.25, 1.2),
+    ],
+}
+for model, expected in expected_periods.items():
+    entry = next(item for item in catalog["entries"] if item["model"] == model)
+    actual = [
+        (period["effective_from"], *(period[field] for field in rate_fields))
+        for period in entry["periods"]
+    ]
+    assert actual == expected, (model, actual)
+indexed_periods = price_index(catalog)
+for model, expected in expected_periods.items():
+    actual = [
+        (period["effective_from"], *(period[field] for field in rate_fields))
+        for period in indexed_periods[("openai", model)]
+    ]
+    assert actual == expected, (model, actual)
 v1 = {
     "schema_version": 1, "currency": "USD", "unknown_model_policy": "assumed_zero",
     "entries": [{"provider": "test", "model": "model", "input_per_million": 1,
