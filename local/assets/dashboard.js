@@ -354,7 +354,12 @@ function setBar(barId, pctId, pct, labelKey = null) {
   const bar = document.getElementById(barId);
   const value = document.getElementById(pctId);
   const accessibleLabelKey = labelKey || (barId === 'five-h-bar' ? 'fiveHourQuotaLabel' : 'weeklyQuotaLabel');
-  bar.value = safePct ?? 0;
+  if (safePct === null) {
+    removeElementAttribute(bar, 'value');
+  } else {
+    setElementAttribute(bar, 'value', safePct);
+    bar.value = safePct;
+  }
   setElementAttribute(bar, 'aria-label', t(accessibleLabelKey));
   setElementAttribute(bar, 'aria-valuetext', safePct === null
     ? t('quotaUnavailable')
@@ -431,9 +436,14 @@ function setHistoryCanvasVisible(visible) {
 }
 
 function destroyChart(title = t('historyUnavailable')) {
-  if (chart) {
-    chart.destroy();
-    chart = null;
+  const chartToDestroy = chart;
+  chart = null;
+  if (chartToDestroy) {
+    try {
+      chartToDestroy.destroy();
+    } catch (_error) {
+      // Chart.js cleanup is best effort; accessible fallbacks must still render.
+    }
   }
   document.getElementById('history-label').textContent = title;
   setHistoryCanvasVisible(false);
@@ -621,16 +631,22 @@ function renderHistory(history) {
   setHistoryState('valid');
 
   if (chart) {
-    const xScale = chart.options.scales.x;
-    if (timeBounds) {
-      xScale.min = timeBounds.min;
-      xScale.max = timeBounds.max;
-    } else {
-      delete xScale.min;
-      delete xScale.max;
+    try {
+      const xScale = chart.options.scales.x;
+      if (timeBounds) {
+        xScale.min = timeBounds.min;
+        xScale.max = timeBounds.max;
+      } else {
+        delete xScale.min;
+        delete xScale.max;
+      }
+      chart.data.datasets = datasets;
+      chart.update('none');
+    } catch (error) {
+      const chartError = historyError('chartFailed');
+      chartError.cause = error;
+      throw chartError;
     }
-    chart.data.datasets = datasets;
-    chart.update('none');
     setHistoryError();
     setHistoryCanvasVisible(true);
     return;
@@ -808,6 +824,7 @@ function refreshLocalizedDashboard() {
     }
   } else if (historyFailure) {
     const localizedFailure = historyFailureKey ? t(historyFailureKey) : historyFailure;
+    destroyChart(t('historyUnavailable'));
     renderHistoryUnavailable(localizedFailure);
     setHistoryError(localizedFailure);
   }

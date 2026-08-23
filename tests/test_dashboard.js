@@ -334,6 +334,8 @@ function evaluate(expression) {
     weekly_pct: null,
     scraped_at: '2026-08-03T17:30:01Z',
   }, { schedule: false })`);
+  if (element('five-h-bar').getAttribute('value') !== null) fail('unavailable 5-hour gauge exposed a determinate value');
+  if (element('weekly-bar').getAttribute('value') !== null) fail('unavailable weekly gauge exposed a determinate value');
   if (element('five-h-bar').getAttribute('aria-valuetext') !== 'Remaining quota unavailable') fail('unavailable 5-hour gauge was not announced');
   if (element('weekly-bar').getAttribute('aria-valuetext') !== 'Remaining quota unavailable') fail('unavailable weekly gauge was not announced');
   if (element('weekly-pace-delta').textContent !== 'Weekly pace unavailable') fail('unavailable pace was not announced');
@@ -418,6 +420,48 @@ function evaluate(expression) {
   if (!element('history-summary').textContent.includes('échantillon')) fail('history summary was not translated without refetch');
   if (element('five-h-bar').getAttribute('aria-label') !== 'Quota restant sur 5 heures') fail('gauge label was not translated without refetch');
   if (!element('weekly-pace-actual').textContent.includes('Restant réel')) fail('pace detail was not translated without refetch');
+
+  context.Chart = FakeChart;
+  evaluate(`renderHistory([
+    {scraped_at:'2026-08-04T00:00:00Z', five_h_pct:61},
+  ])`);
+  evaluate(`chart.update = () => { throw new Error('chart update exploded') }`);
+  fetchQueue = [
+    { five_h_pct: 61, weekly_pct: 21, scraped_at: '2026-08-04T00:00:00Z' },
+    [{ scraped_at: '2026-08-04T00:00:00Z', five_h_pct: 61 }],
+  ];
+  await evaluate('fetchLocal()');
+  if (element('history-error').hidden) fail('chart update failure was not reported');
+  if (!element('history-summary').textContent.includes('1 échantillon')) fail('chart update failure discarded the valid history summary');
+  if ((element('history-table-body').innerHTML.match(/<tr>/g) || []).length !== 1) fail('chart update failure discarded the valid history table');
+  if (evaluate('document.body.dataset.historyState') !== 'chart-unavailable') fail('chart update failure state is not distinct');
+  if (evaluate('chart !== null')) fail('chart update failure left a stale chart reference');
+
+  evaluate(`CodexPreferences.set({ language: 'en' })`);
+  fetchQueue = [
+    { five_h_pct: 61, weekly_pct: 21, scraped_at: '2026-08-04T00:00:00Z' },
+    [],
+  ];
+  await evaluate('fetchLocal()');
+  if (element('history-label').textContent !== 'History unavailable') fail('empty history did not use the unavailable title');
+  if (evaluate('document.body.dataset.historyState') !== 'unavailable') fail('empty history did not clear the chart state');
+  evaluate(`CodexPreferences.set({ language: 'fr' })`);
+  if (element('history-label').textContent !== 'Historique indisponible') fail('localized empty history restored the generic history title');
+  if (!element('history-summary').textContent.includes('Historique indisponible')) fail('localized empty history summary is not explicit');
+
+  evaluate(`renderHistory([
+    {scraped_at:'2026-08-05T00:00:00Z', five_h_pct:59},
+  ])`);
+  evaluate(`chart.destroy = () => { destroyed += 1; throw new Error('chart destroy exploded') }`);
+  fetchQueue = [
+    { five_h_pct: 59, weekly_pct: 19, scraped_at: '2026-08-05T00:00:00Z' },
+    [],
+  ];
+  await evaluate('fetchLocal()');
+  if (element('history-label').textContent !== 'Historique indisponible') fail('destroy failure changed the unavailable title');
+  if (!element('history-summary').textContent.includes('Historique indisponible')) fail('destroy failure blocked the accessible fallback summary');
+  if (evaluate('document.body.dataset.historyState') !== 'unavailable') fail('destroy failure blocked the unavailable state');
+  if (evaluate('chart !== null')) fail('destroy failure left a stale chart reference');
 
   console.log('PASS: dashboard JavaScript tests');
 })().catch(error => {

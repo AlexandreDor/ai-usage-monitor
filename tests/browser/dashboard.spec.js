@@ -127,9 +127,13 @@ test('hides the freshness badge when no valid snapshot is available', async ({ p
   await page.goto('/dashboard.html');
 
   await expect(page.locator('body')).toHaveAttribute('data-freshness', 'unavailable');
+  await expect(page.locator('#five-h-bar')).not.toHaveAttribute('value');
+  await expect(page.locator('#weekly-bar')).not.toHaveAttribute('value');
   await expect(page.locator('#freshness-badge')).toBeHidden();
   await expect(page.locator('#freshness-detail')).toHaveText('Data unavailable');
   await expect(page.locator('#freshness-status')).toHaveText('Data unavailable');
+  const results = await new AxeBuilder({ page }).analyze();
+  expectNoAxeViolations(results, ['critical', 'serious']);
 });
 
 test('renders fresh external Gist data with independent source and freshness states', async ({ page }) => {
@@ -261,6 +265,44 @@ test('clears a previous chart when history becomes empty', async ({ page }) => {
   await expect(page.locator('body')).toHaveAttribute('data-history-state', 'unavailable');
   await expect(page.locator('#history-summary')).toContainText('History unavailable');
   await expect(page.locator('#history-table-body tr')).toHaveCount(0);
+  await page.locator('#language-toggle').click();
+  await expect(page.locator('#history-label')).toHaveText('Historique indisponible');
+  await expect(page.locator('#history-summary')).toContainText('Historique indisponible');
+  const results = await new AxeBuilder({ page }).analyze();
+  expectNoAxeViolations(results, ['critical', 'serious']);
+});
+
+test('keeps the accessible history fallback when Chart.js update or destroy throws', async ({ page }) => {
+  let history = [snapshot];
+  await page.clock.install({ time: DASHBOARD_NOW });
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
+  await page.route('**/data.json?*', route => route.fulfill({ json: snapshot }));
+  await page.route('**/history.json?*', route => route.fulfill({ json: history }));
+  await page.goto('/dashboard.html');
+  await expect.poll(() => page.evaluate(() => Boolean(chart))).toBe(true);
+
+  await page.evaluate(() => {
+    chart.update = () => { throw new Error('chart update exploded'); };
+  });
+  await page.evaluate(() => refresh());
+  await expect(page.locator('#history-error')).toContainText('Chart.js failed to load');
+  await expect(page.locator('body')).toHaveAttribute('data-history-state', 'chart-unavailable');
+  await expect(page.locator('#history-summary')).toContainText('1 sample from');
+  await expect(page.locator('#history-table-body tr')).toHaveCount(1);
+  await expect(page.locator('#error-banner')).toBeHidden();
+
+  await page.evaluate(historyData => renderHistory(historyData), [snapshot]);
+  await page.evaluate(() => {
+    chart.destroy = () => { throw new Error('chart destroy exploded'); };
+  });
+  history = [];
+  await page.evaluate(() => refresh());
+  await expect(page.locator('#history-error')).toContainText('History is empty');
+  await expect(page.locator('body')).toHaveAttribute('data-history-state', 'unavailable');
+  await expect(page.locator('#history-label')).toHaveText('History unavailable');
+  await expect(page.locator('#history-summary')).toContainText('History unavailable');
+  await expect(page.locator('#history-table-body tr')).toHaveCount(0);
+  await expect(page.locator('#error-banner')).toBeHidden();
   const results = await new AxeBuilder({ page }).analyze();
   expectNoAxeViolations(results, ['critical', 'serious']);
 });
