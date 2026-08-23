@@ -5,6 +5,10 @@ const AxeBuilder = require('@axe-core/playwright').default;
 
 const DASHBOARD_NOW = new Date('2026-08-03T17:30:31Z');
 
+function expectNoAxeViolations(results, impacts = ['critical']) {
+  expect(results.violations.filter(({ impact }) => impacts.includes(impact))).toEqual([]);
+}
+
 const snapshot = {
   five_h_pct: 72,
   weekly_pct: 36,
@@ -56,7 +60,7 @@ test('signals visible local dashboard activity without affecting rendering', asy
   await expect(page.locator('#error-banner')).toBeHidden();
 });
 
-test('works offline and exposes no critical accessibility violations', async ({ page }) => {
+test('works offline and exposes no serious or critical accessibility violations', async ({ page }) => {
   const externalRequests = [];
   page.on('request', request => {
     if (new URL(request.url()).hostname !== '127.0.0.1') externalRequests.push(request.url());
@@ -101,6 +105,7 @@ test('works offline and exposes no critical accessibility violations', async ({ 
   await expect(page.locator('#history-summary')).toContainText('1 sample from');
   await expect(page.locator('#history-table-body tr')).toHaveCount(1);
   await expect(page.locator('#history-chart')).toHaveAttribute('role', 'img');
+  await expect(page.locator('#history-chart')).toHaveAttribute('aria-labelledby', 'history-label');
   await expect(page.locator('#history-chart')).toHaveAttribute('aria-describedby', 'history-summary history-table-caption');
   await expect(page.locator('#history-chart')).not.toHaveAttribute('tabindex');
   const historyOrder = await page.locator('.history-card').evaluate(card => [
@@ -112,7 +117,7 @@ test('works offline and exposes no critical accessibility violations', async ({ 
   await expect(page.locator('body')).not.toContainText('—');
 
   const results = await new AxeBuilder({ page }).analyze();
-  expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+  expectNoAxeViolations(results, ['critical', 'serious']);
 });
 
 test('hides the freshness badge when no valid snapshot is available', async ({ page }) => {
@@ -179,7 +184,7 @@ test('becomes stale without a request and exposes age and collection delay', asy
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   expect(dataRequests).toHaveLength(requestsBefore);
   const results = await new AxeBuilder({ page }).analyze();
-  expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+  expectNoAxeViolations(results, ['critical', 'serious']);
 });
 
 test('keeps stale values and source through a refresh error, then recovers', async ({ page }) => {
@@ -239,7 +244,7 @@ test('keeps metrics visible when Chart.js is unavailable', async ({ page }) => {
   await expect(page.locator('#history-chart')).toBeHidden();
   await expect(page.locator('#error-banner')).toBeHidden();
   const results = await new AxeBuilder({ page }).analyze();
-  expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+  expectNoAxeViolations(results, ['critical', 'serious']);
 });
 
 test('clears a previous chart when history becomes empty', async ({ page }) => {
@@ -257,7 +262,7 @@ test('clears a previous chart when history becomes empty', async ({ page }) => {
   await expect(page.locator('#history-summary')).toContainText('History unavailable');
   await expect(page.locator('#history-table-body tr')).toHaveCount(0);
   const results = await new AxeBuilder({ page }).analyze();
-  expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+  expectNoAxeViolations(results, ['critical', 'serious']);
 });
 
 test('shows weekly pace values and direction as text', async ({ page }) => {
