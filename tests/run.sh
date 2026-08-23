@@ -6,6 +6,8 @@ TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 python3 "$TEST_DIR/test_alerts.py"
 python3 "$TEST_DIR/test_anomalies.py"
 python3 "$TEST_DIR/test_history.py"
+python3 "$TEST_DIR/test_config.py"
+python3 "$TEST_DIR/test_storage_durability.py"
 
 for test_file in "$TEST_DIR"/test_*.sh; do
   bash "$test_file"

@@ -48,13 +48,15 @@ The local Analytics page provides:
 - quota, token, and API-equivalent cost charts;
 - implicit weekly-limit value estimates from all locally collected
   API-equivalent token-event costs (Codex, OpenCode, and Hermes) in a rolling
-  two-hour window. The estimator converts the observed quota drop from
+  twelve-hour window, shown at one point per fixed six-hour UTC bucket. The
+  latest snapshot in the current bucket is retained so the current estimate
+  remains visible. The estimator converts the observed quota drop from
   percentage points to a fraction (for example, 2 % → 0.02), then uses
   `observed all-source cost / consumed fraction`; it is independent of the
   source and model filters used by the token charts;
 - a short median of the current and two previous valid values for the trend,
   with `good`, `low confidence`, and `volatile` quality states. Windows outside
-  1 h 45 min–2 h 15 min, quota resets or limit/deadline transitions,
+  11 h 45 min–12 h 15 min, quota resets or limit/deadline transitions,
   increases or sub-0.5-point drops, stale/incomplete observations, missing
   positive prices, invalid counters, and zero cost are shown as unavailable
   with a reason rather than silently extrapolated;
@@ -249,12 +251,25 @@ cp local/.env.example local/.env
 chmod 600 local/.env
 ```
 
-Blank optional values disable the corresponding integration. Unsupported keys
-are ignored with a warning, while invalid values for supported keys are
-rejected. Environment variables can also provide values; the monitor currently
-parses `local/.env` after the inherited environment, so values in `.env` take
-precedence. `CODEX_BIN_OVERRIDE` is the documented process-only exception and
-is applied after `.env`. `serve.sh` has a separate, narrow priority chain:
+`local/config.py` parses and validates the monitor and server configuration as
+data. It never evaluates shell syntax, expands variables, follows a `.env`
+symlink, or exposes secret values in diagnostics. Existing files are secured
+to mode `600` and must be regular files owned by the current user. Blank
+optional values disable their integration; a blank required value is invalid
+and does not silently fall back to a default. Unsupported keys are ignored
+with a warning, while invalid values for supported keys are rejected.
+
+For every shared option the priority is CLI option → process environment →
+`local/.env` → default. The monitor's `--loop SECONDS` is the CLI override for
+`LOOP_INTERVAL`; `serve.sh --bind` and `--port` are the corresponding network
+options. The shared pricing catalog and dashboard active interval use the same
+reader and validators in both programs. The process-only aliases are:
+
+- `CODEX_BIN_OVERRIDE` for the monitor's `CODEX_BIN`;
+- `DASHBOARD_PRICING_FILE` for the server's pricing catalog;
+- `DASHBOARD_ANALYTICS_DATABASE` for the server's SQLite path.
+
+The server's pricing chain is therefore:
 
 - pricing catalog: `DASHBOARD_PRICING_FILE` (process) → `TOKEN_PRICING_FILE`
   (process) → `TOKEN_PRICING_FILE` in `local/.env` → `local/pricing.json`;
@@ -265,14 +280,7 @@ is applied after `.env`. `serve.sh` has a separate, narrow priority chain:
 
 `DASHBOARD_ANALYTICS_DATABASE` has no `.env` fallback, and
 `DASHBOARD_PRICING_FILE` is process-only. `DASHBOARD_ACTIVE_INTERVAL_SECONDS`
-is also read from `local/.env` when no process value is supplied; these are
-`serve.sh`-specific paths and timing controls, not a shared configuration
-module.
-
-There is deliberately no `local/config.py` yet. If configuration is
-centralised in a future change, update this README and `local/.env.example`
-together with the implementation; do not infer a new configuration contract
-from a roadmap item.
+is shared and may be supplied by either process environment or `.env`.
 
 ### Minimal configuration
 
@@ -416,8 +424,18 @@ An explicitly selected source that cannot be read makes the collection cycle
 degraded. `none` disables token collection while quota monitoring continues.
 
 The default pricing catalog is `local/pricing.json`. Custom catalogs must use
-the supported schema and USD rates per million tokens. Unknown models are kept
-in reports and assigned zero estimated cost.
+the supported schema and USD rates per million tokens. Schema version 1 keeps
+one timeless rate set per entry; schema version 2 uses a strictly ordered
+`periods` array, where every period has an `effective_from` UTC timestamp and
+the four complete rate fields (`input_per_million`, `cache_read_per_million`,
+`cache_write_per_million`, and `output_per_million`). The first period starts
+at `1970-01-01T00:00:00Z` in the default catalog, so events before a later
+boundary retain their historical price. Analytics segments SQL aggregations at
+those boundaries and then merges the public rows; aliases and identifiers use
+the same periods. Unknown models are kept in reports and assigned zero
+estimated cost. The default Standard short-context rates are sourced from the
+[OpenAI API pricing page](https://developers.openai.com/api/docs/pricing) and
+its [API changelog](https://developers.openai.com/api/docs/changelog).
 
 Example with Codex and OpenCode only:
 
@@ -772,9 +790,56 @@ having access to the Gist.
 
 The default archive is
 `local/runtime/usage-history.sqlite3`. It is private local state, not an
-off-machine backup. The monitor currently opens SQLite with
-`PRAGMA journal_mode=DELETE`; P1.7 plans WAL and migration backups but neither
-is implemented yet. The procedure below is written for both modes.
+off-machine backup. Current monitor and Analytics connections use
+`PRAGMA journal_mode=WAL`, so a read-only Analytics connection can continue
+querying while a monitor transaction is writing. Archives created by older
+releases used `PRAGMA journal_mode=DELETE`; opening a recognized v1, v2, or v3
+archive first creates a unique adjacent `*.pre-migration.*` backup, verifies it
+with `PRAGMA quick_check`, and only then migrates the active archive. A failed
+backup aborts migration and leaves the legacy schema untouched. If activation
+or a later migration step fails after WAL activation, SQLite may already have
+changed the journal mode while the schema migration has not been committed;
+the pre-migration backup remains the recovery point.
+
+The archive directory and its adjacent backups must be a real directory owned
+by the current user with no group/other write bit; the monitor runtime is
+created with mode `700`. Writable storage and corruption recovery reject an
+unsafe parent before creating or moving any database artifact.
+
+This is the SQLite durability and concurrency work tracked as P1.7.
+
+Busy/locked archive writes use a bounded retry policy (five attempts, a
+250-ms busy timeout per attempt, and short exponential backoff; about two
+seconds worst case). Corruption, schema, and other operational errors are not
+retried. Individual `execute`/`commit` calls are retryable; scripts are not
+automatically replayed because they may be partially applied, and production
+paths do not depend on that behavior. WAL maintenance is explicit: use the
+checkpoint helper before
+treating sidecars as disposable, and preserve `-wal` and `-shm` as a pair
+during recovery. The procedure below is written for both journal modes.
+
+For a controlled maintenance checkpoint, stop writers and run:
+
+```bash
+# BEGIN SQLITE_CHECKPOINT_SHELL_EXAMPLE
+set -euo pipefail
+
+cd /path/to/ai-usage-monitor
+DB=local/runtime/usage-history.sqlite3
+python3 - "$DB" <<'PY'
+import sys
+from pathlib import Path
+from local.storage import checkpoint_database
+
+status = checkpoint_database(Path(sys.argv[1]), mode="TRUNCATE")
+print("WAL checkpoint:", status)
+PY
+# END SQLITE_CHECKPOINT_SHELL_EXAMPLE
+```
+
+The status tuple is `(busy, log_frames, checkpointed_frames)`. A non-zero
+`busy` value means that another connection is still active; keep both sidecars
+and retry after all writers/readers have closed.
 
 ### Create a coherent backup
 

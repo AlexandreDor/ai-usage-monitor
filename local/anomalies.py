@@ -25,6 +25,7 @@ from storage import ArchiveCorruptionError, connect_database
 # an anomaly as well.
 QUOTA_INCREASE_TOLERANCE_PCT = 5.0
 RESET_SHIFT_TOLERANCE_SECONDS = 30 * 60
+RESET_OSCILLATION_MIN_DELTA_SECONDS = 3 * 60
 RESET_MISSING_CONFIRMATIONS = 2
 RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT = 20.0
 RANDOM_WEEKLY_RESET_FULL_REFILL_PCT = 98.0
@@ -35,6 +36,13 @@ ANOMALY_TYPES = (
     "quota_increase", "reset_shift", "reset_in_past", "reset_missing",
     "reset_oscillation",
 )
+
+
+def _format_reset_timestamp(timestamp: int) -> str:
+    """Format anomaly timestamps as deterministic UTC wall-clock dates."""
+    return dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).strftime(
+        "%d/%m/%Y - %H:%M"
+    )
 
 
 def _number(value: Any) -> float | None:
@@ -279,11 +287,13 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
                     and history[-2][1] == current_reset):
                 pair = sorted((int(history[-1][1]), int(current_reset)))
                 signature = f"{pair[0]}:{pair[1]}"
-                if state.get("oscillation_signature") != signature:
+                if (pair[1] - pair[0] >= RESET_OSCILLATION_MIN_DELTA_SECONDS
+                        and state.get("oscillation_signature") != signature):
                     anomaly = (
                         "reset_oscillation",
                         f"{window} reset date oscillated repeatedly between "
-                        f"{pair[0]} and {pair[1]}.",
+                        f"{_format_reset_timestamp(pair[0])} and "
+                        f"{_format_reset_timestamp(pair[1])}.",
                     )
                     state["oscillation_signature"] = signature
                     state["oscillation_episode_started"] = epoch

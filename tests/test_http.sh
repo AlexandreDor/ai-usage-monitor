@@ -26,7 +26,8 @@ pricing_path = Path(sys.argv[3])
 catalog = json.loads((root / "local" / "pricing.json").read_text(encoding="utf-8"))
 for entry in catalog["entries"]:
     if entry["provider"] == "openai" and entry["model"] == "gpt-5.6-sol":
-        entry["input_per_million"] = 123.0
+        for period in entry["periods"]:
+            period["input_per_million"] = 123.0
         break
 else:
     raise AssertionError("fixture pricing entry not found")
@@ -135,7 +136,7 @@ wait "$server_pid" 2>/dev/null || true
 server_pid=""
 serve_fixture="${TEST_ROOT}/serve-fixture"
 mkdir -p "$serve_fixture"
-cp "$SERVE" "$ROOT_DIR/local/analytics.py" "$ROOT_DIR/local/storage.py" "$ROOT_DIR/local/token_usage.py" "$serve_fixture/"
+cp "$SERVE" "$ROOT_DIR/local/config.py" "$ROOT_DIR/local/analytics.py" "$ROOT_DIR/local/storage.py" "$ROOT_DIR/local/token_usage.py" "$serve_fixture/"
 printf "TOKEN_PRICING_FILE='%s'\nDASHBOARD_ACTIVE_INTERVAL_SECONDS=120\n" "$custom_pricing" > "${serve_fixture}/.env"
 env_port="$(python3 - <<'PY'
 import socket

@@ -77,6 +77,8 @@ for required in \
   "mv -- \"\$DB\"" \
   "# BEGIN SQLITE_BACKUP_SHELL_EXAMPLE" \
   "# END SQLITE_BACKUP_SHELL_EXAMPLE" \
+  "# BEGIN SQLITE_CHECKPOINT_SHELL_EXAMPLE" \
+  "# END SQLITE_CHECKPOINT_SHELL_EXAMPLE" \
   "# BEGIN SQLITE_BACKUP_EXAMPLE" \
   "# END SQLITE_BACKUP_EXAMPLE" \
   "# BEGIN SQLITE_RESTORE_EXAMPLE" \
@@ -121,12 +123,12 @@ import re
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
-start = text.index("`serve.sh` has a separate, narrow priority chain:")
-end = text.index("There is deliberately no `local/config.py` yet.", start)
+start = text.index("The server's pricing chain is therefore:")
+end = text.index("`DASHBOARD_ANALYTICS_DATABASE` has no `.env` fallback", start)
 section = re.sub(r"\s+", " ", text[start:end])
 expected = (
-    "`DASHBOARD_PRICING_FILE` (process) → `TOKEN_PRICING_FILE` (process) "
-    "→ `TOKEN_PRICING_FILE` in `local/.env` → `local/pricing.json`"
+    "`DASHBOARD_PRICING_FILE` (process) → `TOKEN_PRICING_FILE` "
+    "(process) → `TOKEN_PRICING_FILE` in `local/.env` → `local/pricing.json`"
 )
 if expected not in section:
     raise SystemExit("serve.sh pricing priority chain is incomplete or reordered")
@@ -172,11 +174,13 @@ extract_example() {
 
 BACKUP_EXAMPLE="${TEST_ROOT}/sqlite-backup-example.py"
 BACKUP_SHELL_EXAMPLE="${TEST_ROOT}/sqlite-backup-example.sh"
+CHECKPOINT_SHELL_EXAMPLE="${TEST_ROOT}/sqlite-checkpoint-example.sh"
 RESTORE_EXAMPLE="${TEST_ROOT}/sqlite-restore-example.py"
 RESTORE_CLEANUP_EXAMPLE="${TEST_ROOT}/sqlite-restore-cleanup-example.sh"
 RESTORE_SAFETY_EXAMPLE="${TEST_ROOT}/sqlite-restore-safety-example.sh"
 extract_example '# BEGIN SQLITE_BACKUP_EXAMPLE' '# END SQLITE_BACKUP_EXAMPLE' "$BACKUP_EXAMPLE"
 extract_example '# BEGIN SQLITE_BACKUP_SHELL_EXAMPLE' '# END SQLITE_BACKUP_SHELL_EXAMPLE' "$BACKUP_SHELL_EXAMPLE"
+extract_example '# BEGIN SQLITE_CHECKPOINT_SHELL_EXAMPLE' '# END SQLITE_CHECKPOINT_SHELL_EXAMPLE' "$CHECKPOINT_SHELL_EXAMPLE"
 extract_example '# BEGIN SQLITE_RESTORE_EXAMPLE' '# END SQLITE_RESTORE_EXAMPLE' "$RESTORE_EXAMPLE"
 extract_example '# BEGIN SQLITE_RESTORE_CLEANUP_EXAMPLE' '# END SQLITE_RESTORE_CLEANUP_EXAMPLE' "$RESTORE_CLEANUP_EXAMPLE"
 
@@ -218,6 +222,20 @@ run_backup_wrapper() {
   bash "$run_script"
 }
 
+run_checkpoint_example() {
+  local workspace="$1" run_script="${TEST_ROOT}/sqlite-checkpoint-wrapper.sh"
+  local workspace_quoted
+  printf -v workspace_quoted '%q' "$workspace"
+  CHECKPOINT_CD="$workspace_quoted" awk '
+    $0 == "cd /path/to/ai-usage-monitor" {
+      print "cd " ENVIRON["CHECKPOINT_CD"]
+      next
+    }
+    { print }
+  ' "$CHECKPOINT_SHELL_EXAMPLE" > "$run_script"
+  (cd "${TEST_ROOT}/unrelated-cwd" && bash "$run_script")
+}
+
 make_sqlite_fixture() {
   python3 - "$ROOT_DIR" "$1" "$2" <<'PY'
 from pathlib import Path
@@ -234,6 +252,7 @@ with connect_database(Path(database)) as connection:
         (journal_mode,),
     )
     connection.commit()
+connection.close()
 with sqlite3.connect(database) as connection:
     connection.execute(f"PRAGMA journal_mode={journal_mode}")
     connection.execute("PRAGMA wal_autocheckpoint=0")
@@ -420,6 +439,60 @@ PY
   assert_eq "replacement active ${journal_mode}" "$(<"$active_database")" \
     "active ${journal_mode} database moved for file collision"
 done
+
+checkpoint_workspace="${TEST_ROOT}/checkpoint-workspace"
+checkpoint_database="${checkpoint_workspace}/local/runtime/usage-history.sqlite3"
+mkdir -p "${checkpoint_workspace}/local/runtime" "${TEST_ROOT}/unrelated-cwd"
+chmod 700 "${checkpoint_workspace}/local/runtime"
+ln -s "$ROOT_DIR/local/storage.py" "${checkpoint_workspace}/local/storage.py"
+python3 - "$ROOT_DIR" "$checkpoint_database" <<'PY'
+from pathlib import Path
+import sys
+
+root, database = sys.argv[1:]
+sys.path.insert(0, str(Path(root) / "local"))
+from storage import connect_database
+
+with connect_database(Path(database)) as connection:
+    connection.execute("PRAGMA wal_autocheckpoint = 0")
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES('checkpoint_fixture', 'present')"
+    )
+    connection.commit()
+PY
+
+checkpoint_output="$(run_checkpoint_example "$checkpoint_workspace")"
+python3 - "$checkpoint_output" "$checkpoint_database" <<'PY'
+import ast
+import sqlite3
+import sys
+from pathlib import Path
+
+output, database = sys.argv[1:]
+prefix = "WAL checkpoint: "
+line = next((line for line in output.splitlines() if line.startswith(prefix)), None)
+if line is None:
+    raise SystemExit(f"checkpoint output missing status: {output!r}")
+status = ast.literal_eval(line[len(prefix):])
+if not isinstance(status, tuple) or len(status) != 3:
+    raise SystemExit(f"unexpected checkpoint status: {status!r}")
+if status[0] != 0 or status[1] != status[2]:
+    raise SystemExit(f"checkpoint did not finish cleanly: {status!r}")
+
+with sqlite3.connect(database) as connection:
+    if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+        raise SystemExit("checkpoint left an invalid SQLite database")
+    if connection.execute("PRAGMA journal_mode").fetchone() != ("wal",):
+        raise SystemExit("checkpoint changed the archive journal mode")
+    if connection.execute(
+        "SELECT value FROM metadata WHERE key = 'checkpoint_fixture'"
+    ).fetchone() != ("present",):
+        raise SystemExit("checkpoint lost fixture data")
+
+wal_path = Path(f"{database}-wal")
+if wal_path.exists() and wal_path.stat().st_size != 0:
+    raise SystemExit("TRUNCATE checkpoint retained WAL frames")
+PY
 
 reservation_example="${TEST_ROOT}/restore-reservation-example.sh"
 awk '

@@ -28,56 +28,6 @@ jusqu'à la stabilisation du socle.
 
 ## P1 - Robustesse et qualité
 
-### 6. Centraliser la configuration partagée
-
-La configuration est validée par le monitor et `serve.sh` sait déjà relire le
-catalogue tarifaire sans exécuter `.env`. Cette logique reste toutefois répartie
-entre plusieurs scripts.
-
-**Actions :**
-
-- Extraire dans `local/config.py` les parseurs et validations déjà présents dans
-  `monitor.sh` et `serve.sh`, y compris les contrôles de permissions et de
-  liens symboliques.
-- Partager les valeurs nécessaires entre le monitor et le serveur.
-- Appliquer partout l'ordre de priorité suivant : option CLI, variable
-  d'environnement, `local/.env`, valeur par défaut.
-- Conserver des messages d'erreur lisibles sans traceback ni secret.
-
-**Critères de validation :**
-
-- Le monitor et le serveur interprètent de la même manière une configuration
-  valide ou invalide.
-- La garantie existante qu'un fichier `.env` n'est jamais exécuté comme du code
-  shell ne régresse pas.
-- Les priorités et les cas de variables incomplètes sont testés.
-
-**Effort : M**
-
-### 7. Finaliser la durabilité et la concurrence SQLite
-
-La migration v1 vers v2, le rejet des versions inconnues, `quick_check`,
-`busy_timeout` et un test de lecture/écriture concurrente sont en place. La base
-utilise encore le journal `DELETE` et aucune sauvegarde pré-migration n'est
-créée.
-
-**Actions :**
-
-- Sauvegarder une base existante avant toute migration susceptible de
-  l'altérer.
-- Passer progressivement du journal `DELETE` à `WAL`.
-- Gérer explicitement les erreurs `locked` avec des retries bornés.
-- Nettoyer les fichiers WAL de manière contrôlée lors des opérations de
-  récupération ou de maintenance.
-
-**Critères de validation :**
-
-- Une migration conserve les snapshots et laisse une sauvegarde récupérable.
-- Les lectures Analytics restent disponibles pendant les écritures du monitor.
-- Les scénarios de verrouillage, checkpoint et récupération WAL sont testés.
-
-**Effort : M**
-
 ### 12. Compléter les contrôles de qualité de la CI
 
 La CI exécute déjà les tests shell, Python, HTTP et navigateur ainsi que
@@ -178,13 +128,11 @@ retirées de cette liste car elles sont déjà implémentées.
 
 1. Ajouter la détection des données périmées au dashboard principal.
 2. Détecter les anomalies de quota.
-3. Centraliser la configuration partagée.
-4. Finaliser WAL et les sauvegardes SQLite.
-5. Terminer l'accessibilité du dashboard.
-6. Renforcer la CI.
-7. Préparer les releases et le packaging.
-8. Réduire progressivement le script monolithique.
-9. Ajouter les évolutions P3 selon les besoins utilisateurs.
+3. Terminer l'accessibilité du dashboard.
+4. Renforcer la CI.
+5. Préparer les releases et le packaging.
+6. Réduire progressivement le script monolithique.
+7. Ajouter les évolutions P3 selon les besoins utilisateurs.
 
 ## Définition globale de terminé
 
@@ -203,8 +151,6 @@ Le programme restant est terminé lorsque :
 - le dashboard principal détecte et annonce les données périmées ;
 - les mouvements de quota anormaux sont détectés sans confondre les resets
   légitimes ;
-- le monitor et le serveur partagent une configuration non exécutable ;
-- SQLite est sauvegardé avant migration et fonctionne de manière fiable en WAL ;
 - les tests shell, Python, HTTP et navigateur passent en CI ;
 - la distribution comprend une version, un changelog, des unités systemd et des
   archives vérifiables.
