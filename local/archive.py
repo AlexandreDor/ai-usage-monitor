@@ -19,6 +19,8 @@ from storage import (
     SCHEMA_VERSION,
     connect_database,
     is_corruption_error,
+    validate_database_parent,
+    wal_sidecar_paths,
 )
 from anomalies import (
     RANDOM_WEEKLY_RESET_FULL_REFILL_PCT,
@@ -454,13 +456,44 @@ def ingest(
 
 
 def backup_corrupt_database(database_path: Path) -> Path:
+    database_path = Path(database_path)
+    validate_database_parent(database_path)
     timestamp = int(time.time())
     backup = database_path.with_name(f"{database_path.name}.corrupt.{timestamp}")
     suffix = 1
-    while backup.exists():
+    source_paths = (database_path, *wal_sidecar_paths(database_path))
+    while True:
+        destinations = (
+            backup,
+            backup.with_name(f"{backup.name}-wal"),
+            backup.with_name(f"{backup.name}-shm"),
+        )
+        if not any(path.exists() or path.is_symlink() for path in destinations):
+            break
         backup = database_path.with_name(f"{database_path.name}.corrupt.{timestamp}.{suffix}")
         suffix += 1
-    os.replace(database_path, backup)
+    existing_sources = [path for path in source_paths if path.exists() or path.is_symlink()]
+    if not existing_sources:
+        raise OSError(f"archive database and WAL sidecars are missing: {database_path}")
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for source_path in existing_sources:
+            destination = backup if source_path == database_path else backup.with_name(
+                f"{backup.name}{source_path.name[len(database_path.name):]}"
+            )
+            if destination.exists() or destination.is_symlink():
+                raise FileExistsError(destination)
+            os.replace(source_path, destination)
+            moved.append((source_path, destination))
+    except Exception:
+        # Keep recovery atomic from the caller's point of view: if a sidecar
+        # cannot be moved, put every already-moved member back in place.
+        for source_path, destination in reversed(moved):
+            try:
+                os.replace(destination, source_path)
+            except OSError:
+                pass
+        raise
     return backup
 
 
