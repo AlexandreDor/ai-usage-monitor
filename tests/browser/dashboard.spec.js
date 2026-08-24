@@ -5,6 +5,10 @@ const AxeBuilder = require('@axe-core/playwright').default;
 
 const DASHBOARD_NOW = new Date('2026-08-03T17:30:31Z');
 
+function expectNoAxeViolations(results, impacts = ['critical']) {
+  expect(results.violations.filter(({ impact }) => impacts.includes(impact))).toEqual([]);
+}
+
 const snapshot = {
   five_h_pct: 72,
   weekly_pct: 36,
@@ -56,7 +60,7 @@ test('signals visible local dashboard activity without affecting rendering', asy
   await expect(page.locator('#error-banner')).toBeHidden();
 });
 
-test('works offline and exposes no critical accessibility violations', async ({ page }) => {
+test('works offline and exposes no serious or critical accessibility violations', async ({ page }) => {
   const externalRequests = [];
   page.on('request', request => {
     if (new URL(request.url()).hostname !== '127.0.0.1') externalRequests.push(request.url());
@@ -66,6 +70,15 @@ test('works offline and exposes no critical accessibility violations', async ({ 
 
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   await expect(page.locator('#weekly-pct')).toHaveText('36%');
+  await expect(page.locator('#five-hour-title')).toHaveText('5-Hour Limit');
+  await expect(page.locator('#weekly-title')).toHaveText('Weekly Limit');
+  await expect(page.locator('.limit-card').first()).toHaveAttribute('aria-labelledby', 'five-hour-title');
+  await expect(page.locator('.limit-card').last()).toHaveAttribute('aria-labelledby', 'weekly-title');
+  await expect(page.locator('#five-h-bar')).toHaveAttribute('aria-label', '5-hour remaining quota');
+  await expect(page.locator('#five-h-bar')).toHaveAttribute('aria-valuetext', '72% remaining');
+  await expect(page.locator('#weekly-bar')).toHaveAttribute('aria-label', 'Weekly remaining quota');
+  await expect(page.locator('#weekly-bar')).toHaveAttribute('aria-valuetext', '36% remaining');
+  await expect(page.locator('#weekly-pace-delta')).toHaveText('Weekly pace unavailable');
   await expect(page.locator('#freshness-status')).toHaveAttribute('role', 'status');
   await expect(page.locator('#freshness-status')).toHaveAttribute('aria-live', 'polite');
   await expect(page.locator('#freshness-status')).toHaveAttribute('aria-atomic', 'true');
@@ -87,11 +100,22 @@ test('works offline and exposes no critical accessibility violations', async ({ 
   await expect(page.locator('.dashboard-links .external-link')).toHaveAttribute('href', 'https://github.com/AlexandreDor/ai-usage-monitor');
   await expect(page.locator('.dashboard-links a').first()).toHaveAttribute('href', 'https://github.com/AlexandreDor/ai-usage-monitor');
   await expect(page.locator('.dashboard-links a').last()).toHaveAttribute('href', 'analytics.html');
+  await expect(page.locator('#history-summary')).toHaveCount(0);
+  await expect(page.locator('#history-details')).toHaveCount(0);
+  await expect(page.locator('#history-table')).toHaveCount(0);
+  await expect(page.locator('#history-chart')).toHaveAttribute('role', 'img');
+  await expect(page.locator('#history-chart')).toHaveAttribute('aria-labelledby', 'history-label');
+  await expect(page.locator('#history-chart')).not.toHaveAttribute('aria-describedby');
+  await expect(page.locator('#history-chart')).not.toHaveAttribute('tabindex');
+  const historyOrder = await page.locator('.history-card').evaluate(card => [
+    ...card.children,
+  ].map(child => child.id));
+  expect(historyOrder.indexOf('history-error')).toBeLessThan(historyOrder.indexOf('history-chart'));
   expect(externalRequests).toEqual([]);
   await expect(page.locator('body')).not.toContainText('—');
 
   const results = await new AxeBuilder({ page }).analyze();
-  expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+  expectNoAxeViolations(results, ['critical', 'serious']);
 });
 
 test('hides the freshness badge when no valid snapshot is available', async ({ page }) => {
@@ -101,9 +125,16 @@ test('hides the freshness badge when no valid snapshot is available', async ({ p
   await page.goto('/dashboard.html');
 
   await expect(page.locator('body')).toHaveAttribute('data-freshness', 'unavailable');
+  await expect(page.locator('#five-h-pct')).toHaveText('--');
+  await expect(page.locator('#five-h-bar')).toHaveClass(/unavailable/);
+  await expect(page.locator('#five-h-bar')).not.toHaveAttribute('value');
+  await expect(page.locator('#five-h-bar')).not.toHaveAttribute('aria-valuenow');
+  await expect(page.locator('#weekly-bar')).not.toHaveAttribute('value');
   await expect(page.locator('#freshness-badge')).toBeHidden();
   await expect(page.locator('#freshness-detail')).toHaveText('Data unavailable');
   await expect(page.locator('#freshness-status')).toHaveText('Data unavailable');
+  const results = await new AxeBuilder({ page }).analyze();
+  expectNoAxeViolations(results, ['critical', 'serious']);
 });
 
 test('renders fresh external Gist data with independent source and freshness states', async ({ page }) => {
@@ -158,7 +189,7 @@ test('becomes stale without a request and exposes age and collection delay', asy
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   expect(dataRequests).toHaveLength(requestsBefore);
   const results = await new AxeBuilder({ page }).analyze();
-  expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+  expectNoAxeViolations(results, ['critical', 'serious']);
 });
 
 test('keeps stale values and source through a refresh error, then recovers', async ({ page }) => {
@@ -212,7 +243,13 @@ test('keeps metrics visible when Chart.js is unavailable', async ({ page }) => {
 
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   await expect(page.locator('#history-error')).toContainText('Chart.js failed to load');
+  await expect(page.locator('body')).toHaveAttribute('data-history-state', 'chart-unavailable');
+  await expect(page.locator('#history-summary')).toHaveCount(0);
+  await expect(page.locator('#history-details')).toHaveCount(0);
+  await expect(page.locator('#history-chart')).toBeHidden();
   await expect(page.locator('#error-banner')).toBeHidden();
+  const results = await new AxeBuilder({ page }).analyze();
+  expectNoAxeViolations(results, ['critical', 'serious']);
 });
 
 test('clears a previous chart when history becomes empty', async ({ page }) => {
@@ -226,6 +263,62 @@ test('clears a previous chart when history becomes empty', async ({ page }) => {
   await page.evaluate(() => refresh());
   await expect(page.locator('#history-error')).toContainText('History is empty');
   await expect(page.locator('#history-label')).toHaveText('History unavailable');
+  await expect(page.locator('body')).toHaveAttribute('data-history-state', 'unavailable');
+  await expect(page.locator('#history-summary')).toHaveCount(0);
+  await expect(page.locator('#history-details')).toHaveCount(0);
+  await page.locator('#language-toggle').click();
+  await expect(page.locator('#history-label')).toHaveText('Historique indisponible');
+  const results = await new AxeBuilder({ page }).analyze();
+  expectNoAxeViolations(results, ['critical', 'serious']);
+});
+
+test('keeps the accessible history fallback when Chart.js update or destroy throws', async ({ page }) => {
+  let history = [snapshot];
+  await page.clock.install({ time: DASHBOARD_NOW });
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
+  await page.route('**/data.json?*', route => route.fulfill({ json: snapshot }));
+  await page.route('**/history.json?*', route => route.fulfill({ json: history }));
+  await page.goto('/dashboard.html');
+  await expect.poll(() => page.evaluate(() => Boolean(chart))).toBe(true);
+
+  await page.evaluate(() => {
+    chart.update = () => { throw new Error('chart update exploded'); };
+  });
+  await page.evaluate(() => refresh());
+  await expect(page.locator('#history-error')).toContainText('Chart.js failed to load');
+  await expect(page.locator('body')).toHaveAttribute('data-history-state', 'chart-unavailable');
+  await expect(page.locator('#history-summary')).toHaveCount(0);
+  await expect(page.locator('#error-banner')).toBeHidden();
+
+  await page.evaluate(historyData => renderHistory(historyData), [snapshot]);
+  await page.evaluate(() => {
+    chart.destroy = () => { throw new Error('chart destroy exploded'); };
+  });
+  history = [];
+  await page.evaluate(() => refresh());
+  await expect(page.locator('#history-error')).toContainText('History is empty');
+  await expect(page.locator('body')).toHaveAttribute('data-history-state', 'unavailable');
+  await expect(page.locator('#history-label')).toHaveText('History unavailable');
+  await expect(page.locator('#history-summary')).toHaveCount(0);
+  await expect(page.locator('#error-banner')).toBeHidden();
+  const results = await new AxeBuilder({ page }).analyze();
+  expectNoAxeViolations(results, ['critical', 'serious']);
+});
+
+test('shows the weekly pace delta and direction as text', async ({ page }) => {
+  const accessibleSnapshot = { ...snapshot, weekly_reset_at: 1786147200 };
+  await page.clock.install({ time: DASHBOARD_NOW });
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
+  await page.route('**/data.json?*', route => route.fulfill({ json: accessibleSnapshot }));
+  await page.route('**/history.json?*', route => route.fulfill({ json: [accessibleSnapshot] }));
+  await page.goto('/dashboard.html');
+
+  const paceDelta = page.locator('#weekly-pace-delta');
+  await expect(paceDelta).toContainText('below');
+  await expect(paceDelta).toContainText(' / ');
+  await expect(paceDelta).not.toContainText(';');
+  await expect(page.locator('#weekly-pace-delta')).toHaveAttribute('title', '');
+  await expect(page.locator('body')).not.toContainText('—');
 });
 
 test('explores the nearest dashboard time slice across the full chart height', async ({ page }) => {

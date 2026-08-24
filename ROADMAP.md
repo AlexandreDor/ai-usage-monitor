@@ -26,55 +26,7 @@ jusqu'à la stabilisation du socle.
 | M | Entre deux et quatre jours |
 | L | Une semaine ou plus |
 
-## P1 - Robustesse et qualité
-
-### 12. Compléter les contrôles de qualité de la CI
-
-La CI exécute déjà les tests shell, Python, HTTP et navigateur ainsi que
-ShellCheck. Les contrôles de distribution et de couverture restent à ajouter.
-
-**Actions :**
-
-- Fixer explicitement les versions de Python et Node utilisées par la CI.
-- Compiler les modules Python avant les tests.
-- Mesurer la couverture utile des modules Python.
-- Auditer les dépendances npm et les migrations.
-- Ajouter une vérification `systemd-analyze verify` lorsque les unités systemd
-  seront disponibles.
-
-**Critères de validation :**
-
-- Chaque pull request exécute les contrôles avec des versions reproductibles.
-- Une erreur de syntaxe Python, une migration cassée ou une vulnérabilité de
-  dépendance détectable fait échouer la CI.
-
-**Effort : S à M**
-
 ## P2 - Expérience utilisateur et maintenance
-
-### 13. Terminer l'accessibilité du dashboard principal
-
-Analytics possède déjà des résumés et tableaux alternatifs, des régions
-`aria-live` et une navigation clavier. Le dashboard principal n'offre pas encore
-de résumé accessible de son graphique, et les détails d'allure reposent encore
-en partie sur l'attribut `title`.
-
-**Actions :**
-
-- Fournir un résumé textuel et un tableau alternatif de l'historique.
-- Donner aux jauges des labels accessibles complets.
-- Afficher dans le contenu visible les valeurs réelle et idéale encore limitées
-  à l'attribut `title`, en plus du delta déjà visible.
-- Vérifier la navigation clavier et l'état sans couleur.
-
-**Critères de validation :**
-
-- Le quota, l'allure, la fraîcheur et l'historique sont compréhensibles sans
-  graphique, couleur ou attribut `title`.
-- Les scénarios historique vide, données périmées et graphique indisponible
-  passent les tests Playwright et axe-core.
-
-**Effort : M**
 
 ### 16. Préparer le packaging et les releases
 
@@ -128,11 +80,9 @@ retirées de cette liste car elles sont déjà implémentées.
 
 1. Ajouter la détection des données périmées au dashboard principal.
 2. Détecter les anomalies de quota.
-3. Terminer l'accessibilité du dashboard.
-4. Renforcer la CI.
-5. Préparer les releases et le packaging.
-6. Réduire progressivement le script monolithique.
-7. Ajouter les évolutions P3 selon les besoins utilisateurs.
+3. Préparer les releases et le packaging.
+4. Réduire progressivement le script monolithique.
+5. Ajouter les évolutions P3 selon les besoins utilisateurs.
 
 ## Définition globale de terminé
 

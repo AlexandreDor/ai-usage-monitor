@@ -22,7 +22,9 @@ let refreshRetryDelayMs = REFRESH_RETRY_INITIAL_MS;
 let lastObservedScrapedAt = null;
 let dashboardData = null;
 let dashboardHistory = null;
+let dashboardHistoryPoints = null;
 let historyFailure = null;
+let historyFailureKey = null;
 let mainFailure = null;
 let dashboardSource = null;
 
@@ -42,6 +44,26 @@ function validPct(value) {
 
 function displayText(value, fallback = '-', maxLength = 200) {
   return typeof value === 'string' && value.length <= maxLength ? value : fallback;
+}
+
+function setElementAttribute(element, name, value) {
+  if (!element) return;
+  if (typeof element.setAttribute === 'function') element.setAttribute(name, String(value));
+  else element[name] = String(value);
+}
+
+function removeElementAttribute(element, name) {
+  if (!element) return;
+  if (typeof element.removeAttribute === 'function') element.removeAttribute(name);
+  else delete element[name];
+}
+
+function formatPercent(value) {
+  const pct = validPct(value);
+  if (pct === null) return t('notAvailable');
+  return `${new Intl.NumberFormat(currentLocale(), {
+    maximumFractionDigits: 1,
+  }).format(pct)}%`;
 }
 
 function normalizedSampleIntervalSeconds(rawValue) {
@@ -298,8 +320,8 @@ function renderWeeklyPaceDelta(data) {
   element.classList.remove('ahead', 'behind');
 
   if (actual === null || ideal === null) {
-    element.textContent = '--';
-    element.title = t('weeklyPaceUnavailable');
+    element.textContent = t('weeklyPaceUnavailable');
+    element.title = '';
     return;
   }
 
@@ -310,19 +332,37 @@ function renderWeeklyPaceDelta(data) {
     : null;
   const direction = pointDifference === 0 ? t('onPace') : pointDifference > 0 ? t('above') : t('below');
   const sign = pointDifference > 0 ? '+' : '';
-  const relativeLabel = relativeDifference === null ? '' : ` / ${relativeDifference.toFixed(1)}% ${direction}`;
-
-  element.textContent = `${sign}${pointDifference.toFixed(1)} ${t('points')}${relativeLabel}`;
-  element.title = `${t('actualRemaining')}: ${actual.toFixed(1)}% / ${t('idealRemaining')}: ${ideal.toFixed(1)}%`;
+  element.textContent = relativeDifference === null
+    ? t('paceDeltaPoints', { sign, value: pointDifference.toFixed(1), direction })
+    : t('paceDelta', {
+      sign,
+      value: pointDifference.toFixed(1),
+      relative: relativeDifference.toFixed(1),
+      direction,
+    });
+  element.title = '';
   element.classList.add(pointDifference >= 0 ? 'ahead' : 'behind');
 }
 
-function setBar(barId, pctId, pct) {
+function setBar(barId, pctId, pct, labelKey = null, unavailableValue = t('notAvailable')) {
   const safePct = validPct(pct);
   const bar = document.getElementById(barId);
   const value = document.getElementById(pctId);
-  bar.value = safePct ?? 0;
-  value.textContent = safePct === null ? '--' : `${safePct}%`;
+  const accessibleLabelKey = labelKey || (barId === 'five-h-bar' ? 'fiveHourQuotaLabel' : 'weeklyQuotaLabel');
+  if (safePct === null) {
+    removeElementAttribute(bar, 'value');
+  } else {
+    setElementAttribute(bar, 'value', safePct);
+    bar.value = safePct;
+  }
+  setElementAttribute(bar, 'aria-label', t(accessibleLabelKey));
+  setElementAttribute(bar, 'aria-valuetext', safePct === null
+    ? t('quotaUnavailable')
+    : t('quotaRemaining', { value: formatPercent(safePct) }));
+  if (safePct === null) removeElementAttribute(bar, 'aria-valuenow');
+  else setElementAttribute(bar, 'aria-valuenow', safePct);
+  value.textContent = safePct === null ? unavailableValue : formatPercent(safePct);
+  bar.classList.toggle('unavailable', barId === 'five-h-bar' && safePct === null);
   value.classList.toggle('unavailable', safePct === null);
 }
 
@@ -379,17 +419,33 @@ function setHistoryError(message = '') {
   element.hidden = !message;
 }
 
+function setHistoryState(state) {
+  document.body.dataset.historyState = state;
+}
+
+function setHistoryCanvasVisible(visible) {
+  const canvas = document.getElementById('history-chart');
+  canvas.hidden = !visible;
+  removeElementAttribute(canvas, 'aria-describedby');
+}
+
 function destroyChart(title = t('historyUnavailable')) {
-  if (chart) {
-    chart.destroy();
-    chart = null;
+  const chartToDestroy = chart;
+  chart = null;
+  if (chartToDestroy) {
+    try {
+      chartToDestroy.destroy();
+    } catch (_error) {
+      // Chart.js cleanup is best effort; accessible fallbacks must still render.
+    }
   }
   document.getElementById('history-label').textContent = title;
+  setHistoryCanvasVisible(false);
 }
 
 function normalizeHistory(history) {
-  if (!Array.isArray(history)) throw new Error(t('invalidHistory'));
-  if (history.length === 0) throw new Error(t('historyEmpty'));
+  if (!Array.isArray(history)) throw historyError('invalidHistory');
+  if (history.length === 0) throw historyError('historyEmpty');
 
   const byTimestamp = new Map();
   for (const item of history) {
@@ -412,8 +468,14 @@ function normalizeHistory(history) {
   }
 
   const points = [...byTimestamp.values()].sort((a, b) => a.timestamp - b.timestamp);
-  if (points.length === 0) throw new Error(t('historyNoValidSamples'));
+  if (points.length === 0) throw historyError('historyNoValidSamples');
   return points;
+}
+
+function historyError(key) {
+  const error = new Error(t(key));
+  error.historyKey = key;
+  return error;
 }
 
 function historyTitle(points) {
@@ -504,29 +566,41 @@ function chartTimeBounds(points) {
 }
 
 function renderHistory(history) {
+  dashboardHistory = null;
+  dashboardHistoryPoints = null;
   const points = normalizeHistory(history);
   dashboardHistory = history;
+  dashboardHistoryPoints = points;
   historyFailure = null;
+  historyFailureKey = null;
   const datasets = chartDatasets(points);
   const timeBounds = chartTimeBounds(points);
   document.getElementById('history-label').textContent = historyTitle(points);
+  setHistoryState('valid');
 
   if (chart) {
-    const xScale = chart.options.scales.x;
-    if (timeBounds) {
-      xScale.min = timeBounds.min;
-      xScale.max = timeBounds.max;
-    } else {
-      delete xScale.min;
-      delete xScale.max;
+    try {
+      const xScale = chart.options.scales.x;
+      if (timeBounds) {
+        xScale.min = timeBounds.min;
+        xScale.max = timeBounds.max;
+      } else {
+        delete xScale.min;
+        delete xScale.max;
+      }
+      chart.data.datasets = datasets;
+      chart.update('none');
+    } catch (error) {
+      const chartError = historyError('chartFailed');
+      chartError.cause = error;
+      throw chartError;
     }
-    chart.data.datasets = datasets;
-    chart.update('none');
     setHistoryError();
+    setHistoryCanvasVisible(true);
     return;
   }
 
-  if (typeof Chart !== 'function') throw new Error(t('chartFailed'));
+  if (typeof Chart !== 'function') throw historyError('chartFailed');
   const context = document.getElementById('history-chart').getContext('2d');
   let options = {
     responsive: true,
@@ -565,18 +639,37 @@ function renderHistory(history) {
       formatValue: value => `${new Intl.NumberFormat(currentLocale(), { maximumFractionDigits: 1 }).format(value)}%`,
     });
   }
-  chart = new Chart(context, {
-    type: 'line',
-    data: { datasets },
-    options,
-  });
+  try {
+    chart = new Chart(context, {
+      type: 'line',
+      data: { datasets },
+      options,
+    });
+  } catch (error) {
+    chart = null;
+    const chartError = historyError('chartFailed');
+    chartError.cause = error;
+    throw chartError;
+  }
   setHistoryError();
+  setHistoryCanvasVisible(true);
 }
 
-function renderHistoryFailure(message) {
+function renderHistoryFailure(message, key = null, { preserveValidHistory = false } = {}) {
   historyFailure = message;
-  dashboardHistory = null;
-  destroyChart();
+  historyFailureKey = key;
+  const hasValidHistory = preserveValidHistory
+    && Array.isArray(dashboardHistoryPoints)
+    && dashboardHistoryPoints.length > 0;
+  if (hasValidHistory) {
+    setHistoryState('chart-unavailable');
+    destroyChart(historyTitle(dashboardHistoryPoints));
+  } else {
+    dashboardHistory = null;
+    dashboardHistoryPoints = null;
+    setHistoryState('unavailable');
+    destroyChart();
+  }
   setHistoryError(message);
 }
 
@@ -586,8 +679,8 @@ function renderData(data, { schedule = true, clearError = true } = {}) {
   }
   classifySnapshotFreshness(data);
   dashboardData = data;
-  setBar('five-h-bar', 'five-h-pct', data.five_h_pct);
-  setBar('weekly-bar', 'weekly-pct', data.weekly_pct);
+  setBar('five-h-bar', 'five-h-pct', data.five_h_pct, 'fiveHourQuotaLabel', '--');
+  setBar('weekly-bar', 'weekly-pct', data.weekly_pct, 'weeklyQuotaLabel');
   renderForecast(data);
   document.getElementById('five-h-reset').textContent = formatParisUnixTimestamp(data.five_h_reset_at);
   document.getElementById('weekly-reset').textContent = formatParisUnixTimestamp(data.weekly_reset_at);
@@ -602,7 +695,11 @@ function renderData(data, { schedule = true, clearError = true } = {}) {
 
 async function fetchJson(url, missingMessage) {
   const response = await fetch(`${url}?_=${Date.now()}`);
-  if (!response.ok) throw new Error(response.status === 404 ? missingMessage : `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(response.status === 404 ? missingMessage : `HTTP ${response.status}`);
+    if (response.status === 404 && missingMessage === t('historyNotFound')) error.historyKey = 'historyNotFound';
+    return Promise.reject(error);
+  }
   return response.json();
 }
 
@@ -615,7 +712,11 @@ async function fetchLocal() {
   try {
     renderHistory(await fetchJson('history.json', t('historyNotFound')));
   } catch (error) {
-    renderHistoryFailure(error instanceof Error ? error.message : t('unableToLoadHistory'));
+    renderHistoryFailure(
+      error instanceof Error ? error.message : t('unableToLoadHistory'),
+      error instanceof Error ? error.historyKey || null : null,
+      { preserveValidHistory: error instanceof Error && error.historyKey === 'chartFailed' },
+    );
   }
 }
 
@@ -632,10 +733,14 @@ async function fetchGist() {
 
   try {
     const historyContent = gist?.files?.['history.json']?.content;
-    if (!historyContent) throw new Error(t('gistHistoryNotFound'));
+    if (!historyContent) throw historyError('gistHistoryNotFound');
     renderHistory(JSON.parse(historyContent));
   } catch (error) {
-    renderHistoryFailure(error instanceof Error ? error.message : t('unableToLoadHistory'));
+    renderHistoryFailure(
+      error instanceof Error ? error.message : t('unableToLoadHistory'),
+      error instanceof Error ? error.historyKey || null : null,
+      { preserveValidHistory: error instanceof Error && error.historyKey === 'chartFailed' },
+    );
   }
 }
 
@@ -654,14 +759,20 @@ function refreshLocalizedDashboard() {
   if (dashboardData) renderData(dashboardData, { schedule: false, clearError: false });
   else renderFreshness();
   if (mainFailure) setMainError(mainFailure);
-  if (dashboardHistory) {
+  if (dashboardHistory && dashboardHistoryPoints) {
     try {
       renderHistory(dashboardHistory);
     } catch (error) {
-      renderHistoryFailure(error instanceof Error ? error.message : t('unableToLoadHistory'));
+      renderHistoryFailure(
+        error instanceof Error ? error.message : t('unableToLoadHistory'),
+        error instanceof Error ? error.historyKey || null : null,
+        { preserveValidHistory: true },
+      );
     }
   } else if (historyFailure) {
-    setHistoryError(historyFailure);
+    const localizedFailure = historyFailureKey ? t(historyFailureKey) : historyFailure;
+    destroyChart(t('historyUnavailable'));
+    setHistoryError(localizedFailure);
   }
 }
 

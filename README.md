@@ -17,6 +17,8 @@ reset probabilities from the independent Codex Forecast service.
 - Current remaining quota for the active 5-hour and weekly windows.
 - Reset dates and weekly pace compared with ideal consumption.
 - Rolling history chart generated from local quota and Forecast snapshots.
+- Accessible quota gauges expose localized names and value text for the 5-hour
+  and weekly remaining windows.
 - Mouse and touch exploration by nearest time slice, with a vertical cursor and
   one tooltip for every visible quota series at that time.
 - Automatic refresh based on the monitor collection interval.
@@ -180,6 +182,43 @@ stale, time past the expected update threshold. A valid fetch clears a refresh
 error; only a sufficiently recent snapshot clears the stale state. This
 browser-side check needs no Analytics API or additional endpoint; in external
 mode it can therefore also identify an interrupted Gist publication.
+
+## Reproducible quality checks
+
+The CI runtime versions are pinned in `.python-version` (Python 3.12.8) and
+`.node-version` (Node.js 22.14.0). The application still supports Python 3.9
+and newer; the pinned Python version only makes CI results reproducible. The
+coverage tool is a CI/development dependency in `requirements-ci.txt` and is
+not used at runtime.
+
+From the repository root, run the same quality controls locally:
+
+```bash
+python3 -m pip install --requirement requirements-ci.txt
+python3 -m compileall -q local tests
+python3 -m unittest tests.test_migrations
+python3 -m coverage run --branch --rcfile=.coveragerc -m unittest \
+  tests.test_alerts tests.test_anomalies tests.test_history tests.test_config \
+  tests.test_storage_durability
+python3 -m coverage report --rcfile=.coveragerc
+tests/run.sh
+npm ci
+npm audit --audit-level=low
+npx playwright install --with-deps chromium
+npm run test:browser
+shellcheck -x local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
+```
+
+Coverage enables branch measurement for the exercised Python modules and fails
+below the combined 60% line-and-branch threshold. The threshold is deliberately
+below the current measured baseline (66%) so it blocks regressions without
+pretending that unexercised browser-facing subprocess paths are covered.
+`npm audit --audit-level=low` is also blocking: every vulnerability reported at
+low severity or above fails the CI job, while `package-lock.json` remains the
+reproducible installation source. Migration tests cover fresh archives,
+supported v1–v3 archives upgrading to v4, data/integrity preservation, and
+rejection of future or partial schemas. `systemd-analyze verify` is deferred
+until the real packaged units planned for P2.16 exist.
 
 ## Freshness and availability states
 
