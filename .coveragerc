@@ -1,0 +1,12 @@
+[run]
+branch = True
+source = local
+omit =
+    local/analytics.py
+    local/archive.py
+    local/token_usage.py
+
+[report]
+fail_under = 60
+precision = 0
+show_missing = True

@@ -26,30 +26,6 @@ jusqu'à la stabilisation du socle.
 | M | Entre deux et quatre jours |
 | L | Une semaine ou plus |
 
-## P1 - Robustesse et qualité
-
-### 12. Compléter les contrôles de qualité de la CI
-
-La CI exécute déjà les tests shell, Python, HTTP et navigateur ainsi que
-ShellCheck. Les contrôles de distribution et de couverture restent à ajouter.
-
-**Actions :**
-
-- Fixer explicitement les versions de Python et Node utilisées par la CI.
-- Compiler les modules Python avant les tests.
-- Mesurer la couverture utile des modules Python.
-- Auditer les dépendances npm et les migrations.
-- Ajouter une vérification `systemd-analyze verify` lorsque les unités systemd
-  seront disponibles.
-
-**Critères de validation :**
-
-- Chaque pull request exécute les contrôles avec des versions reproductibles.
-- Une erreur de syntaxe Python, une migration cassée ou une vulnérabilité de
-  dépendance détectable fait échouer la CI.
-
-**Effort : S à M**
-
 ## P2 - Expérience utilisateur et maintenance
 
 ### 16. Préparer le packaging et les releases
@@ -104,10 +80,9 @@ retirées de cette liste car elles sont déjà implémentées.
 
 1. Ajouter la détection des données périmées au dashboard principal.
 2. Détecter les anomalies de quota.
-3. Renforcer la CI.
-4. Préparer les releases et le packaging.
-5. Réduire progressivement le script monolithique.
-6. Ajouter les évolutions P3 selon les besoins utilisateurs.
+3. Préparer les releases et le packaging.
+4. Réduire progressivement le script monolithique.
+5. Ajouter les évolutions P3 selon les besoins utilisateurs.
 
 ## Définition globale de terminé
 

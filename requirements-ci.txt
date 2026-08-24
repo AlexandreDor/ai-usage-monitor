@@ -1,0 +1,2 @@
+# Development-only quality tooling. Runtime code uses Python's standard library.
+coverage==7.6.10
