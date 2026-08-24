@@ -12,17 +12,41 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python 3.12.8
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - name: Set up Node.js 22.14.0
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - name: Install quality dependencies
+        run: python -m pip install --requirement requirements-ci.txt
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install --yes shellcheck
-      - name: Check Bash syntax
-        run: bash -n local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
-      - name: Run tests
-        run: tests/run.sh
       - name: Install browser test dependencies
         run: npm ci
+      - name: Check Bash syntax
+        run: bash -n local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
+      - name: Compile Python modules
+        run: python -m compileall -q local tests
+      - name: Verify SQLite migrations
+        run: python -m unittest tests.test_migrations
+      - name: Run Python tests with branch coverage
+        run: >-
+          python -m coverage run --branch --rcfile=.coveragerc -m unittest
+          tests.test_alerts tests.test_anomalies tests.test_history tests.test_config
+          tests.test_storage_durability
+      - name: Enforce Python coverage threshold
+        run: python -m coverage report --rcfile=.coveragerc
+      - name: Run shell and functional tests
+        run: SKIP_PYTHON_TESTS=1 tests/run.sh
       - name: Install Chromium
         run: npx playwright install --with-deps chromium
       - name: Run browser tests
         run: npm run test:browser
+      - name: Audit npm dependencies (all vulnerability levels)
+        run: npm audit --audit-level=low
       - name: Run ShellCheck
         run: shellcheck -x local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
