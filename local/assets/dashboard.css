@@ -319,6 +319,14 @@ body[data-freshness="stale"] .limit-card {
   background: var(--surface2);
 }
 
+.bar.unavailable::-webkit-progress-value {
+  background: transparent;
+}
+
+.bar.unavailable::-moz-progress-bar {
+  background: transparent;
+}
+
 .bar::-webkit-progress-bar {
   background: var(--surface2);
   border-radius: 999px;

@@ -34,6 +34,10 @@ if (defaults.CodexPreferences.t('dashboard.globalResetForecast') !== 'Global res
 if (defaults.CodexPreferences.t('dashboard.stale') !== 'STALE') fail('dashboard freshness translation is missing');
 if (defaults.CodexPreferences.t('dashboard.dataAge', { age: '1 min' }) !== '1 min') fail('dashboard freshness duration contains an extra label');
 if (defaults.CodexPreferences.t('dashboard.staleDataAge', { age: '5 min', overdue: '1 min' }).includes('—')) fail('dashboard stale summary contains an em dash');
+const paceDelta = defaults.CodexPreferences.t('dashboard.paceDelta', { sign: '+', value: '1.0', relative: '2.5', direction: 'above' });
+const paceDeltaPoints = defaults.CodexPreferences.t('dashboard.paceDeltaPoints', { sign: '+', value: '1.0', direction: 'above' });
+if (paceDelta !== '+1.0 pts / 2.5% above' || paceDelta.includes(';')) fail('English pace delta separator is incorrect');
+if (paceDeltaPoints !== '+1.0 pts / above' || paceDeltaPoints.includes(';')) fail('English points-only pace delta separator is incorrect');
 if (defaults.CodexPreferences.t('analytics.granularityUnknown') !== '-') fail('analytics missing-value placeholder is incorrect');
 if (defaults.CodexPreferences.formatCurrency('invalid') !== '-') fail('invalid currency placeholder is incorrect');
 if (!defaults.CodexPreferences.t('dashboard.refreshFailedWithData', { message: 'HTTP 503' }).includes('last valid data')) fail('dashboard refresh error translation is missing');
@@ -52,6 +56,10 @@ if (defaults.CodexPreferences.t('dashboard.forecastUnavailable') !== 'Prévision
 if (defaults.CodexPreferences.t('dashboard.stale') !== 'PÉRIMÉ') fail('French dashboard freshness translation is missing');
 if (defaults.CodexPreferences.t('dashboard.dataAge', { age: '1 min' }) !== '1 min') fail('French dashboard freshness duration contains an extra label');
 if (!defaults.CodexPreferences.t('dashboard.staleDataAge', { age: '5 min', overdue: '1 min' }).includes('retard')) fail('French dashboard stale summary translation is missing');
+const frenchPaceDelta = defaults.CodexPreferences.t('dashboard.paceDelta', { sign: '+', value: '1,0', relative: '2,5', direction: 'au-dessus' });
+const frenchPaceDeltaPoints = defaults.CodexPreferences.t('dashboard.paceDeltaPoints', { sign: '+', value: '1,0', direction: 'au-dessus' });
+if (frenchPaceDelta !== '+1,0 pts / 2,5 % au-dessus' || frenchPaceDelta.includes(';')) fail('French pace delta separator is incorrect');
+if (frenchPaceDeltaPoints !== '+1,0 pts / au-dessus' || frenchPaceDeltaPoints.includes(';')) fail('French points-only pace delta separator is incorrect');
 if (defaults.CodexPreferences.t('analytics.randomResets') !== 'Réinitialisations aléatoires') fail('French random reset translation is missing');
 if (!defaults.CodexPreferences.t('analytics.randomResetImpact', { gained: '1 pt', lost: '2 pts' }).includes('rythme idéal')) fail('French random reset impact does not mention ideal pace');
 if (defaults.CodexPreferences.t('analytics.freshness') !== 'Fraîcheur') fail('French analytics freshness translation is missing');
