@@ -67,7 +67,7 @@
     <section class="card limit-card" aria-labelledby="five-hour-title">
       <h2 class="card-label" id="five-hour-title" data-i18n="dashboard.fiveHourLimit">5-Hour Limit</h2>
       <div class="pct-value unavailable" id="five-h-pct">--</div>
-      <progress class="bar" id="five-h-bar" max="100" data-i18n-aria-label="dashboard.fiveHourQuotaLabel" data-i18n-aria-valuetext="dashboard.quotaUnavailable" aria-label="5-hour remaining quota" aria-valuetext="Unavailable"></progress>
+      <progress class="bar unavailable" id="five-h-bar" max="100" data-i18n-aria-label="dashboard.fiveHourQuotaLabel" data-i18n-aria-valuetext="dashboard.quotaUnavailable" aria-label="5-hour remaining quota" aria-valuetext="Unavailable"></progress>
       <div class="reset-info"><span data-i18n="dashboard.resetsAt">Resets at</span> <span id="five-h-reset">-</span></div>
     </section>
     <section class="card limit-card" aria-labelledby="weekly-title">
@@ -77,37 +77,13 @@
       <div class="reset-info"><span data-i18n="dashboard.resets">Resets</span> <span id="weekly-reset">-</span></div>
       <div class="pace-indicator">
         <div class="pace-label" data-i18n="dashboard.paceVsIdeal">Pace vs ideal</div>
-        <div class="pace-values" aria-live="polite" aria-atomic="true">
-          <div id="weekly-pace-actual" data-i18n="dashboard.paceActualUnavailable">Actual remaining: Unavailable</div>
-          <div id="weekly-pace-ideal" data-i18n="dashboard.paceIdealUnavailable">Ideal remaining: Unavailable</div>
-        </div>
         <div class="pace-value" id="weekly-pace-delta" data-i18n="dashboard.weeklyPaceUnavailable" aria-live="polite" aria-atomic="true">Unavailable</div>
       </div>
     </section>
     <section class="card full history-card" aria-labelledby="history-label">
       <h2 class="card-label history-label" id="history-label" data-i18n="dashboard.history">History</h2>
       <div id="history-error" class="history-error" role="alert" hidden></div>
-      <canvas id="history-chart" class="time-slice-chart" role="img" aria-labelledby="history-label" aria-describedby="history-summary history-table-caption"></canvas>
-      <div id="history-summary" class="history-summary" data-i18n="dashboard.historyUnavailable" role="status" aria-live="polite" aria-atomic="true">History unavailable</div>
-      <details id="history-details" class="history-details">
-        <summary data-i18n="dashboard.showHistoryTable">Show history data table</summary>
-        <div class="history-table-wrapper">
-          <table id="history-table">
-            <caption id="history-table-caption" data-i18n="dashboard.historyTableCaption">Quota and forecast history</caption>
-            <thead>
-              <tr>
-                <th scope="col" data-i18n="dashboard.historyDate">Date</th>
-                <th scope="col" data-i18n="dashboard.historyFiveHour">5-hour remaining</th>
-                <th scope="col" data-i18n="dashboard.historyWeekly">Weekly remaining</th>
-                <th scope="col" data-i18n="dashboard.historyIdeal">Ideal weekly remaining</th>
-                <th scope="col" data-i18n="dashboard.historyForecast24h">Forecast 24h</th>
-                <th scope="col" data-i18n="dashboard.historyForecast6h">Forecast 6h</th>
-              </tr>
-            </thead>
-            <tbody id="history-table-body"></tbody>
-          </table>
-        </div>
-      </details>
+      <canvas id="history-chart" class="time-slice-chart" role="img" aria-labelledby="history-label"></canvas>
     </section>
   </main>
 

@@ -32,7 +32,6 @@ if (defaults.CodexPreferences.formatRate() !== '0.86') fail('conversion rate for
 if (defaults.CodexPreferences.t('analytics.showCost') !== 'Show cost') fail('analytics cost toggle translation is missing');
 if (defaults.CodexPreferences.t('dashboard.globalResetForecast') !== 'Global reset forecast') fail('dashboard forecast translation is missing');
 if (defaults.CodexPreferences.t('dashboard.stale') !== 'STALE') fail('dashboard freshness translation is missing');
-if (!defaults.CodexPreferences.t('dashboard.historySummarySingle', { from: '01/08/2026', to: '01/08/2026', fiveHour: '5-hour remaining: 80%', weekly: 'Weekly remaining: 60%', ideal: 'Ideal weekly remaining: 70%', forecast24h: 'Forecast 24h: 50%', forecast6h: 'Forecast 6h: 20%' }).startsWith('1 sample ')) fail('singular history summary translation is missing');
 if (defaults.CodexPreferences.t('dashboard.dataAge', { age: '1 min' }) !== '1 min') fail('dashboard freshness duration contains an extra label');
 if (defaults.CodexPreferences.t('dashboard.staleDataAge', { age: '5 min', overdue: '1 min' }).includes('—')) fail('dashboard stale summary contains an em dash');
 if (defaults.CodexPreferences.t('analytics.granularityUnknown') !== '-') fail('analytics missing-value placeholder is incorrect');
@@ -51,7 +50,6 @@ if (defaults.CodexPreferences.get().language !== 'fr') fail('language preference
 if (defaults.CodexPreferences.t('analytics.showCost') !== 'Afficher le coût') fail('French analytics cost toggle translation is missing');
 if (defaults.CodexPreferences.t('dashboard.forecastUnavailable') !== 'Prévision indisponible') fail('French dashboard forecast translation is missing');
 if (defaults.CodexPreferences.t('dashboard.stale') !== 'PÉRIMÉ') fail('French dashboard freshness translation is missing');
-if (!defaults.CodexPreferences.t('dashboard.historySummarySingle', { from: '01/08/2026', to: '01/08/2026', fiveHour: 'Restant sur 5 heures : 80 %', weekly: 'Restant hebdomadaire : 60 %', ideal: 'Restant hebdomadaire idéal : 70 %', forecast24h: 'Prévision 24 h : 50 %', forecast6h: 'Prévision 6 h : 20 %' }).startsWith('1 échantillon ')) fail('French singular history summary translation is missing');
 if (defaults.CodexPreferences.t('dashboard.dataAge', { age: '1 min' }) !== '1 min') fail('French dashboard freshness duration contains an extra label');
 if (!defaults.CodexPreferences.t('dashboard.staleDataAge', { age: '5 min', overdue: '1 min' }).includes('retard')) fail('French dashboard stale summary translation is missing');
 if (defaults.CodexPreferences.t('analytics.randomResets') !== 'Réinitialisations aléatoires') fail('French random reset translation is missing');

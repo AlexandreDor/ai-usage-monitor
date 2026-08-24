@@ -315,14 +315,9 @@ function idealWeeklyRemaining(sampledAt, resetTimestamp) {
 
 function renderWeeklyPaceDelta(data) {
   const element = document.getElementById('weekly-pace-delta');
-  const actualElement = document.getElementById('weekly-pace-actual');
-  const idealElement = document.getElementById('weekly-pace-ideal');
   const actual = validPct(data.weekly_pct);
   const ideal = idealWeeklyRemaining(data.scraped_at, data.weekly_reset_at);
   element.classList.remove('ahead', 'behind');
-
-  actualElement.textContent = t('paceActual', { value: formatPercent(actual) });
-  idealElement.textContent = t('paceIdeal', { value: formatPercent(ideal) });
 
   if (actual === null || ideal === null) {
     element.textContent = t('weeklyPaceUnavailable');
@@ -349,7 +344,7 @@ function renderWeeklyPaceDelta(data) {
   element.classList.add(pointDifference >= 0 ? 'ahead' : 'behind');
 }
 
-function setBar(barId, pctId, pct, labelKey = null) {
+function setBar(barId, pctId, pct, labelKey = null, unavailableValue = t('notAvailable')) {
   const safePct = validPct(pct);
   const bar = document.getElementById(barId);
   const value = document.getElementById(pctId);
@@ -366,7 +361,8 @@ function setBar(barId, pctId, pct, labelKey = null) {
     : t('quotaRemaining', { value: formatPercent(safePct) }));
   if (safePct === null) removeElementAttribute(bar, 'aria-valuenow');
   else setElementAttribute(bar, 'aria-valuenow', safePct);
-  value.textContent = safePct === null ? t('notAvailable') : formatPercent(safePct);
+  value.textContent = safePct === null ? unavailableValue : formatPercent(safePct);
+  bar.classList.toggle('unavailable', barId === 'five-h-bar' && safePct === null);
   value.classList.toggle('unavailable', safePct === null);
 }
 
@@ -430,9 +426,7 @@ function setHistoryState(state) {
 function setHistoryCanvasVisible(visible) {
   const canvas = document.getElementById('history-chart');
   canvas.hidden = !visible;
-  if (visible) {
-    setElementAttribute(canvas, 'aria-describedby', 'history-summary history-table-caption');
-  }
+  removeElementAttribute(canvas, 'aria-describedby');
 }
 
 function destroyChart(title = t('historyUnavailable')) {
@@ -490,51 +484,6 @@ function historyTitle(points) {
   return points.length === 1
     ? t('historyTitleSingle', { start })
     : t('historyTitleRange', { start, end });
-}
-
-function historyPointValue(value) {
-  return value === null || value === undefined ? t('notAvailable') : formatPercent(value);
-}
-
-function renderHistoryAlternatives(points) {
-  const summary = document.getElementById('history-summary');
-  const tableBody = document.getElementById('history-table-body');
-  if (!points || points.length === 0) {
-    summary.textContent = t('historyUnavailable');
-    tableBody.innerHTML = '';
-    return;
-  }
-
-  const latest = points[points.length - 1];
-  const latestIdeal = idealWeeklyRemaining(latest.timestamp, latest.weeklyReset);
-  const summaryKey = points.length === 1 ? 'historySummarySingle' : 'historySummaryMany';
-  summary.textContent = t(summaryKey, {
-    samples: points.length,
-    from: formatParisDateTime(points[0].timestamp),
-    to: formatParisDateTime(latest.timestamp),
-    fiveHour: `${t('historyFiveHour')}: ${historyPointValue(latest.fiveHour)}`,
-    weekly: `${t('historyWeekly')}: ${historyPointValue(latest.weekly)}`,
-    ideal: `${t('historyIdeal')}: ${historyPointValue(latestIdeal)}`,
-    forecast24h: `${t('historyForecast24h')}: ${historyPointValue(latest.forecast24h)}`,
-    forecast6h: `${t('historyForecast6h')}: ${historyPointValue(latest.forecast6h)}`,
-  });
-
-  tableBody.innerHTML = points.map(point => {
-    const ideal = idealWeeklyRemaining(point.timestamp, point.weeklyReset);
-    return `<tr><th scope="row">${formatParisDateTime(point.timestamp)}</th>`
-      + `<td>${historyPointValue(point.fiveHour)}</td>`
-      + `<td>${historyPointValue(point.weekly)}</td>`
-      + `<td>${historyPointValue(ideal)}</td>`
-      + `<td>${historyPointValue(point.forecast24h)}</td>`
-      + `<td>${historyPointValue(point.forecast6h)}</td></tr>`;
-  }).join('');
-}
-
-function renderHistoryUnavailable(message) {
-  document.getElementById('history-summary').textContent = t('historyUnavailableWithReason', {
-    reason: displayText(message, t('unableToLoadHistory')),
-  });
-  document.getElementById('history-table-body').innerHTML = '';
 }
 
 function chartDatasets(points) {
@@ -627,7 +576,6 @@ function renderHistory(history) {
   const datasets = chartDatasets(points);
   const timeBounds = chartTimeBounds(points);
   document.getElementById('history-label').textContent = historyTitle(points);
-  renderHistoryAlternatives(points);
   setHistoryState('valid');
 
   if (chart) {
@@ -721,7 +669,6 @@ function renderHistoryFailure(message, key = null, { preserveValidHistory = fals
     dashboardHistoryPoints = null;
     setHistoryState('unavailable');
     destroyChart();
-    renderHistoryUnavailable(message);
   }
   setHistoryError(message);
 }
@@ -732,7 +679,7 @@ function renderData(data, { schedule = true, clearError = true } = {}) {
   }
   classifySnapshotFreshness(data);
   dashboardData = data;
-  setBar('five-h-bar', 'five-h-pct', data.five_h_pct, 'fiveHourQuotaLabel');
+  setBar('five-h-bar', 'five-h-pct', data.five_h_pct, 'fiveHourQuotaLabel', '--');
   setBar('weekly-bar', 'weekly-pct', data.weekly_pct, 'weeklyQuotaLabel');
   renderForecast(data);
   document.getElementById('five-h-reset').textContent = formatParisUnixTimestamp(data.five_h_reset_at);
@@ -825,7 +772,6 @@ function refreshLocalizedDashboard() {
   } else if (historyFailure) {
     const localizedFailure = historyFailureKey ? t(historyFailureKey) : historyFailure;
     destroyChart(t('historyUnavailable'));
-    renderHistoryUnavailable(localizedFailure);
     setHistoryError(localizedFailure);
   }
 }
