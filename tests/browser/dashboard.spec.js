@@ -313,7 +313,10 @@ test('shows the weekly pace delta and direction as text', async ({ page }) => {
   await page.route('**/history.json?*', route => route.fulfill({ json: [accessibleSnapshot] }));
   await page.goto('/dashboard.html');
 
-  await expect(page.locator('#weekly-pace-delta')).toContainText('below');
+  const paceDelta = page.locator('#weekly-pace-delta');
+  await expect(paceDelta).toContainText('below');
+  await expect(paceDelta).toContainText(' / ');
+  await expect(paceDelta).not.toContainText(';');
   await expect(page.locator('#weekly-pace-delta')).toHaveAttribute('title', '');
   await expect(page.locator('body')).not.toContainText('—');
 });
