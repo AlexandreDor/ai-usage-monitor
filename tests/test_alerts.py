@@ -122,11 +122,12 @@ class AlertJournalTests(unittest.TestCase):
         alerts.register(self.document, request())
         alerts.atomic_write(self.path, self.document)
         self.assertEqual(0o600, stat.S_IMODE(self.path.stat().st_mode))
-        self.assertEqual(1, alerts.load(self.path)["schema_version"])
+        self.assertEqual(2, alerts.load(self.path)["schema_version"])
+        self.assertEqual(1, alerts.load(self.path)["limit_id_contract_version"])
 
     def test_future_and_oversized_journals_fail_closed(self):
         future = alerts.empty_journal(4, 1)
-        future["schema_version"] = 2
+        future["schema_version"] = 3
         self.path.write_text(json.dumps(future), encoding="utf-8")
         with self.assertRaises(alerts.JournalError):
             alerts.load(self.path)
@@ -134,6 +135,74 @@ class AlertJournalTests(unittest.TestCase):
             handle.truncate(alerts.MAX_BYTES + 1)
         with self.assertRaises(alerts.JournalError):
             alerts.load(self.path)
+
+    def test_legacy_journal_migration_hashes_ids_and_rewrites_replacements(self):
+        first = alerts.register(self.document, request("50"))
+        second = alerts.register(self.document, request("25", created=101))
+        legacy = json.loads(json.dumps(self.document))
+        legacy.pop("limit_id_contract_version")
+        legacy["schema_version"] = 1
+        old_ids = {}
+        raw_limit_id = "default"
+        for item in legacy["alerts"]:
+            old_cycle = item["cycle_key"].replace(
+                f"limit:{alerts.opaque_limit_id_from_raw(raw_limit_id)}",
+                f"limit:{raw_limit_id}",
+            )
+            item["event_data"]["limit_id"] = raw_limit_id
+            item["cycle_key"] = old_cycle
+            old_id = alerts.alert_id(
+                item["kind"], item["window"], item["selector"], old_cycle, "alert-v1"
+            )
+            old_ids[item["alert_id"]] = old_id
+            item["alert_id"] = old_id
+        for item in legacy["alerts"]:
+            if item["replacement_alert_id"] is not None:
+                item["replacement_alert_id"] = old_ids[item["replacement_alert_id"]]
+
+        migrated = alerts.migrate_document(legacy, 999)
+        expected_limit_id = alerts.opaque_limit_id_from_raw(raw_limit_id)
+        self.assertEqual(2, migrated["schema_version"])
+        self.assertEqual(1, migrated["limit_id_contract_version"])
+        self.assertEqual(999, migrated["legacy_migration"]["completed_at"])
+        self.assertTrue(all(
+            item["event_data"]["limit_id"] == expected_limit_id
+            for item in migrated["alerts"]
+        ))
+        self.assertTrue(all(
+            f"limit:{expected_limit_id}" in item["cycle_key"]
+            for item in migrated["alerts"]
+        ))
+        migrated_by_selector = {item["selector"]: item for item in migrated["alerts"]}
+        self.assertEqual(
+            migrated_by_selector["25"]["alert_id"],
+            migrated_by_selector["50"]["replacement_alert_id"],
+        )
+        self.assertIs(alerts.migrate_document(migrated, 1000), migrated)
+
+    def test_legacy_digest_shaped_id_is_hashed_and_bad_cycle_fails_explicitly(self):
+        raw_limit_id = "limit-" + "a" * 64
+        item = alerts.register(self.document, request())
+        legacy = json.loads(json.dumps(self.document))
+        legacy.pop("limit_id_contract_version")
+        legacy["schema_version"] = 1
+        legacy_item = legacy["alerts"][0]
+        old_cycle = f"limit:{raw_limit_id}|reset:200"
+        legacy_item["event_data"]["limit_id"] = raw_limit_id
+        legacy_item["cycle_key"] = old_cycle
+        legacy_item["alert_id"] = alerts.alert_id(
+            legacy_item["kind"], legacy_item["window"], legacy_item["selector"], old_cycle, "alert-v1"
+        )
+        migrated = alerts.migrate_document(legacy, 100)
+        self.assertEqual(
+            alerts.opaque_limit_id_from_raw(raw_limit_id),
+            migrated["alerts"][0]["event_data"]["limit_id"],
+        )
+
+        broken = json.loads(json.dumps(legacy))
+        broken["alerts"][0]["cycle_key"] = "limit:other|reset:200"
+        with self.assertRaisesRegex(alerts.JournalError, "cycle key"):
+            alerts.migrate_document(broken, 100)
 
     def test_retry_after_seconds_date_and_backoff(self):
         headers = pathlib.Path(self.directory.name) / "headers"

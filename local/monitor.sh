@@ -1089,11 +1089,126 @@ csv_contains() {
   [[ ",${list}," == *",${wanted},"* ]]
 }
 
+canonicalize_alert_limit_id() {
+  python3 - "$1" <<'PYEOF'
+import hashlib
+import re
+import sys
+
+value = sys.argv[1]
+if re.fullmatch(r"limit-[0-9a-f]{64}", value):
+    print(value)
+else:
+    print("limit-" + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest())
+PYEOF
+}
+
+migrate_alert_state_file() {
+  [[ -f "$STATE_FILE" ]] || return 0
+  python3 - "$STATE_FILE" <<'PYEOF'
+import hashlib
+import os
+import pathlib
+import re
+import stat
+import tempfile
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    raw = path.read_text(encoding="utf-8")
+except (OSError, UnicodeError) as exc:
+    raise SystemExit(f"cannot read alert state: {exc}")
+
+values = {}
+lines = raw.splitlines()
+for line_number, line in enumerate(lines, 1):
+    if not line:
+        continue
+    key, separator, value = line.partition("=")
+    if not separator or not key or key in values:
+        raise SystemExit(f"invalid alert state line {line_number}")
+    values[key] = value
+
+version_text = values.get("state_version", "0")
+if not re.fullmatch(r"[0-9]+", version_text):
+    raise SystemExit("invalid alert state version")
+version = int(version_text)
+if version > 5:
+    raise SystemExit(f"unsupported future alert state version {version}")
+if version < 0:
+    raise SystemExit("invalid alert state version")
+
+marker = values.get("limit_id_contract_version")
+if marker is not None:
+    if marker != "1" or version < 5:
+        raise SystemExit("invalid alert state limit ID contract marker")
+    for key in ("observed_weekly_limit_id", "weekly_armed_limit_id"):
+        value = values.get(key, "")
+        if value and not re.fullmatch(r"limit-[0-9a-f]{64}", value):
+            raise SystemExit(f"marked alert state contains a raw {key}")
+    raise SystemExit(0)
+
+if version not in range(0, 5):
+    raise SystemExit(f"unsupported alert state version {version}")
+
+def opaque(value):
+    if not value:
+        return value
+    return "limit-" + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+
+for key in ("observed_weekly_limit_id", "weekly_armed_limit_id"):
+    if key in values:
+        values[key] = opaque(values[key])
+
+output = ["state_version=5", "limit_id_contract_version=1"]
+for line in lines:
+    if not line:
+        continue
+    key, _, value = line.partition("=")
+    if key in {"state_version", "limit_id_contract_version"}:
+        continue
+    if key in {"observed_weekly_limit_id", "weekly_armed_limit_id"}:
+        value = values[key]
+    output.append(f"{key}={value}")
+encoded = ("\n".join(output) + "\n").encode("utf-8")
+
+try:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, mode or (stat.S_IRUSR | stat.S_IWUSR))
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+except OSError as exc:
+    raise SystemExit(f"cannot atomically migrate alert state: {exc}")
+PYEOF
+}
+
 persist_alert_state() {
   local state_tmp
   state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || return 1
   if ! printf '%s\n' \
-    'state_version=4' \
+    'state_version=5' \
+    'limit_id_contract_version=1' \
     "prev_5h_pct=${prev_5h_pct}" \
     "prev_weekly_pct=${prev_weekly_pct}" \
     "observed_weekly_pct=${observed_weekly_pct}" \
@@ -1391,6 +1506,10 @@ check_thresholds() {
   local weekly_reset_at="$6"
   local scraped_at_epoch="$7"
   local limit_id="${8:-default}"
+  if ! limit_id="$(canonicalize_alert_limit_id "$limit_id")"; then
+    ALERT_PROCESSING_ERROR="invalid alert limit ID"
+    return 1
+  fi
 
   local state_version=1
   local prev_5h_pct=100
@@ -1422,9 +1541,19 @@ check_thresholds() {
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 initialize_script_baseline=0
   local observed_weekly_reset=0 weekly_observation_valid=0 process_weekly_sample=1 state_loaded=0
   local resumed_after_disabled=0 resume_delivery_attempted=0
+  local journal_source_state_version=1 raw_source_state_version
   local -a script_thresholds=()
   ALERT_PROCESSING_ERROR=""
   if [[ -f "$STATE_FILE" ]]; then
+    raw_source_state_version="$(awk -F= '$1 == "state_version" {print $2; exit}' "$STATE_FILE")"
+    if [[ "$raw_source_state_version" =~ ^[0-9]+$ ]]; then
+      journal_source_state_version="$raw_source_state_version"
+    fi
+    if ! migrate_alert_state_file; then
+      echo "[ERROR] Alert state migration failed; alerts are disabled." >&2
+      ALERT_PROCESSING_ERROR="alert state migration failed"
+      return 1
+    fi
     state_loaded=1
     while IFS='=' read -r state_key state_value; do
       case "$state_key" in
@@ -1467,12 +1596,12 @@ check_thresholds() {
     done < "$STATE_FILE"
   fi
 
-  if (( state_version > 4 )); then
+  if (( state_version > 5 )); then
     echo "[ERROR] Unsupported future alert state version ${state_version}; alerts are disabled." >&2
     ALERT_PROCESSING_ERROR="unsupported future alert state version"
     return 1
   fi
-  if (( state_version < 1 || state_version > 4 )); then
+  if (( state_version < 1 || state_version > 5 )); then
     echo "[ERROR] Unsupported alert state version ${state_version}." >&2
     ALERT_PROCESSING_ERROR="invalid alert state version"
     return 1
@@ -1494,12 +1623,13 @@ check_thresholds() {
 
 
   if [[ ! -e "$ALERT_DELIVERIES_FILE" ]]; then
-    if ! initialize_alert_delivery_journal "$state_version" "$scraped_at_epoch" "$limit_id" \
+    if ! initialize_alert_delivery_journal "$journal_source_state_version" "$scraped_at_epoch" "$limit_id" \
       "$five_h_pct" "$weekly_pct" "$five_h_reset" "$weekly_reset"; then
       ALERT_PROCESSING_ERROR="alert journal initialization failed"
       return 1
     fi
-  elif ! python3 "$ALERTS_PY" validate "$ALERT_DELIVERIES_FILE"; then
+  elif ! python3 "$ALERTS_PY" migrate "$ALERT_DELIVERIES_FILE" --at "$scraped_at_epoch" \
+    || ! python3 "$ALERTS_PY" validate "$ALERT_DELIVERIES_FILE"; then
     echo "[ERROR] Alert delivery journal is invalid; no notification was sent." >&2
     ALERT_PROCESSING_ERROR="invalid alert delivery journal"
     return 1

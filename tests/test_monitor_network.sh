@@ -89,6 +89,76 @@ assert_eq 4 "$(json_field "$ALERT_DELIVERIES_FILE" legacy_migration.source_state
 assert_contains "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.cycle_key)" 'legacy-v4|' "legacy cycle key"
 assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.status)" "migrated delivery"
 
+# A schema-1 journal and v4 state migrate independently, including a raw ID
+# that already has the opaque-looking digest shape.  Delivery remains
+# terminal and a second cycle does not replay it.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-journal-migration"
+export FAKE_CURL_DISCORD_STATUS=204
+legacy_digest_id="limit-$(printf 'a%.0s' {1..64})"
+current_digest_id="$(python3 - "$legacy_digest_id" <<'PYEOF'
+import hashlib
+import sys
+print("limit-" + hashlib.sha256(sys.argv[1].encode()).hexdigest())
+PYEOF
+)"
+legacy_journal_now=2000000260
+legacy_journal_reset=$((legacy_journal_now + 300))
+python3 - "$ALERT_DELIVERIES_FILE" "$legacy_digest_id" "$legacy_journal_now" "$legacy_journal_reset" <<'PYEOF'
+import copy
+import importlib.util
+import json
+import pathlib
+import sys
+
+path, raw_id, now, reset = sys.argv[1:]
+now, reset = map(int, (now, reset))
+spec = importlib.util.spec_from_file_location("alerts_fixture", pathlib.Path("local/alerts.py"))
+alerts = importlib.util.module_from_spec(spec)
+assert spec.loader
+spec.loader.exec_module(alerts)
+document = alerts.empty_journal(4, now)
+request = {
+    "kind": "threshold", "window": "5h", "selector": "75",
+    "cycle_key": f"legacy-v4|limit:{raw_id}|reset:{reset}",
+    "id_namespace": "legacy-v4", "message": "legacy migration",
+    "event_data": {"limit_id": raw_id, "remaining_pct": 70,
+                   "reset_epoch": reset, "covered_thresholds": [75]},
+    "created_at": now, "expires_at": reset, "channels": ["discord"],
+    "replace_pending_thresholds": True, "expire_threshold_cycle": None,
+}
+item = alerts.register(document, request)
+legacy = copy.deepcopy(document)
+legacy["schema_version"] = 1
+legacy.pop("limit_id_contract_version")
+item = legacy["alerts"][0]
+item["event_data"]["limit_id"] = raw_id
+item["cycle_key"] = f"legacy-v4|limit:{raw_id}|reset:{reset}"
+item["alert_id"] = alerts.alert_id(
+    item["kind"], item["window"], item["selector"], item["cycle_key"], "legacy-v4"
+)
+pathlib.Path(path).write_text(json.dumps(legacy), encoding="utf-8")
+PYEOF
+printf '%s\n' \
+  'state_version=4' 'prev_5h_pct=80' 'prev_weekly_pct=100' \
+  "observed_weekly_limit_id=${legacy_digest_id}" \
+  "weekly_armed_limit_id=${legacy_digest_id}" \
+  "five_h_armed_reset_at=${legacy_journal_reset}" 'weekly_armed_reset_at=0' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=75' 'pending_weekly_threshold=' > "$STATE_FILE"
+check_thresholds 70 100 later unknown "$legacy_journal_reset" '' "$legacy_journal_now" "$current_digest_id" >/dev/null
+assert_eq 2 "$(json_field "$ALERT_DELIVERIES_FILE" schema_version)" "alert journal schema migration"
+assert_eq 1 "$(json_field "$ALERT_DELIVERIES_FILE" limit_id_contract_version)" "alert journal contract marker"
+assert_eq "$current_digest_id" "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.event_data.limit_id)" "digest-shaped legacy ID migration"
+assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.status)" "legacy pending delivery"
+assert_eq 1 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" "migrated delivery attempt"
+check_thresholds 70 100 later unknown "$legacy_journal_reset" '' "$((legacy_journal_now + 1))" "$current_digest_id" >/dev/null
+assert_eq 1 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" "migrated delivery replay"
+if rg -q "$legacy_digest_id" "$STATE_FILE" "$ALERT_DELIVERIES_FILE"; then
+  fail "legacy raw ID survived alert migration"
+fi
+
 # A long Retry-After is persisted without blocking and suppresses early cycles.
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-rate-limit"
@@ -154,7 +224,7 @@ for line in path.read_text(encoding="utf-8").splitlines():
     if key == "weekly_armed_reset_at":
         value = reset_at
     elif key == "weekly_armed_limit_id":
-        value = "default"
+        value = "limit-" + __import__("hashlib").sha256(b"default").hexdigest()
     elif key == "last_notified_weekly_reset_at":
         value = "0"
     lines.append(f"{key}={value}")

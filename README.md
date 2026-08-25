@@ -147,9 +147,9 @@ added to the contract):
 
 `limit_id` is intentionally opaque. Every raw app-server value is hashed at
 the client boundary (including a value that happens to look like
-`limit-<sha256>`), so the server value is never published. Persisted v0/v1
-data is canonicalized idempotently, which avoids hashing an already opaque
-value again during migration.
+`limit-<sha256>`), so the server value is never published. Persisted v0 data
+is hashed unconditionally at migration time, while v1 data is canonicalized
+without hashing an already opaque value again.
 
 The same opaque representation is used in SQLite snapshots, anomaly state,
 deduplication keys, and analytics projections. Opening a writable legacy
@@ -399,6 +399,13 @@ CODEX_FORECAST_ENABLED=1
 Discord and Telegram maintain separate delivery progress. Temporary failures
 such as timeouts, HTTP 408, 429, or 5xx remain pending. Successful channels are
 not replayed because another channel failed.
+
+The durable detector state uses `state_version: 5` with an explicit opaque-ID
+contract marker, and `local/runtime/alert-deliveries.json` uses journal schema
+2 with the same marker. Existing unmarked state and schema-1 journals are
+migrated one file at a time with atomic replacement; pending and delivered
+channel state is retained, and a failed migration is retried on the next
+cycle. Future versions or inconsistent alert/cycle identities fail closed.
 
 Set `ALERTS_ENABLED=0` to pause outbound alerting. New threshold, reset, and
 anomaly events observed while disabled are acknowledged locally: they advance
@@ -869,10 +876,11 @@ this mutable value near the top of the copied file:
 let GIST_ID = '0123456789abcdef0123456789abcdef';
 ```
 
-Do not commit a personal token. Only the static live quota page works in this
-external mode: Advanced Analytics requires the local `serve.sh` API and the
-local SQLite archive. A Pages browser cannot provide Analytics merely by
-having access to the Gist.
+Do not commit a personal token. In this external mode, the static dashboard
+can display the live quota plus the Gist-backed rolling history and Forecast;
+Advanced Analytics requires the local `serve.sh` API and the local SQLite
+archive. A Pages browser cannot provide Analytics merely by having access to
+the Gist.
 
 ## Backup/Restore SQLite
 

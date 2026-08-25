@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import email.utils
 import hashlib
@@ -18,7 +19,9 @@ import tempfile
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
+LIMIT_ID_CONTRACT_VERSION = 1
 MAX_BYTES = 16 * 1024 * 1024
 RETENTION_SECONDS = 30 * 24 * 60 * 60
 MAX_RECONCILED_TERMINAL = 500
@@ -42,10 +45,28 @@ TERMINAL_REASONS = {
     "delivered", "permanent_failure", "superseded",
     "expired_after_reset", "channel_unconfigured",
 }
+OPAQUE_LIMIT_ID_RE = re.compile(r"limit-[0-9a-f]{64}\Z")
 
 
 class JournalError(ValueError):
     pass
+
+
+def opaque_limit_id_from_raw(value: Any) -> str | None:
+    """Hash one legacy protocol identifier at the journal trust boundary."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    digest = hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"limit-{digest}"
+
+
+def canonicalize_limit_id(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if OPAQUE_LIMIT_ID_RE.fullmatch(value):
+        return value
+    return opaque_limit_id_from_raw(value)
 
 
 def _is_int(value: Any, minimum: int = 0) -> bool:
@@ -61,6 +82,7 @@ def alert_id(kind: str, window: str, selector: str, cycle_key: str,
 def empty_journal(source_version: int, completed_at: int) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
+        "limit_id_contract_version": LIMIT_ID_CONTRACT_VERSION,
         "legacy_migration": {
             "source_state_version": source_version,
             "completed_at": completed_at,
@@ -94,7 +116,7 @@ def _validate_channel(name: str, channel: Any) -> None:
         raise JournalError("delivered channel has an error")
 
 
-def _validate_alert(item: Any) -> None:
+def _validate_alert(item: Any, *, require_opaque_limit_id: bool = False) -> None:
     if not isinstance(item, dict):
         raise JournalError("alert must be an object")
     required = {
@@ -131,6 +153,8 @@ def _validate_alert(item: Any) -> None:
     if (not isinstance(event.get("limit_id"), str)
             or any(ord(character) < 32 for character in event["limit_id"])):
         raise JournalError("invalid event limit_id")
+    if require_opaque_limit_id and not OPAQUE_LIMIT_ID_RE.fullmatch(event["limit_id"]):
+        raise JournalError("event limit_id is not an opaque identifier")
     if not _is_int(event.get("reset_epoch")):
         raise JournalError("invalid event reset_epoch")
     if item["kind"] == "threshold":
@@ -192,16 +216,25 @@ def _validate_alert(item: Any) -> None:
         raise JournalError("terminal alert lacks completion metadata")
 
 
-def validate_document(document: Any) -> dict[str, Any]:
-    if not isinstance(document, dict) or set(document) != {"schema_version", "legacy_migration", "alerts"}:
+def validate_document(document: Any, *, allow_legacy: bool = True) -> dict[str, Any]:
+    if not isinstance(document, dict) or "schema_version" not in document:
         raise JournalError("invalid journal document")
     version = document["schema_version"]
     if not _is_int(version):
         raise JournalError("invalid schema_version")
     if version > SCHEMA_VERSION:
         raise JournalError(f"unsupported future journal schema version {version}")
-    if version != SCHEMA_VERSION:
+    if version != SCHEMA_VERSION and (version != LEGACY_SCHEMA_VERSION or not allow_legacy):
         raise JournalError(f"unsupported journal schema version {version}")
+    expected_fields = (
+        {"schema_version", "legacy_migration", "alerts"}
+        if version == LEGACY_SCHEMA_VERSION
+        else {"schema_version", "limit_id_contract_version", "legacy_migration", "alerts"}
+    )
+    if set(document) != expected_fields:
+        raise JournalError("invalid journal document")
+    if version == SCHEMA_VERSION and document["limit_id_contract_version"] != LIMIT_ID_CONTRACT_VERSION:
+        raise JournalError("unsupported limit ID contract version")
     migration = document["legacy_migration"]
     if not isinstance(migration, dict) or set(migration) != {"source_state_version", "completed_at"}:
         raise JournalError("invalid legacy migration metadata")
@@ -211,11 +244,88 @@ def validate_document(document: Any) -> dict[str, Any]:
         raise JournalError("alerts must be an array")
     seen: set[str] = set()
     for item in document["alerts"]:
-        _validate_alert(item)
+        _validate_alert(item, require_opaque_limit_id=version == SCHEMA_VERSION)
         if item["alert_id"] in seen:
             raise JournalError("duplicate alert_id")
         seen.add(item["alert_id"])
     return document
+
+
+def _legacy_namespace(cycle_key: str) -> str:
+    if cycle_key.startswith("legacy-v") and "|" in cycle_key:
+        return cycle_key.split("|", 1)[0]
+    return "alert-v1"
+
+
+def _migrate_cycle_key(cycle_key: str, old_limit_id: str, new_limit_id: str) -> str:
+    token = f"limit:{old_limit_id}"
+    occurrences = cycle_key.count(token)
+    if occurrences != 1:
+        raise JournalError(
+            "legacy alert cycle key does not contain exactly one event limit ID"
+        )
+    return cycle_key.replace(token, f"limit:{new_limit_id}", 1)
+
+
+def migrate_document(document: dict[str, Any], completed_at: int) -> dict[str, Any]:
+    """Upgrade a legacy journal in memory, preserving delivery state.
+
+    The v1 format has no way to distinguish a raw identifier from one that
+    merely looks opaque.  It is therefore hashed unconditionally.  The v2
+    contract marker makes the operation idempotent on retries.
+    """
+
+    validate_document(document, allow_legacy=True)
+    if document["schema_version"] == SCHEMA_VERSION:
+        return document
+    if not _is_int(completed_at):
+        raise JournalError("invalid migration completion time")
+
+    migrated_alerts: list[dict[str, Any]] = []
+    id_map: dict[str, str] = {}
+    seen_ids: set[str] = set()
+    for original in document["alerts"]:
+        item = copy.deepcopy(original)
+        old_alert_id = item["alert_id"]
+        old_limit_id = item["event_data"]["limit_id"]
+        new_limit_id = opaque_limit_id_from_raw(old_limit_id)
+        if new_limit_id is None:
+            raise JournalError("legacy alert has an empty event limit ID")
+        namespace = _legacy_namespace(item["cycle_key"])
+        expected_old_alert_id = alert_id(
+            item["kind"], item["window"], item["selector"], item["cycle_key"], namespace
+        )
+        if old_alert_id != expected_old_alert_id:
+            raise JournalError("legacy alert_id is inconsistent with its cycle key")
+        item["event_data"]["limit_id"] = new_limit_id
+        item["cycle_key"] = _migrate_cycle_key(
+            item["cycle_key"], old_limit_id, new_limit_id
+        )
+        item["alert_id"] = alert_id(
+            item["kind"], item["window"], item["selector"], item["cycle_key"], namespace
+        )
+        if item["alert_id"] in seen_ids:
+            raise JournalError("legacy alert migration produced an alert_id collision")
+        seen_ids.add(item["alert_id"])
+        id_map[old_alert_id] = item["alert_id"]
+        migrated_alerts.append(item)
+
+    for item in migrated_alerts:
+        replacement = item["replacement_alert_id"]
+        if replacement is not None and replacement in id_map:
+            item["replacement_alert_id"] = id_map[replacement]
+
+    migrated = {
+        "schema_version": SCHEMA_VERSION,
+        "limit_id_contract_version": LIMIT_ID_CONTRACT_VERSION,
+        "legacy_migration": {
+            "source_state_version": document["legacy_migration"]["source_state_version"],
+            "completed_at": completed_at,
+        },
+        "alerts": migrated_alerts,
+    }
+    validate_document(migrated, allow_legacy=False)
+    return migrated
 
 
 def load(path: pathlib.Path) -> dict[str, Any]:
@@ -232,7 +342,7 @@ def load(path: pathlib.Path) -> dict[str, Any]:
 
 
 def atomic_write(path: pathlib.Path, document: dict[str, Any]) -> None:
-    validate_document(document)
+    validate_document(document, allow_legacy=False)
     encoded = (json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
     if len(encoded) > MAX_BYTES:
         raise JournalError("journal exceeds 16 MiB")
@@ -288,6 +398,19 @@ def _request_alert(request: dict[str, Any]) -> dict[str, Any]:
     namespace = request.get("id_namespace", "alert-v1")
     if not isinstance(namespace, str) or not namespace:
         raise JournalError("invalid id namespace")
+    event_data = copy.deepcopy(request.get("event_data", {}))
+    raw_limit_id = event_data.get("limit_id") if isinstance(event_data, dict) else None
+    limit_id = canonicalize_limit_id(raw_limit_id)
+    if isinstance(event_data, dict) and limit_id is not None:
+        event_data["limit_id"] = limit_id
+    if isinstance(cycle_key, str) and isinstance(raw_limit_id, str) and limit_id is not None:
+        token = f"limit:{raw_limit_id}"
+        if raw_limit_id != limit_id:
+            if cycle_key.count(token) != 1:
+                raise JournalError("registration cycle key does not contain its limit ID")
+            cycle_key = cycle_key.replace(token, f"limit:{limit_id}", 1)
+        elif cycle_key.count(f"limit:{limit_id}") != 1:
+            raise JournalError("registration cycle key does not contain its limit ID")
     item = {
         "alert_id": alert_id(kind, window, selector, cycle_key, namespace),
         "kind": kind,
@@ -295,7 +418,7 @@ def _request_alert(request: dict[str, Any]) -> dict[str, Any]:
         "selector": selector,
         "cycle_key": cycle_key,
         "message": request.get("message"),
-        "event_data": request.get("event_data", {}),
+        "event_data": event_data,
         "created_at": request.get("created_at"),
         "expires_at": request.get("expires_at", 0),
         "status": "pending",
@@ -305,7 +428,7 @@ def _request_alert(request: dict[str, Any]) -> dict[str, Any]:
         "completed_at": None,
         "detector_acknowledged_at": None,
     }
-    _validate_alert(item)
+    _validate_alert(item, require_opaque_limit_id=True)
     return item
 
 
@@ -355,6 +478,14 @@ def register(document: dict[str, Any], request: dict[str, Any]) -> dict[str, Any
                     and existing["status"] == "pending"):
                 _terminate(existing, "superseded", now, "superseded", incoming["alert_id"])
     expire_cycle = request.get("expire_threshold_cycle")
+    if isinstance(expire_cycle, str):
+        raw_limit_id = request.get("event_data", {}).get("limit_id") if isinstance(request.get("event_data"), dict) else None
+        canonical_limit_id = incoming["event_data"].get("limit_id")
+        if isinstance(raw_limit_id, str) and isinstance(canonical_limit_id, str) and raw_limit_id != canonical_limit_id:
+            token = f"limit:{raw_limit_id}"
+            if expire_cycle.count(token) != 1:
+                raise JournalError("expiration cycle key does not contain its limit ID")
+            expire_cycle = expire_cycle.replace(token, f"limit:{canonical_limit_id}", 1)
     if expire_cycle is not None:
         for existing in document["alerts"]:
             cycle_matches = _same_cycle(existing["cycle_key"], expire_cycle) or _unarmed_cycle(
@@ -472,9 +603,18 @@ def command(args: argparse.Namespace) -> None:
     if args.action == "validate":
         load(path)
         return
+    if args.action == "migrate":
+        document = load(path)
+        migrated = migrate_document(document, args.at)
+        if migrated is not document:
+            atomic_write(path, migrated)
+        return
     if args.action == "init":
         if path.exists():
-            load(path)
+            document = load(path)
+            migrated = migrate_document(document, int(dt.datetime.now(dt.timezone.utc).timestamp()))
+            if migrated is not document:
+                atomic_write(path, migrated)
             return
         payload = _read_stdin({})
         if not isinstance(payload, dict):
@@ -580,6 +720,9 @@ def parser() -> argparse.ArgumentParser:
     for name in ("validate", "register", "terminal-unacknowledged"):
         command_parser = sub.add_parser(name)
         command_parser.add_argument("journal")
+    migrate_parser = sub.add_parser("migrate")
+    migrate_parser.add_argument("journal")
+    migrate_parser.add_argument("--at", type=int, required=True)
     init_parser = sub.add_parser("init")
     init_parser.add_argument("journal")
     init_parser.add_argument("--source-state-version", type=int, required=True)
