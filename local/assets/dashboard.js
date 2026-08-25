@@ -794,7 +794,13 @@ function refresh() {
   };
   if (refreshInFlight) {
     const queuedKey = queuedRefreshState ? queuedRefreshState.key : null;
-    if (requestedState.key === activeRefreshKey || requestedState.key === queuedKey) {
+    if (requestedState.key === activeRefreshKey) {
+      // Returning to the source currently being fetched supersedes any
+      // different follow-up that was queued in the meantime.
+      queuedRefreshState = null;
+      return refreshInFlight;
+    }
+    if (requestedState.key === queuedKey) {
       return refreshInFlight;
     }
     // A source change during a fetch must not be swallowed by the current
