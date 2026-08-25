@@ -635,6 +635,13 @@ def _set_limit_id_contract_marker(connection: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_limit_id_contract(connection: sqlite3.Connection) -> None:
+    """Migrate legacy IDs only after rereading the contract marker."""
+    if _limit_id_migration_required(connection):
+        _migrate_limit_ids(connection, legacy=True)
+    _set_limit_id_contract_marker(connection)
+
+
 def _table_names(connection: sqlite3.Connection) -> set[str]:
     return {
         str(row[0])
@@ -733,12 +740,6 @@ def create_schema(connection: sqlite3.Connection) -> None:
     elif version == SCHEMA_VERSION_NUMBER:
         _validate_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
 
-    # Capture this before schema metadata is rewritten.  An archive from before
-    # the public-ID contract has no reliable way to distinguish a raw value that
-    # happens to look like a digest, so every dedicated ID is hashed once.
-    legacy_limit_id_contract = (
-        _limit_id_contract_version(connection) != PUBLIC_LIMIT_ID_CONTRACT_VERSION
-    )
     started_transaction = not connection.in_transaction
     if started_transaction:
         connection.execute("BEGIN IMMEDIATE")
@@ -760,9 +761,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
             connection.execute("CREATE INDEX IF NOT EXISTS idx_anomaly_detector_state_updated ON anomaly_detector_state(updated_at_epoch)")
         _set_schema_metadata(connection)
         _validate_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
-        if legacy_limit_id_contract:
-            _migrate_limit_ids(connection, legacy=True)
-        _set_limit_id_contract_marker(connection)
+        _ensure_limit_id_contract(connection)
         if started_transaction:
             # Validate the post-migration layout before making it durable.
             check_integrity(connection)
@@ -981,8 +980,7 @@ def connect_database(database_path: Path, *, read_only: bool = False) -> sqlite3
                     migrated.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
                     migrated.execute("PRAGMA foreign_keys = ON")
                     migrated.execute("BEGIN IMMEDIATE")
-                    _migrate_limit_ids(migrated, legacy=True)
-                    _set_limit_id_contract_marker(migrated)
+                    _ensure_limit_id_contract(migrated)
                     migrated.commit()
                     migrated.execute("PRAGMA query_only = ON")
                 except Exception:

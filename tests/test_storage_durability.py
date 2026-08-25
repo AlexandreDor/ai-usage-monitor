@@ -331,6 +331,161 @@ class StorageDurabilityTests(unittest.TestCase):
                 "SELECT limit_id FROM snapshots"
             ).fetchone())
 
+    def test_concurrent_legacy_writers_hash_each_id_once(self):
+        raw_id = "concurrent-legacy-secret"
+        connection = storage.connect_database(self.path)
+        with connection:
+            connection.execute(
+                "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (1_700_000_000, "2023-11-14T22:13:20Z", 80, None, None,
+                 60, None, None, 900, 192, raw_id),
+            )
+        connection.close()
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "DELETE FROM metadata WHERE key = ?",
+                (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+            )
+
+        begin_barrier = threading.Barrier(2)
+        hash_calls = []
+        errors = []
+        original_execute = storage.RetryingConnection.execute
+        original_hash = storage.opaque_limit_id_from_raw
+
+        def synchronized_execute(connection, sql, parameters=()):
+            if str(sql).strip().upper() == "BEGIN IMMEDIATE":
+                begin_barrier.wait(timeout=10)
+            return original_execute(connection, sql, parameters)
+
+        def counted_hash(value):
+            if value == raw_id:
+                hash_calls.append(value)
+            return original_hash(value)
+
+        def writer():
+            connection = None
+            try:
+                connection = sqlite3.connect(
+                    self.path,
+                    timeout=storage.SQLITE_BUSY_TIMEOUT_MS / 1000,
+                    factory=storage.RetryingConnection,
+                    check_same_thread=False,
+                )
+                connection.execute(f"PRAGMA busy_timeout = {storage.SQLITE_BUSY_TIMEOUT_MS}")
+                storage.create_schema(connection)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                if connection is not None:
+                    connection.close()
+
+        with mock.patch.object(storage.RetryingConnection, "execute", new=synchronized_execute), \
+                mock.patch.object(storage, "opaque_limit_id_from_raw", side_effect=counted_hash):
+            writers = [threading.Thread(target=writer) for _ in range(2)]
+            for thread in writers:
+                thread.start()
+            for thread in writers:
+                thread.join(timeout=10)
+
+        self.assertTrue(all(not thread.is_alive() for thread in writers))
+        self.assertEqual([], errors)
+        self.assertEqual([raw_id], hash_calls)
+        expected = storage.opaque_limit_id_from_raw(raw_id)
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual((expected,), connection.execute(
+                "SELECT limit_id FROM snapshots"
+            ).fetchone())
+            self.assertEqual(
+                (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION,),
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key = ?",
+                    (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+                ).fetchone(),
+            )
+            self.assertEqual(("ok",), connection.execute("PRAGMA quick_check").fetchone())
+
+    def test_reader_rechecks_limit_id_contract_on_copy_after_writer_migrates(self):
+        raw_id = "reader-copy-legacy-secret"
+        connection = storage.connect_database(self.path)
+        with connection:
+            connection.execute(
+                "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (1_700_000_000, "2023-11-14T22:13:20Z", 80, None, None,
+                 60, None, None, 900, 192, raw_id),
+            )
+        connection.close()
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "DELETE FROM metadata WHERE key = ?",
+                (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+            )
+
+        source_observed = threading.Event()
+        writer_finished = threading.Event()
+        first_call = True
+        first_call_lock = threading.Lock()
+        reader_result = []
+        reader_errors = []
+        writer_errors = []
+        original_required = storage._limit_id_migration_required
+        original_hash = storage.opaque_limit_id_from_raw
+        hash_calls = []
+
+        def observe_source(connection):
+            nonlocal first_call
+            decision = original_required(connection)
+            with first_call_lock:
+                is_first_call = first_call
+                first_call = False
+            if is_first_call:
+                source_observed.set()
+                if not writer_finished.wait(timeout=10):
+                    raise AssertionError("writer did not finish before reader copied")
+            return decision
+
+        def counted_hash(value):
+            hash_calls.append(value)
+            return original_hash(value)
+
+        def reader():
+            try:
+                with storage.connect_database(self.path, read_only=True) as connection:
+                    reader_result.append(connection.execute(
+                        "SELECT limit_id FROM snapshots"
+                    ).fetchone())
+            except BaseException as exc:  # pragma: no cover - asserted below
+                reader_errors.append(exc)
+
+        def writer():
+            connection = None
+            try:
+                connection = storage.connect_database(self.path)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                writer_errors.append(exc)
+            finally:
+                if connection is not None:
+                    connection.close()
+                writer_finished.set()
+
+        with mock.patch.object(storage, "_limit_id_migration_required", side_effect=observe_source), \
+                mock.patch.object(storage, "opaque_limit_id_from_raw", side_effect=counted_hash):
+            reader_thread = threading.Thread(target=reader)
+            reader_thread.start()
+            self.assertTrue(source_observed.wait(timeout=10))
+            writer_thread = threading.Thread(target=writer)
+            writer_thread.start()
+            writer_thread.join(timeout=10)
+            self.assertFalse(writer_thread.is_alive())
+            reader_thread.join(timeout=10)
+
+        self.assertFalse(reader_thread.is_alive())
+        self.assertEqual([], writer_errors)
+        self.assertEqual([], reader_errors)
+        expected = original_hash(raw_id)
+        self.assertEqual([(expected,)], reader_result)
+        self.assertEqual([raw_id], hash_calls)
+
     def test_wal_failure_does_not_commit_legacy_schema_migration(self):
         with sqlite3.connect(self.path) as connection:
             connection.executescript(
