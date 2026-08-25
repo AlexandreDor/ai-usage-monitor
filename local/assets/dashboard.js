@@ -29,6 +29,7 @@ let historyFailureKey = null;
 let mainFailure = null;
 let dashboardSource = null;
 let refreshInFlight = null;
+let queuedRefreshState = null;
 
 function t(key, values = {}) {
   return typeof CodexPreferences === 'object' ? CodexPreferences.t(`dashboard.${key}`, values) : key;
@@ -759,8 +760,8 @@ async function fetchLocal() {
   }
 }
 
-async function fetchGist() {
-  const response = await fetch(`https://api.github.com/gists/${encodeURIComponent(GIST_ID)}?_=${Date.now()}`);
+async function fetchGist(gistId) {
+  const response = await fetch(`https://api.github.com/gists/${encodeURIComponent(gistId)}?_=${Date.now()}`);
   if (!response.ok) throw new Error(t('githubApiError', { status: response.status }));
   const gist = await response.json();
   const dataContent = gist?.files?.['data.json']?.content;
@@ -785,15 +786,28 @@ async function fetchGist() {
 }
 
 function refresh() {
-  if (refreshInFlight) return refreshInFlight;
+  const requestedState = { gistId: GIST_ID };
+  if (refreshInFlight) {
+    // A source change during a fetch must not be swallowed by the current
+    // operation. Coalesce repeated calls into one follow-up using the latest
+    // source state; every caller awaits the complete chain below.
+    queuedRefreshState = requestedState;
+    return refreshInFlight;
+  }
+
   const operation = (async () => {
-    try {
-      await (GIST_ID ? fetchGist() : fetchLocal());
-    } catch (error) {
-      setMainError(error instanceof Error ? error.message : t('unableToLoadData'));
-      renderFreshness();
-      scheduleRefresh();
-    }
+    let state = requestedState;
+    do {
+      queuedRefreshState = null;
+      try {
+        await (state.gistId ? fetchGist(state.gistId) : fetchLocal());
+      } catch (error) {
+        setMainError(error instanceof Error ? error.message : t('unableToLoadData'));
+        renderFreshness();
+        scheduleRefresh();
+      }
+      if (queuedRefreshState) state = queuedRefreshState;
+    } while (queuedRefreshState);
   })();
   refreshInFlight = operation;
   operation.finally(() => {

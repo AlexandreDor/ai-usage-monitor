@@ -204,6 +204,54 @@ class AlertJournalTests(unittest.TestCase):
         with self.assertRaisesRegex(alerts.JournalError, "cycle key"):
             alerts.migrate_document(broken, 100)
 
+    def test_cycle_limit_replacement_requires_one_exact_segment(self):
+        for cycle in (
+            "limit:default-extra|reset:200",
+            "limit:default|limit:default|reset:200",
+        ):
+            with self.subTest(cycle=cycle), self.assertRaisesRegex(
+                alerts.JournalError, "cycle key"
+            ):
+                alerts.register(self.document, request(cycle=cycle))
+
+    def test_expiration_cycle_replacement_rejects_prefix_suffix_and_ambiguity(self):
+        for expire_cycle in (
+            "limit:default-extra|reset:200",
+            "limit:default|limit:default|reset:200",
+        ):
+            reset = reset_request()
+            reset["expire_threshold_cycle"] = expire_cycle
+            with self.subTest(expire_cycle=expire_cycle), self.assertRaisesRegex(
+                alerts.JournalError, "cycle key"
+            ):
+                alerts.register(self.document, reset)
+
+    def test_v2_validation_requires_typed_marker_and_coherent_identity(self):
+        item = alerts.register(self.document, request())
+
+        typed_marker = json.loads(json.dumps(self.document))
+        typed_marker["limit_id_contract_version"] = True
+        with self.assertRaises(alerts.JournalError):
+            alerts.validate_document(typed_marker, allow_legacy=False)
+
+        broken_cycle = json.loads(json.dumps(self.document))
+        broken_cycle["alerts"][0]["cycle_key"] = "limit:other|reset:200"
+        with self.assertRaisesRegex(alerts.JournalError, "cycle key"):
+            alerts.validate_document(broken_cycle, allow_legacy=False)
+
+        broken_id = json.loads(json.dumps(self.document))
+        broken_id["alerts"][0]["alert_id"] = "0" * 24
+        with self.assertRaisesRegex(alerts.JournalError, "alert_id"):
+            alerts.validate_document(broken_id, allow_legacy=False)
+
+        self.assertEqual(
+            alerts.alert_id(
+                item["kind"], item["window"], item["selector"],
+                item["cycle_key"], "alert-v1"
+            ),
+            item["alert_id"],
+        )
+
     def test_retry_after_seconds_date_and_backoff(self):
         headers = pathlib.Path(self.directory.name) / "headers"
         headers.write_text("Retry-After: 120\r\n", encoding="ascii")

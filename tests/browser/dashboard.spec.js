@@ -140,7 +140,14 @@ test('hides the freshness badge when no valid snapshot is available', async ({ p
 test('renders fresh external Gist data with independent source and freshness states', async ({ page }) => {
   await page.clock.install({ time: DASHBOARD_NOW });
   await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
-  await page.route('**/data.json?*', route => route.fulfill({ status: 503 }));
+  let localRequestStarted = false;
+  let releaseInitialLocal;
+  const initialLocalResponse = new Promise(resolve => { releaseInitialLocal = resolve; });
+  await page.route('**/data.json?*', async route => {
+    localRequestStarted = true;
+    await initialLocalResponse;
+    await route.fulfill({ status: 503 });
+  });
   await page.route('https://api.github.com/gists/**', route => route.fulfill({
     json: {
       files: {
@@ -150,10 +157,13 @@ test('renders fresh external Gist data with independent source and freshness sta
     },
   }));
   await page.goto('/dashboard.html');
-  await page.evaluate(async () => {
+  await expect.poll(() => localRequestStarted).toBe(true);
+  await page.evaluate(() => {
     GIST_ID = 'external-fixture';
-    await refresh();
+    window.__externalRefresh = refresh();
   });
+  releaseInitialLocal();
+  await page.evaluate(() => window.__externalRefresh);
 
   await expect(page.locator('#mode-badge')).toHaveText('EXTERNAL');
   await expect(page.locator('body')).toHaveAttribute('data-dashboard-source', 'external');

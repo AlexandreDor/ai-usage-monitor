@@ -46,6 +46,7 @@ TERMINAL_REASONS = {
     "expired_after_reset", "channel_unconfigured",
 }
 OPAQUE_LIMIT_ID_RE = re.compile(r"limit-[0-9a-f]{64}\Z")
+LEGACY_NAMESPACE_RE = re.compile(r"legacy-v[0-9]+\Z")
 
 
 class JournalError(ValueError):
@@ -77,6 +78,40 @@ def alert_id(kind: str, window: str, selector: str, cycle_key: str,
              namespace: str = "alert-v1") -> str:
     material = "\0".join((namespace, kind, window, selector, cycle_key))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+
+def _namespace_for_cycle(cycle_key: str) -> str:
+    prefix = cycle_key.split("|", 1)[0]
+    return prefix if LEGACY_NAMESPACE_RE.fullmatch(prefix) else "alert-v1"
+
+
+def _limit_segment_index(cycle_key: str, limit_id: str) -> int:
+    """Return the sole exact limit segment belonging to an alert event."""
+
+    if (not isinstance(cycle_key, str) or not isinstance(limit_id, str)
+            or not limit_id or "|" in limit_id):
+        raise JournalError("cycle key does not contain exactly one event limit ID")
+    segments = cycle_key.split("|")
+    limit_indexes = [index for index, segment in enumerate(segments)
+                     if segment.startswith("limit:")]
+    expected = f"limit:{limit_id}"
+    matching = [index for index in limit_indexes if segments[index] == expected]
+    if len(limit_indexes) != 1 or len(matching) != 1:
+        raise JournalError("cycle key does not contain exactly one event limit ID")
+    return matching[0]
+
+
+def _replace_limit_segment(cycle_key: str, old_limit_id: str,
+                           new_limit_id: str) -> str:
+    """Replace one exact ``limit:<id>`` segment without substring matches."""
+
+    if (not isinstance(new_limit_id, str) or not new_limit_id
+            or "|" in new_limit_id):
+        raise JournalError("cycle key replacement has an invalid event limit ID")
+    segments = cycle_key.split("|")
+    index = _limit_segment_index(cycle_key, old_limit_id)
+    segments[index] = f"limit:{new_limit_id}"
+    return "|".join(segments)
 
 
 def empty_journal(source_version: int, completed_at: int) -> dict[str, Any]:
@@ -151,6 +186,7 @@ def _validate_alert(item: Any, *, require_opaque_limit_id: bool = False) -> None
         raise JournalError("invalid event_data")
     event = item["event_data"]
     if (not isinstance(event.get("limit_id"), str)
+            or not event["limit_id"]
             or any(ord(character) < 32 for character in event["limit_id"])):
         raise JournalError("invalid event limit_id")
     if require_opaque_limit_id and not OPAQUE_LIMIT_ID_RE.fullmatch(event["limit_id"]):
@@ -187,6 +223,12 @@ def _validate_alert(item: Any, *, require_opaque_limit_id: bool = False) -> None
         for key in ("before_reset_at", "after_reset_at", "detected_at_epoch"):
             if not _is_int(event[key]):
                 raise JournalError(f"invalid anomaly {key}")
+    _limit_segment_index(item["cycle_key"], event["limit_id"])
+    namespace = _namespace_for_cycle(item["cycle_key"])
+    if item["alert_id"] != alert_id(
+            item["kind"], item["window"], item["selector"],
+            item["cycle_key"], namespace):
+        raise JournalError("alert_id is inconsistent with alert identity")
     if not _is_int(item["created_at"]) or not _is_int(item["expires_at"]):
         raise JournalError("invalid alert timestamps")
     if item["expires_at"] and item["expires_at"] < item["created_at"]:
@@ -233,7 +275,9 @@ def validate_document(document: Any, *, allow_legacy: bool = True) -> dict[str, 
     )
     if set(document) != expected_fields:
         raise JournalError("invalid journal document")
-    if version == SCHEMA_VERSION and document["limit_id_contract_version"] != LIMIT_ID_CONTRACT_VERSION:
+    if version == SCHEMA_VERSION and (
+            not _is_int(document["limit_id_contract_version"])
+            or document["limit_id_contract_version"] != LIMIT_ID_CONTRACT_VERSION):
         raise JournalError("unsupported limit ID contract version")
     migration = document["legacy_migration"]
     if not isinstance(migration, dict) or set(migration) != {"source_state_version", "completed_at"}:
@@ -252,19 +296,11 @@ def validate_document(document: Any, *, allow_legacy: bool = True) -> dict[str, 
 
 
 def _legacy_namespace(cycle_key: str) -> str:
-    if cycle_key.startswith("legacy-v") and "|" in cycle_key:
-        return cycle_key.split("|", 1)[0]
-    return "alert-v1"
+    return _namespace_for_cycle(cycle_key)
 
 
 def _migrate_cycle_key(cycle_key: str, old_limit_id: str, new_limit_id: str) -> str:
-    token = f"limit:{old_limit_id}"
-    occurrences = cycle_key.count(token)
-    if occurrences != 1:
-        raise JournalError(
-            "legacy alert cycle key does not contain exactly one event limit ID"
-        )
-    return cycle_key.replace(token, f"limit:{new_limit_id}", 1)
+    return _replace_limit_segment(cycle_key, old_limit_id, new_limit_id)
 
 
 def migrate_document(document: dict[str, Any], completed_at: int) -> dict[str, Any]:
@@ -328,7 +364,7 @@ def migrate_document(document: dict[str, Any], completed_at: int) -> dict[str, A
     return migrated
 
 
-def load(path: pathlib.Path) -> dict[str, Any]:
+def load(path: pathlib.Path, *, allow_legacy: bool = True) -> dict[str, Any]:
     try:
         size = path.stat().st_size
         if size > MAX_BYTES:
@@ -338,7 +374,7 @@ def load(path: pathlib.Path) -> dict[str, Any]:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise JournalError(f"cannot read journal: {exc}") from None
-    return validate_document(document)
+    return validate_document(document, allow_legacy=allow_legacy)
 
 
 def atomic_write(path: pathlib.Path, document: dict[str, Any]) -> None:
@@ -395,22 +431,17 @@ def _request_alert(request: dict[str, Any]) -> dict[str, Any]:
         raise JournalError("registration requires configured channels")
     if len(set(channels)) != len(channels):
         raise JournalError("duplicate registration channel")
-    namespace = request.get("id_namespace", "alert-v1")
-    if not isinstance(namespace, str) or not namespace:
-        raise JournalError("invalid id namespace")
     event_data = copy.deepcopy(request.get("event_data", {}))
     raw_limit_id = event_data.get("limit_id") if isinstance(event_data, dict) else None
     limit_id = canonicalize_limit_id(raw_limit_id)
     if isinstance(event_data, dict) and limit_id is not None:
         event_data["limit_id"] = limit_id
     if isinstance(cycle_key, str) and isinstance(raw_limit_id, str) and limit_id is not None:
-        token = f"limit:{raw_limit_id}"
-        if raw_limit_id != limit_id:
-            if cycle_key.count(token) != 1:
-                raise JournalError("registration cycle key does not contain its limit ID")
-            cycle_key = cycle_key.replace(token, f"limit:{limit_id}", 1)
-        elif cycle_key.count(f"limit:{limit_id}") != 1:
-            raise JournalError("registration cycle key does not contain its limit ID")
+        cycle_key = _replace_limit_segment(cycle_key, raw_limit_id, limit_id)
+    namespace = _namespace_for_cycle(cycle_key)
+    requested_namespace = request.get("id_namespace")
+    if requested_namespace is not None and requested_namespace != namespace:
+        raise JournalError("id namespace does not match cycle key")
     item = {
         "alert_id": alert_id(kind, window, selector, cycle_key, namespace),
         "kind": kind,
@@ -478,15 +509,14 @@ def register(document: dict[str, Any], request: dict[str, Any]) -> dict[str, Any
                     and existing["status"] == "pending"):
                 _terminate(existing, "superseded", now, "superseded", incoming["alert_id"])
     expire_cycle = request.get("expire_threshold_cycle")
-    if isinstance(expire_cycle, str):
+    if expire_cycle is not None:
+        if not isinstance(expire_cycle, str):
+            raise JournalError("expiration cycle key is invalid")
         raw_limit_id = request.get("event_data", {}).get("limit_id") if isinstance(request.get("event_data"), dict) else None
         canonical_limit_id = incoming["event_data"].get("limit_id")
-        if isinstance(raw_limit_id, str) and isinstance(canonical_limit_id, str) and raw_limit_id != canonical_limit_id:
-            token = f"limit:{raw_limit_id}"
-            if expire_cycle.count(token) != 1:
-                raise JournalError("expiration cycle key does not contain its limit ID")
-            expire_cycle = expire_cycle.replace(token, f"limit:{canonical_limit_id}", 1)
-    if expire_cycle is not None:
+        if not isinstance(raw_limit_id, str) or not isinstance(canonical_limit_id, str):
+            raise JournalError("expiration cycle key does not contain its limit ID")
+        expire_cycle = _replace_limit_segment(expire_cycle, raw_limit_id, canonical_limit_id)
         for existing in document["alerts"]:
             cycle_matches = _same_cycle(existing["cycle_key"], expire_cycle) or _unarmed_cycle(
                 existing["cycle_key"], incoming["event_data"]["limit_id"])
@@ -601,7 +631,7 @@ def emit_json_lines(items: Iterable[dict[str, Any]]) -> None:
 def command(args: argparse.Namespace) -> None:
     path = pathlib.Path(args.journal)
     if args.action == "validate":
-        load(path)
+        load(path, allow_legacy=False)
         return
     if args.action == "migrate":
         document = load(path)
