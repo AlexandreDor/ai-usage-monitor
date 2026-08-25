@@ -155,7 +155,7 @@ assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.status)" "le
 assert_eq 1 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" "migrated delivery attempt"
 check_thresholds 70 100 later unknown "$legacy_journal_reset" '' "$((legacy_journal_now + 1))" "$current_digest_id" >/dev/null
 assert_eq 1 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" "migrated delivery replay"
-if rg -q "$legacy_digest_id" "$STATE_FILE" "$ALERT_DELIVERIES_FILE"; then
+if grep -Fq -- "$legacy_digest_id" "$STATE_FILE" "$ALERT_DELIVERIES_FILE"; then
   fail "legacy raw ID survived alert migration"
 fi
 
