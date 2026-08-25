@@ -29,6 +29,7 @@ let historyFailureKey = null;
 let mainFailure = null;
 let dashboardSource = null;
 let refreshInFlight = null;
+let activeRefreshKey = null;
 let queuedRefreshState = null;
 
 function t(key, values = {}) {
@@ -786,11 +787,19 @@ async function fetchGist(gistId) {
 }
 
 function refresh() {
-  const requestedState = { gistId: GIST_ID };
+  const gistId = GIST_ID;
+  const requestedState = {
+    gistId,
+    key: gistId ? `external:${gistId}` : 'local',
+  };
   if (refreshInFlight) {
+    const queuedKey = queuedRefreshState ? queuedRefreshState.key : null;
+    if (requestedState.key === activeRefreshKey || requestedState.key === queuedKey) {
+      return refreshInFlight;
+    }
     // A source change during a fetch must not be swallowed by the current
-    // operation. Coalesce repeated calls into one follow-up using the latest
-    // source state; every caller awaits the complete chain below.
+    // operation. Coalesce changes into one follow-up using the latest source
+    // state; every caller awaits the complete chain below.
     queuedRefreshState = requestedState;
     return refreshInFlight;
   }
@@ -799,6 +808,7 @@ function refresh() {
     let state = requestedState;
     do {
       queuedRefreshState = null;
+      activeRefreshKey = state.key;
       try {
         await (state.gistId ? fetchGist(state.gistId) : fetchLocal());
       } catch (error) {
@@ -811,7 +821,11 @@ function refresh() {
   })();
   refreshInFlight = operation;
   operation.finally(() => {
-    if (refreshInFlight === operation) refreshInFlight = null;
+    if (refreshInFlight === operation) {
+      refreshInFlight = null;
+      activeRefreshKey = null;
+      queuedRefreshState = null;
+    }
   });
   return operation;
 }

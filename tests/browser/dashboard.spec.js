@@ -137,6 +137,28 @@ test('hides the freshness badge when no valid snapshot is available', async ({ p
   expectNoAxeViolations(results, ['critical', 'serious']);
 });
 
+test('coalesces concurrent refreshes for the same source', async ({ page }) => {
+  let dataRequests = 0;
+  let releaseData;
+  const dataResponse = new Promise(resolve => { releaseData = resolve; });
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
+  await page.route('**/data.json?*', async route => {
+    dataRequests += 1;
+    await dataResponse;
+    await route.fulfill({ json: snapshot });
+  });
+  await page.route('**/history.json?*', route => route.fulfill({ json: [snapshot] }));
+  await page.goto('/dashboard.html');
+  await expect.poll(() => dataRequests).toBe(1);
+  await page.evaluate(() => {
+    window.__firstRefresh = refresh();
+    window.__secondRefresh = refresh();
+  });
+  releaseData();
+  await page.evaluate(() => Promise.all([window.__firstRefresh, window.__secondRefresh]));
+  expect(dataRequests).toBe(1);
+});
+
 test('renders fresh external Gist data with independent source and freshness states', async ({ page }) => {
   await page.clock.install({ time: DASHBOARD_NOW });
   await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
