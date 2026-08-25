@@ -274,6 +274,13 @@ class SQLiteMigrationTests(unittest.TestCase):
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone(),
             )
+            self.assertEqual(
+                (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION,),
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key = ?",
+                    (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+                ).fetchone(),
+            )
             self.assertEqual(("ok",), connection.execute("PRAGMA quick_check").fetchone())
             self._assert_v4_layout(connection)
 

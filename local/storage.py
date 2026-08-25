@@ -15,20 +15,27 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 try:
-    from history import canonicalize_limit_id
+    from history import canonicalize_limit_id, opaque_limit_id_from_raw
 except ImportError:  # Standalone storage restore helper used by recovery tooling.
     _OPAQUE_LIMIT_ID_RE = re.compile(r"limit-[0-9a-f]{64}\Z")
+
+    def opaque_limit_id_from_raw(value: object) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        return "limit-" + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
 
     def canonicalize_limit_id(value: object) -> str | None:
         if not isinstance(value, str) or not value:
             return None
         if _OPAQUE_LIMIT_ID_RE.fullmatch(value):
             return value
-        return "limit-" + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+        return opaque_limit_id_from_raw(value)
 
 
 SCHEMA_VERSION = "4"
 SCHEMA_VERSION_NUMBER = 4
+PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY = "public_limit_id_contract_version"
+PUBLIC_LIMIT_ID_CONTRACT_VERSION = "1"
 SQLITE_RETRY_ATTEMPTS = 5
 SQLITE_RETRY_INITIAL_DELAY_SECONDS = 0.05
 SQLITE_RETRY_MAX_DELAY_SECONDS = 0.5
@@ -367,82 +374,113 @@ def _quote_identifier(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
-def _replace_known_limit_ids(value: str, replacements: dict[str, str]) -> str:
-    """Replace known raw IDs in text columns, longest first."""
+_LIMIT_ID_COLUMNS = {
+    "snapshots": ("limit_id",),
+}
+_LIMIT_ID_JSON_COLUMNS = {
+    "collector_state": ("state_json",),
+}
+_LIMIT_ID_JSON_KEYS = frozenset({
+    "limit_id", "limitId", "active_limit_id", "previous_limit_id",
+})
+_ANOMALY_WINDOWS = frozenset({"5h", "weekly"})
+_ANOMALY_TYPES = frozenset({
+    "quota_increase", "reset_shift", "reset_in_past",
+    "reset_missing", "reset_oscillation",
+})
 
-    for raw in sorted(replacements, key=len, reverse=True):
-        value = value.replace(raw, replacements[raw])
-    return value
+
+def _limit_id_contract_version(connection: sqlite3.Connection) -> str | None:
+    if "metadata" not in _table_names(connection):
+        return None
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+    ).fetchone()
+    return str(row[0]) if row and row[0] is not None else None
 
 
-def _collect_json_limit_ids(value: object, replacements: dict[str, str], key: str = "") -> None:
-    """Discover IDs stored in JSON state/metadata without trusting the text."""
+def _limit_id_migration_required(connection: sqlite3.Connection) -> bool:
+    """Require one durable migration until the explicit contract marker exists."""
+
+    return _limit_id_contract_version(connection) != PUBLIC_LIMIT_ID_CONTRACT_VERSION
+
+
+def _migrate_limit_id(value: object, *, legacy: bool) -> object:
+    if not isinstance(value, str) or not value:
+        return value
+    if legacy:
+        return opaque_limit_id_from_raw(value)
+    return canonicalize_limit_id(value)
+
+
+def _is_limit_id_key(key: object) -> bool:
+    return isinstance(key, str) and key in _LIMIT_ID_JSON_KEYS
+
+
+def _migrate_json_limit_ids(value: object, *, legacy: bool) -> tuple[object, bool]:
+    """Recursively migrate only explicitly named ID fields in structured JSON."""
 
     if isinstance(value, dict):
-        for child_key, child in value.items():
-            _collect_json_limit_ids(child, replacements, str(child_key))
-        return
+        changed = False
+        migrated: dict[object, object] = {}
+        for key, child in value.items():
+            if _is_limit_id_key(key) and isinstance(child, str):
+                new_child = _migrate_limit_id(child, legacy=legacy)
+                changed = changed or new_child != child
+            else:
+                new_child, child_changed = _migrate_json_limit_ids(child, legacy=legacy)
+                changed = changed or child_changed
+            migrated[key] = new_child
+        return migrated, changed
     if isinstance(value, list):
+        changed = False
+        migrated_list = []
         for child in value:
-            _collect_json_limit_ids(child, replacements, key)
-        return
-    normalized_key = "".join(character for character in key.lower() if character.isalnum())
-    if isinstance(value, str) and (normalized_key.endswith("limitid") or normalized_key == "limit"):
-        canonical = canonicalize_limit_id(value)
-        if canonical is not None and canonical != value:
-            replacements.setdefault(value, canonical)
+            new_child, child_changed = _migrate_json_limit_ids(child, legacy=legacy)
+            changed = changed or child_changed
+            migrated_list.append(new_child)
+        return migrated_list, changed
+    return value, False
 
 
-def _limit_id_replacements(connection: sqlite3.Connection) -> dict[str, str]:
-    """Return all persisted raw IDs and their opaque v1 representations."""
+def _migrate_json_text(value: object, *, legacy: bool) -> object:
+    if not isinstance(value, str):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, OverflowError):
+        return value
+    migrated, changed = _migrate_json_limit_ids(parsed, legacy=legacy)
+    if not changed:
+        return value
+    return json.dumps(migrated, ensure_ascii=False, separators=(",", ":"))
 
-    replacements: dict[str, str] = {}
-    tables = _table_names(connection)
-    for table in tables:
-        if table.startswith("sqlite_"):
-            continue
-        columns = {
-            str(row[1]): str(row[2]).upper()
-            for row in connection.execute(f"PRAGMA table_info({_quote_identifier(table)})")
-        }
-        if "limit_id" in columns:
-            for row in connection.execute(
-                f"SELECT {_quote_identifier('limit_id')} FROM {_quote_identifier(table)}"
-            ):
-                value = row[0]
-                canonical = canonicalize_limit_id(value)
-                if canonical is not None and canonical != value:
-                    replacements.setdefault(str(value), canonical)
-        text_columns = [name for name, kind in columns.items() if "CHAR" in kind or "TEXT" in kind or "CLOB" in kind]
-        for column in text_columns:
-            for row in connection.execute(
-                f"SELECT {_quote_identifier(column)} FROM {_quote_identifier(table)}"
-            ):
-                raw = row[0]
-                if not isinstance(raw, str) or not raw:
-                    continue
-                # A metadata value is a known ID only for the active anomaly
-                # selector; arbitrary text remains opaque unless it appears in
-                # a JSON object under a limit-id key.
-                if table == "metadata" and column == "value":
-                    key_row = connection.execute(
-                        "SELECT key FROM metadata WHERE value = ? LIMIT 1", (raw,)
-                    ).fetchone()
-                    if key_row and key_row[0] == "anomaly_active_limit_id":
-                        canonical = canonicalize_limit_id(raw)
-                        if canonical is not None and canonical != raw:
-                            replacements.setdefault(raw, canonical)
-                try:
-                    parsed = json.loads(raw)
-                except (TypeError, ValueError, OverflowError):
-                    continue
-                _collect_json_limit_ids(parsed, replacements)
-    return replacements
+
+def _migrate_dedupe_key(value: object, *, legacy: bool) -> object:
+    """Rebuild the exact anomaly dedupe format, never substitute arbitrary text."""
+
+    if not isinstance(value, str):
+        return value
+    parts = value.split("|", 3)
+    if (
+        len(parts) != 4
+        or not parts[0]
+        or parts[1] not in _ANOMALY_WINDOWS
+        or parts[2] not in _ANOMALY_TYPES
+        or not parts[3]
+    ):
+        return value
+    limit_id = _migrate_limit_id(parts[0], legacy=legacy)
+    if not isinstance(limit_id, str):
+        return value
+    return "|".join((limit_id, parts[1], parts[2], parts[3]))
 
 
 def _migrate_anomaly_detector_ids(
     connection: sqlite3.Connection,
-    replacements: dict[str, str],
+    *,
+    legacy: bool,
 ) -> None:
     """Move the ID primary key while merging an impossible canonical collision."""
 
@@ -454,9 +492,17 @@ def _migrate_anomaly_detector_ids(
     for old_id, window, state_json, updated in rows:
         if not isinstance(old_id, str):
             continue
-        new_id = replacements.get(old_id, old_id)
+        new_id = _migrate_limit_id(old_id, legacy=legacy)
         if new_id == old_id:
+            new_state_json = _migrate_json_text(state_json, legacy=legacy)
+            if new_state_json != state_json:
+                connection.execute(
+                    "UPDATE anomaly_detector_state SET state_json = ? "
+                    "WHERE limit_id = ? AND window = ?",
+                    (new_state_json, old_id, window),
+                )
             continue
+        new_state_json = _migrate_json_text(state_json, legacy=legacy)
         conflict = connection.execute(
             "SELECT state_json, updated_at_epoch FROM anomaly_detector_state "
             "WHERE limit_id = ? AND window = ?",
@@ -464,14 +510,15 @@ def _migrate_anomaly_detector_ids(
         ).fetchone()
         if conflict is None:
             connection.execute(
-                "UPDATE anomaly_detector_state SET limit_id = ? WHERE limit_id = ? AND window = ?",
-                (new_id, old_id, window),
+                "UPDATE anomaly_detector_state SET limit_id = ?, state_json = ? "
+                "WHERE limit_id = ? AND window = ?",
+                (new_id, new_state_json, old_id, window),
             )
         elif updated is not None and conflict[1] is not None and updated > conflict[1]:
             connection.execute(
                 "UPDATE anomaly_detector_state SET state_json = ?, updated_at_epoch = ? "
                 "WHERE limit_id = ? AND window = ?",
-                (state_json, updated, new_id, window),
+                (new_state_json, updated, new_id, window),
             )
             connection.execute(
                 "DELETE FROM anomaly_detector_state WHERE limit_id = ? AND window = ?",
@@ -486,7 +533,8 @@ def _migrate_anomaly_detector_ids(
 
 def _migrate_quota_anomaly_ids(
     connection: sqlite3.Connection,
-    replacements: dict[str, str],
+    *,
+    legacy: bool,
 ) -> None:
     """Rewrite anomaly IDs/dedupe keys without violating their unique key."""
 
@@ -497,11 +545,8 @@ def _migrate_quota_anomaly_ids(
     ).fetchall()
     transformed = []
     for anomaly_id, dedupe_key, limit_id, detected_at in rows:
-        new_limit = replacements.get(limit_id, limit_id) if isinstance(limit_id, str) else limit_id
-        new_dedupe = (
-            _replace_known_limit_ids(dedupe_key, replacements)
-            if isinstance(dedupe_key, str) else dedupe_key
-        )
+        new_limit = _migrate_limit_id(limit_id, legacy=legacy)
+        new_dedupe = _migrate_dedupe_key(dedupe_key, legacy=legacy)
         transformed.append((anomaly_id, new_dedupe, new_limit, detected_at))
 
     winners: dict[str, tuple[object, object, object, object]] = {}
@@ -532,51 +577,62 @@ def _migrate_quota_anomaly_ids(
         )
 
 
-def _migrate_limit_ids(connection: sqlite3.Connection) -> None:
-    """Canonicalize IDs across archive columns in the surrounding transaction."""
+def _migrate_limit_ids(connection: sqlite3.Connection, *, legacy: bool) -> None:
+    """Migrate only schema-defined ID fields in the surrounding transaction."""
 
-    replacements = _limit_id_replacements(connection)
-    if not replacements:
-        return
-    _migrate_quota_anomaly_ids(connection, replacements)
-    _migrate_anomaly_detector_ids(connection, replacements)
+    _migrate_quota_anomaly_ids(connection, legacy=legacy)
+    _migrate_anomaly_detector_ids(connection, legacy=legacy)
 
-    # Every ordinary table in the archive is rowid-backed. Updating every text
-    # column catches dedupe keys, anomaly messages, collector JSON, and future
-    # projections that embed an already-known ID, while the transaction keeps
-    # the migration atomic.
-    for table in _table_names(connection):
-        if table.startswith("sqlite_"):
+    for table, columns in _LIMIT_ID_COLUMNS.items():
+        if table not in _table_names(connection):
             continue
-        columns = {
-            str(row[1]): str(row[2]).upper()
-            for row in connection.execute(f"PRAGMA table_info({_quote_identifier(table)})")
-        }
-        text_columns = [name for name, kind in columns.items() if "CHAR" in kind or "TEXT" in kind or "CLOB" in kind]
-        for column in text_columns:
-            rows = connection.execute(
+        for column in columns:
+            for rowid, value in connection.execute(
                 f"SELECT rowid, {_quote_identifier(column)} FROM {_quote_identifier(table)}"
-            ).fetchall()
-            for rowid, raw in rows:
-                if not isinstance(raw, str):
-                    continue
-                updated = _replace_known_limit_ids(raw, replacements)
-                if updated != raw:
+            ).fetchall():
+                migrated = _migrate_limit_id(value, legacy=legacy)
+                if migrated != value:
                     connection.execute(
                         f"UPDATE {_quote_identifier(table)} SET {_quote_identifier(column)} = ? WHERE rowid = ?",
-                        (updated, rowid),
+                        (migrated, rowid),
                     )
 
+    for table, columns in _LIMIT_ID_JSON_COLUMNS.items():
+        if table not in _table_names(connection):
+            continue
+        for column in columns:
+            for rowid, value in connection.execute(
+                f"SELECT rowid, {_quote_identifier(column)} FROM {_quote_identifier(table)}"
+            ).fetchall():
+                migrated = _migrate_json_text(value, legacy=legacy)
+                if migrated != value:
+                    connection.execute(
+                        f"UPDATE {_quote_identifier(table)} SET {_quote_identifier(column)} = ? WHERE rowid = ?",
+                        (migrated, rowid),
+                    )
 
-def _limit_id_migration_required(connection: sqlite3.Connection) -> bool:
-    """Read-only check used to create a recovery backup before ID mutation."""
+    if "metadata" in _table_names(connection):
+        active = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'anomaly_active_limit_id'"
+        ).fetchone()
+        if active:
+            migrated = _migrate_limit_id(active[0], legacy=legacy)
+            if migrated != active[0]:
+                connection.execute(
+                    "UPDATE metadata SET value = ? WHERE key = 'anomaly_active_limit_id'",
+                    (migrated,),
+                )
 
-    try:
-        return bool(_limit_id_replacements(connection))
-    except sqlite3.DatabaseError:
-        # Schema validation below will produce the actionable archive error;
-        # do not mask it with a speculative preflight query.
-        return False
+
+def _set_limit_id_contract_marker(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        INSERT INTO metadata(key, value) VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        WHERE metadata.value IS NOT excluded.value
+        """,
+        (PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY, PUBLIC_LIMIT_ID_CONTRACT_VERSION),
+    )
 
 
 def _table_names(connection: sqlite3.Connection) -> set[str]:
@@ -677,6 +733,12 @@ def create_schema(connection: sqlite3.Connection) -> None:
     elif version == SCHEMA_VERSION_NUMBER:
         _validate_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
 
+    # Capture this before schema metadata is rewritten.  An archive from before
+    # the public-ID contract has no reliable way to distinguish a raw value that
+    # happens to look like a digest, so every dedicated ID is hashed once.
+    legacy_limit_id_contract = (
+        _limit_id_contract_version(connection) != PUBLIC_LIMIT_ID_CONTRACT_VERSION
+    )
     started_transaction = not connection.in_transaction
     if started_transaction:
         connection.execute("BEGIN IMMEDIATE")
@@ -698,7 +760,9 @@ def create_schema(connection: sqlite3.Connection) -> None:
             connection.execute("CREATE INDEX IF NOT EXISTS idx_anomaly_detector_state_updated ON anomaly_detector_state(updated_at_epoch)")
         _set_schema_metadata(connection)
         _validate_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
-        _migrate_limit_ids(connection)
+        if legacy_limit_id_contract:
+            _migrate_limit_ids(connection, legacy=True)
+        _set_limit_id_contract_marker(connection)
         if started_transaction:
             # Validate the post-migration layout before making it durable.
             check_integrity(connection)
@@ -917,7 +981,8 @@ def connect_database(database_path: Path, *, read_only: bool = False) -> sqlite3
                     migrated.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
                     migrated.execute("PRAGMA foreign_keys = ON")
                     migrated.execute("BEGIN IMMEDIATE")
-                    _migrate_limit_ids(migrated)
+                    _migrate_limit_ids(migrated, legacy=True)
+                    _set_limit_id_contract_marker(migrated)
                     migrated.commit()
                     migrated.execute("PRAGMA query_only = ON")
                 except Exception:

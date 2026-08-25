@@ -100,11 +100,11 @@ class StorageDurabilityTests(unittest.TestCase):
             connection.execute(
                 "INSERT INTO quota_anomalies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 ("anomaly-1", f"{raw_id}|5h|quota_increase|episode", "quota_increase", "5h",
-                 raw_id, 1_700_000_000, 20, 80, None, None, f"message {raw_id}", None),
+                 raw_id, 1_700_000_000, 20, 80, None, None, "unrelated default setting", None),
             )
             connection.execute(
                 "INSERT INTO anomaly_detector_state VALUES (?, ?, ?, ?)",
-                (raw_id, "5h", json.dumps({"limit_id": raw_id, "previous": raw_id}), 1_700_000_000),
+                (raw_id, "5h", json.dumps({"limit_id": raw_id, "previous": "unrelated default setting"}), 1_700_000_000),
             )
             connection.execute(
                 "INSERT INTO metadata(key, value) VALUES (?, ?)",
@@ -115,6 +115,14 @@ class StorageDurabilityTests(unittest.TestCase):
                 ("codex", "fixture", json.dumps({"limit_id": raw_id}), 1_700_000_000),
             )
         connection.close()
+
+        # The fixture represents a pre-contract archive rather than a marked
+        # v4 archive with a newly inserted raw value.
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "DELETE FROM metadata WHERE key = ?",
+                (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+            )
 
         connection = storage.connect_database(self.path)
         try:
@@ -129,6 +137,17 @@ class StorageDurabilityTests(unittest.TestCase):
                     self.assertNotIn(raw_id, json.dumps(row, default=str))
             self.assertEqual((canonical,), connection.execute("SELECT limit_id FROM snapshots").fetchone())
             self.assertEqual((canonical,), connection.execute("SELECT limit_id FROM quota_anomalies").fetchone())
+            self.assertEqual(
+                ("unrelated default setting",),
+                connection.execute("SELECT message FROM quota_anomalies").fetchone(),
+            )
+            self.assertEqual(
+                (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION,),
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key = ?",
+                    (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+                ).fetchone(),
+            )
         finally:
             connection.close()
 
@@ -140,6 +159,177 @@ class StorageDurabilityTests(unittest.TestCase):
         )
         self.assertNotIn(raw_id, json.dumps(payload))
         self.assertTrue(list(self.path.parent.glob(f"{self.path.name}.pre-migration.*")))
+
+    def test_limit_id_migration_is_semantic_marked_and_idempotent(self):
+        raw_id = "legacy-secret-account-id"
+        raw_digest_shaped = "limit-" + "a" * 64
+        raw_digest = storage.opaque_limit_id_from_raw(raw_digest_shaped)
+        expected = storage.opaque_limit_id_from_raw(raw_id)
+        sentinel = "unrelated default setting"
+
+        connection = storage.connect_database(self.path)
+        with connection:
+            connection.execute(
+                "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (1_700_000_000, "2023-11-14T22:13:20Z", 80, None, None,
+                 60, None, None, 900, 192, raw_id),
+            )
+            connection.execute(
+                "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (1_700_000_100, "2023-11-14T22:15:00Z", 70, None, None,
+                 50, None, None, 900, 192, raw_digest_shaped),
+            )
+            connection.execute(
+                "INSERT INTO quota_anomalies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("anomaly-raw", f"{raw_id}|5h|quota_increase|episode", "quota_increase", "5h",
+                 raw_id, 1_700_000_000, 20, 80, None, None, sentinel, None),
+            )
+            connection.execute(
+                "INSERT INTO quota_anomalies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("anomaly-digest", f"{raw_digest_shaped}|weekly|reset_shift|episode-2",
+                 "reset_shift", "weekly", raw_digest_shaped, 1_700_000_100,
+                 20, 80, None, None, sentinel, None),
+            )
+            connection.execute(
+                "INSERT INTO anomaly_detector_state VALUES (?, ?, ?, ?)",
+                (raw_digest_shaped, "weekly", json.dumps({"limit_id": raw_digest_shaped,
+                 "default": sentinel}), 1_700_000_100),
+            )
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                ("anomaly_active_limit_id", raw_id),
+            )
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                ("unrelated-default", sentinel),
+            )
+            connection.execute(
+                "INSERT INTO collector_state VALUES (?, ?, ?, ?)",
+                ("codex", "semantic-id", json.dumps({"limit_id": raw_id,
+                 "default": sentinel}), 1_700_000_000),
+            )
+            connection.execute(
+                "INSERT INTO collector_state VALUES (?, ?, ?, ?)",
+                ("codex", "sentinel", json.dumps({"default": sentinel}), 1_700_000_000),
+            )
+        connection.close()
+
+        # This is an archive written before P1.17: no marker means even a
+        # digest-looking server value is still raw and must be hashed.
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "DELETE FROM metadata WHERE key = ?",
+                (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+            )
+
+        # The read-only analytics projection gets the same migration in memory,
+        # while the durable archive remains untouched until a writer opens it.
+        with storage.connect_database(self.path, read_only=True) as connection:
+            self.assertEqual((expected,), connection.execute(
+                "SELECT limit_id FROM snapshots WHERE scraped_at_epoch = 1700000000"
+            ).fetchone())
+            self.assertEqual((raw_digest,), connection.execute(
+                "SELECT limit_id FROM snapshots WHERE scraped_at_epoch = 1700000100"
+            ).fetchone())
+            self.assertEqual((storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION,), connection.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+            ).fetchone())
+        payload = analytics.build_payload(
+            self.path, ROOT / "local" / "pricing.json", {"range": "24h"},
+            now=1_700_000_100,
+        )
+        self.assertNotIn(raw_id, json.dumps(payload))
+        self.assertNotIn(raw_digest_shaped, json.dumps(payload))
+
+        with sqlite3.connect(self.path) as connection:
+            self.assertIsNone(connection.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+            ).fetchone())
+            self.assertEqual((raw_id,), connection.execute(
+                "SELECT limit_id FROM snapshots WHERE scraped_at_epoch = 1700000000"
+            ).fetchone())
+
+        with storage.connect_database(self.path) as connection:
+            self.assertEqual(
+                [(expected,), (raw_digest,)],
+                connection.execute(
+                    "SELECT limit_id FROM snapshots ORDER BY scraped_at_epoch"
+                ).fetchall(),
+            )
+            self.assertEqual((expected,), connection.execute(
+                "SELECT limit_id FROM quota_anomalies WHERE anomaly_id = 'anomaly-raw'"
+            ).fetchone())
+            self.assertEqual((raw_digest,), connection.execute(
+                "SELECT limit_id FROM quota_anomalies WHERE anomaly_id = 'anomaly-digest'"
+            ).fetchone())
+            self.assertEqual((f"{expected}|5h|quota_increase|episode",), connection.execute(
+                "SELECT dedupe_key FROM quota_anomalies WHERE anomaly_id = 'anomaly-raw'"
+            ).fetchone())
+            self.assertEqual((raw_digest,), connection.execute(
+                "SELECT limit_id FROM anomaly_detector_state"
+            ).fetchone())
+            state = json.loads(connection.execute(
+                "SELECT state_json FROM anomaly_detector_state"
+            ).fetchone()[0])
+            self.assertEqual(raw_digest, state["limit_id"])
+            self.assertEqual(sentinel, state["default"])
+            self.assertEqual((expected,), connection.execute(
+                "SELECT value FROM metadata WHERE key = 'anomaly_active_limit_id'"
+            ).fetchone())
+            self.assertEqual((sentinel,), connection.execute(
+                "SELECT value FROM metadata WHERE key = 'unrelated-default'"
+            ).fetchone())
+            self.assertEqual(json.dumps({"default": sentinel}), connection.execute(
+                "SELECT state_json FROM collector_state WHERE state_key = 'sentinel'"
+            ).fetchone()[0])
+            marker = connection.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+            ).fetchone()
+            self.assertEqual((storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION,), marker)
+
+        # A marked archive is a no-op on the second writable open: in
+        # particular, the opaque values are not hashed a second time.
+        with storage.connect_database(self.path) as connection:
+            self.assertEqual(
+                [(expected,), (raw_digest,)],
+                connection.execute(
+                    "SELECT limit_id FROM snapshots ORDER BY scraped_at_epoch"
+                ).fetchall(),
+            )
+
+    def test_limit_id_marker_is_not_written_when_migration_rolls_back(self):
+        raw_id = "rollback-secret-account-id"
+        connection = storage.connect_database(self.path)
+        with connection:
+            connection.execute(
+                "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (1_700_000_000, "2023-11-14T22:13:20Z", 80, None, None,
+                 60, None, None, 900, 192, raw_id),
+            )
+            connection.execute(
+                "DELETE FROM metadata WHERE key = ?",
+                (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+            )
+        connection.close()
+
+        with mock.patch.object(
+            storage, "_migrate_limit_ids",
+            side_effect=sqlite3.DatabaseError("simulated ID migration failure"),
+        ):
+            with self.assertRaisesRegex(sqlite3.DatabaseError, "simulated ID migration failure"):
+                storage.connect_database(self.path)
+
+        with sqlite3.connect(self.path) as connection:
+            self.assertIsNone(connection.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+            ).fetchone())
+            self.assertEqual((raw_id,), connection.execute(
+                "SELECT limit_id FROM snapshots"
+            ).fetchone())
 
     def test_wal_failure_does_not_commit_legacy_schema_migration(self):
         with sqlite3.connect(self.path) as connection:
