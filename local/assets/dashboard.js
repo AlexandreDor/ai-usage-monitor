@@ -28,6 +28,7 @@ let historyFailure = null;
 let historyFailureKey = null;
 let mainFailure = null;
 let dashboardSource = null;
+let refreshInFlight = null;
 
 function t(key, values = {}) {
   return typeof CodexPreferences === 'object' ? CodexPreferences.t(`dashboard.${key}`, values) : key;
@@ -783,14 +784,22 @@ async function fetchGist() {
   }
 }
 
-async function refresh() {
-  try {
-    await (GIST_ID ? fetchGist() : fetchLocal());
-  } catch (error) {
-    setMainError(error instanceof Error ? error.message : t('unableToLoadData'));
-    renderFreshness();
-    scheduleRefresh();
-  }
+function refresh() {
+  if (refreshInFlight) return refreshInFlight;
+  const operation = (async () => {
+    try {
+      await (GIST_ID ? fetchGist() : fetchLocal());
+    } catch (error) {
+      setMainError(error instanceof Error ? error.message : t('unableToLoadData'));
+      renderFreshness();
+      scheduleRefresh();
+    }
+  })();
+  refreshInFlight = operation;
+  operation.finally(() => {
+    if (refreshInFlight === operation) refreshInFlight = null;
+  });
+  return operation;
 }
 
 function refreshLocalizedDashboard() {

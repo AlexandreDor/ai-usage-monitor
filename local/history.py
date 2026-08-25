@@ -310,7 +310,14 @@ def normalize_entry(
             )
         normalized["history_window_hours"] = normal_number(window)
 
-    limit_id = sanitize_limit_id(snapshot.get("limit_id"))
+    # A v0 snapshot predates the persisted opaque-ID contract.  Treat its
+    # value as raw even when it happens to look like a digest; otherwise a
+    # legacy producer could leave a protocol-shaped identifier un-migrated.
+    limit_id = (
+        canonicalize_limit_id(snapshot.get("limit_id"))
+        if declared_version == SCHEMA_VERSION
+        else opaque_limit_id_from_raw(snapshot.get("limit_id"))
+    )
     if limit_id is not None:
         normalized["limit_id"] = limit_id
 

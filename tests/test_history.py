@@ -277,6 +277,53 @@ class HistoryTests(unittest.TestCase):
             self.assertIn(expected, current_written)
             self.assertNotIn(raw_id, current_written)
 
+    def test_legacy_digest_shaped_limit_id_is_hashed_once_at_v0_boundary(self):
+        raw_digest = "limit-" + "a" * 64
+        expected = history.opaque_limit_id_from_raw(raw_digest)
+        now = 1_700_000_000
+
+        for declared_version in (None, 0):
+            legacy = snapshot(now, limit_id=raw_digest)
+            if declared_version is not None:
+                legacy["schema_version"] = declared_version
+            normalized = history.validate_snapshot(legacy)
+            self.assertEqual(expected, normalized["limit_id"])
+            self.assertNotEqual(raw_digest, normalized["limit_id"])
+
+        # A v1 value is already persisted data and must remain idempotent.
+        persisted = {**snapshot(now), "schema_version": 1, "limit_id": expected}
+        self.assertEqual(expected, history.validate_snapshot(persisted)["limit_id"])
+        self.assertEqual(
+            expected,
+            history.validate_snapshot(history.validate_snapshot(persisted))["limit_id"],
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "data.json"
+            history_path = root / "history.json"
+            data_path.write_text(json.dumps({**snapshot(now), "limit_id": raw_digest}), encoding="utf-8")
+            history_path.write_text(
+                json.dumps([{**snapshot(now), "schema_version": 0, "limit_id": raw_digest}]),
+                encoding="utf-8",
+            )
+
+            history.update_current_data(data_path, snapshot(now - 1))
+            history.update_history(
+                history_path,
+                root / "unused-data.json",
+                snapshot(now - 1),
+                24,
+                now_epoch=now,
+            )
+
+            current = json.loads(data_path.read_text(encoding="utf-8"))
+            archived = json.loads(history_path.read_text(encoding="utf-8"))[0]
+            self.assertEqual(expected, current["limit_id"])
+            self.assertEqual(expected, archived["limit_id"])
+            self.assertNotIn(raw_digest, data_path.read_text(encoding="utf-8"))
+            self.assertNotIn(raw_digest, history_path.read_text(encoding="utf-8"))
+
     def test_sqlite_epoch_range_is_rejected(self):
         invalid = snapshot(1_700_000_000, five=50, weekly=75, five_h_reset_at=1e308)
         with self.assertRaises(history.SnapshotValidationError):

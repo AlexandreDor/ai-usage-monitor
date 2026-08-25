@@ -32,6 +32,7 @@ from history import (
     SQLITE_INTEGER_MAX,
     SCHEMA_VERSION as SNAPSHOT_SCHEMA_VERSION,
     canonicalize_limit_id,
+    opaque_limit_id_from_raw,
 )
 
 RECENT_SECONDS = 24 * 60 * 60
@@ -186,7 +187,11 @@ def normalize_snapshot(value: Any, *, strict: bool) -> dict[str, Any] | None:
         else:
             normalized["history_window_hours"] = float(window)
 
-    normalized["limit_id"] = canonicalize_limit_id(value.get("limit_id"))
+    normalized["limit_id"] = (
+        canonicalize_limit_id(value.get("limit_id"))
+        if declared_version == SNAPSHOT_SCHEMA_VERSION
+        else opaque_limit_id_from_raw(value.get("limit_id"))
+    )
 
     forecast = value.get("codex_forecast")
     if isinstance(forecast, dict):

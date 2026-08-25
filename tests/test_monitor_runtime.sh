@@ -45,6 +45,9 @@ check_thresholds() { return 0; }
 collect_token_usage() { return 0; }
 sync_gist() { future_gist_calls=$((future_gist_calls + 1)); }
 set +e
+# This one-shot regression intentionally calls the sourced implementation
+# before replacing run_cycle for the lock test below.
+# shellcheck disable=SC2218
 run_cycle 900 >/dev/null 2>&1
 future_cycle_status=$?
 set -e
