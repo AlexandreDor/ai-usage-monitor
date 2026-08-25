@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import os
 import pathlib
+import json
+import hashlib
 import sqlite3
 import sys
 import tempfile
@@ -14,6 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "local"))
 
 import archive  # noqa: E402
+import analytics  # noqa: E402
 import storage  # noqa: E402
 
 
@@ -84,6 +87,59 @@ class StorageDurabilityTests(unittest.TestCase):
         self.assertEqual(("wal",), connection.execute("PRAGMA journal_mode").fetchone())
         connection.close()
         self.assertEqual([], list(self.path.parent.glob(f"{self.path.name}.pre-migration.*")))
+
+    def test_existing_limit_ids_are_migrated_across_archive_and_analytics(self):
+        raw_id = "raw-secret-account-id"
+        connection = storage.connect_database(self.path)
+        with connection:
+            connection.execute(
+                "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (1_700_000_000, "2023-11-14T22:13:20Z", 80, "later", 1_700_000_100,
+                 60, "later", 1_700_001_000, 900, 192, raw_id),
+            )
+            connection.execute(
+                "INSERT INTO quota_anomalies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("anomaly-1", f"{raw_id}|5h|quota_increase|episode", "quota_increase", "5h",
+                 raw_id, 1_700_000_000, 20, 80, None, None, f"message {raw_id}", None),
+            )
+            connection.execute(
+                "INSERT INTO anomaly_detector_state VALUES (?, ?, ?, ?)",
+                (raw_id, "5h", json.dumps({"limit_id": raw_id, "previous": raw_id}), 1_700_000_000),
+            )
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                ("anomaly_active_limit_id", raw_id),
+            )
+            connection.execute(
+                "INSERT INTO collector_state VALUES (?, ?, ?, ?)",
+                ("codex", "fixture", json.dumps({"limit_id": raw_id}), 1_700_000_000),
+            )
+        connection.close()
+
+        connection = storage.connect_database(self.path)
+        try:
+            canonical = "limit-" + hashlib.sha256(raw_id.encode()).hexdigest()
+            table_names = [
+                row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                )
+            ]
+            for table in table_names:
+                for row in connection.execute(f'SELECT * FROM "{table}"'):
+                    self.assertNotIn(raw_id, json.dumps(row, default=str))
+            self.assertEqual((canonical,), connection.execute("SELECT limit_id FROM snapshots").fetchone())
+            self.assertEqual((canonical,), connection.execute("SELECT limit_id FROM quota_anomalies").fetchone())
+        finally:
+            connection.close()
+
+        payload = analytics.build_payload(
+            self.path,
+            ROOT / "local" / "pricing.json",
+            {"range": "24h"},
+            now=1_700_000_100,
+        )
+        self.assertNotIn(raw_id, json.dumps(payload))
+        self.assertTrue(list(self.path.parent.glob(f"{self.path.name}.pre-migration.*")))
 
     def test_wal_failure_does_not_commit_legacy_schema_migration(self):
         with sqlite3.connect(self.path) as connection:

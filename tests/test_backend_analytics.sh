@@ -39,7 +39,9 @@ from storage import ArchiveSchemaError, connect_database
 
 with connect_database(Path(sys.argv[2])) as connection:
     assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
-    assert connection.execute("SELECT limit_id FROM snapshots").fetchone()[0] == "v1"
+    import hashlib
+    expected_limit = "limit-" + hashlib.sha256(b"v1").hexdigest()
+    assert connection.execute("SELECT limit_id FROM snapshots").fetchone()[0] == expected_limit
     assert connection.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()[0] == "4"
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"reset_events", "token_usage_events", "collector_state", "collector_runs", "forecast_samples", "quota_anomalies", "anomaly_detector_state"} <= tables

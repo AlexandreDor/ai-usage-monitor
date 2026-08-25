@@ -40,24 +40,6 @@ jusqu'à la stabilisation du socle.
 
 **Effort : M**
 
-### 17. Réduire progressivement le script monolithique
-
-Le stockage, l'historique, l'archivage et la collecte Analytics sont déjà
-séparés en modules Python. Le protocole Codex, la validation principale et
-l'orchestration restent concentrés dans `monitor.sh`.
-
-**Objectif :** améliorer la testabilité sans lancer une réécriture prématurée.
-
-**Actions :**
-
-- Définir un schéma versionné pour les snapshots et l'historique JSON.
-- Déplacer progressivement le protocole Codex et la validation vers des modules
-  Python testables.
-- Extraire en priorité `config.py` et un client du protocole Codex, puis limiter
-  Bash au parsing CLI et à l'orchestration.
-
-**Effort : L**
-
 ## P3 - Évolutions fonctionnelles différées
 
 Ces évolutions viendront après la stabilisation des fonctions existantes :
@@ -81,8 +63,7 @@ retirées de cette liste car elles sont déjà implémentées.
 1. Ajouter la détection des données périmées au dashboard principal.
 2. Détecter les anomalies de quota.
 3. Préparer les releases et le packaging.
-4. Réduire progressivement le script monolithique.
-5. Ajouter les évolutions P3 selon les besoins utilisateurs.
+4. Ajouter les évolutions P3 selon les besoins utilisateurs.
 
 ## Définition globale de terminé
 

@@ -37,6 +37,7 @@ ALERT_DELIVERIES_FILE="${RUNTIME_DIR}/alert-deliveries.json"
 ALERTS_PY="${SCRIPT_DIR}/alerts.py"
 ANOMALIES_PY="${SCRIPT_DIR}/anomalies.py"
 HISTORY_PY="${SCRIPT_DIR}/history.py"
+CODEX_CLIENT_PY="${SCRIPT_DIR}/codex_client.py"
 DATA_FILE="${RUNTIME_DIR}/data.json"
 HISTORY_FILE="${RUNTIME_DIR}/history.json"
 ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"
@@ -357,218 +358,15 @@ initialize() {
 fetch_status_json() {
   local interval_seconds="$1"
   local codex_cmd="${CODEX_BIN:-codex}"
+  local debug_args=()
+  [[ "${MONITOR_DEBUG:-0}" == 1 ]] && debug_args+=(--debug)
 
-  python3 - "$codex_cmd" "${CODEX_STATUS_TIMEOUT_SECONDS:-20}" "$interval_seconds" "$HISTORY_RETENTION_HOURS" "${MONITOR_DEBUG:-0}" <<'PYEOF'
-import datetime
-import json
-import math
-import os
-import select
-import subprocess
-import sys
-import time
-from zoneinfo import ZoneInfo
-
-codex_cmd = sys.argv[1]
-timeout_seconds = max(5, int(sys.argv[2]))
-interval_seconds = max(1, int(sys.argv[3]))
-history_window_hours = float(sys.argv[4])
-debug = sys.argv[5] == "1"
-paris_timezone = ZoneInfo("Europe/Paris")
-
-# Do not pass notification or storage credentials to the Codex subprocess.
-codex_environment = os.environ.copy()
-for secret_name in ("DISCORD_WEBHOOK", "GITHUB_PAT", "TELEGRAM_BOT_TOKEN"):
-    codex_environment.pop(secret_name, None)
-
-process = subprocess.Popen(
-    [codex_cmd, "app-server", "--stdio"],
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    text=True,
-    bufsize=1,
-    close_fds=True,
-    env=codex_environment,
-)
-
-
-def send(message):
-    process.stdin.write(json.dumps(message) + "\n")
-    process.stdin.flush()
-
-
-def stop_process():
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=2)
-
-
-send({
-    "id": 1,
-    "method": "initialize",
-    "params": {
-        "clientInfo": {"name": "codex-usage-monitor", "version": "1.0.0"},
-        "capabilities": {"experimentalApi": True},
-    },
-})
-
-deadline = time.monotonic() + timeout_seconds
-result = None
-rate_limit_requested = False
-diagnostic = bytearray()
-
-
-def clean_diagnostic(raw):
-    text = raw.decode("utf-8", "replace")
-    return "".join(char if char in "\n\t" or ord(char) >= 32 else "?" for char in text).strip()[:4096]
-
-try:
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([process.stdout, process.stderr], [], [], 0.5)
-        if not ready:
-            if process.poll() is not None:
-                break
-            continue
-
-        if process.stderr in ready:
-            chunk = os.read(process.stderr.fileno(), 1024)
-            if len(diagnostic) < 4096:
-                diagnostic.extend(chunk[: 4096 - len(diagnostic)])
-            ready.remove(process.stderr)
-        if process.stdout not in ready:
-            continue
-        line = process.stdout.readline()
-        if not line:
-            break
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        if message.get("id") == 1 and not rate_limit_requested:
-            if message.get("error"):
-                break
-            send({"method": "initialized"})
-            send({"id": 2, "method": "account/rateLimits/read", "params": None})
-            rate_limit_requested = True
-        elif message.get("id") == 2:
-            result = message.get("result")
-            break
-finally:
-    stop_process()
-
-if not isinstance(result, dict):
-    sys.stderr.write("[ERROR] Codex app-server did not return usage limits.\n")
-    if debug and diagnostic:
-        sys.stderr.write(f"[DEBUG] Codex diagnostic: {clean_diagnostic(diagnostic)}\n")
-    raise SystemExit(1)
-
-snapshots_by_id = result.get("rateLimitsByLimitId")
-if isinstance(snapshots_by_id, dict) and snapshots_by_id:
-    snapshots = [(str(limit_id), snapshot) for limit_id, snapshot in snapshots_by_id.items()]
-else:
-    flat = result.get("rateLimits")
-    snapshots = [(str(flat.get("limitId", "default")), flat)] if isinstance(flat, dict) else []
-
-
-def finite_number(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-
-
-def classify_windows(snapshot):
-    short = weekly = None
-    for name in ("primary", "secondary"):
-        window = snapshot.get(name)
-        if not isinstance(window, dict):
-            continue
-        duration = window.get("windowDurationMins")
-        used = window.get("usedPercent")
-        if not finite_number(duration) or duration <= 0:
-            continue
-        if not finite_number(used) or not 0 <= used <= 100:
-            continue
-        if 1 <= duration <= 360 and short is None:
-            short = window
-        elif 7 * 24 * 60 <= duration <= 8 * 24 * 60 and weekly is None:
-            weekly = window
-    return short, weekly
-
-
-# Select one coherent limit group; never combine windows from different IDs.
-candidates = []
-for limit_id, snapshot in snapshots:
-    if isinstance(snapshot, dict):
-        short, weekly = classify_windows(snapshot)
-        if short is not None or weekly is not None:
-            candidates.append((int(short is not None) + int(weekly is not None), limit_id, short, weekly))
-
-if not candidates:
-    sys.stderr.write("[ERROR] Codex returned no valid recognized usage window.\n")
-    if debug and diagnostic:
-        sys.stderr.write(f"[DEBUG] Codex diagnostic: {clean_diagnostic(diagnostic)}\n")
-    raise SystemExit(1)
-
-candidates.sort(key=lambda item: item[0], reverse=True)
-_, selected_limit_id, five_hour_window, weekly_window = candidates[0]
-if five_hour_window is None or weekly_window is None:
-    missing = "short" if five_hour_window is None else "weekly"
-    sys.stderr.write(
-        f"[WARN] Codex returned a partial limit group '{selected_limit_id}'; "
-        f"the {missing} usage window is unavailable.\n"
-    )
-
-
-def remaining_percent(window):
-    if not window:
-        return None
-    used = window.get("usedPercent")
-    if not finite_number(used) or not 0 <= used <= 100:
-        return None
-    remaining = 100 - used
-    return int(remaining) if float(remaining).is_integer() else remaining
-
-
-def reset_time(window):
-    if not window:
-        return "unknown"
-    timestamp = window.get("resetsAt")
-    if not finite_number(timestamp):
-        return "unknown"
-    try:
-        reset = datetime.datetime.fromtimestamp(timestamp, paris_timezone)
-    except (OverflowError, OSError, ValueError):
-        return "unknown"
-    return reset.strftime("%d/%m/%Y %H:%M")
-
-
-def reset_timestamp(window):
-    if not window:
-        return None
-    timestamp = window.get("resetsAt")
-    if not finite_number(timestamp) or timestamp <= 0:
-        return None
-    return int(timestamp)
-
-payload = {
-    "five_h_pct": remaining_percent(five_hour_window),
-    "five_h_reset": reset_time(five_hour_window),
-    "five_h_reset_at": reset_timestamp(five_hour_window),
-    "weekly_pct": remaining_percent(weekly_window),
-    "weekly_reset": reset_time(weekly_window),
-    "weekly_reset_at": reset_timestamp(weekly_window),
-    "limit_id": selected_limit_id,
-    "scraped_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "sample_interval_seconds": interval_seconds,
-    "history_window_hours": history_window_hours,
-}
-print(json.dumps(payload, indent=2))
-PYEOF
+  python3 "$CODEX_CLIENT_PY" \
+    --codex-bin "$codex_cmd" \
+    --timeout "${CODEX_STATUS_TIMEOUT_SECONDS:-20}" \
+    --interval "$interval_seconds" \
+    --history-window-hours "$HISTORY_RETENTION_HOURS" \
+    "${debug_args[@]}"
 }
 
 json_get_field() {
@@ -706,10 +504,12 @@ format_paris_timestamp() {
 write_local_snapshot() {
   local json="$1"
 
-  printf '%s\n' "$json" | python3 "$HISTORY_PY" \
+  if ! printf '%s\n' "$json" | python3 "$HISTORY_PY" \
     --history "$HISTORY_FILE" \
     --data "$DATA_FILE" \
-    --retention-hours "$HISTORY_RETENTION_HOURS"
+    --retention-hours "$HISTORY_RETENTION_HOURS"; then
+    return 1
+  fi
 
   echo "[OK] Snapshot storage processed at ${DATA_FILE}"
 }
@@ -717,9 +517,11 @@ write_local_snapshot() {
 write_current_snapshot() {
   local json="$1"
 
-  printf '%s\n' "$json" | python3 "$HISTORY_PY" \
-    --data "$DATA_FILE" \
-    --data-only
+  if ! printf '%s\n' "$json" | python3 "$HISTORY_PY" \
+      --data "$DATA_FILE" \
+      --data-only; then
+    return 1
+  fi
 
   echo "[OK] Current snapshot updated at ${DATA_FILE}"
 }
@@ -2329,7 +2131,7 @@ run_cycle() {
   fi
   echo "[$(format_paris_now)] Scraping codex status (${cycle_mode} cycle)..."
 
-  local json public_json gist_json status=0 history_json="[]"
+  local json public_json gist_json status=0 history_json="[]" storage_ok=1
   CYCLE_ERROR=""
   if json=$(fetch_status_json "$interval_seconds"); then
     echo "$json" | python3 -m json.tool 2>/dev/null || echo "$json"
@@ -2342,12 +2144,16 @@ run_cycle() {
     if [[ "$cycle_mode" == full ]]; then
       if ! archive_snapshot "$public_json"; then
         status=1
+        storage_ok=0
         append_cycle_error "Long-term archive update failed"
       fi
       if write_local_snapshot "$public_json"; then
-        [[ -f "$HISTORY_FILE" ]] && history_json="$(<"$HISTORY_FILE")"
+        if [[ -f "$HISTORY_FILE" ]]; then
+          history_json="$(<"$HISTORY_FILE")"
+        fi
       else
         status=1
+        storage_ok=0
         append_cycle_error "Local snapshot write failed"
       fi
       gist_json="$public_json"
@@ -2358,7 +2164,11 @@ run_cycle() {
           append_cycle_error "External snapshot cadence update failed"
         fi
       fi
-      sync_gist "$gist_json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
+      if (( storage_ok )); then
+        sync_gist "$gist_json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
+      else
+        echo "[WARN] Skipping GitHub Gist sync because local storage failed." >&2
+      fi
     else
       write_current_snapshot "$public_json" || { status=1; append_cycle_error "Current snapshot write failed"; }
     fi

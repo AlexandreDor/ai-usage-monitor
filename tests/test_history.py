@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import contextlib
 from datetime import datetime, timedelta, timezone
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -37,6 +38,41 @@ def snapshot(epoch, five=50, weekly=75, **extra):
 
 
 class HistoryTests(unittest.TestCase):
+    def test_unversioned_snapshot_is_read_as_v0_and_written_as_v1(self):
+        now = 1_700_000_000
+        legacy = snapshot(now)
+        self.assertNotIn("schema_version", legacy)
+        normalized = history.validate_snapshot(legacy)
+        self.assertEqual(1, normalized["schema_version"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history_path = root / "history.json"
+            data_path = root / "data.json"
+            history_path.write_text(json.dumps([legacy]), encoding="utf-8")
+            history.update_history(history_path, data_path, legacy, 24, now_epoch=now)
+            self.assertEqual(1, json.loads(history_path.read_text())[0]["schema_version"])
+            self.assertEqual(1, json.loads(data_path.read_text())["schema_version"])
+
+    def test_future_snapshot_schema_is_rejected_without_rewriting_history(self):
+        now = 1_700_000_000
+        future = {**snapshot(now), "schema_version": history.SCHEMA_VERSION + 1}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history_path = root / "history.json"
+            data_path = root / "data.json"
+            original = json.dumps([future])
+            history_path.write_text(original, encoding="utf-8")
+            with self.assertRaises(history.UnsupportedSchemaVersionError):
+                history.update_history(history_path, data_path, snapshot(now), 24, now_epoch=now)
+            self.assertEqual(original, history_path.read_text(encoding="utf-8"))
+            self.assertFalse(data_path.exists())
+
+    def test_huge_future_schema_version_is_rejected_without_echoing_the_integer(self):
+        huge_version = 10**5_000
+        with self.assertRaises(history.UnsupportedSchemaVersionError) as raised:
+            history.validate_snapshot({**snapshot(1_700_000_000), "schema_version": huge_version})
+        self.assertLess(len(str(raised.exception)), 200)
+
     def test_timestamp_normalization_sorting_and_equivalent_offsets(self):
         instant = 1_700_000_000
         later = instant + 60
@@ -119,6 +155,154 @@ class HistoryTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(history.SnapshotValidationError):
                     history.validate_snapshot(value)
+
+    def test_arbitrarily_large_json_integer_is_rejected_without_overflow(self):
+        huge = 10**5_000
+        value = snapshot(1_700_000_000, five=huge)
+        with self.assertRaises(history.SnapshotValidationError):
+            history.validate_snapshot(value)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = (
+                '{"five_h_pct":' + ("9" * 5_000)
+                + ',"weekly_pct":75,"scraped_at":"2023-11-14T22:13:20Z"}'
+            )
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "local" / "history.py"),
+                    "--data",
+                    str(root / "data.json"),
+                    "--data-only",
+                ],
+                input=raw,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(1, process.returncode)
+            self.assertNotIn("Traceback", process.stderr)
+
+            existing = root / "existing-data.json"
+            existing.write_text(raw, encoding="utf-8")
+            replaced = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "local" / "history.py"),
+                    "--data",
+                    str(existing),
+                    "--data-only",
+                ],
+                input=json.dumps(snapshot(1_700_000_001)),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, replaced.returncode, replaced.stderr)
+            self.assertNotIn("Traceback", replaced.stderr)
+
+            existing_history = root / "existing-history.json"
+            existing_history.write_text("[" + raw + "]", encoding="utf-8")
+            migrated = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "local" / "history.py"),
+                    "--history",
+                    str(existing_history),
+                    "--data",
+                    str(root / "history-data.json"),
+                    "--retention-hours",
+                    "24",
+                ],
+                input=json.dumps(snapshot(1_700_000_002)),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, migrated.returncode, migrated.stderr)
+            self.assertNotIn("Traceback", migrated.stderr)
+
+    def test_extreme_retention_cli_value_is_user_error_without_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "local" / "history.py"),
+                    "--history",
+                    str(root / "history.json"),
+                    "--data",
+                    str(root / "data.json"),
+                    "--retention-hours",
+                    "9" * 5_000,
+                ],
+                input=json.dumps(snapshot(1_700_000_000)),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(1, process.returncode)
+            self.assertIn("retention hours", process.stderr)
+            self.assertNotIn("Traceback", process.stderr)
+            self.assertFalse((root / "history.json").exists())
+
+    def test_limit_id_is_opaque_stable_and_migrated_from_legacy(self):
+        raw_id = "server-secret /workspace/path\nwith-control"
+        expected = "limit-" + hashlib.sha256(raw_id.encode()).hexdigest()
+        self.assertEqual(expected, history.sanitize_limit_id(raw_id))
+        self.assertEqual(expected, history.sanitize_limit_id(expected))
+        now = 1_700_000_000
+        legacy = snapshot(now, limit_id=raw_id)
+        normalized = history.validate_snapshot(legacy)
+        self.assertEqual(expected, normalized["limit_id"])
+        self.assertNotIn(raw_id, json.dumps(normalized))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history_path = root / "history.json"
+            data_path = root / "data.json"
+            history.update_history(history_path, data_path, legacy, 24, now_epoch=now)
+            written = history_path.read_text(encoding="utf-8")
+            self.assertIn(expected, written)
+            self.assertNotIn(raw_id, written)
+
+            data_path.write_text(json.dumps({**snapshot(now), "limit_id": raw_id}), encoding="utf-8")
+            history.update_history(
+                history_path,
+                data_path,
+                {**snapshot(now - 1), "limit_id": raw_id},
+                24,
+                now_epoch=now,
+            )
+            current_written = data_path.read_text(encoding="utf-8")
+            self.assertIn(expected, current_written)
+            self.assertNotIn(raw_id, current_written)
+
+    def test_sqlite_epoch_range_is_rejected(self):
+        invalid = snapshot(1_700_000_000, five=50, weekly=75, five_h_reset_at=1e308)
+        with self.assertRaises(history.SnapshotValidationError):
+            history.validate_snapshot(invalid)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = (
+                '{"five_h_pct":50,"weekly_pct":75,"five_h_reset_at":1e308,'
+                '"scraped_at":"2023-11-14T22:13:20Z"}'
+            )
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "local" / "history.py"),
+                    "--data",
+                    str(root / "data.json"),
+                    "--data-only",
+                ],
+                input=raw,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(1, process.returncode)
+            self.assertNotIn("Traceback", process.stderr)
+            self.assertFalse((root / "data.json").exists())
 
     def test_retention_is_inclusive_and_independent_of_collection_interval(self):
         now = 1_700_000_000
@@ -435,6 +619,46 @@ class HistoryTests(unittest.TestCase):
             current = json.loads(data_path.read_text(encoding="utf-8"))
             self.assertEqual(40, current["five_h_pct"])
             self.assertEqual(next_forecast, current["codex_forecast"])
+
+    def test_data_only_migrates_recent_legacy_snapshot_when_incoming_is_older(self):
+        recent = 1_700_000_600
+        older = recent - 300
+        raw_id = "raw-secret-account-id"
+        with tempfile.TemporaryDirectory() as directory:
+            data_path = Path(directory) / "data.json"
+            data_path.write_text(
+                json.dumps(snapshot(recent, five=88, weekly=66, limit_id=raw_id)),
+                encoding="utf-8",
+            )
+            result = history.update_current_data(
+                data_path,
+                snapshot(older, five=12, weekly=23),
+            )
+            current = json.loads(data_path.read_text(encoding="utf-8"))
+
+            self.assertFalse(result.data_updated)
+            self.assertEqual(timestamp(recent), current["scraped_at"])
+            self.assertEqual(88, current["five_h_pct"])
+            self.assertEqual(66, current["weekly_pct"])
+            self.assertEqual(1, current["schema_version"])
+            self.assertEqual(history.opaque_limit_id_from_raw(raw_id), current["limit_id"])
+            self.assertNotIn(raw_id, data_path.read_text(encoding="utf-8"))
+
+    def test_reset_epoch_requires_integer_seconds_but_accepts_integral_float(self):
+        normalized = history.validate_snapshot(snapshot(1_700_000_000, five_h_reset_at=1.0))
+        self.assertEqual(1, normalized["five_h_reset_at"])
+        with self.assertRaises(history.SnapshotValidationError):
+            history.validate_snapshot(snapshot(1_700_000_000, five_h_reset_at=1.5))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history_path = root / "history.json"
+            data_path = root / "data.json"
+            original = json.dumps([snapshot(1_700_000_000, five_h_reset_at=1.5)])
+            history_path.write_text(original, encoding="utf-8")
+            with self.assertRaises(history.SnapshotValidationError):
+                history.update_history(history_path, data_path, snapshot(1_700_000_001), 24)
+            self.assertEqual(original, history_path.read_text(encoding="utf-8"))
+            self.assertFalse(data_path.exists())
 
     def test_data_only_cli_does_not_require_or_repair_history(self):
         now = 1_700_000_000

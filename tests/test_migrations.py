@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pathlib
+import hashlib
 import sqlite3
 import sys
 import tempfile
@@ -290,7 +291,7 @@ class SQLiteMigrationTests(unittest.TestCase):
                     )
                     self._assert_v4_layout(connection)
                     self.assertEqual(
-                        (f"v{version}",),
+                        ("limit-" + hashlib.sha256(f"v{version}".encode()).hexdigest(),),
                         connection.execute(
                             "SELECT limit_id FROM snapshots WHERE scraped_at_epoch = ?",
                             (1000 + version,),

@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -20,6 +22,10 @@ import uuid
 
 MAX_HISTORY_ENTRIES = 10_000
 MAX_HISTORY_BYTES = 16 * 1024 * 1024
+SCHEMA_VERSION = 1
+SQLITE_INTEGER_MIN = -(1 << 63)
+SQLITE_INTEGER_MAX = (1 << 63) - 1
+OPAQUE_LIMIT_ID_RE = re.compile(r"limit-[0-9a-f]{64}\Z")
 
 PERCENTAGE_FIELDS = ("five_h_pct", "weekly_pct")
 RESET_LABEL_FIELDS = ("five_h_reset", "weekly_reset")
@@ -34,6 +40,10 @@ class HistoryError(ValueError):
 
 class SnapshotValidationError(HistoryError):
     """A public snapshot does not satisfy the history contract."""
+
+
+class UnsupportedSchemaVersionError(SnapshotValidationError):
+    """A snapshot declares a schema version this monitor cannot understand."""
 
 
 @dataclass(frozen=True)
@@ -72,15 +82,19 @@ def error(message: str) -> None:
 
 
 def finite_number(value: Any) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, ValueError):
+        return False
 
 
 def normal_number(value: int | float) -> int | float:
-    numeric = float(value)
+    try:
+        numeric = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise SnapshotValidationError("numeric value is outside the supported range") from exc
     return int(numeric) if numeric.is_integer() else numeric
 
 
@@ -140,20 +154,52 @@ def sanitize_reset_label(value: Any) -> str:
     return value
 
 
-def sanitize_optional_epoch(value: Any) -> int | float | None:
-    if not finite_number(value) or float(value) <= 0:
+def sanitize_optional_epoch(value: Any) -> int | None:
+    if value is None:
         return None
-    return normal_number(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        numeric = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise SnapshotValidationError("reset epoch is outside the supported range") from exc
+    if not math.isfinite(numeric):
+        raise SnapshotValidationError("reset epoch must be finite")
+    if numeric <= 0:
+        return None
+    if numeric > SQLITE_INTEGER_MAX:
+        raise SnapshotValidationError("reset epoch is outside the supported range")
+    # ``reset_at`` is an integer Unix-seconds contract.  A few old producers
+    # serialized integral seconds as ``1.0``; retain that compatibility while
+    # refusing a fractional value which SQLite would silently truncate.
+    if not numeric.is_integer():
+        raise SnapshotValidationError("reset epoch must be an integer number of seconds")
+    return int(numeric)
 
 
-def sanitize_limit_id(value: Any) -> str | None:
-    if (
-        isinstance(value, str)
-        and len(value) <= 100
-        and not any(ord(character) < 32 for character in value)
-    ):
+def opaque_limit_id_from_raw(value: Any) -> str | None:
+    """Hash one raw protocol identifier unconditionally at the trust boundary."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    digest = hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"limit-{digest}"
+
+
+def canonicalize_limit_id(value: Any) -> str | None:
+    """Normalize a persisted identifier without hashing an opaque ID twice."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    if OPAQUE_LIMIT_ID_RE.fullmatch(value):
         return value
-    return None
+    return opaque_limit_id_from_raw(value)
+
+
+# Backwards-compatible public name used by archive/tests and external scripts.
+# It describes persisted-data normalization; protocol clients must call
+# ``opaque_limit_id_from_raw`` instead.
+sanitize_limit_id = canonicalize_limit_id
 
 
 def sanitize_forecast(
@@ -202,8 +248,28 @@ def normalize_entry(
     if not isinstance(snapshot, Mapping) or isinstance(snapshot, list):
         raise SnapshotValidationError("snapshot must be a JSON object")
 
+    # Files written before the versioned contract are v0 by implication.  An
+    # explicit v0 is accepted for callers that already annotated a legacy
+    # snapshot; every known snapshot is emitted as v1 below.  Future versions
+    # are fatal rather than silently discarded or partially migrated.
+    declared_version = snapshot.get("schema_version", 0)
+    if (
+        isinstance(declared_version, bool)
+        or not isinstance(declared_version, int)
+        or declared_version < 0
+    ):
+        raise SnapshotValidationError("schema_version must be an integer")
+    if declared_version > SCHEMA_VERSION:
+        raise UnsupportedSchemaVersionError(
+            "unsupported snapshot schema version; "
+            f"maximum supported version is {SCHEMA_VERSION}"
+        )
+
     canonical_timestamp, epoch_microseconds = parse_timestamp(snapshot.get("scraped_at"))
-    normalized: dict[str, Any] = {"scraped_at": canonical_timestamp}
+    normalized: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "scraped_at": canonical_timestamp,
+    }
 
     valid_percentage = False
     for field in PERCENTAGE_FIELDS:
@@ -299,7 +365,7 @@ def read_existing_history(path: Path) -> LoadedHistory:
             return LoadedHistory([], True, "history exceeds the 16 MiB input limit")
         raw = path.read_text(encoding="utf-8")
         value = json.loads(raw)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, ValueError) as exc:
         return LoadedHistory([], True, f"history is not valid JSON: {exc}")
     if not isinstance(value, list):
         return LoadedHistory([], True, "history root is not a JSON array")
@@ -309,7 +375,18 @@ def read_existing_history(path: Path) -> LoadedHistory:
     for item in value:
         try:
             valid_entries.append(normalize_entry(item, include_forecast=True))
-        except SnapshotValidationError:
+        except UnsupportedSchemaVersionError:
+            # A future contract cannot be safely reconstructed by dropping
+            # fields.  Let update_history reject it explicitly and preserve the
+            # original file for an operator to migrate intentionally.
+            raise
+        except SnapshotValidationError as exc:
+            # Reset epochs are a storage contract, not a lossy best-effort
+            # field. Refuse a fractional legacy entry before any reconstruction
+            # or data write; other malformed legacy samples retain salvage
+            # compatibility.
+            if str(exc).startswith("reset epoch"):
+                raise
             invalid_count += 1
     entries = deduplicate(valid_entries)
     if invalid_count:
@@ -405,10 +482,15 @@ def serialize_history(entries: list[Entry]) -> bytes:
 
 
 def serialize_snapshot(snapshot: Mapping[str, Any]) -> bytes:
+    public = normalize_entry(
+        snapshot,
+        include_forecast=True,
+        include_forecast_thresholds=True,
+    ).public
     try:
         return (
             json.dumps(
-                dict(snapshot),
+                public,
                 ensure_ascii=False,
                 allow_nan=False,
                 indent=2,
@@ -463,7 +545,7 @@ def parse_retention_hours(value: Any) -> float:
         raise HistoryError("retention hours must be a finite number from 0.25 to 8760")
     try:
         retention = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise HistoryError("retention hours must be a finite number from 0.25 to 8760") from exc
     if not math.isfinite(retention) or not 0.25 <= retention <= 8_760:
         raise HistoryError("retention hours must be a finite number from 0.25 to 8760")
@@ -482,7 +564,14 @@ def read_current_data(data_file: Path) -> Entry | None:
             include_forecast=True,
             include_forecast_thresholds=True,
         )
-    except (OSError, UnicodeError, json.JSONDecodeError, SnapshotValidationError) as exc:
+    except UnsupportedSchemaVersionError:
+        raise
+    except SnapshotValidationError as exc:
+        if str(exc).startswith("reset epoch"):
+            raise
+        warn(f"Current data snapshot is invalid and will be replaced: {exc}")
+        return None
+    except (OSError, UnicodeError, ValueError) as exc:
         warn(f"Current data snapshot is invalid and will be replaced: {exc}")
         return None
 
@@ -503,6 +592,19 @@ def update_current_data(
     )
     current = read_current_data(data_file)
     if current is not None and incoming.epoch_microseconds < current.epoch_microseconds:
+        # A stale incoming sample must not prevent a one-time data-only
+        # migration.  Keep the recent values/timestamp, but atomically rewrite
+        # the legacy representation so public data cannot retain a v0/raw ID.
+        try:
+            raw_current = json.loads(data_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            raw_current = None
+        if (
+            not isinstance(raw_current, Mapping)
+            or raw_current.get("schema_version") != SCHEMA_VERSION
+            or raw_current.get("limit_id") != current.public.get("limit_id")
+        ):
+            atomic_write(data_file, serialize_snapshot(current.public))
         warn("Older snapshot did not replace data.json.")
         return DataUpdate(dict(current.public), False)
 
@@ -547,6 +649,10 @@ def update_history(
     else:
         current_epoch = float(now_epoch)
 
+    # Validate an existing current snapshot before changing history.  In
+    # particular, an unknown future schema must not result in a half-applied
+    # update where history was rewritten before data.json was rejected.
+    current_data = read_current_data(data_file)
     loaded = read_existing_history(history_file)
     backup: Path | None = None
     if loaded.corrupt and history_file.exists():
@@ -567,8 +673,6 @@ def update_history(
     retained = apply_defensive_limits(retained)
 
     atomic_write(history_file, serialize_history(retained))
-
-    current_data = read_current_data(data_file)
 
     merged_incoming = next(
         (
@@ -591,6 +695,36 @@ def update_history(
         atomic_write(data_file, serialize_snapshot(data_public))
         data_updated = True
     else:
+        # Even an older observation must canonicalize a legacy current file;
+        # otherwise a v0/raw limit_id could remain publicly readable forever.
+        # Preserve its original timestamp spelling, which is part of the
+        # backwards-compatible public representation for an older snapshot.
+        try:
+            raw_current = json.loads(data_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            raw_current = None
+        needs_migration = (
+            not isinstance(raw_current, Mapping)
+            or raw_current.get("schema_version") != SCHEMA_VERSION
+            or raw_current.get("limit_id") != current_data.public.get("limit_id")
+        )
+        if needs_migration:
+            migrated_public = dict(current_data.public)
+            if isinstance(raw_current, Mapping) and isinstance(raw_current.get("scraped_at"), str):
+                migrated_public["scraped_at"] = raw_current["scraped_at"]
+            try:
+                migrated_bytes = (
+                    json.dumps(
+                        migrated_public,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise HistoryError("could not serialize migrated current snapshot") from exc
+            atomic_write(data_file, migrated_bytes)
         warn("Older snapshot retained in history but did not replace data.json.")
 
     return HistoryUpdate(
@@ -642,7 +776,7 @@ def main(argv: list[str] | None = None) -> int:
                 snapshot,
                 args.retention_hours,
             )
-    except (HistoryError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (HistoryError, OSError, UnicodeError, ValueError, OverflowError) as exc:
         error(str(exc))
         return 1
 

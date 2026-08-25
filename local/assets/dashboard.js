@@ -11,6 +11,7 @@ const MAX_SAMPLE_INTERVAL_SECONDS = 86_400;
 const DECIMATION_THRESHOLD = 1000;
 const DECIMATION_SAMPLES = 600;
 const PARIS_TIME_ZONE = 'Europe/Paris';
+const SNAPSHOT_SCHEMA_VERSION = 1;
 
 let chart = null;
 let refreshTimer = null;
@@ -40,6 +41,24 @@ function validPct(value) {
   if (value === null || value === undefined || value === '') return null;
   const pct = Number(value);
   return Number.isFinite(pct) && pct >= 0 && pct <= 100 ? pct : null;
+}
+
+function validateSnapshotSchema(snapshot, history = false) {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    const error = history ? historyError('invalidHistory') : new Error(t('invalidDashboardData'));
+    throw error;
+  }
+  const version = snapshot.schema_version;
+  if (version === undefined) return snapshot; // implicit v0 compatibility
+  if (!Number.isInteger(version) || version < 0) {
+    const error = history ? historyError('invalidSnapshotSchema') : new Error(t('invalidSnapshotSchema'));
+    throw error;
+  }
+  if (version > SNAPSHOT_SCHEMA_VERSION) {
+    const error = history ? historyError('unsupportedSchema') : new Error(t('unsupportedSchema'));
+    throw error;
+  }
+  return snapshot;
 }
 
 function displayText(value, fallback = '-', maxLength = 200) {
@@ -450,6 +469,7 @@ function normalizeHistory(history) {
   const byTimestamp = new Map();
   for (const item of history) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    validateSnapshotSchema(item, true);
     const timestamp = Date.parse(displayText(item.scraped_at, ''));
     const fiveHour = validPct(item.five_h_pct);
     const weekly = validPct(item.weekly_pct);
@@ -476,6 +496,13 @@ function historyError(key) {
   const error = new Error(t(key));
   error.historyKey = key;
   return error;
+}
+
+function shouldPreserveValidHistory(error) {
+  return error instanceof Error
+    && ['chartFailed', 'unsupportedSchema', 'invalidSnapshotSchema'].includes(error.historyKey)
+    && Array.isArray(dashboardHistoryPoints)
+    && dashboardHistoryPoints.length > 0;
 }
 
 function historyTitle(points) {
@@ -566,8 +593,9 @@ function chartTimeBounds(points) {
 }
 
 function renderHistory(history) {
-  dashboardHistory = null;
-  dashboardHistoryPoints = null;
+  // Normalize first.  A future/invalid payload must not erase the last valid
+  // chart state; the caller can then render an explicit error while retaining
+  // those points for the accessible fallback.
   const points = normalizeHistory(history);
   dashboardHistory = history;
   dashboardHistoryPoints = points;
@@ -663,7 +691,15 @@ function renderHistoryFailure(message, key = null, { preserveValidHistory = fals
     && dashboardHistoryPoints.length > 0;
   if (hasValidHistory) {
     setHistoryState('chart-unavailable');
-    destroyChart(historyTitle(dashboardHistoryPoints));
+    // Unsupported/invalid payloads are transient publication failures. Keep
+    // the last rendered chart and points visible while surfacing the error;
+    // only an empty history or a chart rendering failure should destroy it.
+    const keepVisible = ['unsupportedSchema', 'invalidSnapshotSchema'].includes(key);
+    if (keepVisible) {
+      setHistoryCanvasVisible(true);
+    } else {
+      destroyChart(historyTitle(dashboardHistoryPoints));
+    }
   } else {
     dashboardHistory = null;
     dashboardHistoryPoints = null;
@@ -677,6 +713,7 @@ function renderData(data, { schedule = true, clearError = true } = {}) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     throw new Error(t('invalidDashboardData'));
   }
+  validateSnapshotSchema(data);
   classifySnapshotFreshness(data);
   dashboardData = data;
   setBar('five-h-bar', 'five-h-pct', data.five_h_pct, 'fiveHourQuotaLabel', '--');
@@ -705,6 +742,7 @@ async function fetchJson(url, missingMessage) {
 
 async function fetchLocal() {
   const data = await fetchJson('data.json', t('dataNotFound'));
+  validateSnapshotSchema(data);
   classifySnapshotFreshness(data);
   renderSource('local');
   renderData(data);
@@ -715,7 +753,7 @@ async function fetchLocal() {
     renderHistoryFailure(
       error instanceof Error ? error.message : t('unableToLoadHistory'),
       error instanceof Error ? error.historyKey || null : null,
-      { preserveValidHistory: error instanceof Error && error.historyKey === 'chartFailed' },
+      { preserveValidHistory: shouldPreserveValidHistory(error) },
     );
   }
 }
@@ -727,6 +765,7 @@ async function fetchGist() {
   const dataContent = gist?.files?.['data.json']?.content;
   if (!dataContent) throw new Error(t('gistDataNotFound'));
   const data = JSON.parse(dataContent);
+  validateSnapshotSchema(data);
   classifySnapshotFreshness(data);
   renderSource('external');
   renderData(data);
@@ -739,7 +778,7 @@ async function fetchGist() {
     renderHistoryFailure(
       error instanceof Error ? error.message : t('unableToLoadHistory'),
       error instanceof Error ? error.historyKey || null : null,
-      { preserveValidHistory: error instanceof Error && error.historyKey === 'chartFailed' },
+      { preserveValidHistory: shouldPreserveValidHistory(error) },
     );
   }
 }

@@ -17,7 +17,7 @@ import sqlite3
 import sys
 from typing import Any
 
-from storage import ArchiveCorruptionError, connect_database
+from storage import ArchiveCorruptionError, canonicalize_limit_id, connect_database
 
 
 # These are intentionally named and shared with archive.py/monitor.sh's
@@ -61,7 +61,7 @@ def _epoch(value: Any) -> int | None:
 
 def _limit_id(value: Any) -> str:
     if isinstance(value, str) and value and all(ord(char) >= 32 for char in value):
-        return value
+        return canonicalize_limit_id(value) or "__unknown__"
     return "__unknown__"
 
 
