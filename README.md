@@ -194,14 +194,16 @@ not used at runtime.
 From the repository root, run the same quality controls locally:
 
 ```bash
+test "$(python3 -c 'import platform; print(platform.python_version())')" = "$(tr -d '[:space:]' < .python-version)"
+test "$(node --version)" = "v$(tr -d '[:space:]' < .node-version)"
 python3 -m pip install --requirement requirements-ci.txt
+bash -n local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
 python3 -m compileall -q local tests
-python3 -m unittest tests.test_migrations
 python3 -m coverage run --branch --rcfile=.coveragerc -m unittest \
-  tests.test_alerts tests.test_anomalies tests.test_history tests.test_config \
-  tests.test_storage_durability
+  tests.test_migrations tests.test_alerts tests.test_anomalies tests.test_history \
+  tests.test_config tests.test_storage_durability
 python3 -m coverage report --rcfile=.coveragerc
-tests/run.sh
+SKIP_PYTHON_TESTS=1 tests/run.sh
 npm ci
 npm audit --audit-level=low
 npx playwright install --with-deps chromium
@@ -209,10 +211,12 @@ npm run test:browser
 shellcheck -x local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
 ```
 
-Coverage enables branch measurement for the exercised Python modules and fails
-below the combined 60% line-and-branch threshold. The threshold is deliberately
-below the current measured baseline (66%) so it blocks regressions without
-pretending that unexercised browser-facing subprocess paths are covered.
+Coverage enables branch measurement for the exercised Python modules, including
+the SQLite migration tests, and fails below the combined 60% line-and-branch
+threshold. The threshold is deliberately
+below the current measured baseline (67%) so it blocks regressions without
+pretending that modules exercised only through separate subprocesses are
+covered by this in-process report.
 `npm audit --audit-level=low` is also blocking: every vulnerability reported at
 low severity or above fails the CI job, while `package-lock.json` remains the
 reproducible installation source. Migration tests cover fresh archives,

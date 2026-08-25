@@ -21,6 +21,13 @@ jobs:
         with:
           node-version-file: .node-version
           cache: npm
+      - name: Verify pinned runtime versions
+        run: |
+          expected_python="$(tr -d '[:space:]' < .python-version)"
+          actual_python="$(python -c 'import platform; print(platform.python_version())')"
+          test "$actual_python" = "$expected_python"
+          expected_node="$(tr -d '[:space:]' < .node-version)"
+          test "$(node --version)" = "v$expected_node"
       - name: Install quality dependencies
         run: python -m pip install --requirement requirements-ci.txt
       - name: Install ShellCheck
@@ -36,8 +43,8 @@ jobs:
       - name: Run Python tests with branch coverage
         run: >-
           python -m coverage run --branch --rcfile=.coveragerc -m unittest
-          tests.test_alerts tests.test_anomalies tests.test_history tests.test_config
-          tests.test_storage_durability
+          tests.test_migrations tests.test_alerts tests.test_anomalies
+          tests.test_history tests.test_config tests.test_storage_durability
       - name: Enforce Python coverage threshold
         run: python -m coverage report --rcfile=.coveragerc
       - name: Run shell and functional tests
