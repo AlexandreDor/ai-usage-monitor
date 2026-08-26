@@ -44,6 +44,8 @@ output_one="$(mktemp -d "${TMPDIR:-/tmp}/codex-release-one.XXXXXX")"
 output_two="$(mktemp -d "${TMPDIR:-/tmp}/codex-release-two.XXXXXX")"
 trap 'rm -rf -- "$output_one" "$output_two"' EXIT
 
+env -u RELEASE_TAG GITHUB_REF_NAME='52/merge' SOURCE_DATE_EPOCH=0 "$BUILD_SCRIPT" \
+  --version "$version" --output-dir "${output_one}/github-ref-name"
 SOURCE_DATE_EPOCH=0 "$BUILD_SCRIPT" --version "$version" --tag "v${version}" --output-dir "$output_one"
 SOURCE_DATE_EPOCH=0 "$BUILD_SCRIPT" --version "$version" --tag "v${version}" --output-dir "$output_two"
 archive_one="${output_one}/codex-usage-monitor-${version}.tar.gz"

@@ -6,7 +6,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 VERSION_ARG=""
-RELEASE_TAG="${RELEASE_TAG:-${GITHUB_REF_NAME:-}}"
+# A release tag is opt-in: CI sets GITHUB_REF_NAME for branch and PR builds,
+# neither of which should turn an ordinary archive build into a release check.
+RELEASE_TAG="${RELEASE_TAG:-}"
 OUTPUT_DIR="${ROOT_DIR}/dist"
 SEMVER_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?$'
 
