@@ -43,6 +43,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          git fetch --no-tags origin dev
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/dev
           version="$(tr -d '[:space:]' < VERSION)"
           test "$RELEASE_TAG" = "v$version"
           printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?$'
@@ -85,7 +87,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="$(tr -d '[:space:]' < VERSION)"
+          prerelease=()
+          if [[ "$version" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
           gh release create "$GITHUB_REF_NAME" \
             "dist/codex-usage-monitor-${version}.tar.gz" \
             "dist/codex-usage-monitor-${version}.tar.gz.sha256" \
-            --verify-tag --title "Codex Usage Monitor $GITHUB_REF_NAME" --generate-notes
+            --verify-tag --title "Codex Usage Monitor $GITHUB_REF_NAME" --generate-notes "${prerelease[@]}"

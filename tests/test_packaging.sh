@@ -55,6 +55,26 @@ cmp "$archive_one" "$archive_two" || fail "release archives are not reproducible
 cmp "$checksum_one" "${archive_two}.sha256" || fail "release checksums are not reproducible"
 (cd "$output_one" && sha256sum --check "$(basename -- "$checksum_one")")
 
+# The index, rather than a mutable worktree path, is the release source. A
+# directory replaced by an absolute symlink must therefore still archive as
+# the staged directory rather than creating an extraction-traversal archive.
+builder_fixture="${output_one}/builder-fixture"
+git clone --quiet --no-hardlinks "$ROOT_DIR" "$builder_fixture"
+cp "$BUILD_SCRIPT" "$builder_fixture/scripts/build-release.sh"
+mv "$builder_fixture/local" "$builder_fixture/local.staged"
+ln -s "$builder_fixture/local.staged" "$builder_fixture/local"
+"$builder_fixture/scripts/build-release.sh" --output-dir "${builder_fixture}/dist"
+python3 - "${builder_fixture}/dist/codex-usage-monitor-${version}.tar.gz" "$version" <<'PY'
+import tarfile
+import sys
+
+archive, version = sys.argv[1:]
+prefix = f"codex-usage-monitor-{version}"
+with tarfile.open(archive, "r:gz") as handle:
+    assert handle.getmember(f"{prefix}/local").isdir()
+    assert handle.getmember(f"{prefix}/local/config.py").isfile()
+PY
+
 archive_listing="$(tar -tzf "$archive_one")"
 assert_contains "$archive_listing" "codex-usage-monitor-${version}/VERSION" "archive has a versioned root"
 assert_contains "$archive_listing" "codex-usage-monitor-${version}/packaging/systemd/codex-usage-monitor.service" "archive has monitor unit"
@@ -77,5 +97,9 @@ PY
 if "$BUILD_SCRIPT" --tag "v999.999.999" --output-dir "$output_one" >/dev/null 2>&1; then
   fail "mismatched release tag was accepted"
 fi
+
+release_workflow="${ROOT_DIR}/.github/workflows/release.yml"
+assert_contains "$(<"$release_workflow")" "git merge-base --is-ancestor \"\$GITHUB_SHA\" origin/dev" "release workflow permits non-dev tags"
+assert_contains "$(<"$release_workflow")" 'prerelease=(--prerelease)' "release workflow publishes pre-releases as stable"
 
 printf 'PASS: packaging and release tests\n'

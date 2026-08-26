@@ -141,6 +141,8 @@ printf "TOKEN_PRICING_FILE='%s'\nDASHBOARD_ACTIVE_INTERVAL_SECONDS=120\n" "$cust
 runtime_override="${TEST_ROOT}/serve-runtime"
 mkdir -m 700 "$runtime_override"
 cp "$analytics_database" "$runtime_override/usage-history.sqlite3"
+printf '{"source":"runtime-override"}\n' > "$runtime_override/data.json"
+printf '[]\n' > "$runtime_override/history.json"
 env_port="$(python3 - <<'PY'
 import socket
 with socket.socket() as sock:
@@ -158,6 +160,12 @@ done
 kill -0 "$server_pid" 2>/dev/null || fail "HTTP server using .env pricing did not start"
 assert_eq 123.0 "$(json_field "${TEST_ROOT}/env-analytics" tokens.summary.estimated_cost_usd)" "pricing catalog from .env was ignored"
 assert_eq 700 "$(stat -c '%a' "$runtime_override")" "runtime override permissions are not private"
+runtime_data_code="$(curl --silent --output "${TEST_ROOT}/runtime-data" --write-out '%{http_code}' "http://127.0.0.1:${env_port}/data.json")"
+assert_eq 200 "$runtime_data_code" "runtime override data was not served"
+assert_eq '{"source":"runtime-override"}' "$(<"${TEST_ROOT}/runtime-data")" "server used the release runtime instead of the override"
+runtime_history_code="$(curl --silent --output "${TEST_ROOT}/runtime-history" --write-out '%{http_code}' "http://127.0.0.1:${env_port}/history.json")"
+assert_eq 200 "$runtime_history_code" "runtime override history was not served"
+assert_eq '[]' "$(<"${TEST_ROOT}/runtime-history")" "runtime override history content was not served"
 
 heartbeat_url="http://127.0.0.1:${env_port}/api/dashboard-heartbeat"
 heartbeat_file="$runtime_override/dashboard-heartbeat"

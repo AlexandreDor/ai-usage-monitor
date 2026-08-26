@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Build a deterministic source release from the tracked worktree files.
+# Build a deterministic source release from the Git index.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-VERSION_FILE="${ROOT_DIR}/VERSION"
 VERSION_ARG=""
 RELEASE_TAG="${RELEASE_TAG:-${GITHUB_REF_NAME:-}}"
 OUTPUT_DIR="${ROOT_DIR}/dist"
@@ -24,8 +23,8 @@ Options:
   -h, --help          Show this help
 
 SOURCE_DATE_EPOCH defaults to 0 so repeated builds have identical bytes.
-Only files tracked by Git are included. The archive never includes .env or
-local runtime state.
+Only files staged in Git are included; working-tree substitutions are never
+read. The archive never includes .env or local runtime state.
 EOF
 }
 
@@ -66,11 +65,10 @@ while (($#)); do
   esac
 done
 
-[[ -f "$VERSION_FILE" && ! -L "$VERSION_FILE" ]] || {
-  echo "[ERROR] VERSION must be a regular file." >&2
+VERSION="$(git -C "$ROOT_DIR" show ':VERSION' 2>/dev/null | tr -d '[:space:]')" || {
+  echo "[ERROR] VERSION must be a regular file staged in Git." >&2
   exit 1
 }
-VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
 if [[ ! "$VERSION" =~ $SEMVER_RE ]]; then
   echo "[ERROR] VERSION is not a supported SemVer value: $VERSION" >&2
   exit 1
@@ -97,8 +95,8 @@ mkdir -p -- "$OUTPUT_DIR"
 
 python3 - "$ROOT_DIR" "$ARCHIVE_PATH" "$VERSION" "$SOURCE_DATE_EPOCH" <<'PY'
 import gzip
+import io
 import os
-import stat
 import subprocess
 import sys
 import tarfile
@@ -117,16 +115,18 @@ try:
 except (OSError, subprocess.CalledProcessError) as error:
     raise SystemExit(f"could not enumerate tracked files: {error}") from error
 
-paths: list[tuple[str, int]] = []
+paths: list[tuple[str, int, str]] = []
 for raw in listed:
     if not raw:
         continue
     try:
         index_metadata, raw_path = raw.split(b"\t", 1)
-        mode_text = index_metadata.split(b" ", 1)[0].decode("ascii")
+        mode_text, object_id, stage = index_metadata.decode("ascii").split(" ")
         relative = raw_path.decode("utf-8")
     except (UnicodeDecodeError, ValueError) as error:
         raise SystemExit(f"tracked path is not UTF-8: {raw!r}") from error
+    if stage != "0" or not all(character in "0123456789abcdef" for character in object_id):
+        raise SystemExit(f"tracked path has unsupported index metadata: {relative}")
     try:
         mode = int(mode_text, 8)
     except ValueError:
@@ -147,13 +147,13 @@ for raw in listed:
         or (pure.name.startswith(".env") and pure.name != ".env.example")
     ):
         raise SystemExit(f"refusing to package local state or secrets: {relative}")
-    paths.append((relative, mode))
+    paths.append((relative, mode, object_id))
 
-if not any(relative == "VERSION" for relative, _ in paths):
+if not any(relative == "VERSION" for relative, _, _ in paths):
     raise SystemExit("VERSION is not tracked; release builds require committed source files")
 
 entries: set[str] = {prefix}
-for relative, _ in paths:
+for relative, _, _ in paths:
     current = PurePosixPath(prefix) / PurePosixPath(relative)
     entries.update(
         parent.as_posix() for parent in current.parents if parent.as_posix() != "."
@@ -162,7 +162,29 @@ for relative, _ in paths:
 
 archive.parent.mkdir(parents=True, exist_ok=True)
 temporary = archive.with_name(f".{archive.name}.{os.getpid()}.tmp")
-tracked_modes = dict(paths)
+tracked_files = {relative: (mode, object_id) for relative, mode, object_id in paths}
+
+
+def blob(object_id: str, relative: str) -> bytes:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(root), "cat-file", "blob", object_id], stderr=subprocess.STDOUT
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise SystemExit(f"could not read staged file: {relative}: {error}") from error
+
+
+def safe_link_target(payload: bytes, relative: str) -> str:
+    try:
+        target = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SystemExit(f"symbolic link target is not UTF-8: {relative}") from None
+    pure = PurePosixPath(target)
+    if pure.is_absolute() or ".." in pure.parts:
+        raise SystemExit(f"unsafe symbolic link target: {relative}")
+    return target
+
+
 try:
     with temporary.open("wb") as raw:
         with gzip.GzipFile(fileobj=raw, filename="", mode="wb", mtime=epoch) as gzip_stream:
@@ -178,30 +200,27 @@ try:
                     if entry == prefix:
                         continue
                     relative = entry.removeprefix(prefix + "/")
-                    source = root / Path(relative)
-                    try:
-                        metadata = source.lstat()
-                    except OSError as error:
-                        raise SystemExit(f"tracked file is missing from worktree: {relative}") from error
                     info = tarfile.TarInfo(entry)
                     info.mtime = epoch
                     info.uid = info.gid = 0
                     info.uname = info.gname = ""
-                    if stat.S_ISDIR(metadata.st_mode):
+                    tracked = tracked_files.get(relative)
+                    if tracked is None:
                         info.type = tarfile.DIRTYPE
                         info.mode = 0o755
-                    elif stat.S_ISLNK(metadata.st_mode):
-                        info.type = tarfile.SYMTYPE
-                        info.mode = 0o777
-                        info.linkname = os.readlink(source)
-                    elif stat.S_ISREG(metadata.st_mode):
-                        info.mode = 0o755 if tracked_modes[relative] == 0o100755 else 0o644
-                        info.size = metadata.st_size
-                        with source.open("rb") as content:
-                            tar.addfile(info, content)
-                        continue
                     else:
-                        raise SystemExit(f"unsupported tracked file type: {relative}")
+                        mode, object_id = tracked
+                        content = blob(object_id, relative)
+                        if mode == 0o120000:
+                            info.type = tarfile.SYMTYPE
+                            info.mode = 0o777
+                            info.linkname = safe_link_target(content, relative)
+                            tar.addfile(info)
+                            continue
+                        info.mode = 0o755 if mode == 0o100755 else 0o644
+                        info.size = len(content)
+                        tar.addfile(info, io.BytesIO(content))
+                        continue
                     tar.addfile(info)
     os.replace(temporary, archive)
 except BaseException:

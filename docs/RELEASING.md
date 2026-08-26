@@ -47,10 +47,11 @@ scripts/build-release.sh --version 0.1.0 --tag v0.1.0 --output-dir dist
 tar -tzf dist/codex-usage-monitor-0.1.0.tar.gz | sed -n '1,20p'
 ```
 
-The builder enumerates only files tracked by Git, writes a versioned archive
-root, fixes tar and gzip timestamps from `SOURCE_DATE_EPOCH` (default `0`), and
-fails closed if `.env`, SQLite files, or `local/runtime` are tracked. Two builds
-from the same tracked tree and epoch therefore have identical archive bytes.
+The builder reads only staged Git objects (never a substituted working-tree
+path), writes a versioned archive root, fixes tar and gzip timestamps from
+`SOURCE_DATE_EPOCH` (default `0`), and fails closed if `.env`, SQLite files, or
+`local/runtime` are tracked. Two builds from the same Git index and epoch
+therefore have identical archive bytes.
 The checksum file uses the conventional `sha256sum --check` format.
 
 ## Release safety
@@ -58,6 +59,7 @@ The checksum file uses the conventional `sha256sum --check` format.
 Never commit `local/.env`, `local/runtime`, Codex authentication, notification
 tokens, Gist credentials, or personal alert scripts. The release workflow has
 only `contents: write` permission because it must create the GitHub Release;
-pull requests and the normal CI workflow retain read-only contents access. The
-first `v0.1.0` tag is intentionally a post-merge action and is not created by
-this feature branch.
+pull requests and the normal CI workflow retain read-only contents access. It
+rejects a tagged commit that is not already reachable from `dev`, and marks
+SemVer pre-release tags as GitHub pre-releases. The first `v0.1.0` tag is
+intentionally a post-merge action and is not created by this feature branch.

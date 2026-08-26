@@ -151,8 +151,10 @@ public_files = {
     "/assets/chart.umd.min.js": "/assets/chart.umd.min.js",
     "/assets/chart-interactions.js": "/assets/chart-interactions.js",
     "/images/favicon.png": "/images/favicon.png",
-    "/data.json": "/runtime/data.json",
-    "/history.json": "/runtime/history.json",
+}
+runtime_files = {
+    "/data.json": runtime_directory / "data.json",
+    "/history.json": runtime_directory / "history.json",
 }
 
 
@@ -265,10 +267,40 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             return
         super().do_HEAD()
 
+    def send_runtime_file(self, path):
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            )
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+                raise OSError("runtime file is not a service-owned regular file")
+            source = os.fdopen(descriptor, "rb")
+            descriptor = -1
+        except FileNotFoundError:
+            self.send_error(404, "Not found")
+            return None
+        except OSError:
+            self.send_error(404, "Not found")
+            return None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        self.send_response(200)
+        self.send_header("Content-type", self.guess_type(str(path)))
+        self.send_header("Content-Length", str(metadata.st_size))
+        self.send_header("Last-Modified", self.date_time_string(metadata.st_mtime))
+        self.end_headers()
+        return source
+
     def send_head(self):
         request_path = unquote(urlsplit(self.path).path)
         if request_path == "/":
             request_path = "/dashboard.html"
+        runtime_path = runtime_files.get(request_path)
+        if runtime_path is not None:
+            return self.send_runtime_file(runtime_path)
         mapped_path = public_files.get(request_path)
         if mapped_path is None:
             self.send_error(404, "Not found")
