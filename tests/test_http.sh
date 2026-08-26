@@ -138,6 +138,9 @@ serve_fixture="${TEST_ROOT}/serve-fixture"
 mkdir -p "$serve_fixture"
 cp "$SERVE" "$ROOT_DIR/local/config.py" "$ROOT_DIR/local/analytics.py" "$ROOT_DIR/local/storage.py" "$ROOT_DIR/local/token_usage.py" "$serve_fixture/"
 printf "TOKEN_PRICING_FILE='%s'\nDASHBOARD_ACTIVE_INTERVAL_SECONDS=120\n" "$custom_pricing" > "${serve_fixture}/.env"
+runtime_override="${TEST_ROOT}/serve-runtime"
+mkdir -m 700 "$runtime_override"
+cp "$analytics_database" "$runtime_override/usage-history.sqlite3"
 env_port="$(python3 - <<'PY'
 import socket
 with socket.socket() as sock:
@@ -145,7 +148,7 @@ with socket.socket() as sock:
     print(sock.getsockname()[1])
 PY
 )"
-DASHBOARD_ANALYTICS_DATABASE="$analytics_database" \
+env -u DASHBOARD_ANALYTICS_DATABASE CODEX_MONITOR_RUNTIME_DIR="$runtime_override" \
   bash "${serve_fixture}/serve.sh" --port "$env_port" >"${TEST_ROOT}/env-server.log" 2>&1 &
 server_pid=$!
 for _ in {1..50}; do
@@ -154,9 +157,10 @@ for _ in {1..50}; do
 done
 kill -0 "$server_pid" 2>/dev/null || fail "HTTP server using .env pricing did not start"
 assert_eq 123.0 "$(json_field "${TEST_ROOT}/env-analytics" tokens.summary.estimated_cost_usd)" "pricing catalog from .env was ignored"
+assert_eq 700 "$(stat -c '%a' "$runtime_override")" "runtime override permissions are not private"
 
 heartbeat_url="http://127.0.0.1:${env_port}/api/dashboard-heartbeat"
-heartbeat_file="${serve_fixture}/runtime/dashboard-heartbeat"
+heartbeat_file="$runtime_override/dashboard-heartbeat"
 missing_header_code="$(curl --silent --request POST --output "${TEST_ROOT}/heartbeat-forbidden" --write-out '%{http_code}' "$heartbeat_url")"
 assert_eq 403 "$missing_header_code" "heartbeat without activity header was accepted"
 [[ ! -e "$heartbeat_file" ]] || fail "forbidden heartbeat created runtime state"
@@ -175,7 +179,6 @@ assert_contains "$(<"$heartbeat_headers")" 'X-Codex-Dashboard-Interval-Seconds: 
 assert_file "$heartbeat_file"
 assert_eq 0 "$(stat -c '%s' "$heartbeat_file")" "heartbeat file stored request data"
 assert_eq 600 "$(stat -c '%a' "$heartbeat_file")" "heartbeat permissions are not private"
-assert_eq 700 "$(stat -c '%a' "${serve_fixture}/runtime")" "runtime directory permissions are not private"
 if grep -Fiq 'Access-Control-Allow-Origin:' "$heartbeat_headers"; then
   fail "heartbeat response enabled cross-origin access"
 fi
@@ -188,7 +191,7 @@ done
 for heartbeat_pid in "${heartbeat_pids[@]}"; do
   wait "$heartbeat_pid"
 done
-assert_eq 1 "$(find "${serve_fixture}/runtime" -maxdepth 1 -type f -name 'dashboard-heartbeat' | wc -l)" "concurrent heartbeats created multiple files"
+assert_eq 1 "$(find "$runtime_override" -maxdepth 1 -type f -name 'dashboard-heartbeat' | wc -l)" "concurrent heartbeats created multiple files"
 assert_eq 0 "$(stat -c '%s' "$heartbeat_file")" "concurrent heartbeat wrote content"
 
 future_epoch=$(( $(date -u +%s) + 3600 ))

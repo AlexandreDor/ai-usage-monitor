@@ -1,0 +1,6 @@
+# Install as /etc/systemd/system/codex-usage-dashboard.service.d/lan.conf
+# only when the dashboard must be reachable from a trusted LAN. Restrict the
+# port with the host firewall; the dashboard has no authentication or TLS.
+[Service]
+ExecStart=
+ExecStart=/usr/bin/env bash /opt/codex-usage-monitor/current/local/serve.sh --bind 192.0.2.20 --port 8080

@@ -229,6 +229,14 @@ error; only a sufficiently recent snapshot clears the stale state. This
 browser-side check needs no Analytics API or additional endpoint; in external
 mode it can therefore also identify an interrupted Gist publication.
 
+## Installation and releases
+
+For packaged systemd installation, upgrades, rollback, LAN configuration, and
+safe removal, follow [`docs/INSTALL.md`](docs/INSTALL.md). The version source,
+SemVer policy, archive/checksum commands, and post-merge tag process are in
+[`docs/RELEASING.md`](docs/RELEASING.md); the first `v0.1.0` tag is intentionally
+created only after the release change has merged to `dev`.
+
 ## Reproducible quality checks
 
 The CI runtime versions are pinned in `.python-version` (Python 3.12.8) and
@@ -254,7 +262,7 @@ npm ci
 npm audit --audit-level=low
 npx playwright install --with-deps chromium
 npm run test:browser
-shellcheck -x local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
+shellcheck -x local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
 ```
 
 Coverage enables branch measurement for the exercised Python modules, including
@@ -266,8 +274,9 @@ in-process coverage.
 low severity or above fails the CI job, while `package-lock.json` remains the
 reproducible installation source. Migration tests cover fresh archives,
 supported v1–v3 archives upgrading to v4, data/integrity preservation, and
-rejection of future or partial schemas. `systemd-analyze verify` is deferred
-until the real packaged units planned for P2.16 exist.
+rejection of future or partial schemas. The packaged systemd units are
+validated by CI and can be installed with
+[`docs/INSTALL.md`](docs/INSTALL.md).
 
 ## Freshness and availability states
 
@@ -354,6 +363,9 @@ options. The shared pricing catalog and dashboard active interval use the same
 reader and validators in both programs. The process-only aliases are:
 
 - `CODEX_BIN_OVERRIDE` for the monitor's `CODEX_BIN`;
+- `CODEX_MONITOR_ENV_FILE` for the entry points' dotenv path;
+- `CODEX_MONITOR_RUNTIME_DIR` for the monitor state directory and the
+  server's default Analytics directory;
 - `DASHBOARD_PRICING_FILE` for the server's pricing catalog;
 - `DASHBOARD_ANALYTICS_DATABASE` for the server's SQLite path.
 
@@ -362,7 +374,8 @@ The server's pricing chain is therefore:
 - pricing catalog: `DASHBOARD_PRICING_FILE` (process) → `TOKEN_PRICING_FILE`
   (process) → `TOKEN_PRICING_FILE` in `local/.env` → `local/pricing.json`;
 - Analytics database: `DASHBOARD_ANALYTICS_DATABASE` (process only) →
-  `local/runtime/usage-history.sqlite3`;
+  `CODEX_MONITOR_RUNTIME_DIR/usage-history.sqlite3` (or
+  `local/runtime/usage-history.sqlite3` by default);
 - active refresh interval: `DASHBOARD_ACTIVE_INTERVAL_SECONDS` (process) →
   the same key in `local/.env` → `300`.
 
@@ -606,10 +619,13 @@ These variables are normally unnecessary:
 | Variable | Default | Description |
 |---|---:|---|
 | `TELEGRAM_API_URL` | `https://api.telegram.org` | Telegram-compatible HTTP(S) API base URL, mainly for tests. |
-| `DASHBOARD_ANALYTICS_DATABASE` | `local/runtime/usage-history.sqlite3` | Process-only absolute database path override for `serve.sh`; no `.env` fallback. |
+| `CODEX_MONITOR_ENV_FILE` | Entry-point directory `.env` | Process-only dotenv path override for `monitor.sh` and `serve.sh`; not read from `.env`. |
+| `CODEX_MONITOR_RUNTIME_DIR` | `local/runtime` | Process-only absolute runtime directory override. The dashboard uses its `usage-history.sqlite3` as the Analytics default unless `DASHBOARD_ANALYTICS_DATABASE` is set. |
+| `DASHBOARD_ANALYTICS_DATABASE` | `${CODEX_MONITOR_RUNTIME_DIR}/usage-history.sqlite3` | Process-only absolute database path override for `serve.sh`; no `.env` fallback. |
 | `DASHBOARD_PRICING_FILE` | See the priority chain above | Process-only absolute pricing path override for `serve.sh`. |
 | `CODEX_BIN_OVERRIDE` | empty | Environment-only override that takes precedence over `CODEX_BIN` during monitor initialization. |
 
+`CODEX_MONITOR_ENV_FILE`, `CODEX_MONITOR_RUNTIME_DIR`,
 `DASHBOARD_ANALYTICS_DATABASE`, `DASHBOARD_PRICING_FILE`, and
 `CODEX_BIN_OVERRIDE` are process-only overrides and are not read from
 `local/.env`. `TELEGRAM_API_URL` remains an application key that can be read
@@ -704,8 +720,9 @@ the pricing catalog.
 The monitor and dashboard server are deliberately separate processes. The
 server records recent visible-dashboard activity, and a monitor already running
 in `--loop` mode reacts to it; `serve.sh` never starts a collection itself. The
-examples below are manual deployment recipes, not the packaged systemd units
-planned for P2.16.
+release layout and operational procedures are maintained in
+[`docs/INSTALL.md`](docs/INSTALL.md). The monitor and dashboard remain separate
+processes so either service can be restarted and diagnosed independently.
 
 ### LXC Ubuntu/Debian
 
@@ -742,61 +759,28 @@ and any Proxmox network policy. Never forward it directly to the internet.
 Run `./monitor.sh --loop` and `./serve.sh` under the same account, for example
 with the systemd recipe below.
 
-### systemd (manual units)
+### systemd packaged units
 
-Create two separate units so collection and HTTP serving can be restarted and
-diagnosed independently. Replace `codex-monitor` and the home path with the
-actual account; the `User`, `HOME`, and `WorkingDirectory` values below all
-refer to that same account and checkout. Do not ask systemd to interpret
-`.env`: the application parses it as data and validates its permissions.
+Install the static units
+`packaging/systemd/codex-usage-monitor.service` and
+`packaging/systemd/codex-usage-dashboard.service` using
+[`docs/INSTALL.md`](docs/INSTALL.md). They use the stable release link
+`/opt/codex-usage-monitor/current`, run as the non-root `codex-monitor` user,
+and keep mutable `monitor.env` and SQLite state in `/etc/codex-usage-monitor/` and
+`/var/lib/codex-usage-monitor/`. The units do not delegate dotenv parsing to
+systemd: the application parses and validates `monitor.env` itself. `HOME` and the default
+`CODEX_DATA_DIR` point at the service user's Codex account, or an explicit
+absolute `CODEX_DATA_DIR` can be set in that user's `monitor.env`.
 
-```ini
-# /etc/systemd/system/codex-usage-monitor.service
-[Unit]
-Description=Codex Usage Monitor collection loop
-After=network-online.target
-Wants=network-online.target
+The packaged dashboard unit binds only to `127.0.0.1`. A LAN bind requires the
+reviewed drop-in `packaging/systemd/codex-usage-dashboard.lan.conf.example`, an
+explicit trusted address, and a host-firewall rule. It must not be enabled by
+editing the base unit or by exposing unauthenticated `0.0.0.0` to the internet.
+Both units order startup after `network-online.target`, use
+`Restart=on-failure`, and are checked with `systemd-analyze verify` before
+activation.
 
-[Service]
-Type=simple
-User=codex-monitor
-Environment=HOME=/home/codex-monitor
-WorkingDirectory=/home/codex-monitor/ai-usage-monitor/local
-ExecStart=/usr/bin/env bash /home/codex-monitor/ai-usage-monitor/local/monitor.sh --loop
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# /etc/systemd/system/codex-usage-dashboard.service
-[Unit]
-Description=Codex Usage Monitor dashboard server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=codex-monitor
-Environment=HOME=/home/codex-monitor
-WorkingDirectory=/home/codex-monitor/ai-usage-monitor/local
-ExecStart=/usr/bin/env bash /home/codex-monitor/ai-usage-monitor/local/serve.sh --port 8080
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-```
-
-The dashboard unit above stays on `127.0.0.1`. If LAN access is intentional,
-make it explicit in that unit, for example by changing only its command to
-`ExecStart=/usr/bin/env bash /home/codex-monitor/ai-usage-monitor/local/serve.sh --bind 192.0.2.20 --port 8080`,
-then restrict port 8080 with the host firewall. Do not use an unauthenticated
-`0.0.0.0` bind without that firewall decision.
-
-Install, start, and inspect both units as follows:
+After installation, start and inspect both units as follows:
 
 ```bash
 sudo systemctl daemon-reload
@@ -805,23 +789,23 @@ sudo systemctl status codex-usage-monitor.service codex-usage-dashboard.service
 sudo journalctl -u codex-usage-monitor.service -f
 sudo journalctl -u codex-usage-dashboard.service -f
 
-# After a checkout or configuration update:
+# After an upgrade or configuration update:
 sudo systemctl restart codex-usage-monitor.service codex-usage-dashboard.service
 sudo systemctl status codex-usage-monitor.service codex-usage-dashboard.service
 ```
 
-Use `./monitor.sh --check` as the service account when diagnosing
-authentication, paths, or Analytics sources. Keep `local/.env` owned by that
+Use `monitor.sh --check` as the service account when diagnosing authentication,
+paths, or Analytics sources. Keep `/etc/codex-usage-monitor/monitor.env` owned by that
 account and mode `600`; a systemd unit must not duplicate its values in a
 second environment file.
 
 If Codex was installed in a user-only directory that is not in systemd's
 `PATH`, obtain its absolute path as the service account and put that value in
-`local/.env`:
+`/etc/codex-usage-monitor/monitor.env`:
 
 ```bash
 sudo -u codex-monitor -H bash -lc 'command -v codex'
-# If the command printed /absolute/path/to/codex, set this in local/.env:
+# If the command printed /absolute/path/to/codex, set this in monitor.env:
 CODEX_BIN=/absolute/path/to/codex
 ```
 

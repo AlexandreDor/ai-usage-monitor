@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# A release needs to create one GitHub Release and upload its two assets.
+# Pull requests and normal CI retain contents: read in ci.yml.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install quality dependencies
+        run: python -m pip install --requirement requirements-ci.txt
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+
+      - name: Install browser test dependencies
+        run: npm ci
+
+      - name: Validate tag and source version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          test "$RELEASE_TAG" = "v$version"
+          printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?$'
+          grep -Eq "^## \\[$version\\]( - [0-9]{4}-[0-9]{2}-[0-9]{2})?$" CHANGELOG.md
+
+      - name: Validate source, units, and functional tests
+        run: |
+          expected_python="$(tr -d '[:space:]' < .python-version)"
+          actual_python="$(python -c 'import platform; print(platform.python_version())')"
+          test "$actual_python" = "$expected_python"
+          expected_node="$(tr -d '[:space:]' < .node-version)"
+          test "$(node --version)" = "v$expected_node"
+          bash -n local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
+          python -m unittest tests.test_migrations
+          python -m unittest tests.test_codex_client
+          python -m compileall -q local tests
+          systemd-analyze verify packaging/systemd/codex-usage-monitor.service packaging/systemd/codex-usage-dashboard.service
+          python -m coverage run --branch --rcfile=.coveragerc -m unittest \
+            tests.test_migrations tests.test_alerts tests.test_anomalies \
+            tests.test_history tests.test_codex_client tests.test_config \
+            tests.test_storage_durability
+          python -m coverage report --rcfile=.coveragerc
+          SKIP_PYTHON_TESTS=1 tests/run.sh
+          npx playwright install --with-deps chromium
+          npm run test:browser
+          npm audit --audit-level=low
+          shellcheck -x local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
+
+      - name: Build and verify release assets
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          scripts/build-release.sh --tag "$RELEASE_TAG" --output-dir dist
+          version="$(tr -d '[:space:]' < VERSION)"
+          (cd dist && sha256sum --check "codex-usage-monitor-${version}.tar.gz.sha256")
+          ! tar -tzf "dist/codex-usage-monitor-${version}.tar.gz" | grep -E '(^|/)(\.env$|runtime/|.*\.sqlite3$)'
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/codex-usage-monitor-${version}.tar.gz" \
+            "dist/codex-usage-monitor-${version}.tar.gz.sha256" \
+            --verify-tag --title "Codex Usage Monitor $GITHUB_REF_NAME" --generate-notes

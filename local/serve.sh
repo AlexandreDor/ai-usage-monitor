@@ -5,6 +5,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_PY="${SCRIPT_DIR}/config.py"
+ENV_FILE="${CODEX_MONITOR_ENV_FILE:-${SCRIPT_DIR}/.env}"
+RUNTIME_DIR="${CODEX_MONITOR_RUNTIME_DIR:-${SCRIPT_DIR}/runtime}"
 ANALYTICS_DATABASE_PATH="${DASHBOARD_ANALYTICS_DATABASE:-}"
 ANALYTICS_PRICING_PATH="${DASHBOARD_PRICING_FILE:-${TOKEN_PRICING_FILE:-}}"
 DASHBOARD_ACTIVE_INTERVAL="${DASHBOARD_ACTIVE_INTERVAL_SECONDS:-}"
@@ -79,7 +81,7 @@ config_transport="$(mktemp "${TMPDIR:-/tmp}/codex-dashboard-config.XXXXXX")" || 
   exit 1
 }
 config_transport_error=0
-if ! python3 "$CONFIG_PY" --profile serve --env-file "${SCRIPT_DIR}/.env" \
+if ! python3 "$CONFIG_PY" --profile serve --env-file "$ENV_FILE" \
     --script-dir "$SCRIPT_DIR" --bind "$BIND_ADDRESS" --port "$PORT" >"$config_transport"; then
   rm -f -- "$config_transport"
   exit 2
@@ -111,7 +113,7 @@ fi
 echo "Serving dashboard at http://${DISPLAY_ADDRESS}:${PORT}/dashboard.html"
 echo "Only allowlisted dashboard assets and usage JSON are exposed. Press Ctrl+C to stop."
 
-python3 - "$SCRIPT_DIR" "$PORT" "$BIND_ADDRESS" "$ANALYTICS_DATABASE_PATH" "$ANALYTICS_PRICING_PATH" "$DASHBOARD_ACTIVE_INTERVAL" <<'PYEOF'
+python3 - "$SCRIPT_DIR" "$PORT" "$BIND_ADDRESS" "$ANALYTICS_DATABASE_PATH" "$ANALYTICS_PRICING_PATH" "$DASHBOARD_ACTIVE_INTERVAL" "$RUNTIME_DIR" <<'PYEOF'
 import functools
 import http.server
 import os
@@ -134,7 +136,7 @@ bind_address = sys.argv[3]
 analytics_database = pathlib.Path(sys.argv[4])
 analytics_pricing = pathlib.Path(sys.argv[5])
 dashboard_active_interval = int(sys.argv[6])
-runtime_directory = root / "runtime"
+runtime_directory = pathlib.Path(sys.argv[7]).absolute()
 heartbeat_path = runtime_directory / "dashboard-heartbeat"
 heartbeat_lock = threading.Lock()
 heartbeat_coalesce_seconds = 5

@@ -26,20 +26,6 @@ jusqu'à la stabilisation du socle.
 | M | Entre deux et quatre jours |
 | L | Une semaine ou plus |
 
-## P2 - Expérience utilisateur et maintenance
-
-### 16. Préparer le packaging et les releases
-
-**Actions :**
-
-- Ajouter des unités systemd réelles prêtes à être validées par la CI.
-- Ajouter `CHANGELOG.md`, définir une politique SemVer et publier le premier tag
-  conformément à cette politique.
-- Publier des archives de release avec checksums.
-- Documenter installation, mise à jour, retour arrière et désinstallation.
-
-**Effort : M**
-
 ## P3 - Évolutions fonctionnelles différées
 
 Ces évolutions viendront après la stabilisation des fonctions existantes :
@@ -62,8 +48,7 @@ retirées de cette liste car elles sont déjà implémentées.
 
 1. Ajouter la détection des données périmées au dashboard principal.
 2. Détecter les anomalies de quota.
-3. Préparer les releases et le packaging.
-4. Ajouter les évolutions P3 selon les besoins utilisateurs.
+3. Ajouter les évolutions P3 selon les besoins utilisateurs.
 
 ## Définition globale de terminé
 
@@ -83,5 +68,3 @@ Le programme restant est terminé lorsque :
 - les mouvements de quota anormaux sont détectés sans confondre les resets
   légitimes ;
 - les tests shell, Python, HTTP et navigateur passent en CI ;
-- la distribution comprend une version, un changelog, des unités systemd et des
-  archives vérifiables.
