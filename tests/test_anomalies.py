@@ -136,12 +136,13 @@ class AnomalyDetectorTests(unittest.TestCase):
             "SELECT limit_id, window, before_pct, after_pct FROM quota_anomalies "
             "ORDER BY window"
         ).fetchall()
+        canonical_group = storage.canonicalize_limit_id("group-a")
         self.assertEqual([
-            ("group-a", "5h", 50.0, 70.0),
-            ("group-a", "weekly", 60.0, 75.0),
+            (canonical_group, "5h", 50.0, 70.0),
+            (canonical_group, "weekly", 60.0, 75.0),
         ], rows)
         self.assertEqual(2, self.connection.execute(
-            "SELECT COUNT(*) FROM anomaly_detector_state WHERE limit_id = 'group-a'"
+            "SELECT COUNT(*) FROM anomaly_detector_state WHERE limit_id = ?", (canonical_group,)
         ).fetchone()[0])
 
     def test_past_reset_is_recorded_with_before_after_values(self):

@@ -213,6 +213,14 @@ function evaluate(expression) {
   const externalRetryDelay = timeoutDelays[timeoutDelays.length - 1];
   if (externalRetryDelay < 5000 || externalRetryDelay > 900000) fail('external failure did not retain regular scheduling');
   if (evaluate('refreshRetryDelayMs') !== retryDelayBeforeExternalFailure) fail('external failure consumed local retry backoff');
+  fetchQueue = [{
+    files: {
+      'data.json': { content: JSON.stringify({ schema_version: 2, five_h_pct: 80, scraped_at: new Date().toISOString() }) },
+      'history.json': { content: '[]' },
+    },
+  }];
+  await evaluate('refresh()');
+  if (!String(evaluate('mainFailure')).includes('Unsupported snapshot schema version')) fail('Gist future data schema was accepted');
   evaluate("GIST_ID = ''");
 
   if (evaluate(`formatParisDateTime('2026-01-03T12:34:00Z')`) !== '03/01/2026 13:34') {
@@ -267,6 +275,38 @@ function evaluate(expression) {
   if (evaluate('historyTitle(testPoints)') !== 'History / 01/08 02:00 - 02/08 02:00') {
     fail('history title is not formatted in Paris time');
   }
+
+  // The public contract accepts legacy v0 snapshots and explicit v1, while a
+  // future version must fail visibly instead of being treated as v0 data.
+  evaluate(`renderData({schema_version:1, five_h_pct:88, weekly_pct:77, scraped_at:'2026-08-02T00:00:00Z'}, {schedule:false})`);
+  evaluate(`renderData({five_h_pct:87, weekly_pct:76, scraped_at:'2026-08-02T00:00:00Z'}, {schedule:false})`);
+  let futureDataRejected = false;
+  try {
+    evaluate(`renderData({schema_version:2, five_h_pct:86, weekly_pct:75, scraped_at:'2026-08-02T00:00:00Z'}, {schedule:false})`);
+  } catch (error) {
+    futureDataRejected = String(error).includes('Unsupported snapshot schema version');
+  }
+  if (!futureDataRejected) fail('future dashboard data schema was accepted');
+  let futureHistoryRejected = false;
+  try {
+    evaluate(`normalizeHistory([{schema_version:2, scraped_at:'2026-08-02T00:00:00Z', five_h_pct:80}])`);
+  } catch (error) {
+    futureHistoryRejected = error.historyKey === 'unsupportedSchema';
+  }
+  if (!futureHistoryRejected) fail('future dashboard history schema was accepted');
+
+  evaluate(`renderHistory([
+    {scraped_at:'2026-08-01T00:00:00Z', five_h_pct:80},
+    {scraped_at:'2026-08-02T00:00:00Z', five_h_pct:70},
+  ])`);
+  let futureRenderRejected = false;
+  try {
+    evaluate(`renderHistory([{schema_version:2, scraped_at:'2026-08-03T00:00:00Z', five_h_pct:60}])`);
+  } catch (error) {
+    futureRenderRejected = error.historyKey === 'unsupportedSchema';
+  }
+  if (!futureRenderRejected) fail('renderHistory accepted a future schema');
+  if (evaluate('dashboardHistoryPoints.length') !== 2) fail('future history erased valid chart points');
 
   evaluate(`renderHistory([
     {scraped_at:'2026-08-01T00:00:00Z', five_h_pct:80},
@@ -391,6 +431,13 @@ function evaluate(expression) {
   })`);
   if (element('forecast-24h').textContent !== '--') fail('future forecast remained visible');
   if (element('forecast-status').textContent !== 'Forecast unavailable') fail('future forecast was not marked unavailable');
+
+  const destroyedBeforeUnsupported = destroyed;
+  evaluate("renderHistoryFailure('Unsupported snapshot schema version', 'unsupportedSchema', { preserveValidHistory: true })");
+  if (evaluate('chart === null')) fail('future history schema destroyed the valid chart');
+  if (element('history-chart').hidden) fail('future history schema hid the valid chart');
+  if (destroyed !== destroyedBeforeUnsupported) fail('future history schema invoked chart destruction');
+  if (evaluate('dashboardHistoryPoints.length') === 0) fail('future history schema discarded valid points');
 
   fetchQueue = [
     { five_h_pct: 80, weekly_pct: 70, scraped_at: '2026-08-03T00:00:00Z' },

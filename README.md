@@ -109,6 +109,11 @@ period-wide token or cost totals.
 
 - Current snapshot in `local/runtime/data.json`.
 - Rolling dashboard history in `local/runtime/history.json`.
+- The Codex JSON-RPC transport lives in the importable `local/codex_client.py`;
+  `monitor.sh` only supplies validated configuration and orchestrates the
+  collection cycle. The client starts the app-server in its own process group,
+  removes monitor credentials/account selectors from its environment, and
+  bounds protocol lines to 1 MiB.
 - Long-term quota, reset, and token archive in
   `local/runtime/usage-history.sqlite3`.
 - Cycle health information in `local/runtime/health.json`.
@@ -118,6 +123,47 @@ period-wide token or cost totals.
 - Atomic writes and private runtime permissions.
 - Configuration, dependencies, Codex authentication, and analytics source
   validation through `./monitor.sh --check`.
+
+### Snapshot and history JSON contract
+
+`data.json` contains one snapshot object. `history.json` remains a JSON array
+of snapshot objects so the dashboard and Gist publication format do not
+change. Every snapshot written by the monitor carries `schema_version: 1`.
+The runtime validator in `local/history.py` accepts the following public
+fields (unknown private paths, credentials, and account metadata are never
+added to the contract):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema_version` | integer, `1` | Snapshot contract version. |
+| `scraped_at` | UTC ISO-8601 string | Observation time. |
+| `five_h_pct`, `weekly_pct` | number from `0` to `100`, or `null` | Remaining quota; at least one must be available. |
+| `five_h_reset`, `weekly_reset` | string | Paris-local display label, or `unknown`. |
+| `five_h_reset_at`, `weekly_reset_at` | positive integer within SQLite signed 64-bit range, or `null` | Reset Unix timestamp when known. |
+| `sample_interval_seconds` | integer from `1` to `86400` | Requested collection interval, when supplied. |
+| `history_window_hours` | number from `0` to `8760` | Requested rolling history window, when supplied. |
+| `limit_id` | opaque string `limit-` plus 64 lowercase hexadecimal characters | Stable hash of the coherent Codex limit group; the server value is never published. |
+| `codex_forecast` | object | Validated Forecast observation, when available. |
+
+`limit_id` is intentionally opaque. Every raw app-server value is hashed at
+the client boundary (including a value that happens to look like
+`limit-<sha256>`), so the server value is never published. Persisted v0 data
+is hashed unconditionally at migration time, while v1 data is canonicalized
+without hashing an already opaque value again.
+
+The same opaque representation is used in SQLite snapshots, anomaly state,
+deduplication keys, and analytics projections. Opening a writable legacy
+archive performs an atomic v0-to-v1 ID migration with the existing recovery
+backup; read-only analytics uses a sanitized in-memory copy until that write
+path runs.
+
+Snapshots written before this contract had no `schema_version`; they are read
+as implicit v0 and upgraded to v1 on the next atomic write without changing
+their recognized public values. An explicit schema version newer than `1` is
+rejected instead of being silently discarded or partially migrated. Corrupt
+legacy JSON keeps the existing backup-and-reconstruct behavior. No JSON Schema
+package is required at runtime: validation uses only the Python standard
+library.
 
 ## Requirements
 
@@ -201,7 +247,7 @@ bash -n local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
 python3 -m compileall -q local tests
 python3 -m coverage run --branch --rcfile=.coveragerc -m unittest \
   tests.test_migrations tests.test_alerts tests.test_anomalies tests.test_history \
-  tests.test_config tests.test_storage_durability
+  tests.test_codex_client tests.test_config tests.test_storage_durability
 python3 -m coverage report --rcfile=.coveragerc
 SKIP_PYTHON_TESTS=1 tests/run.sh
 npm ci
@@ -213,10 +259,9 @@ shellcheck -x local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
 
 Coverage enables branch measurement for the exercised Python modules, including
 the SQLite migration tests, and fails below the combined 60% line-and-branch
-threshold. The threshold is deliberately
-below the current measured baseline (67%) so it blocks regressions without
-pretending that modules exercised only through separate subprocesses are
-covered by this in-process report.
+threshold. The documented command is the same test selection used by CI;
+modules exercised only through separate subprocesses are not counted as
+in-process coverage.
 `npm audit --audit-level=low` is also blocking: every vulnerability reported at
 low severity or above fails the CI job, while `package-lock.json` remains the
 reproducible installation source. Migration tests cover fresh archives,
@@ -354,6 +399,13 @@ CODEX_FORECAST_ENABLED=1
 Discord and Telegram maintain separate delivery progress. Temporary failures
 such as timeouts, HTTP 408, 429, or 5xx remain pending. Successful channels are
 not replayed because another channel failed.
+
+The durable detector state uses `state_version: 5` with an explicit opaque-ID
+contract marker, and `local/runtime/alert-deliveries.json` uses journal schema
+2 with the same marker. Existing unmarked state and schema-1 journals are
+migrated one file at a time with atomic replacement; pending and delivered
+channel state is retained, and a failed migration is retried on the next
+cycle. Future versions or inconsistent alert/cycle identities fail closed.
 
 Set `ALERTS_ENABLED=0` to pause outbound alerting. New threshold, reset, and
 anomaly events observed while disabled are acknowledged locally: they advance
@@ -824,10 +876,11 @@ this mutable value near the top of the copied file:
 let GIST_ID = '0123456789abcdef0123456789abcdef';
 ```
 
-Do not commit a personal token. Only the static live quota page works in this
-external mode: Advanced Analytics requires the local `serve.sh` API and the
-local SQLite archive. A Pages browser cannot provide Analytics merely by
-having access to the Gist.
+Do not commit a personal token. In this external mode, the static dashboard
+can display the live quota plus the Gist-backed rolling history and Forecast;
+Advanced Analytics requires the local `serve.sh` API and the local SQLite
+archive. A Pages browser cannot provide Analytics merely by having access to
+the Gist.
 
 ## Backup/Restore SQLite
 

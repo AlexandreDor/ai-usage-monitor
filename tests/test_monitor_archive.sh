@@ -33,6 +33,126 @@ archive_at() {
     --retention-days "$retention"
 }
 
+future_database="${TEST_ROOT}/future.sqlite3"
+if printf '{"schema_version":2,"five_h_pct":80,"weekly_pct":60,"scraped_at":"2033-05-18T03:33:20Z"}\n' \
+  | python3 "$ARCHIVE_SCRIPT" --database "$future_database" --history "$HISTORY_FILE" --retention-days 0; then
+  fail "archive accepted a future snapshot schema"
+fi
+[[ ! -e "$future_database" ]] || fail "future snapshot created or modified a SQLite archive"
+
+future_existing_database="$TEST_ROOT/future-existing.sqlite3"
+printf '{"five_h_pct":80,"weekly_pct":60,"scraped_at":"2033-05-18T03:33:20Z"}\n' \
+  | python3 "$ARCHIVE_SCRIPT" --database "$future_existing_database" --history "$HISTORY_FILE" --retention-days 0
+future_history="$TEST_ROOT/future-history.json"
+printf '[{"schema_version":2,"five_h_pct":80,"weekly_pct":60,"scraped_at":"2033-05-18T03:33:21Z"}]\n' >"$future_history"
+future_before="$(python3 - "$future_existing_database" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute('SELECT COUNT(*) FROM snapshots').fetchone()[0])
+PYEOF
+)"
+if printf '{"five_h_pct":80,"weekly_pct":60,"scraped_at":"2033-05-18T03:33:22Z"}\n' \
+  | python3 "$ARCHIVE_SCRIPT" --database "$future_existing_database" --history "$future_history" --retention-days 0 \
+  >"$TEST_ROOT/future-existing.out" 2>"$TEST_ROOT/future-existing.err"; then
+  fail "archive accepted a future schema in existing history"
+fi
+future_after="$(python3 - "$future_existing_database" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute('SELECT COUNT(*) FROM snapshots').fetchone()[0])
+PYEOF
+)"
+assert_eq "$future_before" "$future_after" "future history changed an existing archive"
+[[ "$(( $(grep -c Traceback "$TEST_ROOT/future-existing.err" || true) ))" -eq 0 ]] || fail "future history leaked traceback"
+
+epoch_database="$TEST_ROOT/epoch-range.sqlite3"
+if printf '{"five_h_pct":80,"weekly_pct":60,"five_h_reset_at":1e308,"scraped_at":"2033-05-18T03:33:20Z"}\n' \
+  | python3 "$ARCHIVE_SCRIPT" --database "$epoch_database" --history "$HISTORY_FILE" --retention-days 0 \
+  >"$TEST_ROOT/epoch-range.out" 2>"$TEST_ROOT/epoch-range.err"; then
+  fail "out-of-range reset epoch was accepted"
+fi
+[[ ! -e "$epoch_database" ]] || fail "out-of-range reset epoch created a database"
+[[ "$(<"$TEST_ROOT/epoch-range.err")" != *Traceback* ]] || fail "epoch range failure leaked traceback"
+
+fractional_database="$TEST_ROOT/fractional-epoch.sqlite3"
+if printf '{"five_h_pct":80,"weekly_pct":60,"five_h_reset_at":1.5,"scraped_at":"2033-05-18T03:33:20Z"}\n' \
+  | python3 "$ARCHIVE_SCRIPT" --database "$fractional_database" --history "$HISTORY_FILE" --retention-days 0 \
+  >"$TEST_ROOT/fractional-epoch.out" 2>"$TEST_ROOT/fractional-epoch.err"; then
+  fail "fractional reset epoch was accepted"
+fi
+[[ ! -e "$fractional_database" ]] || fail "fractional reset epoch created a database"
+[[ "$(<"$TEST_ROOT/fractional-epoch.err")" != *Traceback* ]] || fail "fractional epoch failure leaked traceback"
+integral_database="$TEST_ROOT/integral-float-epoch.sqlite3"
+if ! printf '{"five_h_pct":80,"weekly_pct":60,"five_h_reset_at":1.0,"scraped_at":"2033-05-18T03:33:20Z"}\n' \
+  | python3 "$ARCHIVE_SCRIPT" --database "$integral_database" --history "$HISTORY_FILE" --retention-days 0; then
+  fail "integral float reset epoch was rejected"
+fi
+fractional_history="$TEST_ROOT/fractional-history.json"
+printf '[{"five_h_pct":80,"weekly_pct":60,"five_h_reset_at":1.5,"scraped_at":"2033-05-18T03:33:19Z"}]\n' >"$fractional_history"
+fractional_before="$(python3 - "$integral_database" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute('SELECT COUNT(*) FROM snapshots').fetchone()[0])
+PYEOF
+)"
+if printf '{"five_h_pct":80,"weekly_pct":60,"scraped_at":"2033-05-18T03:33:21Z"}\n' \
+  | python3 "$ARCHIVE_SCRIPT" --database "$integral_database" --history "$fractional_history" --retention-days 0 \
+  >"$TEST_ROOT/fractional-history.out" 2>"$TEST_ROOT/fractional-history.err"; then
+  fail "fractional reset epoch in history was accepted"
+fi
+fractional_after="$(python3 - "$integral_database" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute('SELECT COUNT(*) FROM snapshots').fetchone()[0])
+PYEOF
+)"
+assert_eq "$fractional_before" "$fractional_after" "fractional history changed the archive"
+[[ "$(<"$TEST_ROOT/fractional-history.err")" != *Traceback* ]] || fail "fractional history leaked traceback"
+
+huge_snapshot_database="$TEST_ROOT/huge-snapshot.sqlite3"
+if python3 - <<'PYEOF' \
+  | python3 "$ARCHIVE_SCRIPT" --database "$huge_snapshot_database" --history "$HISTORY_FILE" --retention-days 0 \
+  >"$TEST_ROOT/huge-snapshot.out" 2>"$TEST_ROOT/huge-snapshot.err"; then
+print('{"five_h_pct":' + ('9' * 5000) + ',"weekly_pct":60,"scraped_at":"2033-05-18T03:33:20Z"}')
+PYEOF
+  fail "oversized JSON integer on archive stdin was accepted"
+fi
+[[ ! -e "$huge_snapshot_database" ]] || fail "oversized JSON integer created a database"
+[[ "$(<"$TEST_ROOT/huge-snapshot.err")" != *Traceback* ]] || fail "oversized JSON integer leaked traceback"
+
+huge_retention="$(python3 -c 'print("9" * 5000)')"
+retention_database="$TEST_ROOT/retention-range.sqlite3"
+if printf '{"five_h_pct":80,"weekly_pct":60,"scraped_at":"2033-05-18T03:33:20Z"}\n' \
+  | python3 "$ARCHIVE_SCRIPT" --database "$retention_database" --history "$HISTORY_FILE" --retention-days "$huge_retention" \
+  >"$TEST_ROOT/retention-range.out" 2>"$TEST_ROOT/retention-range.err"; then
+  fail "oversized archive retention was accepted"
+fi
+[[ ! -e "$retention_database" ]] || fail "oversized archive retention created a database"
+[[ "$(<"$TEST_ROOT/retention-range.err")" != *Traceback* ]] || fail "retention failure leaked traceback"
+
+huge_history="$TEST_ROOT/huge-history.json"
+python3 - "$huge_history" <<'PYEOF'
+import json
+import sys
+path = sys.argv[1]
+pathlib = __import__('pathlib')
+pathlib.Path(path).write_text(
+    '[{"five_h_pct":' + ('9' * 5000) + ',"scraped_at":"2033-05-18T03:33:20Z"}]',
+    encoding='utf-8',
+)
+PYEOF
+history_recovery_database="$TEST_ROOT/history-recovery.sqlite3"
+if ! printf '{"five_h_pct":80,"weekly_pct":60,"scraped_at":"2033-05-18T03:33:21Z"}\n' \
+  | python3 "$ARCHIVE_SCRIPT" --database "$history_recovery_database" --history "$huge_history" --retention-days 0 \
+  >"$TEST_ROOT/history-recovery.out" 2>"$TEST_ROOT/history-recovery.err"; then
+  fail "archive did not recover from an oversized existing history file"
+fi
+[[ "$(<"$TEST_ROOT/history-recovery.err")" != *Traceback* ]] || fail "history recovery leaked traceback"
+
 forecast_archive_at() {
   local epoch="$1" chance_24h="${2:-50}" chance_6h="${3:-25}" retention="${4:-0}"
   printf '{"five_h_pct":80,"weekly_pct":60,"scraped_at":"%s","codex_forecast":{"chance_24h_pct":%s,"chance_6h_pct":%s,"generated_at":"%s"}}\n' \
@@ -67,6 +187,16 @@ PYEOF
 printf '[%s]\n' "$(snapshot_at "$((BASE - 100))")" > "$HISTORY_FILE"
 archive_at "$BASE"
 assert_eq 2 "$(count_rows)" "history migration did not import the rolling entry"
+expected_test_limit="$(python3 -c 'import hashlib; print("limit-" + hashlib.sha256(b"test").hexdigest())')"
+assert_eq "$expected_test_limit" "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute(
+        "SELECT limit_id FROM snapshots WHERE scraped_at_epoch = ?", (2000000000,)
+    ).fetchone()[0])
+PYEOF
+)" "archive persisted an opaque limit_id"
 archive_at "$BASE"
 assert_eq 2 "$(count_rows)" "re-ingesting a timestamp created a duplicate"
 assert_eq 1 "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'

@@ -40,11 +40,14 @@ jobs:
         run: python -m compileall -q local tests
       - name: Verify SQLite migrations
         run: python -m unittest tests.test_migrations
+      - name: Test Codex protocol client
+        run: python -m unittest tests.test_codex_client
       - name: Run Python tests with branch coverage
         run: >-
           python -m coverage run --branch --rcfile=.coveragerc -m unittest
           tests.test_migrations tests.test_alerts tests.test_anomalies
-          tests.test_history tests.test_config tests.test_storage_durability
+          tests.test_history tests.test_codex_client tests.test_config
+          tests.test_storage_durability
       - name: Enforce Python coverage threshold
         run: python -m coverage report --rcfile=.coveragerc
       - name: Run shell and functional tests
