@@ -772,6 +772,16 @@ systemd: the application parses and validates `monitor.env` itself. `HOME` and t
 `CODEX_DATA_DIR` point at the service user's Codex account, or an explicit
 absolute `CODEX_DATA_DIR` can be set in that user's `monitor.env`.
 
+Both units retain `ProtectHome=read-only`. The monitor alone has a narrowly scoped
+`ReadWritePaths` exception for `/home/codex-monitor/.codex`, allowing the official
+`codex app-server` child process to persist refreshed tokens; its other writable
+path is `/var/lib/codex-usage-monitor`. The dashboard never launches Codex and has
+no exception for the Codex home. Before enabling the monitor, ensure
+`/home/codex-monitor/.codex` exists and is owned by `codex-monitor`; run `codex login`
+as that account so renewed credentials remain service-owned. A custom
+`CODEX_DATA_DIR` outside this directory is not covered by the packaged writable
+exception and must be planned separately.
+
 The packaged dashboard unit binds only to `127.0.0.1`. A LAN bind requires the
 reviewed drop-in `packaging/systemd/codex-usage-dashboard.lan.conf.example`, an
 explicit trusted address, and a host-firewall rule. It must not be enabled by

@@ -19,12 +19,19 @@ sudo useradd --system --create-home --home-dir /home/codex-monitor \
 ```
 
 Install the Codex CLI using its current upstream instructions, then authenticate
-as `codex-monitor`. The monitor never receives another user's credentials:
+as `codex-monitor`. The packaged monitor keeps `ProtectHome=read-only`, with a
+write exception only for the real Codex state directory
+`/home/codex-monitor/.codex`; the dashboard has no such exception. Prepare that
+directory before login and verify that the login process leaves it owned by the
+service account. The monitor never receives another user's credentials:
 
 ```bash
+sudo install -d -o codex-monitor -g codex-monitor -m 0700 /home/codex-monitor/.codex
 sudo -u codex-monitor -H codex login
 sudo -u codex-monitor -H codex login status
 sudo -u codex-monitor -H codex /status
+sudo -u codex-monitor -H test -d /home/codex-monitor/.codex
+sudo test "$(stat -c '%U:%G' /home/codex-monitor/.codex)" = codex-monitor:codex-monitor
 ```
 
 Verify the release archive before extracting it. The checksum file must be
@@ -63,9 +70,10 @@ sudoedit /etc/codex-usage-monitor/monitor.env
 ```
 
 At minimum, set `CODEX_DATA_DIR` if the Codex data is not under
-`/home/codex-monitor/.codex`, set an absolute `CODEX_BIN` when the CLI is not
-on the service account's `PATH`, and keep any notification/Gist secrets in this
-mode-600 file. Never put secrets in a unit's `Environment=` lines or in a
+`/home/codex-monitor/.codex` (an override outside that directory is not covered
+by the unit's writable exception), set an absolute `CODEX_BIN` when the CLI is
+not on the service account's `PATH`, and keep any notification/Gist secrets in
+this mode-600 file. Never put secrets in a unit's `Environment=` lines or in a
 release archive.
 
 Install and validate both real unit files:

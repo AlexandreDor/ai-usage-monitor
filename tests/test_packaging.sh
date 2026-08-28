@@ -26,6 +26,16 @@ assert_contains "$(<"$MONITOR_UNIT")" "User=codex-monitor" "monitor unit runs as
 assert_contains "$(<"$DASHBOARD_UNIT")" "User=codex-monitor" "dashboard unit runs as the dedicated user"
 assert_contains "$(<"$MONITOR_UNIT")" "ExecStart=/usr/bin/env bash /opt/codex-usage-monitor/current/local/monitor.sh --loop" "monitor unit path is stable"
 assert_contains "$(<"$DASHBOARD_UNIT")" "ExecStart=/usr/bin/env bash /opt/codex-usage-monitor/current/local/serve.sh --bind 127.0.0.1 --port 8080" "dashboard defaults to loopback"
+assert_contains "$(<"$MONITOR_UNIT")" "ProtectHome=read-only" "monitor protects home by default"
+assert_contains "$(<"$DASHBOARD_UNIT")" "ProtectHome=read-only" "dashboard protects home by default"
+assert_eq \
+  "ReadWritePaths=/var/lib/codex-usage-monitor /home/codex-monitor/.codex" \
+  "$(grep '^ReadWritePaths=' "$MONITOR_UNIT")" \
+  "monitor writable paths are limited to runtime state and Codex state"
+assert_eq \
+  "ReadWritePaths=/var/lib/codex-usage-monitor" \
+  "$(grep '^ReadWritePaths=' "$DASHBOARD_UNIT")" \
+  "dashboard writable paths exclude Codex state"
 if grep -q '^User=root$' "$MONITOR_UNIT" "$DASHBOARD_UNIT"; then
   fail "a packaged unit runs as root"
 fi
