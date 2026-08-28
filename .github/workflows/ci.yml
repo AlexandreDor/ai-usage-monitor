@@ -35,7 +35,9 @@ jobs:
       - name: Install browser test dependencies
         run: npm ci
       - name: Check Bash syntax
-        run: bash -n local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
+        run: bash -n local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
+      - name: Validate packaged systemd units
+        run: systemd-analyze verify packaging/systemd/codex-usage-monitor.service packaging/systemd/codex-usage-dashboard.service
       - name: Compile Python modules
         run: python -m compileall -q local tests
       - name: Verify SQLite migrations
@@ -59,4 +61,4 @@ jobs:
       - name: Audit npm dependencies (all vulnerability levels)
         run: npm audit --audit-level=low
       - name: Run ShellCheck
-        run: shellcheck -x local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
+        run: shellcheck -x local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh

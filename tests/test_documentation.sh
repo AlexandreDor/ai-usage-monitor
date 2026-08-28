@@ -7,8 +7,10 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test_helper.sh"
 README="${ROOT_DIR}/README.md"
 ROADMAP="${ROOT_DIR}/ROADMAP.md"
 ENV_EXAMPLE="${ROOT_DIR}/local/.env.example"
+INSTALL="${ROOT_DIR}/docs/INSTALL.md"
 
 assert_file "${README}"
+assert_file "${INSTALL}"
 
 readme_text="$(<"${README}")"
 roadmap_text="$(<"${ROADMAP}")"
@@ -22,7 +24,7 @@ assert_contains "$readme_text" "ai-usage-monitor/local" "current local path miss
 for required in \
   "## Deployment" \
   "### LXC Ubuntu/Debian" \
-  "### systemd (manual units)" \
+  "### systemd packaged units" \
   "### GitHub Pages and Gist (static external dashboard)" \
   "## Backup/Restore SQLite" \
   "sqlite3.Connection.backup" \
@@ -38,6 +40,8 @@ for required in \
   "Restart=on-failure" \
   "systemctl status" \
   "journalctl" \
+  "monitor.env" \
+  "CODEX_MONITOR_RUNTIME_DIR" \
   "/(root)" \
   "/docs" \
   "index.html" \
@@ -116,13 +120,20 @@ fi
 if [[ "$roadmap_text" == *"P2.15"* || "$roadmap_text" == *"### 15."* ]]; then
   fail "completed P2.15 remains in ROADMAP.md"
 fi
-assert_contains "$roadmap_text" "### 16. Préparer le packaging et les releases" "P2.16 was removed from roadmap"
+if [[ "$roadmap_text" == *"P2.16"* || "$roadmap_text" == *"### 16."* ]]; then
+  fail "completed P2.16 remains in ROADMAP.md"
+fi
+assert_contains "$readme_text" "docs/INSTALL.md" "installation documentation link missing"
+assert_contains "$readme_text" "packaging/systemd/codex-usage-monitor.service" "packaged monitor unit missing"
+assert_contains "$readme_text" "packaging/systemd/codex-usage-dashboard.service" "packaged dashboard unit missing"
+assert_contains "$readme_text" "codex-usage-dashboard.lan.conf.example" "LAN drop-in documentation missing"
 
-python3 - "$README" <<'PY'
+python3 - "$README" "$INSTALL" <<'PY'
 import re
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
+install = open(sys.argv[2], encoding="utf-8").read()
 start = text.index("The server's pricing chain is therefore:")
 end = text.index("`DASHBOARD_ANALYTICS_DATABASE` has no `.env` fallback", start)
 section = re.sub(r"\s+", " ", text[start:end])
@@ -158,6 +169,23 @@ if restore_section.index("trap restore_cleanup EXIT") > restore_section.index(
     raise SystemExit("restore stops services before installing its cleanup trap")
 if restore_section.index("ROLLBACK_REQUIRED=0") < restore_section.index("systemctl status"):
     raise SystemExit("restore disables rollback before service status checks")
+
+for heading, end_heading in (("## Upgrade", "## Rollback"), ("## Rollback", "## Uninstallation")):
+    start = install.index(heading)
+    end = install.index(end_heading, start)
+    section = install[start:end]
+    if section.index("systemctl stop") > section.index("ln -sfnT"):
+        raise SystemExit(f"{heading} switches releases before stopping services")
+    for required in (
+        "sudo install -o root -g root -m 0644",
+        "packaging/systemd/codex-usage-monitor.service",
+        "packaging/systemd/codex-usage-dashboard.service",
+        "sudo systemd-analyze verify",
+        "sudo systemctl daemon-reload",
+        "sudo systemctl start codex-usage-monitor.service codex-usage-dashboard.service",
+    ):
+        if required not in section:
+            raise SystemExit(f"{heading} omits required unit refresh step: {required}")
 PY
 
 extract_example() {

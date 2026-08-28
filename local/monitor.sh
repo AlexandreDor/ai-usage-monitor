@@ -29,9 +29,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/.env"
+# Packaged installations keep mutable configuration and state outside the
+# versioned release tree. These process-only paths are deliberately separate
+# from dotenv keys: config.py still parses .env as data and validates it.
+ENV_FILE="${CODEX_MONITOR_ENV_FILE:-${SCRIPT_DIR}/.env}"
 CONFIG_PY="${SCRIPT_DIR}/config.py"
-RUNTIME_DIR="${SCRIPT_DIR}/runtime"
+RUNTIME_DIR="${CODEX_MONITOR_RUNTIME_DIR:-${SCRIPT_DIR}/runtime}"
 STATE_FILE="${RUNTIME_DIR}/.alert_state"
 ALERT_DELIVERIES_FILE="${RUNTIME_DIR}/alert-deliveries.json"
 ALERTS_PY="${SCRIPT_DIR}/alerts.py"
@@ -350,8 +353,26 @@ initialize() {
   fi
 
   check_requirements || return 1
-  mkdir -p "$RUNTIME_DIR"
-  chmod 700 "$RUNTIME_DIR"
+  if [[ "$RUNTIME_DIR" != /* ]]; then
+    config_error "Runtime directory must be an absolute path: $RUNTIME_DIR"
+    return 1
+  fi
+  if [[ -L "$RUNTIME_DIR" ]]; then
+    config_error "Runtime directory must not be a symbolic link: $RUNTIME_DIR"
+    return 1
+  fi
+  mkdir -p -- "$RUNTIME_DIR" || {
+    config_error "Unable to create runtime directory: $RUNTIME_DIR"
+    return 1
+  }
+  if [[ -L "$RUNTIME_DIR" || ! -d "$RUNTIME_DIR" || ! -O "$RUNTIME_DIR" ]]; then
+    config_error "Runtime directory must be a directory owned by the current user: $RUNTIME_DIR"
+    return 1
+  fi
+  chmod 700 -- "$RUNTIME_DIR" || {
+    config_error "Unable to secure runtime directory: $RUNTIME_DIR"
+    return 1
+  }
   [[ -w "$RUNTIME_DIR" ]] || { config_error "Runtime directory is not writable: $RUNTIME_DIR"; return 1; }
 }
 
