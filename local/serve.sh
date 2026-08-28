@@ -5,6 +5,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_PY="${SCRIPT_DIR}/config.py"
+ENV_FILE="${CODEX_MONITOR_ENV_FILE:-${SCRIPT_DIR}/.env}"
+RUNTIME_DIR="${CODEX_MONITOR_RUNTIME_DIR:-${SCRIPT_DIR}/runtime}"
 ANALYTICS_DATABASE_PATH="${DASHBOARD_ANALYTICS_DATABASE:-}"
 ANALYTICS_PRICING_PATH="${DASHBOARD_PRICING_FILE:-${TOKEN_PRICING_FILE:-}}"
 DASHBOARD_ACTIVE_INTERVAL="${DASHBOARD_ACTIVE_INTERVAL_SECONDS:-}"
@@ -79,7 +81,7 @@ config_transport="$(mktemp "${TMPDIR:-/tmp}/codex-dashboard-config.XXXXXX")" || 
   exit 1
 }
 config_transport_error=0
-if ! python3 "$CONFIG_PY" --profile serve --env-file "${SCRIPT_DIR}/.env" \
+if ! python3 "$CONFIG_PY" --profile serve --env-file "$ENV_FILE" \
     --script-dir "$SCRIPT_DIR" --bind "$BIND_ADDRESS" --port "$PORT" >"$config_transport"; then
   rm -f -- "$config_transport"
   exit 2
@@ -111,7 +113,7 @@ fi
 echo "Serving dashboard at http://${DISPLAY_ADDRESS}:${PORT}/dashboard.html"
 echo "Only allowlisted dashboard assets and usage JSON are exposed. Press Ctrl+C to stop."
 
-python3 - "$SCRIPT_DIR" "$PORT" "$BIND_ADDRESS" "$ANALYTICS_DATABASE_PATH" "$ANALYTICS_PRICING_PATH" "$DASHBOARD_ACTIVE_INTERVAL" <<'PYEOF'
+python3 - "$SCRIPT_DIR" "$PORT" "$BIND_ADDRESS" "$ANALYTICS_DATABASE_PATH" "$ANALYTICS_PRICING_PATH" "$DASHBOARD_ACTIVE_INTERVAL" "$RUNTIME_DIR" <<'PYEOF'
 import functools
 import http.server
 import os
@@ -134,7 +136,7 @@ bind_address = sys.argv[3]
 analytics_database = pathlib.Path(sys.argv[4])
 analytics_pricing = pathlib.Path(sys.argv[5])
 dashboard_active_interval = int(sys.argv[6])
-runtime_directory = root / "runtime"
+runtime_directory = pathlib.Path(sys.argv[7]).absolute()
 heartbeat_path = runtime_directory / "dashboard-heartbeat"
 heartbeat_lock = threading.Lock()
 heartbeat_coalesce_seconds = 5
@@ -149,8 +151,10 @@ public_files = {
     "/assets/chart.umd.min.js": "/assets/chart.umd.min.js",
     "/assets/chart-interactions.js": "/assets/chart-interactions.js",
     "/images/favicon.png": "/images/favicon.png",
-    "/data.json": "/runtime/data.json",
-    "/history.json": "/runtime/history.json",
+}
+runtime_files = {
+    "/data.json": runtime_directory / "data.json",
+    "/history.json": runtime_directory / "history.json",
 }
 
 
@@ -263,10 +267,40 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             return
         super().do_HEAD()
 
+    def send_runtime_file(self, path):
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            )
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+                raise OSError("runtime file is not a service-owned regular file")
+            source = os.fdopen(descriptor, "rb")
+            descriptor = -1
+        except FileNotFoundError:
+            self.send_error(404, "Not found")
+            return None
+        except OSError:
+            self.send_error(404, "Not found")
+            return None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        self.send_response(200)
+        self.send_header("Content-type", self.guess_type(str(path)))
+        self.send_header("Content-Length", str(metadata.st_size))
+        self.send_header("Last-Modified", self.date_time_string(metadata.st_mtime))
+        self.end_headers()
+        return source
+
     def send_head(self):
         request_path = unquote(urlsplit(self.path).path)
         if request_path == "/":
             request_path = "/dashboard.html"
+        runtime_path = runtime_files.get(request_path)
+        if runtime_path is not None:
+            return self.send_runtime_file(runtime_path)
         mapped_path = public_files.get(request_path)
         if mapped_path is None:
             self.send_error(404, "Not found")

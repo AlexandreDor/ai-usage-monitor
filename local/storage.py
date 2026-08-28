@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import json
+import hashlib
+import re
 import sqlite3
 import os
 import stat
@@ -11,9 +14,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, TypeVar
 
+try:
+    from history import canonicalize_limit_id, opaque_limit_id_from_raw
+except ImportError:  # Standalone storage restore helper used by recovery tooling.
+    _OPAQUE_LIMIT_ID_RE = re.compile(r"limit-[0-9a-f]{64}\Z")
+
+    def opaque_limit_id_from_raw(value: object) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        return "limit-" + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+
+    def canonicalize_limit_id(value: object) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        if _OPAQUE_LIMIT_ID_RE.fullmatch(value):
+            return value
+        return opaque_limit_id_from_raw(value)
+
 
 SCHEMA_VERSION = "4"
 SCHEMA_VERSION_NUMBER = 4
+PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY = "public_limit_id_contract_version"
+PUBLIC_LIMIT_ID_CONTRACT_VERSION = "1"
 SQLITE_RETRY_ATTEMPTS = 5
 SQLITE_RETRY_INITIAL_DELAY_SECONDS = 0.05
 SQLITE_RETRY_MAX_DELAY_SECONDS = 0.5
@@ -348,6 +370,278 @@ _V4_INDEX_NAMES = frozenset({
 })
 
 
+def _quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+_LIMIT_ID_COLUMNS = {
+    "snapshots": ("limit_id",),
+}
+_LIMIT_ID_JSON_COLUMNS = {
+    "collector_state": ("state_json",),
+}
+_LIMIT_ID_JSON_KEYS = frozenset({
+    "limit_id", "limitId", "active_limit_id", "previous_limit_id",
+})
+_ANOMALY_WINDOWS = frozenset({"5h", "weekly"})
+_ANOMALY_TYPES = frozenset({
+    "quota_increase", "reset_shift", "reset_in_past",
+    "reset_missing", "reset_oscillation",
+})
+
+
+def _limit_id_contract_version(connection: sqlite3.Connection) -> str | None:
+    if "metadata" not in _table_names(connection):
+        return None
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+    ).fetchone()
+    return str(row[0]) if row and row[0] is not None else None
+
+
+def _limit_id_migration_required(connection: sqlite3.Connection) -> bool:
+    """Require one durable migration until the explicit contract marker exists."""
+
+    return _limit_id_contract_version(connection) != PUBLIC_LIMIT_ID_CONTRACT_VERSION
+
+
+def _migrate_limit_id(value: object, *, legacy: bool) -> object:
+    if not isinstance(value, str) or not value:
+        return value
+    if legacy:
+        return opaque_limit_id_from_raw(value)
+    return canonicalize_limit_id(value)
+
+
+def _is_limit_id_key(key: object) -> bool:
+    return isinstance(key, str) and key in _LIMIT_ID_JSON_KEYS
+
+
+def _migrate_json_limit_ids(value: object, *, legacy: bool) -> tuple[object, bool]:
+    """Recursively migrate only explicitly named ID fields in structured JSON."""
+
+    if isinstance(value, dict):
+        changed = False
+        migrated: dict[object, object] = {}
+        for key, child in value.items():
+            if _is_limit_id_key(key) and isinstance(child, str):
+                new_child = _migrate_limit_id(child, legacy=legacy)
+                changed = changed or new_child != child
+            else:
+                new_child, child_changed = _migrate_json_limit_ids(child, legacy=legacy)
+                changed = changed or child_changed
+            migrated[key] = new_child
+        return migrated, changed
+    if isinstance(value, list):
+        changed = False
+        migrated_list = []
+        for child in value:
+            new_child, child_changed = _migrate_json_limit_ids(child, legacy=legacy)
+            changed = changed or child_changed
+            migrated_list.append(new_child)
+        return migrated_list, changed
+    return value, False
+
+
+def _migrate_json_text(value: object, *, legacy: bool) -> object:
+    if not isinstance(value, str):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, OverflowError):
+        return value
+    migrated, changed = _migrate_json_limit_ids(parsed, legacy=legacy)
+    if not changed:
+        return value
+    return json.dumps(migrated, ensure_ascii=False, separators=(",", ":"))
+
+
+def _migrate_dedupe_key(value: object, *, legacy: bool) -> object:
+    """Rebuild the exact anomaly dedupe format, never substitute arbitrary text."""
+
+    if not isinstance(value, str):
+        return value
+    parts = value.split("|", 3)
+    if (
+        len(parts) != 4
+        or not parts[0]
+        or parts[1] not in _ANOMALY_WINDOWS
+        or parts[2] not in _ANOMALY_TYPES
+        or not parts[3]
+    ):
+        return value
+    limit_id = _migrate_limit_id(parts[0], legacy=legacy)
+    if not isinstance(limit_id, str):
+        return value
+    return "|".join((limit_id, parts[1], parts[2], parts[3]))
+
+
+def _migrate_anomaly_detector_ids(
+    connection: sqlite3.Connection,
+    *,
+    legacy: bool,
+) -> None:
+    """Move the ID primary key while merging an impossible canonical collision."""
+
+    if "anomaly_detector_state" not in _table_names(connection):
+        return
+    rows = connection.execute(
+        "SELECT limit_id, window, state_json, updated_at_epoch FROM anomaly_detector_state"
+    ).fetchall()
+    for old_id, window, state_json, updated in rows:
+        if not isinstance(old_id, str):
+            continue
+        new_id = _migrate_limit_id(old_id, legacy=legacy)
+        if new_id == old_id:
+            new_state_json = _migrate_json_text(state_json, legacy=legacy)
+            if new_state_json != state_json:
+                connection.execute(
+                    "UPDATE anomaly_detector_state SET state_json = ? "
+                    "WHERE limit_id = ? AND window = ?",
+                    (new_state_json, old_id, window),
+                )
+            continue
+        new_state_json = _migrate_json_text(state_json, legacy=legacy)
+        conflict = connection.execute(
+            "SELECT state_json, updated_at_epoch FROM anomaly_detector_state "
+            "WHERE limit_id = ? AND window = ?",
+            (new_id, window),
+        ).fetchone()
+        if conflict is None:
+            connection.execute(
+                "UPDATE anomaly_detector_state SET limit_id = ?, state_json = ? "
+                "WHERE limit_id = ? AND window = ?",
+                (new_id, new_state_json, old_id, window),
+            )
+        elif updated is not None and conflict[1] is not None and updated > conflict[1]:
+            connection.execute(
+                "UPDATE anomaly_detector_state SET state_json = ?, updated_at_epoch = ? "
+                "WHERE limit_id = ? AND window = ?",
+                (new_state_json, updated, new_id, window),
+            )
+            connection.execute(
+                "DELETE FROM anomaly_detector_state WHERE limit_id = ? AND window = ?",
+                (old_id, window),
+            )
+        else:
+            connection.execute(
+                "DELETE FROM anomaly_detector_state WHERE limit_id = ? AND window = ?",
+                (old_id, window),
+            )
+
+
+def _migrate_quota_anomaly_ids(
+    connection: sqlite3.Connection,
+    *,
+    legacy: bool,
+) -> None:
+    """Rewrite anomaly IDs/dedupe keys without violating their unique key."""
+
+    if "quota_anomalies" not in _table_names(connection):
+        return
+    rows = connection.execute(
+        "SELECT anomaly_id, dedupe_key, limit_id, detected_at_epoch FROM quota_anomalies"
+    ).fetchall()
+    transformed = []
+    for anomaly_id, dedupe_key, limit_id, detected_at in rows:
+        new_limit = _migrate_limit_id(limit_id, legacy=legacy)
+        new_dedupe = _migrate_dedupe_key(dedupe_key, legacy=legacy)
+        transformed.append((anomaly_id, new_dedupe, new_limit, detected_at))
+
+    winners: dict[str, tuple[object, object, object, object]] = {}
+    losers: list[object] = []
+    for row in transformed:
+        key = row[1]
+        previous = winners.get(key)
+        if previous is None or (row[3] is not None and (previous[3] is None or row[3] > previous[3])):
+            if previous is not None:
+                losers.append(previous[0])
+            winners[key] = row
+        else:
+            losers.append(row[0])
+    for anomaly_id in losers:
+        connection.execute("DELETE FROM quota_anomalies WHERE anomaly_id = ?", (anomaly_id,))
+
+    # Use a temporary unique value for every surviving row before assigning its
+    # final dedupe key, so a canonical row cannot collide with an old raw one.
+    for anomaly_id, _new_dedupe, _new_limit, _ in winners.values():
+        connection.execute(
+            "UPDATE quota_anomalies SET dedupe_key = ? WHERE anomaly_id = ?",
+            (f"__limit_id_migration__{anomaly_id}", anomaly_id),
+        )
+    for anomaly_id, new_dedupe, new_limit, _ in winners.values():
+        connection.execute(
+            "UPDATE quota_anomalies SET dedupe_key = ?, limit_id = ? WHERE anomaly_id = ?",
+            (new_dedupe, new_limit, anomaly_id),
+        )
+
+
+def _migrate_limit_ids(connection: sqlite3.Connection, *, legacy: bool) -> None:
+    """Migrate only schema-defined ID fields in the surrounding transaction."""
+
+    _migrate_quota_anomaly_ids(connection, legacy=legacy)
+    _migrate_anomaly_detector_ids(connection, legacy=legacy)
+
+    for table, columns in _LIMIT_ID_COLUMNS.items():
+        if table not in _table_names(connection):
+            continue
+        for column in columns:
+            for rowid, value in connection.execute(
+                f"SELECT rowid, {_quote_identifier(column)} FROM {_quote_identifier(table)}"
+            ).fetchall():
+                migrated = _migrate_limit_id(value, legacy=legacy)
+                if migrated != value:
+                    connection.execute(
+                        f"UPDATE {_quote_identifier(table)} SET {_quote_identifier(column)} = ? WHERE rowid = ?",
+                        (migrated, rowid),
+                    )
+
+    for table, columns in _LIMIT_ID_JSON_COLUMNS.items():
+        if table not in _table_names(connection):
+            continue
+        for column in columns:
+            for rowid, value in connection.execute(
+                f"SELECT rowid, {_quote_identifier(column)} FROM {_quote_identifier(table)}"
+            ).fetchall():
+                migrated = _migrate_json_text(value, legacy=legacy)
+                if migrated != value:
+                    connection.execute(
+                        f"UPDATE {_quote_identifier(table)} SET {_quote_identifier(column)} = ? WHERE rowid = ?",
+                        (migrated, rowid),
+                    )
+
+    if "metadata" in _table_names(connection):
+        active = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'anomaly_active_limit_id'"
+        ).fetchone()
+        if active:
+            migrated = _migrate_limit_id(active[0], legacy=legacy)
+            if migrated != active[0]:
+                connection.execute(
+                    "UPDATE metadata SET value = ? WHERE key = 'anomaly_active_limit_id'",
+                    (migrated,),
+                )
+
+
+def _set_limit_id_contract_marker(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        INSERT INTO metadata(key, value) VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        WHERE metadata.value IS NOT excluded.value
+        """,
+        (PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY, PUBLIC_LIMIT_ID_CONTRACT_VERSION),
+    )
+
+
+def _ensure_limit_id_contract(connection: sqlite3.Connection) -> None:
+    """Migrate legacy IDs only after rereading the contract marker."""
+    if _limit_id_migration_required(connection):
+        _migrate_limit_ids(connection, legacy=True)
+    _set_limit_id_contract_marker(connection)
+
+
 def _table_names(connection: sqlite3.Connection) -> set[str]:
     return {
         str(row[0])
@@ -467,6 +761,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
             connection.execute("CREATE INDEX IF NOT EXISTS idx_anomaly_detector_state_updated ON anomaly_detector_state(updated_at_epoch)")
         _set_schema_metadata(connection)
         _validate_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+        _ensure_limit_id_contract(connection)
         if started_transaction:
             # Validate the post-migration layout before making it durable.
             check_integrity(connection)
@@ -673,6 +968,26 @@ def connect_database(database_path: Path, *, read_only: bool = False) -> sqlite3
                     f"read-only analytics requires archive schema v{SCHEMA_VERSION_NUMBER}; found v{version}"
                 )
             _validate_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+            if _limit_id_migration_required(connection):
+                # Analytics must never expose a legacy raw ID, but its read-only
+                # contract must not mutate the on-disk archive.  Query an
+                # in-memory copy after applying the same transactional mapper;
+                # the next writable archive open still performs the durable
+                # migration and backup.
+                migrated = sqlite3.connect(":memory:", factory=RetryingConnection)
+                try:
+                    connection.backup(migrated)
+                    migrated.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+                    migrated.execute("PRAGMA foreign_keys = ON")
+                    migrated.execute("BEGIN IMMEDIATE")
+                    _ensure_limit_id_contract(migrated)
+                    migrated.commit()
+                    migrated.execute("PRAGMA query_only = ON")
+                except Exception:
+                    migrated.close()
+                    raise
+                connection.close()
+                return migrated
             return connection
         except Exception:
             connection.close()
@@ -690,10 +1005,12 @@ def connect_database(database_path: Path, *, read_only: bool = False) -> sqlite3
         if existed:
             check_integrity(connection)
         _, schema_migration_required, schema_repair_required = _schema_state(connection)
+        limit_id_migration_required = _limit_id_migration_required(connection)
         current_journal_mode = _journal_mode(connection)
         durable_mutation_required = (
             schema_migration_required
             or schema_repair_required
+            or limit_id_migration_required
             or current_journal_mode != "wal"
         )
         if existed and durable_mutation_required:

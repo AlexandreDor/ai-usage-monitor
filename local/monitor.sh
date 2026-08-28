@@ -29,14 +29,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/.env"
+# Packaged installations keep mutable configuration and state outside the
+# versioned release tree. These process-only paths are deliberately separate
+# from dotenv keys: config.py still parses .env as data and validates it.
+ENV_FILE="${CODEX_MONITOR_ENV_FILE:-${SCRIPT_DIR}/.env}"
 CONFIG_PY="${SCRIPT_DIR}/config.py"
-RUNTIME_DIR="${SCRIPT_DIR}/runtime"
+RUNTIME_DIR="${CODEX_MONITOR_RUNTIME_DIR:-${SCRIPT_DIR}/runtime}"
 STATE_FILE="${RUNTIME_DIR}/.alert_state"
 ALERT_DELIVERIES_FILE="${RUNTIME_DIR}/alert-deliveries.json"
 ALERTS_PY="${SCRIPT_DIR}/alerts.py"
 ANOMALIES_PY="${SCRIPT_DIR}/anomalies.py"
 HISTORY_PY="${SCRIPT_DIR}/history.py"
+CODEX_CLIENT_PY="${SCRIPT_DIR}/codex_client.py"
 DATA_FILE="${RUNTIME_DIR}/data.json"
 HISTORY_FILE="${RUNTIME_DIR}/history.json"
 ARCHIVE_FILE="${RUNTIME_DIR}/usage-history.sqlite3"
@@ -349,226 +353,41 @@ initialize() {
   fi
 
   check_requirements || return 1
-  mkdir -p "$RUNTIME_DIR"
-  chmod 700 "$RUNTIME_DIR"
+  if [[ "$RUNTIME_DIR" != /* ]]; then
+    config_error "Runtime directory must be an absolute path: $RUNTIME_DIR"
+    return 1
+  fi
+  if [[ -L "$RUNTIME_DIR" ]]; then
+    config_error "Runtime directory must not be a symbolic link: $RUNTIME_DIR"
+    return 1
+  fi
+  mkdir -p -- "$RUNTIME_DIR" || {
+    config_error "Unable to create runtime directory: $RUNTIME_DIR"
+    return 1
+  }
+  if [[ -L "$RUNTIME_DIR" || ! -d "$RUNTIME_DIR" || ! -O "$RUNTIME_DIR" ]]; then
+    config_error "Runtime directory must be a directory owned by the current user: $RUNTIME_DIR"
+    return 1
+  fi
+  chmod 700 -- "$RUNTIME_DIR" || {
+    config_error "Unable to secure runtime directory: $RUNTIME_DIR"
+    return 1
+  }
   [[ -w "$RUNTIME_DIR" ]] || { config_error "Runtime directory is not writable: $RUNTIME_DIR"; return 1; }
 }
 
 fetch_status_json() {
   local interval_seconds="$1"
   local codex_cmd="${CODEX_BIN:-codex}"
+  local debug_args=()
+  [[ "${MONITOR_DEBUG:-0}" == 1 ]] && debug_args+=(--debug)
 
-  python3 - "$codex_cmd" "${CODEX_STATUS_TIMEOUT_SECONDS:-20}" "$interval_seconds" "$HISTORY_RETENTION_HOURS" "${MONITOR_DEBUG:-0}" <<'PYEOF'
-import datetime
-import json
-import math
-import os
-import select
-import subprocess
-import sys
-import time
-from zoneinfo import ZoneInfo
-
-codex_cmd = sys.argv[1]
-timeout_seconds = max(5, int(sys.argv[2]))
-interval_seconds = max(1, int(sys.argv[3]))
-history_window_hours = float(sys.argv[4])
-debug = sys.argv[5] == "1"
-paris_timezone = ZoneInfo("Europe/Paris")
-
-# Do not pass notification or storage credentials to the Codex subprocess.
-codex_environment = os.environ.copy()
-for secret_name in ("DISCORD_WEBHOOK", "GITHUB_PAT", "TELEGRAM_BOT_TOKEN"):
-    codex_environment.pop(secret_name, None)
-
-process = subprocess.Popen(
-    [codex_cmd, "app-server", "--stdio"],
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    text=True,
-    bufsize=1,
-    close_fds=True,
-    env=codex_environment,
-)
-
-
-def send(message):
-    process.stdin.write(json.dumps(message) + "\n")
-    process.stdin.flush()
-
-
-def stop_process():
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=2)
-
-
-send({
-    "id": 1,
-    "method": "initialize",
-    "params": {
-        "clientInfo": {"name": "codex-usage-monitor", "version": "1.0.0"},
-        "capabilities": {"experimentalApi": True},
-    },
-})
-
-deadline = time.monotonic() + timeout_seconds
-result = None
-rate_limit_requested = False
-diagnostic = bytearray()
-
-
-def clean_diagnostic(raw):
-    text = raw.decode("utf-8", "replace")
-    return "".join(char if char in "\n\t" or ord(char) >= 32 else "?" for char in text).strip()[:4096]
-
-try:
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([process.stdout, process.stderr], [], [], 0.5)
-        if not ready:
-            if process.poll() is not None:
-                break
-            continue
-
-        if process.stderr in ready:
-            chunk = os.read(process.stderr.fileno(), 1024)
-            if len(diagnostic) < 4096:
-                diagnostic.extend(chunk[: 4096 - len(diagnostic)])
-            ready.remove(process.stderr)
-        if process.stdout not in ready:
-            continue
-        line = process.stdout.readline()
-        if not line:
-            break
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        if message.get("id") == 1 and not rate_limit_requested:
-            if message.get("error"):
-                break
-            send({"method": "initialized"})
-            send({"id": 2, "method": "account/rateLimits/read", "params": None})
-            rate_limit_requested = True
-        elif message.get("id") == 2:
-            result = message.get("result")
-            break
-finally:
-    stop_process()
-
-if not isinstance(result, dict):
-    sys.stderr.write("[ERROR] Codex app-server did not return usage limits.\n")
-    if debug and diagnostic:
-        sys.stderr.write(f"[DEBUG] Codex diagnostic: {clean_diagnostic(diagnostic)}\n")
-    raise SystemExit(1)
-
-snapshots_by_id = result.get("rateLimitsByLimitId")
-if isinstance(snapshots_by_id, dict) and snapshots_by_id:
-    snapshots = [(str(limit_id), snapshot) for limit_id, snapshot in snapshots_by_id.items()]
-else:
-    flat = result.get("rateLimits")
-    snapshots = [(str(flat.get("limitId", "default")), flat)] if isinstance(flat, dict) else []
-
-
-def finite_number(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-
-
-def classify_windows(snapshot):
-    short = weekly = None
-    for name in ("primary", "secondary"):
-        window = snapshot.get(name)
-        if not isinstance(window, dict):
-            continue
-        duration = window.get("windowDurationMins")
-        used = window.get("usedPercent")
-        if not finite_number(duration) or duration <= 0:
-            continue
-        if not finite_number(used) or not 0 <= used <= 100:
-            continue
-        if 1 <= duration <= 360 and short is None:
-            short = window
-        elif 7 * 24 * 60 <= duration <= 8 * 24 * 60 and weekly is None:
-            weekly = window
-    return short, weekly
-
-
-# Select one coherent limit group; never combine windows from different IDs.
-candidates = []
-for limit_id, snapshot in snapshots:
-    if isinstance(snapshot, dict):
-        short, weekly = classify_windows(snapshot)
-        if short is not None or weekly is not None:
-            candidates.append((int(short is not None) + int(weekly is not None), limit_id, short, weekly))
-
-if not candidates:
-    sys.stderr.write("[ERROR] Codex returned no valid recognized usage window.\n")
-    if debug and diagnostic:
-        sys.stderr.write(f"[DEBUG] Codex diagnostic: {clean_diagnostic(diagnostic)}\n")
-    raise SystemExit(1)
-
-candidates.sort(key=lambda item: item[0], reverse=True)
-_, selected_limit_id, five_hour_window, weekly_window = candidates[0]
-if five_hour_window is None or weekly_window is None:
-    missing = "short" if five_hour_window is None else "weekly"
-    sys.stderr.write(
-        f"[WARN] Codex returned a partial limit group '{selected_limit_id}'; "
-        f"the {missing} usage window is unavailable.\n"
-    )
-
-
-def remaining_percent(window):
-    if not window:
-        return None
-    used = window.get("usedPercent")
-    if not finite_number(used) or not 0 <= used <= 100:
-        return None
-    remaining = 100 - used
-    return int(remaining) if float(remaining).is_integer() else remaining
-
-
-def reset_time(window):
-    if not window:
-        return "unknown"
-    timestamp = window.get("resetsAt")
-    if not finite_number(timestamp):
-        return "unknown"
-    try:
-        reset = datetime.datetime.fromtimestamp(timestamp, paris_timezone)
-    except (OverflowError, OSError, ValueError):
-        return "unknown"
-    return reset.strftime("%d/%m/%Y %H:%M")
-
-
-def reset_timestamp(window):
-    if not window:
-        return None
-    timestamp = window.get("resetsAt")
-    if not finite_number(timestamp) or timestamp <= 0:
-        return None
-    return int(timestamp)
-
-payload = {
-    "five_h_pct": remaining_percent(five_hour_window),
-    "five_h_reset": reset_time(five_hour_window),
-    "five_h_reset_at": reset_timestamp(five_hour_window),
-    "weekly_pct": remaining_percent(weekly_window),
-    "weekly_reset": reset_time(weekly_window),
-    "weekly_reset_at": reset_timestamp(weekly_window),
-    "limit_id": selected_limit_id,
-    "scraped_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "sample_interval_seconds": interval_seconds,
-    "history_window_hours": history_window_hours,
-}
-print(json.dumps(payload, indent=2))
-PYEOF
+  python3 "$CODEX_CLIENT_PY" \
+    --codex-bin "$codex_cmd" \
+    --timeout "${CODEX_STATUS_TIMEOUT_SECONDS:-20}" \
+    --interval "$interval_seconds" \
+    --history-window-hours "$HISTORY_RETENTION_HOURS" \
+    "${debug_args[@]}"
 }
 
 json_get_field() {
@@ -706,10 +525,12 @@ format_paris_timestamp() {
 write_local_snapshot() {
   local json="$1"
 
-  printf '%s\n' "$json" | python3 "$HISTORY_PY" \
+  if ! printf '%s\n' "$json" | python3 "$HISTORY_PY" \
     --history "$HISTORY_FILE" \
     --data "$DATA_FILE" \
-    --retention-hours "$HISTORY_RETENTION_HOURS"
+    --retention-hours "$HISTORY_RETENTION_HOURS"; then
+    return 1
+  fi
 
   echo "[OK] Snapshot storage processed at ${DATA_FILE}"
 }
@@ -717,9 +538,11 @@ write_local_snapshot() {
 write_current_snapshot() {
   local json="$1"
 
-  printf '%s\n' "$json" | python3 "$HISTORY_PY" \
-    --data "$DATA_FILE" \
-    --data-only
+  if ! printf '%s\n' "$json" | python3 "$HISTORY_PY" \
+      --data "$DATA_FILE" \
+      --data-only; then
+    return 1
+  fi
 
   echo "[OK] Current snapshot updated at ${DATA_FILE}"
 }
@@ -1287,11 +1110,126 @@ csv_contains() {
   [[ ",${list}," == *",${wanted},"* ]]
 }
 
+canonicalize_alert_limit_id() {
+  python3 - "$1" <<'PYEOF'
+import hashlib
+import re
+import sys
+
+value = sys.argv[1]
+if re.fullmatch(r"limit-[0-9a-f]{64}", value):
+    print(value)
+else:
+    print("limit-" + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest())
+PYEOF
+}
+
+migrate_alert_state_file() {
+  [[ -f "$STATE_FILE" ]] || return 0
+  python3 - "$STATE_FILE" <<'PYEOF'
+import hashlib
+import os
+import pathlib
+import re
+import stat
+import tempfile
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    raw = path.read_text(encoding="utf-8")
+except (OSError, UnicodeError) as exc:
+    raise SystemExit(f"cannot read alert state: {exc}")
+
+values = {}
+lines = raw.splitlines()
+for line_number, line in enumerate(lines, 1):
+    if not line:
+        continue
+    key, separator, value = line.partition("=")
+    if not separator or not key or key in values:
+        raise SystemExit(f"invalid alert state line {line_number}")
+    values[key] = value
+
+version_text = values.get("state_version", "0")
+if not re.fullmatch(r"[0-9]+", version_text):
+    raise SystemExit("invalid alert state version")
+version = int(version_text)
+if version > 5:
+    raise SystemExit(f"unsupported future alert state version {version}")
+if version < 0:
+    raise SystemExit("invalid alert state version")
+
+marker = values.get("limit_id_contract_version")
+if marker is not None:
+    if marker != "1" or version < 5:
+        raise SystemExit("invalid alert state limit ID contract marker")
+    for key in ("observed_weekly_limit_id", "weekly_armed_limit_id"):
+        value = values.get(key, "")
+        if value and not re.fullmatch(r"limit-[0-9a-f]{64}", value):
+            raise SystemExit(f"marked alert state contains a raw {key}")
+    raise SystemExit(0)
+
+if version not in range(0, 5):
+    raise SystemExit(f"unsupported alert state version {version}")
+
+def opaque(value):
+    if not value:
+        return value
+    return "limit-" + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+
+for key in ("observed_weekly_limit_id", "weekly_armed_limit_id"):
+    if key in values:
+        values[key] = opaque(values[key])
+
+output = ["state_version=5", "limit_id_contract_version=1"]
+for line in lines:
+    if not line:
+        continue
+    key, _, value = line.partition("=")
+    if key in {"state_version", "limit_id_contract_version"}:
+        continue
+    if key in {"observed_weekly_limit_id", "weekly_armed_limit_id"}:
+        value = values[key]
+    output.append(f"{key}={value}")
+encoded = ("\n".join(output) + "\n").encode("utf-8")
+
+try:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, mode or (stat.S_IRUSR | stat.S_IWUSR))
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+except OSError as exc:
+    raise SystemExit(f"cannot atomically migrate alert state: {exc}")
+PYEOF
+}
+
 persist_alert_state() {
   local state_tmp
   state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || return 1
   if ! printf '%s\n' \
-    'state_version=4' \
+    'state_version=5' \
+    'limit_id_contract_version=1' \
     "prev_5h_pct=${prev_5h_pct}" \
     "prev_weekly_pct=${prev_weekly_pct}" \
     "observed_weekly_pct=${observed_weekly_pct}" \
@@ -1589,6 +1527,10 @@ check_thresholds() {
   local weekly_reset_at="$6"
   local scraped_at_epoch="$7"
   local limit_id="${8:-default}"
+  if ! limit_id="$(canonicalize_alert_limit_id "$limit_id")"; then
+    ALERT_PROCESSING_ERROR="invalid alert limit ID"
+    return 1
+  fi
 
   local state_version=1
   local prev_5h_pct=100
@@ -1620,9 +1562,19 @@ check_thresholds() {
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 initialize_script_baseline=0
   local observed_weekly_reset=0 weekly_observation_valid=0 process_weekly_sample=1 state_loaded=0
   local resumed_after_disabled=0 resume_delivery_attempted=0
+  local journal_source_state_version=1 raw_source_state_version
   local -a script_thresholds=()
   ALERT_PROCESSING_ERROR=""
   if [[ -f "$STATE_FILE" ]]; then
+    raw_source_state_version="$(awk -F= '$1 == "state_version" {print $2; exit}' "$STATE_FILE")"
+    if [[ "$raw_source_state_version" =~ ^[0-9]+$ ]]; then
+      journal_source_state_version="$raw_source_state_version"
+    fi
+    if ! migrate_alert_state_file; then
+      echo "[ERROR] Alert state migration failed; alerts are disabled." >&2
+      ALERT_PROCESSING_ERROR="alert state migration failed"
+      return 1
+    fi
     state_loaded=1
     while IFS='=' read -r state_key state_value; do
       case "$state_key" in
@@ -1665,12 +1617,12 @@ check_thresholds() {
     done < "$STATE_FILE"
   fi
 
-  if (( state_version > 4 )); then
+  if (( state_version > 5 )); then
     echo "[ERROR] Unsupported future alert state version ${state_version}; alerts are disabled." >&2
     ALERT_PROCESSING_ERROR="unsupported future alert state version"
     return 1
   fi
-  if (( state_version < 1 || state_version > 4 )); then
+  if (( state_version < 1 || state_version > 5 )); then
     echo "[ERROR] Unsupported alert state version ${state_version}." >&2
     ALERT_PROCESSING_ERROR="invalid alert state version"
     return 1
@@ -1692,12 +1644,13 @@ check_thresholds() {
 
 
   if [[ ! -e "$ALERT_DELIVERIES_FILE" ]]; then
-    if ! initialize_alert_delivery_journal "$state_version" "$scraped_at_epoch" "$limit_id" \
+    if ! initialize_alert_delivery_journal "$journal_source_state_version" "$scraped_at_epoch" "$limit_id" \
       "$five_h_pct" "$weekly_pct" "$five_h_reset" "$weekly_reset"; then
       ALERT_PROCESSING_ERROR="alert journal initialization failed"
       return 1
     fi
-  elif ! python3 "$ALERTS_PY" validate "$ALERT_DELIVERIES_FILE"; then
+  elif ! python3 "$ALERTS_PY" migrate "$ALERT_DELIVERIES_FILE" --at "$scraped_at_epoch" \
+    || ! python3 "$ALERTS_PY" validate "$ALERT_DELIVERIES_FILE"; then
     echo "[ERROR] Alert delivery journal is invalid; no notification was sent." >&2
     ALERT_PROCESSING_ERROR="invalid alert delivery journal"
     return 1
@@ -2329,7 +2282,7 @@ run_cycle() {
   fi
   echo "[$(format_paris_now)] Scraping codex status (${cycle_mode} cycle)..."
 
-  local json public_json gist_json status=0 history_json="[]"
+  local json public_json gist_json status=0 history_json="[]" storage_ok=1
   CYCLE_ERROR=""
   if json=$(fetch_status_json "$interval_seconds"); then
     echo "$json" | python3 -m json.tool 2>/dev/null || echo "$json"
@@ -2342,12 +2295,16 @@ run_cycle() {
     if [[ "$cycle_mode" == full ]]; then
       if ! archive_snapshot "$public_json"; then
         status=1
+        storage_ok=0
         append_cycle_error "Long-term archive update failed"
       fi
       if write_local_snapshot "$public_json"; then
-        [[ -f "$HISTORY_FILE" ]] && history_json="$(<"$HISTORY_FILE")"
+        if [[ -f "$HISTORY_FILE" ]]; then
+          history_json="$(<"$HISTORY_FILE")"
+        fi
       else
         status=1
+        storage_ok=0
         append_cycle_error "Local snapshot write failed"
       fi
       gist_json="$public_json"
@@ -2358,7 +2315,11 @@ run_cycle() {
           append_cycle_error "External snapshot cadence update failed"
         fi
       fi
-      sync_gist "$gist_json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
+      if (( storage_ok )); then
+        sync_gist "$gist_json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
+      else
+        echo "[WARN] Skipping GitHub Gist sync because local storage failed." >&2
+      fi
     else
       write_current_snapshot "$public_json" || { status=1; append_cycle_error "Current snapshot write failed"; }
     fi

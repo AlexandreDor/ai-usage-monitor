@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pathlib
+import hashlib
 import sqlite3
 import sys
 import tempfile
@@ -273,6 +274,13 @@ class SQLiteMigrationTests(unittest.TestCase):
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone(),
             )
+            self.assertEqual(
+                (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION,),
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key = ?",
+                    (storage.PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,),
+                ).fetchone(),
+            )
             self.assertEqual(("ok",), connection.execute("PRAGMA quick_check").fetchone())
             self._assert_v4_layout(connection)
 
@@ -290,7 +298,7 @@ class SQLiteMigrationTests(unittest.TestCase):
                     )
                     self._assert_v4_layout(connection)
                     self.assertEqual(
-                        (f"v{version}",),
+                        ("limit-" + hashlib.sha256(f"v{version}".encode()).hexdigest(),),
                         connection.execute(
                             "SELECT limit_id FROM snapshots WHERE scraped_at_epoch = ?",
                             (1000 + version,),

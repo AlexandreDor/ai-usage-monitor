@@ -137,10 +137,84 @@ test('hides the freshness badge when no valid snapshot is available', async ({ p
   expectNoAxeViolations(results, ['critical', 'serious']);
 });
 
+test('coalesces concurrent refreshes for the same source', async ({ page }) => {
+  let dataRequests = 0;
+  let releaseData;
+  const dataResponse = new Promise(resolve => { releaseData = resolve; });
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
+  await page.route('**/data.json?*', async route => {
+    dataRequests += 1;
+    await dataResponse;
+    await route.fulfill({ json: snapshot });
+  });
+  await page.route('**/history.json?*', route => route.fulfill({ json: [snapshot] }));
+  await page.goto('/dashboard.html');
+  await expect.poll(() => dataRequests).toBe(1);
+  await page.evaluate(() => {
+    window.__firstRefresh = refresh();
+    window.__secondRefresh = refresh();
+  });
+  releaseData();
+  await page.evaluate(() => Promise.all([window.__firstRefresh, window.__secondRefresh]));
+  expect(dataRequests).toBe(1);
+});
+
+test('cancels a queued Gist refresh when returning to the active local source', async ({ page }) => {
+  let dataRequests = 0;
+  let gistRequests = 0;
+  let releaseData;
+  const dataResponse = new Promise(resolve => { releaseData = resolve; });
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
+  await page.route('**/data.json?*', async route => {
+    dataRequests += 1;
+    await dataResponse;
+    await route.fulfill({ json: snapshot });
+  });
+  await page.route('**/history.json?*', route => route.fulfill({ json: [snapshot] }));
+  await page.route('https://api.github.com/gists/**', async route => {
+    gistRequests += 1;
+    await route.fulfill({
+      json: {
+        files: {
+          'data.json': { content: JSON.stringify(snapshot) },
+          'history.json': { content: JSON.stringify([snapshot]) },
+        },
+      },
+    });
+  });
+  await page.goto('/dashboard.html');
+  await expect.poll(() => dataRequests).toBe(1);
+
+  await page.evaluate(() => {
+    GIST_ID = 'external-fixture';
+    window.__gistRefresh = refresh();
+    GIST_ID = '';
+    window.__localRefresh = refresh();
+  });
+  releaseData();
+  await page.evaluate(() => Promise.all([
+    window.__gistRefresh,
+    window.__localRefresh,
+  ]));
+
+  expect(gistRequests).toBe(0);
+  expect(dataRequests).toBe(1);
+  await expect(page.locator('#mode-badge')).toBeHidden();
+  await expect(page.locator('body')).toHaveAttribute('data-dashboard-source', 'local');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+});
+
 test('renders fresh external Gist data with independent source and freshness states', async ({ page }) => {
   await page.clock.install({ time: DASHBOARD_NOW });
   await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
-  await page.route('**/data.json?*', route => route.fulfill({ status: 503 }));
+  let localRequestStarted = false;
+  let releaseInitialLocal;
+  const initialLocalResponse = new Promise(resolve => { releaseInitialLocal = resolve; });
+  await page.route('**/data.json?*', async route => {
+    localRequestStarted = true;
+    await initialLocalResponse;
+    await route.fulfill({ status: 503 });
+  });
   await page.route('https://api.github.com/gists/**', route => route.fulfill({
     json: {
       files: {
@@ -150,10 +224,13 @@ test('renders fresh external Gist data with independent source and freshness sta
     },
   }));
   await page.goto('/dashboard.html');
-  await page.evaluate(async () => {
+  await expect.poll(() => localRequestStarted).toBe(true);
+  await page.evaluate(() => {
     GIST_ID = 'external-fixture';
-    await refresh();
+    window.__externalRefresh = refresh();
   });
+  releaseInitialLocal();
+  await page.evaluate(() => window.__externalRefresh);
 
   await expect(page.locator('#mode-badge')).toHaveText('EXTERNAL');
   await expect(page.locator('body')).toHaveAttribute('data-dashboard-source', 'external');

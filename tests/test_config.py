@@ -47,6 +47,14 @@ class SharedConfigTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.env.stat().st_mode), 0o600)
         self.assertNotIn("secret-value", " ".join(warnings))
 
+    def test_private_dotenv_does_not_need_fchmod(self) -> None:
+        self.env.write_text("LOOP_INTERVAL=10\n", encoding="utf-8")
+        self.env.chmod(0o600)
+        with mock.patch.object(config.os, "fchmod", side_effect=AssertionError("fchmod called")):
+            values, warnings = config.parse_env_file(self.env)
+        self.assertEqual(values["LOOP_INTERVAL"], "10")
+        self.assertEqual(warnings, [])
+
     def test_cli_process_dotenv_default_precedence(self) -> None:
         self.env.write_text("LOOP_INTERVAL=100\n", encoding="utf-8")
         resolved = config.resolve_config(
@@ -120,6 +128,28 @@ class SharedConfigTests(unittest.TestCase):
         self.assertEqual(resolved["PORT"], "9090")
         self.assertEqual(resolved["BIND_ADDRESS"], "127.0.0.1")
         self.assertEqual(resolved["ANALYTICS_DATABASE_PATH"], str(database))
+
+    def test_runtime_override_selects_server_analytics_default(self) -> None:
+        runtime = self.root / "runtime-state"
+        resolved = config.resolve_config(
+            profile="serve", script_dir=self.local,
+            environ={"HOME": str(self.root), "CODEX_MONITOR_RUNTIME_DIR": str(runtime)},
+            cli={"bind": "127.0.0.1", "port": "8080"},
+        )
+        self.assertEqual(
+            resolved["ANALYTICS_DATABASE_PATH"],
+            str(runtime / "usage-history.sqlite3"),
+        )
+
+        runtime.mkdir()
+        runtime_link = self.root / "runtime-link"
+        runtime_link.symlink_to(runtime, target_is_directory=True)
+        with self.assertRaises(config.ConfigurationError):
+            config.resolve_config(
+                profile="serve", script_dir=self.local,
+                environ={"HOME": str(self.root), "CODEX_MONITOR_RUNTIME_DIR": str(runtime_link)},
+                cli={"bind": "127.0.0.1", "port": "8080"},
+            )
 
     def test_alert_rules_are_normalized_and_deduplicated(self) -> None:
         hook = self.root / "hook.sh"

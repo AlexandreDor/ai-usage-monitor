@@ -109,6 +109,11 @@ period-wide token or cost totals.
 
 - Current snapshot in `local/runtime/data.json`.
 - Rolling dashboard history in `local/runtime/history.json`.
+- The Codex JSON-RPC transport lives in the importable `local/codex_client.py`;
+  `monitor.sh` only supplies validated configuration and orchestrates the
+  collection cycle. The client starts the app-server in its own process group,
+  removes monitor credentials/account selectors from its environment, and
+  bounds protocol lines to 1 MiB.
 - Long-term quota, reset, and token archive in
   `local/runtime/usage-history.sqlite3`.
 - Cycle health information in `local/runtime/health.json`.
@@ -118,6 +123,47 @@ period-wide token or cost totals.
 - Atomic writes and private runtime permissions.
 - Configuration, dependencies, Codex authentication, and analytics source
   validation through `./monitor.sh --check`.
+
+### Snapshot and history JSON contract
+
+`data.json` contains one snapshot object. `history.json` remains a JSON array
+of snapshot objects so the dashboard and Gist publication format do not
+change. Every snapshot written by the monitor carries `schema_version: 1`.
+The runtime validator in `local/history.py` accepts the following public
+fields (unknown private paths, credentials, and account metadata are never
+added to the contract):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema_version` | integer, `1` | Snapshot contract version. |
+| `scraped_at` | UTC ISO-8601 string | Observation time. |
+| `five_h_pct`, `weekly_pct` | number from `0` to `100`, or `null` | Remaining quota; at least one must be available. |
+| `five_h_reset`, `weekly_reset` | string | Paris-local display label, or `unknown`. |
+| `five_h_reset_at`, `weekly_reset_at` | positive integer within SQLite signed 64-bit range, or `null` | Reset Unix timestamp when known. |
+| `sample_interval_seconds` | integer from `1` to `86400` | Requested collection interval, when supplied. |
+| `history_window_hours` | number from `0` to `8760` | Requested rolling history window, when supplied. |
+| `limit_id` | opaque string `limit-` plus 64 lowercase hexadecimal characters | Stable hash of the coherent Codex limit group; the server value is never published. |
+| `codex_forecast` | object | Validated Forecast observation, when available. |
+
+`limit_id` is intentionally opaque. Every raw app-server value is hashed at
+the client boundary (including a value that happens to look like
+`limit-<sha256>`), so the server value is never published. Persisted v0 data
+is hashed unconditionally at migration time, while v1 data is canonicalized
+without hashing an already opaque value again.
+
+The same opaque representation is used in SQLite snapshots, anomaly state,
+deduplication keys, and analytics projections. Opening a writable legacy
+archive performs an atomic v0-to-v1 ID migration with the existing recovery
+backup; read-only analytics uses a sanitized in-memory copy until that write
+path runs.
+
+Snapshots written before this contract had no `schema_version`; they are read
+as implicit v0 and upgraded to v1 on the next atomic write without changing
+their recognized public values. An explicit schema version newer than `1` is
+rejected instead of being silently discarded or partially migrated. Corrupt
+legacy JSON keeps the existing backup-and-reconstruct behavior. No JSON Schema
+package is required at runtime: validation uses only the Python standard
+library.
 
 ## Requirements
 
@@ -183,6 +229,14 @@ error; only a sufficiently recent snapshot clears the stale state. This
 browser-side check needs no Analytics API or additional endpoint; in external
 mode it can therefore also identify an interrupted Gist publication.
 
+## Installation and releases
+
+For packaged systemd installation, upgrades, rollback, LAN configuration, and
+safe removal, follow [`docs/INSTALL.md`](docs/INSTALL.md). The version source,
+SemVer policy, archive/checksum commands, and post-merge tag process are in
+[`docs/RELEASING.md`](docs/RELEASING.md); the first `v0.1.0` tag is intentionally
+created only after the release change has merged to `dev`.
+
 ## Reproducible quality checks
 
 The CI runtime versions are pinned in `.python-version` (Python 3.12.8) and
@@ -194,31 +248,35 @@ not used at runtime.
 From the repository root, run the same quality controls locally:
 
 ```bash
+test "$(python3 -c 'import platform; print(platform.python_version())')" = "$(tr -d '[:space:]' < .python-version)"
+test "$(node --version)" = "v$(tr -d '[:space:]' < .node-version)"
 python3 -m pip install --requirement requirements-ci.txt
+bash -n local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
 python3 -m compileall -q local tests
-python3 -m unittest tests.test_migrations
 python3 -m coverage run --branch --rcfile=.coveragerc -m unittest \
-  tests.test_alerts tests.test_anomalies tests.test_history tests.test_config \
-  tests.test_storage_durability
+  tests.test_migrations tests.test_alerts tests.test_anomalies tests.test_history \
+  tests.test_codex_client tests.test_config tests.test_storage_durability
 python3 -m coverage report --rcfile=.coveragerc
-tests/run.sh
+SKIP_PYTHON_TESTS=1 tests/run.sh
 npm ci
 npm audit --audit-level=low
 npx playwright install --with-deps chromium
 npm run test:browser
-shellcheck -x local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
+shellcheck -x local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
 ```
 
-Coverage enables branch measurement for the exercised Python modules and fails
-below the combined 60% line-and-branch threshold. The threshold is deliberately
-below the current measured baseline (66%) so it blocks regressions without
-pretending that unexercised browser-facing subprocess paths are covered.
+Coverage enables branch measurement for the exercised Python modules, including
+the SQLite migration tests, and fails below the combined 60% line-and-branch
+threshold. The documented command is the same test selection used by CI;
+modules exercised only through separate subprocesses are not counted as
+in-process coverage.
 `npm audit --audit-level=low` is also blocking: every vulnerability reported at
 low severity or above fails the CI job, while `package-lock.json` remains the
 reproducible installation source. Migration tests cover fresh archives,
 supported v1–v3 archives upgrading to v4, data/integrity preservation, and
-rejection of future or partial schemas. `systemd-analyze verify` is deferred
-until the real packaged units planned for P2.16 exist.
+rejection of future or partial schemas. The packaged systemd units are
+validated by CI and can be installed with
+[`docs/INSTALL.md`](docs/INSTALL.md).
 
 ## Freshness and availability states
 
@@ -305,6 +363,9 @@ options. The shared pricing catalog and dashboard active interval use the same
 reader and validators in both programs. The process-only aliases are:
 
 - `CODEX_BIN_OVERRIDE` for the monitor's `CODEX_BIN`;
+- `CODEX_MONITOR_ENV_FILE` for the entry points' dotenv path;
+- `CODEX_MONITOR_RUNTIME_DIR` for the monitor state directory and the
+  server's default Analytics directory;
 - `DASHBOARD_PRICING_FILE` for the server's pricing catalog;
 - `DASHBOARD_ANALYTICS_DATABASE` for the server's SQLite path.
 
@@ -313,7 +374,8 @@ The server's pricing chain is therefore:
 - pricing catalog: `DASHBOARD_PRICING_FILE` (process) → `TOKEN_PRICING_FILE`
   (process) → `TOKEN_PRICING_FILE` in `local/.env` → `local/pricing.json`;
 - Analytics database: `DASHBOARD_ANALYTICS_DATABASE` (process only) →
-  `local/runtime/usage-history.sqlite3`;
+  `CODEX_MONITOR_RUNTIME_DIR/usage-history.sqlite3` (or
+  `local/runtime/usage-history.sqlite3` by default);
 - active refresh interval: `DASHBOARD_ACTIVE_INTERVAL_SECONDS` (process) →
   the same key in `local/.env` → `300`.
 
@@ -350,6 +412,13 @@ CODEX_FORECAST_ENABLED=1
 Discord and Telegram maintain separate delivery progress. Temporary failures
 such as timeouts, HTTP 408, 429, or 5xx remain pending. Successful channels are
 not replayed because another channel failed.
+
+The durable detector state uses `state_version: 5` with an explicit opaque-ID
+contract marker, and `local/runtime/alert-deliveries.json` uses journal schema
+2 with the same marker. Existing unmarked state and schema-1 journals are
+migrated one file at a time with atomic replacement; pending and delivered
+channel state is retained, and a failed migration is retried on the next
+cycle. Future versions or inconsistent alert/cycle identities fail closed.
 
 Set `ALERTS_ENABLED=0` to pause outbound alerting. New threshold, reset, and
 anomaly events observed while disabled are acknowledged locally: they advance
@@ -550,10 +619,13 @@ These variables are normally unnecessary:
 | Variable | Default | Description |
 |---|---:|---|
 | `TELEGRAM_API_URL` | `https://api.telegram.org` | Telegram-compatible HTTP(S) API base URL, mainly for tests. |
-| `DASHBOARD_ANALYTICS_DATABASE` | `local/runtime/usage-history.sqlite3` | Process-only absolute database path override for `serve.sh`; no `.env` fallback. |
+| `CODEX_MONITOR_ENV_FILE` | Entry-point directory `.env` | Process-only dotenv path override for `monitor.sh` and `serve.sh`; not read from `.env`. |
+| `CODEX_MONITOR_RUNTIME_DIR` | `local/runtime` | Process-only absolute runtime directory override. The dashboard uses its `usage-history.sqlite3` as the Analytics default unless `DASHBOARD_ANALYTICS_DATABASE` is set. |
+| `DASHBOARD_ANALYTICS_DATABASE` | `${CODEX_MONITOR_RUNTIME_DIR}/usage-history.sqlite3` | Process-only absolute database path override for `serve.sh`; no `.env` fallback. |
 | `DASHBOARD_PRICING_FILE` | See the priority chain above | Process-only absolute pricing path override for `serve.sh`. |
 | `CODEX_BIN_OVERRIDE` | empty | Environment-only override that takes precedence over `CODEX_BIN` during monitor initialization. |
 
+`CODEX_MONITOR_ENV_FILE`, `CODEX_MONITOR_RUNTIME_DIR`,
 `DASHBOARD_ANALYTICS_DATABASE`, `DASHBOARD_PRICING_FILE`, and
 `CODEX_BIN_OVERRIDE` are process-only overrides and are not read from
 `local/.env`. `TELEGRAM_API_URL` remains an application key that can be read
@@ -648,8 +720,9 @@ the pricing catalog.
 The monitor and dashboard server are deliberately separate processes. The
 server records recent visible-dashboard activity, and a monitor already running
 in `--loop` mode reacts to it; `serve.sh` never starts a collection itself. The
-examples below are manual deployment recipes, not the packaged systemd units
-planned for P2.16.
+release layout and operational procedures are maintained in
+[`docs/INSTALL.md`](docs/INSTALL.md). The monitor and dashboard remain separate
+processes so either service can be restarted and diagnosed independently.
 
 ### LXC Ubuntu/Debian
 
@@ -686,61 +759,38 @@ and any Proxmox network policy. Never forward it directly to the internet.
 Run `./monitor.sh --loop` and `./serve.sh` under the same account, for example
 with the systemd recipe below.
 
-### systemd (manual units)
+### systemd packaged units
 
-Create two separate units so collection and HTTP serving can be restarted and
-diagnosed independently. Replace `codex-monitor` and the home path with the
-actual account; the `User`, `HOME`, and `WorkingDirectory` values below all
-refer to that same account and checkout. Do not ask systemd to interpret
-`.env`: the application parses it as data and validates its permissions.
+Install the static units
+`packaging/systemd/codex-usage-monitor.service` and
+`packaging/systemd/codex-usage-dashboard.service` using
+[`docs/INSTALL.md`](docs/INSTALL.md). They use the stable release link
+`/opt/codex-usage-monitor/current`, run as the non-root `codex-monitor` user,
+and keep mutable `monitor.env` and SQLite state in `/etc/codex-usage-monitor/` and
+`/var/lib/codex-usage-monitor/`. The units do not delegate dotenv parsing to
+systemd: the application parses and validates `monitor.env` itself. `HOME` and the default
+`CODEX_DATA_DIR` point at the service user's Codex account, or an explicit
+absolute `CODEX_DATA_DIR` can be set in that user's `monitor.env`.
 
-```ini
-# /etc/systemd/system/codex-usage-monitor.service
-[Unit]
-Description=Codex Usage Monitor collection loop
-After=network-online.target
-Wants=network-online.target
+Both units retain `ProtectHome=read-only`. The monitor alone has a narrowly scoped
+`ReadWritePaths` exception for `/home/codex-monitor/.codex`, allowing the official
+`codex app-server` child process to persist refreshed tokens; its other writable
+path is `/var/lib/codex-usage-monitor`. The dashboard never launches Codex and has
+no exception for the Codex home. Before enabling the monitor, ensure
+`/home/codex-monitor/.codex` exists and is owned by `codex-monitor`; run `codex login`
+as that account so renewed credentials remain service-owned. A custom
+`CODEX_DATA_DIR` outside this directory is not covered by the packaged writable
+exception and must be planned separately.
 
-[Service]
-Type=simple
-User=codex-monitor
-Environment=HOME=/home/codex-monitor
-WorkingDirectory=/home/codex-monitor/ai-usage-monitor/local
-ExecStart=/usr/bin/env bash /home/codex-monitor/ai-usage-monitor/local/monitor.sh --loop
-Restart=on-failure
-RestartSec=30
+The packaged dashboard unit binds only to `127.0.0.1`. A LAN bind requires the
+reviewed drop-in `packaging/systemd/codex-usage-dashboard.lan.conf.example`, an
+explicit trusted address, and a host-firewall rule. It must not be enabled by
+editing the base unit or by exposing unauthenticated `0.0.0.0` to the internet.
+Both units order startup after `network-online.target`, use
+`Restart=on-failure`, and are checked with `systemd-analyze verify` before
+activation.
 
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# /etc/systemd/system/codex-usage-dashboard.service
-[Unit]
-Description=Codex Usage Monitor dashboard server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=codex-monitor
-Environment=HOME=/home/codex-monitor
-WorkingDirectory=/home/codex-monitor/ai-usage-monitor/local
-ExecStart=/usr/bin/env bash /home/codex-monitor/ai-usage-monitor/local/serve.sh --port 8080
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-```
-
-The dashboard unit above stays on `127.0.0.1`. If LAN access is intentional,
-make it explicit in that unit, for example by changing only its command to
-`ExecStart=/usr/bin/env bash /home/codex-monitor/ai-usage-monitor/local/serve.sh --bind 192.0.2.20 --port 8080`,
-then restrict port 8080 with the host firewall. Do not use an unauthenticated
-`0.0.0.0` bind without that firewall decision.
-
-Install, start, and inspect both units as follows:
+After installation, start and inspect both units as follows:
 
 ```bash
 sudo systemctl daemon-reload
@@ -749,23 +799,23 @@ sudo systemctl status codex-usage-monitor.service codex-usage-dashboard.service
 sudo journalctl -u codex-usage-monitor.service -f
 sudo journalctl -u codex-usage-dashboard.service -f
 
-# After a checkout or configuration update:
+# After an upgrade or configuration update:
 sudo systemctl restart codex-usage-monitor.service codex-usage-dashboard.service
 sudo systemctl status codex-usage-monitor.service codex-usage-dashboard.service
 ```
 
-Use `./monitor.sh --check` as the service account when diagnosing
-authentication, paths, or Analytics sources. Keep `local/.env` owned by that
+Use `monitor.sh --check` as the service account when diagnosing authentication,
+paths, or Analytics sources. Keep `/etc/codex-usage-monitor/monitor.env` owned by that
 account and mode `600`; a systemd unit must not duplicate its values in a
 second environment file.
 
 If Codex was installed in a user-only directory that is not in systemd's
 `PATH`, obtain its absolute path as the service account and put that value in
-`local/.env`:
+`/etc/codex-usage-monitor/monitor.env`:
 
 ```bash
 sudo -u codex-monitor -H bash -lc 'command -v codex'
-# If the command printed /absolute/path/to/codex, set this in local/.env:
+# If the command printed /absolute/path/to/codex, set this in monitor.env:
 CODEX_BIN=/absolute/path/to/codex
 ```
 
@@ -820,10 +870,11 @@ this mutable value near the top of the copied file:
 let GIST_ID = '0123456789abcdef0123456789abcdef';
 ```
 
-Do not commit a personal token. Only the static live quota page works in this
-external mode: Advanced Analytics requires the local `serve.sh` API and the
-local SQLite archive. A Pages browser cannot provide Analytics merely by
-having access to the Gist.
+Do not commit a personal token. In this external mode, the static dashboard
+can display the live quota plus the Gist-backed rolling history and Forecast;
+Advanced Analytics requires the local `serve.sh` API and the local SQLite
+archive. A Pages browser cannot provide Analytics merely by having access to
+the Gist.
 
 ## Backup/Restore SQLite
 

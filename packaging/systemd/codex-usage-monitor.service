@@ -1,0 +1,28 @@
+[Unit]
+Description=Codex Usage Monitor collection loop
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=codex-monitor
+Group=codex-monitor
+WorkingDirectory=/opt/codex-usage-monitor/current/local
+Environment=HOME=/home/codex-monitor
+Environment=CODEX_MONITOR_ENV_FILE=/etc/codex-usage-monitor/monitor.env
+Environment=CODEX_MONITOR_RUNTIME_DIR=/var/lib/codex-usage-monitor
+ExecStart=/usr/bin/env bash /opt/codex-usage-monitor/current/local/monitor.sh --loop
+Restart=on-failure
+RestartSec=15s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/codex-usage-monitor /home/codex-monitor/.codex
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

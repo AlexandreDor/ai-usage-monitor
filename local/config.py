@@ -48,7 +48,8 @@ MONITOR_KEYS = (
 )
 SERVE_KEYS = ("TOKEN_PRICING_FILE", "DASHBOARD_ACTIVE_INTERVAL_SECONDS")
 PROCESS_ONLY_KEYS = (
-    "DASHBOARD_ANALYTICS_DATABASE", "DASHBOARD_PRICING_FILE", "CODEX_BIN_OVERRIDE",
+    "CODEX_MONITOR_ENV_FILE", "CODEX_MONITOR_RUNTIME_DIR", "DASHBOARD_ANALYTICS_DATABASE",
+    "DASHBOARD_PRICING_FILE", "CODEX_BIN_OVERRIDE",
 )
 SCRIPT_KEYS = frozenset(MONITOR_KEYS)
 
@@ -118,10 +119,11 @@ def _read_env(path: Path) -> tuple[dict[str, str], set[str], list[str], bool]:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
             raise ConfigurationError("local/.env must be a regular file owned by the current user")
-        try:
-            os.fchmod(descriptor, 0o600)
-        except OSError:
-            raise ConfigurationError("local/.env permissions cannot be secured") from None
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            try:
+                os.fchmod(descriptor, 0o600)
+            except OSError:
+                raise ConfigurationError("local/.env permissions cannot be secured") from None
         chunks: list[bytes] = []
         size = 0
         limit = 8 * 1024 * 1024
@@ -232,6 +234,21 @@ def _validate_path(value: str, key: str, *, require_file: bool = False, executab
             raise ConfigurationError(f"{key} must be a readable regular file, not a symbolic link")
     elif executable and (not stat.S_ISREG(metadata.st_mode) or not os.access(path, os.X_OK)):
         raise ConfigurationError(f"{key} must be an absolute path to an executable regular file")
+
+
+def _validate_directory_path(value: str, key: str) -> None:
+    """Validate an absolute directory path without following its final symlink."""
+    if not value or not value.startswith("/") or _has_control(value):
+        raise ConfigurationError(f"{key} must be an absolute path without control characters")
+    path = Path(value)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ConfigurationError(f"{key} cannot be inspected safely") from None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ConfigurationError(f"{key} must be a directory, not a symbolic link")
 
 
 def _validate_pricing(path: str) -> None:
@@ -414,7 +431,12 @@ def resolve_config(
             resolved["PORT"] = str(cli["port"])
         else:
             resolved["PORT"] = "8080"
-        database = environ.get("DASHBOARD_ANALYTICS_DATABASE", str(root / "runtime" / "usage-history.sqlite3"))
+        runtime_directory = environ.get("CODEX_MONITOR_RUNTIME_DIR") or str(root / "runtime")
+        _validate_directory_path(runtime_directory, "CODEX_MONITOR_RUNTIME_DIR")
+        database = environ.get(
+            "DASHBOARD_ANALYTICS_DATABASE",
+            str(Path(runtime_directory) / "usage-history.sqlite3"),
+        )
         resolved["ANALYTICS_DATABASE_PATH"] = database
         values, rules = validate_config(resolved, profile=profile)
         _validate_path(database, "DASHBOARD_ANALYTICS_DATABASE")

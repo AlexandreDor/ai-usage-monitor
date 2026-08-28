@@ -33,6 +33,28 @@ assert_eq success "$(json_field "$HEALTH_FILE" last_cycle_result)"
 assert_eq 0 "$(json_field "$HEALTH_FILE" consecutive_failures)"
 assert_file "$HEALTH_FILE"
 
+# A future JSON contract must fail local storage without publishing an empty
+# or stale replacement to the remote dashboard.
+future_gist_calls=0
+fetch_status_json() {
+  printf '{"schema_version":2,"five_h_pct":80,"weekly_pct":60,"scraped_at":"2026-08-03T13:00:00Z"}\n'
+}
+archive_snapshot() { return 0; }
+observe_quota_anomalies() { return 0; }
+check_thresholds() { return 0; }
+collect_token_usage() { return 0; }
+sync_gist() { future_gist_calls=$((future_gist_calls + 1)); }
+set +e
+# This one-shot regression intentionally calls the sourced implementation
+# before replacing run_cycle for the lock test below.
+# shellcheck disable=SC2218
+run_cycle 900 >/dev/null 2>&1
+future_cycle_status=$?
+set -e
+(( future_cycle_status != 0 )) || fail "future snapshot schema was accepted by run_cycle"
+assert_eq 0 "$future_gist_calls" "Gist sync ran after local snapshot failure"
+assert_contains "$CYCLE_ERROR" "Local snapshot write failed" "future schema failure was not recorded"
+
 COLLECTION_LOG="${TEST_ROOT}/collections"
 run_cycle() {
   printf 'collect\n' >> "$COLLECTION_LOG"
