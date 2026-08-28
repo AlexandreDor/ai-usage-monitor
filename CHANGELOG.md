@@ -9,7 +9,7 @@ Git tag and the value in `VERSION` is the single source of truth.
 Changes for the next release will be recorded here before the version is
 updated.
 
-## [0.1.0] - 2026-08-26
+## [0.1.0] - 2026-08-28
 
 ### Added
 

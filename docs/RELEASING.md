@@ -34,10 +34,11 @@ prepared here so the tag can be published after this change has merged:
 
 The release workflow is triggered by `v`-prefixed tags, then re-checks the tag
 and changelog heading against `VERSION`; non-SemVer or mismatched values fail
-before publication. It runs the same pinned-runtime, coverage, shell, browser,
-systemd, and npm-audit controls as CI, then builds the archive, verifies its
-SHA-256 file, and publishes exactly the archive and checksum assets to the
-GitHub Release.
+before publication. Its validation/build job has only `contents: read`
+permission and runs the same pinned-runtime, coverage, shell, browser, systemd,
+and npm-audit controls as CI, then builds and transfers the archive and checksum
+as artifacts. A separate publication job alone receives `contents: write` and
+publishes exactly those two assets to the GitHub Release.
 
 ## Build and verify locally
 
@@ -57,9 +58,10 @@ The checksum file uses the conventional `sha256sum --check` format.
 ## Release safety
 
 Never commit `local/.env`, `local/runtime`, Codex authentication, notification
-tokens, Gist credentials, or personal alert scripts. The release workflow has
-only `contents: write` permission because it must create the GitHub Release;
-pull requests and the normal CI workflow retain read-only contents access. It
-rejects a tagged commit that is not already reachable from `dev`, and marks
-SemVer pre-release tags as GitHub pre-releases. The first `v0.1.0` tag is
-intentionally a post-merge action and is not created by this feature branch.
+tokens, Gist credentials, or personal alert scripts. The release validation/build
+job has only `contents: read`; only the publication job receives `contents: write`
+because it creates the GitHub Release. Pull requests and the normal CI workflow
+also retain read-only contents access. It rejects a tagged commit that is not
+already reachable from `dev`, and marks SemVer pre-release tags as GitHub
+pre-releases. The first `v0.1.0` tag is intentionally a post-merge action and is
+not created by this feature branch.
