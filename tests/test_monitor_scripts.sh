@@ -153,6 +153,30 @@ check_thresholds 100 80 unknown later '' "$old_weekly_deadline" "$now" group-a
 check_thresholds 100 40 unknown unknown '' '' "$((now + 1))" group-b
 [[ ! -e "$HOOK_LOG" ]] || fail "partial observation crossed limit groups"
 
+# A partial 5h row from another group cannot cross network or script
+# thresholds, because it has no complete reset identity to compare.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:50'
+validate_config
+check_thresholds 100 100 later later "$old_five_deadline" '' "$now" group-a
+check_thresholds 40 100 unknown unknown '' '' "$((now + 1))" group-b
+[[ ! -e "$HOOK_LOG" ]] || fail "partial 5h observation crossed limit groups"
+
+# A loaded ownerless legacy state must also suppress local 5h hooks for a
+# partial sample; there is no durable group identity to compare yet.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:50'
+validate_config
+ALERT_THRESHOLDS=50
+printf '%s\n' \
+  'state_version=4' 'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'five_h_armed_reset_at=0' 'weekly_armed_reset_at=0' \
+  'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+check_thresholds 40 100 unknown unknown '' '' "$((now + 2))" group-b
+[[ ! -e "$HOOK_LOG" ]] || fail "ownerless legacy partial observation ran a 5h hook"
+
 # The hook journal contains the current complete observation. Restoring that
 # crash point must still allow the following refill to be detected as a reset.
 reset_case

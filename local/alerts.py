@@ -494,8 +494,74 @@ def _unarmed_cycle(cycle_key: str, limit_id: str) -> bool:
     return cycle_key == f"limit:{limit_id}|unarmed"
 
 
+def expire_pending_thresholds(document: dict[str, Any], window: str,
+                              cycle_key: str, limit_id: str, now: int,
+                              raw_limit_id: str | None = None) -> int:
+    """Terminalize pending thresholds invalidated by a reset.
+
+    Reset evidence and reset notification registration are deliberately
+    separate operations.  Callers can therefore invalidate stale threshold
+    occurrences even when the reset is local-only (for example, an observed
+    5-hour refill).  The matching limit is checked on both the cycle key and
+    event data so an old cycle from another limit group cannot be touched.
+    """
+
+    if window not in WINDOWS:
+        raise JournalError("expiration window is invalid")
+    if (not isinstance(cycle_key, str) or not cycle_key
+            or not isinstance(limit_id, str) or not limit_id
+            or not _is_int(now)):
+        raise JournalError("invalid threshold expiration request")
+
+    canonical_limit_id = canonicalize_limit_id(limit_id)
+    if canonical_limit_id is None:
+        raise JournalError("threshold expiration limit ID is invalid")
+    # A monitor caller normally passes an already canonical cycle.  Register's
+    # legacy migration path may still pass a raw identifier, so normalize that
+    # exact segment without permitting substring or duplicate matches.
+    if raw_limit_id is not None and raw_limit_id != canonical_limit_id:
+        cycle_key = _replace_limit_segment(cycle_key, raw_limit_id, canonical_limit_id)
+    else:
+        try:
+            _limit_segment_index(cycle_key, canonical_limit_id)
+        except JournalError:
+            # Public callers may provide the raw protocol identifier as the
+            # limit argument while retaining it in the cycle key.
+            if limit_id == canonical_limit_id:
+                raise
+            cycle_key = _replace_limit_segment(cycle_key, limit_id, canonical_limit_id)
+
+    expired = 0
+    for existing in document["alerts"]:
+        if (existing["kind"] != "threshold"
+                or existing["window"] != window
+                or existing["status"] != "pending"
+                or existing["event_data"].get("limit_id") != canonical_limit_id):
+            continue
+        cycle_matches = _same_cycle(existing["cycle_key"], cycle_key) or _unarmed_cycle(
+            existing["cycle_key"], canonical_limit_id
+        )
+        if cycle_matches:
+            _terminate(existing, "expired_after_reset", now, "expired_after_reset")
+            expired += 1
+    return expired
+
+
 def register(document: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
     incoming = _request_alert(request)
+    expire_cycle = request.get("expire_threshold_cycle")
+    if expire_cycle is not None:
+        if not isinstance(expire_cycle, str):
+            raise JournalError("expiration cycle key is invalid")
+        event_data = request.get("event_data")
+        raw_limit_id = event_data.get("limit_id") if isinstance(event_data, dict) else None
+        canonical_limit_id = incoming["event_data"].get("limit_id")
+        if not isinstance(raw_limit_id, str) or not isinstance(canonical_limit_id, str):
+            raise JournalError("expiration cycle key does not contain its limit ID")
+        expire_pending_thresholds(
+            document, incoming["window"], expire_cycle, canonical_limit_id,
+            incoming["created_at"], raw_limit_id=raw_limit_id,
+        )
     for existing in document["alerts"]:
         if existing["alert_id"] == incoming["alert_id"]:
             if not _same_registration(existing, incoming):
@@ -508,22 +574,6 @@ def register(document: dict[str, Any], request: dict[str, Any]) -> dict[str, Any
                     and _same_cycle(existing["cycle_key"], incoming["cycle_key"])
                     and existing["status"] == "pending"):
                 _terminate(existing, "superseded", now, "superseded", incoming["alert_id"])
-    expire_cycle = request.get("expire_threshold_cycle")
-    if expire_cycle is not None:
-        if not isinstance(expire_cycle, str):
-            raise JournalError("expiration cycle key is invalid")
-        raw_limit_id = request.get("event_data", {}).get("limit_id") if isinstance(request.get("event_data"), dict) else None
-        canonical_limit_id = incoming["event_data"].get("limit_id")
-        if not isinstance(raw_limit_id, str) or not isinstance(canonical_limit_id, str):
-            raise JournalError("expiration cycle key does not contain its limit ID")
-        expire_cycle = _replace_limit_segment(expire_cycle, raw_limit_id, canonical_limit_id)
-        for existing in document["alerts"]:
-            cycle_matches = _same_cycle(existing["cycle_key"], expire_cycle) or _unarmed_cycle(
-                existing["cycle_key"], incoming["event_data"]["limit_id"])
-            if (existing["kind"] == "threshold" and existing["window"] == incoming["window"]
-                    and cycle_matches
-                    and existing["status"] == "pending"):
-                _terminate(existing, "expired_after_reset", now, "expired_after_reset")
     document["alerts"].append(incoming)
     return incoming
 
@@ -661,6 +711,12 @@ def command(args: argparse.Namespace) -> None:
         item = register(document, _read_stdin())
         atomic_write(path, document)
         print(json.dumps(item, separators=(",", ":"), ensure_ascii=False))
+    elif args.action in {"expire-thresholds", "expire-threshold"}:
+        expired = expire_pending_thresholds(
+            document, args.window, args.cycle_key, args.limit_id, args.now,
+        )
+        if expired:
+            atomic_write(path, document)
     elif args.action == "due":
         configured = _configured_channels(_read_stdin(None))
         changed = False
@@ -750,6 +806,14 @@ def parser() -> argparse.ArgumentParser:
     for name in ("validate", "register", "terminal-unacknowledged"):
         command_parser = sub.add_parser(name)
         command_parser.add_argument("journal")
+    expire_thresholds_parser = sub.add_parser(
+        "expire-thresholds", aliases=["expire-threshold"]
+    )
+    expire_thresholds_parser.add_argument("journal")
+    expire_thresholds_parser.add_argument("window", choices=sorted(WINDOWS))
+    expire_thresholds_parser.add_argument("cycle_key")
+    expire_thresholds_parser.add_argument("limit_id")
+    expire_thresholds_parser.add_argument("--now", type=int, required=True)
     migrate_parser = sub.add_parser("migrate")
     migrate_parser.add_argument("journal")
     migrate_parser.add_argument("--at", type=int, required=True)

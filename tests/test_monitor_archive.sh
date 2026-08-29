@@ -410,16 +410,39 @@ with sqlite3.connect(sys.argv[1]) as connection:
 PYEOF
 )" "observed 5h reset reconstruction created duplicates"
 
+# A partial 5h row from another group breaks the complete baseline.  The
+# return to A must establish a fresh baseline rather than compare A across B.
+rm -f "$ARCHIVE_FILE"
+partial_group_five_before=$((BASE - 1800))
+partial_group_five_first_deadline=$((BASE + 4 * 3600))
+partial_group_five_second_deadline=$((partial_group_five_first_deadline + 900))
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"limit_id":"group-a","scraped_at":"%s"}\n' \
+  "$partial_group_five_first_deadline" "$(iso_at "$partial_group_five_before")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":100,"limit_id":"group-b","scraped_at":"%s"}\n' \
+  "$(iso_at "$((BASE - 900))")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"limit_id":"group-a","scraped_at":"%s"}\n' \
+  "$partial_group_five_second_deadline" "$(iso_at "$BASE")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("SELECT COUNT(*) FROM reset_events WHERE window = '5h'").fetchone()[0])
+PYEOF
+)" "cross-group partial 5h sample fabricated a reset"
+
 # An early weekly refill with a materially advanced deadline is classified as
 # a random reset rather than a scheduled end-of-week reset.
 rm -f "$ARCHIVE_FILE"
 random_before=$((BASE - 900))
 random_previous_deadline=$((BASE + 4 * 86400))
 random_current_deadline=$((random_previous_deadline + 3 * 86400))
-printf '{"weekly_pct":28,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+printf '{"weekly_pct":28,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$random_previous_deadline" "$(iso_at "$random_before")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
-printf '{"weekly_pct":100,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$random_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
 assert_eq '1' "$(python3 - "$ARCHIVE_FILE" "$BASE" <<'PYEOF'
@@ -441,10 +464,10 @@ rm -f "$ARCHIVE_FILE"
 small_refill_before=$((BASE - 900))
 small_refill_previous_deadline=$((BASE + 4 * 86400))
 small_refill_current_deadline=$((small_refill_previous_deadline + 30 * 60))
-printf '{"weekly_pct":97,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+printf '{"weekly_pct":97,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$small_refill_previous_deadline" "$(iso_at "$small_refill_before")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
-printf '{"weekly_pct":98,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+printf '{"weekly_pct":98,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$small_refill_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
 assert_eq '1' "$(python3 - "$ARCHIVE_FILE" "$BASE" <<'PYEOF'
@@ -465,12 +488,12 @@ rm -f "$ARCHIVE_FILE"
 long_refill_before=$((BASE - 3 * 3600))
 long_refill_previous_deadline=$((BASE + 4 * 86400))
 long_refill_current_deadline=$((long_refill_previous_deadline + 30 * 60))
-printf '{"weekly_pct":40,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+printf '{"weekly_pct":40,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$long_refill_previous_deadline" "$(iso_at "$long_refill_before")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
-printf '{"five_h_pct":50,"scraped_at":"%s"}\n' "$(iso_at "$((BASE - 3600))")" | python3 "$ARCHIVE_SCRIPT" \
+printf '{"five_h_pct":50,"limit_id":"test","scraped_at":"%s"}\n' "$(iso_at "$((BASE - 3600))")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
-printf '{"weekly_pct":60,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+printf '{"weekly_pct":60,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$long_refill_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
 assert_eq '1' "$(python3 - "$ARCHIVE_FILE" "$BASE" <<'PYEOF'
@@ -486,18 +509,41 @@ print(1)
 PYEOF
 )" "long-gap weekly refill was not derived as a random reset"
 
+# A partial weekly row from another group likewise breaks the random-reset
+# baseline, while same-owner partials above remain valid.
+rm -f "$ARCHIVE_FILE"
+partial_group_weekly_before=$((BASE - 1800))
+partial_group_weekly_first_deadline=$((BASE + 4 * 86400))
+partial_group_weekly_second_deadline=$((partial_group_weekly_first_deadline + 30 * 60))
+printf '{"weekly_pct":40,"weekly_reset_at":%s,"limit_id":"group-a","scraped_at":"%s"}\n' \
+  "$partial_group_weekly_first_deadline" "$(iso_at "$partial_group_weekly_before")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"weekly_pct":50,"limit_id":"group-b","scraped_at":"%s"}\n' \
+  "$(iso_at "$((BASE - 900))")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"weekly_pct":60,"weekly_reset_at":%s,"limit_id":"group-a","scraped_at":"%s"}\n' \
+  "$partial_group_weekly_second_deadline" "$(iso_at "$BASE")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("SELECT COUNT(*) FROM reset_events WHERE window = 'weekly'").fetchone()[0])
+PYEOF
+)" "cross-group partial weekly sample fabricated a reset"
+
 # A partial row before the old deadline cannot suppress the later strong reset
 # evidence, while a partial row after it must not create a duplicate event.
 rm -f "$ARCHIVE_FILE"
 partial_before=$((BASE - 100))
 partial_deadline=$((BASE - 50))
 partial_current_deadline=$((BASE + 7 * 86400))
-printf '{"weekly_pct":40,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+printf '{"weekly_pct":40,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$partial_deadline" "$(iso_at "$partial_before")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
-printf '{"five_h_pct":50,"scraped_at":"%s"}\n' "$(iso_at "$((BASE - 75))")" | python3 "$ARCHIVE_SCRIPT" \
+printf '{"five_h_pct":50,"limit_id":"test","scraped_at":"%s"}\n' "$(iso_at "$((BASE - 75))")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
-printf '{"weekly_pct":100,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$partial_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
 assert_eq '1' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
@@ -509,12 +555,12 @@ PYEOF
 )" "partial sample before deadline suppressed strong reset evidence"
 
 rm -f "$ARCHIVE_FILE"
-printf '{"weekly_pct":40,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+printf '{"weekly_pct":40,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$partial_deadline" "$(iso_at "$partial_before")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
-printf '{"five_h_pct":50,"scraped_at":"%s"}\n' "$(iso_at "$((BASE - 25))")" | python3 "$ARCHIVE_SCRIPT" \
+printf '{"five_h_pct":50,"limit_id":"test","scraped_at":"%s"}\n' "$(iso_at "$((BASE - 25))")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
-printf '{"weekly_pct":100,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$partial_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
 assert_eq '1' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
@@ -543,10 +589,10 @@ PYEOF
 
 # A deadline jump without any refill remains insufficient evidence of a reset.
 rm -f "$ARCHIVE_FILE"
-printf '{"weekly_pct":97,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+printf '{"weekly_pct":97,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$small_refill_previous_deadline" "$(iso_at "$small_refill_before")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
-printf '{"weekly_pct":97,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+printf '{"weekly_pct":97,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$small_refill_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
 assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
@@ -556,6 +602,26 @@ with sqlite3.connect(sys.argv[1]) as connection:
     print(connection.execute("SELECT COUNT(*) FROM reset_events").fetchone()[0])
 PYEOF
 )" "deadline jump without a refill was classified as a random reset"
+
+# Legacy snapshots without limit IDs remain archived, but an ownerless pair
+# cannot safely produce scheduled, observed 5h, or random weekly reset events.
+rm -f "$ARCHIVE_FILE"
+legacy_pair_before=$((BASE - 900))
+legacy_pair_previous_deadline=$((BASE + 4 * 86400))
+legacy_pair_current_deadline=$((legacy_pair_previous_deadline + 30 * 60))
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"weekly_pct":40,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+  "$legacy_pair_previous_deadline" "$legacy_pair_previous_deadline" "$(iso_at "$legacy_pair_before")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"weekly_pct":60,"weekly_reset_at":%s,"scraped_at":"%s"}\n' \
+  "$legacy_pair_current_deadline" "$legacy_pair_current_deadline" "$(iso_at "$BASE")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("SELECT COUNT(*) FROM reset_events").fetchone()[0])
+PYEOF
+)" "ownerless legacy snapshots fabricated reset events"
 
 mode="$(stat -c '%a' "$ARCHIVE_FILE")"
 assert_eq 600 "$mode" "archive permissions are not private"

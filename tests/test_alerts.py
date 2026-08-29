@@ -104,6 +104,24 @@ class AlertJournalTests(unittest.TestCase):
         self.assertEqual("pending", weekly["status"])
         self.assertEqual("pending", reset["status"])
 
+    def test_expire_thresholds_is_separate_and_scoped_to_limit(self):
+        stale = alerts.register(
+            self.document,
+            request("50", channels=["discord"], cycle="limit:default|unarmed"),
+        )
+        other = request("25", channels=["discord"], cycle="limit:other|unarmed")
+        other["event_data"]["limit_id"] = "other"
+        other = alerts.register(self.document, other)
+
+        expired = alerts.expire_pending_thresholds(
+            self.document, "5h", "limit:default|reset:300", "default", 301,
+        )
+
+        self.assertEqual(1, expired)
+        self.assertEqual("expired_after_reset", stale["terminal_reason"])
+        self.assertEqual("expired_after_reset", stale["channels"]["discord"]["error_class"])
+        self.assertEqual("pending", other["status"])
+
     def test_channels_reach_aggregate_terminal_state_independently(self):
         item = alerts.register(self.document, request())
         discord = item["channels"]["discord"]

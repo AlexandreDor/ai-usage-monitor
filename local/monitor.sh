@@ -1026,6 +1026,12 @@ raise SystemExit(0 if any(item["kind"] == kind and item["window"] == window
 PYEOF
 }
 
+invalidate_pending_thresholds() {
+  local window="$1" cycle_key="$2" limit_id="$3" now="$4"
+  python3 "$ALERTS_PY" expire-thresholds "$ALERT_DELIVERIES_FILE" \
+    "$window" "$cycle_key" "$limit_id" --now "$now"
+}
+
 weekly_pace_vs_ideal() {
   local weekly_pct="$1"
   local weekly_reset_at="$2"
@@ -1355,7 +1361,8 @@ attempt_alert_script() {
 }
 
 reconcile_alert_deliveries() {
-  local now="$1" terminal_file alert_id kind window reason selector remaining reset_epoch covered threshold ack_id
+  local now="$1" current_limit_id="${2:-}" discard_other="${3:-0}"
+  local terminal_file alert_id kind window reason event_limit_id selector remaining reset_epoch covered threshold ack_id
   local -a ack_ids=()
   terminal_file="$(mktemp "${RUNTIME_DIR}/.alerts-terminal.XXXXXX")" || return 1
   if ! python3 "$ALERTS_PY" terminal-unacknowledged "$ALERT_DELIVERIES_FILE" > "$terminal_file"; then
@@ -1364,8 +1371,20 @@ reconcile_alert_deliveries() {
   fi
   # A non-whitespace separator preserves the empty threshold-only/reset-only
   # fields that Bash would otherwise collapse when parsing tab-separated rows.
-  while IFS=$'\x1f' read -r alert_id kind window reason selector remaining reset_epoch covered; do
+  while IFS=$'\x1f' read -r alert_id kind window reason event_limit_id selector remaining reset_epoch covered; do
     [[ -n "$alert_id" ]] || continue
+    if [[ ( "$kind" == threshold || "$kind" == reset ) \
+          && -n "$current_limit_id" && "$event_limit_id" != "$current_limit_id" ]]; then
+      if [[ "$discard_other" == 1 ]]; then
+        # A complete group switch makes the previous detector state obsolete.
+        # A partial sample leaves the terminal occurrence unacknowledged so a
+        # later sample from its owner can reconcile it without polluting the
+        # current group's baseline.
+        ack_ids+=("$alert_id")
+        continue
+      fi
+      continue
+    fi
     ack_ids+=("$alert_id")
     if [[ "$kind" == threshold ]]; then
       if [[ "$reason" == superseded || "$reason" == expired_after_reset ]]; then
@@ -1422,7 +1441,8 @@ for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
     event = item["event_data"]
     covered = ",".join(str(value) for value in event.get("covered_thresholds", []))
     print(item["alert_id"], item["kind"], item["window"], item["terminal_reason"],
-          item["selector"], event.get("remaining_pct", ""), event.get("reset_epoch", 0), covered, sep="\x1f")
+          event.get("limit_id", ""), item["selector"], event.get("remaining_pct", ""),
+          event.get("reset_epoch", 0), covered, sep="\x1f")
 PYEOF
 )
   rm -f "$terminal_file"
@@ -1440,7 +1460,33 @@ PYEOF
 
 initialize_alert_delivery_journal() {
   local state_version="$1" now="$2" limit_id="$3" five_h_pct="$4" weekly_pct="$5"
-  local five_h_reset="$6" weekly_reset="$7" channels thresholds_csv payload
+  local five_h_reset="$6" weekly_reset="$7" skip_five_h_observed="${8:-0}"
+  local observed_five_owner="${9:-}" armed_five_owner="${10:-}"
+  local observed_weekly_owner="${11:-}" armed_weekly_owner="${12:-}"
+  local five_h_owner="" weekly_owner="" allow_five_threshold=0 allow_weekly_threshold=0
+  local channels thresholds_csv payload
+  if [[ -n "$armed_five_owner" && ( -z "$observed_five_owner" || "$armed_five_owner" == "$observed_five_owner" ) ]]; then
+    five_h_owner="$armed_five_owner"
+  elif [[ -n "$observed_five_owner" && -z "$armed_five_owner" ]]; then
+    five_h_owner="$observed_five_owner"
+  fi
+  if [[ -n "$armed_weekly_owner" && ( -z "$observed_weekly_owner" || "$armed_weekly_owner" == "$observed_weekly_owner" ) ]]; then
+    weekly_owner="$armed_weekly_owner"
+  elif [[ -n "$observed_weekly_owner" && -z "$armed_weekly_owner" ]]; then
+    weekly_owner="$observed_weekly_owner"
+  fi
+  [[ "$five_h_owner" == "$limit_id" ]] && allow_five_threshold=1
+  [[ "$weekly_owner" == "$limit_id" ]] && allow_weekly_threshold=1
+  if [[ "$skip_five_h_observed" == 1 ]]; then
+    # This sample is itself the observed local reset.  Do not reconstruct the
+    # old 5h threshold or reset occurrence from the state snapshot while the
+    # delivery journal is being initialized.
+    pending_5h_threshold=""
+  fi
+  # A detector marker without a durable owner cannot safely be reconstructed:
+  # using the current sample's group would manufacture a cross-group event.
+  [[ -n "$five_h_owner" ]] || pending_5h_threshold=""
+  [[ -n "$weekly_owner" ]] || pending_weekly_threshold=""
   if (( five_h_armed_reset_at > 0 && now > five_h_armed_reset_at + 5 * 60 * 60 )); then
     last_notified_5h_reset_at="$five_h_armed_reset_at"
     five_h_armed_reset_at=0
@@ -1460,16 +1506,18 @@ initialize_alert_delivery_journal() {
   channels="$(configured_alert_channels_json)" || return 1
   thresholds_csv="$(load_thresholds | paste -sd, -)"
   if [[ "$channels" != "[]" ]]; then
-    if [[ -n "$pending_5h_threshold" && ! "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+    if [[ -n "$pending_5h_threshold" && "$allow_five_threshold" == 1 \
+          && ! "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
       echo "[ERROR] Historical 5h pending alert cannot be reconstructed from the current observation." >&2
       return 1
     fi
-    if [[ -n "$pending_weekly_threshold" && ! "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+    if [[ -n "$pending_weekly_threshold" && "$allow_weekly_threshold" == 1 \
+          && ! "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
       echo "[ERROR] Historical weekly pending alert cannot be reconstructed from the current observation." >&2
       return 1
     fi
   else
-    if [[ -n "$pending_5h_threshold" ]]; then
+    if [[ -n "$pending_5h_threshold" && "$allow_five_threshold" == 1 ]]; then
       for threshold in $(load_thresholds); do
         if python3 - "$prev_5h_pct" "$pending_5h_threshold" "$threshold" <<'PYEOF'
 import sys
@@ -1483,7 +1531,7 @@ PYEOF
       pending_5h_threshold=""
       [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && prev_5h_pct="$five_h_pct"
     fi
-    if [[ -n "$pending_weekly_threshold" ]]; then
+    if [[ -n "$pending_weekly_threshold" && "$allow_weekly_threshold" == 1 ]]; then
       for threshold in $(load_thresholds); do
         if python3 - "$prev_weekly_pct" "$pending_weekly_threshold" "$threshold" <<'PYEOF'
 import sys
@@ -1500,32 +1548,38 @@ PYEOF
   fi
   payload="$(MIGRATION_FIVE_MESSAGE="*Codex 5h limit at ${five_h_pct}% remaining* (crossed ${pending_5h_threshold}% threshold). Resets at ${five_h_reset}" \
     MIGRATION_WEEKLY_MESSAGE="*Codex weekly limit at ${weekly_pct}% remaining* (crossed ${pending_weekly_threshold}% threshold). Resets ${weekly_reset}" \
-    python3 - "$state_version" "$now" "$limit_id" "$channels" "$thresholds_csv" \
+    python3 - "$state_version" "$now" "$five_h_owner" "$weekly_owner" "$channels" "$thresholds_csv" \
       "$pending_5h_threshold" "$pending_weekly_threshold" "$prev_5h_pct" "$prev_weekly_pct" \
       "$five_h_pct" "$weekly_pct" "$five_h_armed_reset_at" "$weekly_armed_reset_at" \
-      "$last_notified_5h_reset_at" "$last_notified_weekly_reset_at" "$weekly_armed_limit_id" <<'PYEOF'
+      "$last_notified_5h_reset_at" "$last_notified_weekly_reset_at" \
+      "$skip_five_h_observed" "$allow_five_threshold" "$allow_weekly_threshold" <<'PYEOF'
 import json
 import os
 import sys
 
-(version, now, limit_id, channels_raw, thresholds_raw, pending_five, pending_weekly,
+(version, now, five_limit_id, weekly_limit_id, channels_raw, thresholds_raw, pending_five, pending_weekly,
  previous_five, previous_weekly, five_pct, weekly_pct, five_reset, weekly_reset,
- last_five_reset, last_weekly_reset, weekly_limit_id) = sys.argv[1:]
+ last_five_reset, last_weekly_reset, skip_five, allow_five, allow_weekly) = sys.argv[1:]
 version, now, five_reset, weekly_reset, last_five_reset, last_weekly_reset = map(
     int, (version, now, five_reset, weekly_reset, last_five_reset, last_weekly_reset))
+skip_five = int(skip_five)
+allow_five = int(allow_five)
+allow_weekly = int(allow_weekly)
 channels = json.loads(channels_raw)
 thresholds = [int(value) for value in thresholds_raw.split(",") if value]
 alerts = []
 
-def threshold(window, selector, previous, remaining, reset, message):
-    if not selector or not channels:
+def threshold(window, selector, previous, remaining, reset, message, event_limit_id):
+    allow = allow_five if window == "5h" else allow_weekly
+    if not selector or not channels or not event_limit_id or not allow \
+            or (window == "5h" and skip_five):
         return
     critical = int(selector)
-    cycle = f"legacy-v{version}|limit:{limit_id}|" + (f"reset:{reset}" if reset else "unarmed")
+    cycle = f"legacy-v{version}|limit:{event_limit_id}|" + (f"reset:{reset}" if reset else "unarmed")
     alerts.append({
         "kind": "threshold", "window": window, "selector": selector,
         "cycle_key": cycle, "id_namespace": f"legacy-v{version}", "message": message,
-        "event_data": {"limit_id": limit_id, "remaining_pct": float(remaining),
+        "event_data": {"limit_id": event_limit_id, "remaining_pct": float(remaining),
                        "reset_epoch": reset,
                        "covered_thresholds": [value for value in thresholds if critical <= value < float(previous)]},
         "created_at": min(now, reset) if reset else now,
@@ -1534,7 +1588,8 @@ def threshold(window, selector, previous, remaining, reset, message):
     })
 
 def reset(window, reset_at, last_reset, validity, event_limit_id, message):
-    if not channels or not reset_at or reset_at > now or reset_at == last_reset or now > reset_at + validity:
+    if (not channels or not event_limit_id or not reset_at or reset_at > now or reset_at == last_reset
+            or now > reset_at + validity or (window == "5h" and skip_five)):
         return
     cycle = f"legacy-v{version}|limit:{event_limit_id}|reset:{reset_at}"
     alerts.append({
@@ -1545,12 +1600,12 @@ def reset(window, reset_at, last_reset, validity, event_limit_id, message):
         "replace_pending_thresholds": False, "expire_threshold_cycle": cycle,
     })
 
-threshold("5h", pending_five, previous_five, five_pct, five_reset, os.environ["MIGRATION_FIVE_MESSAGE"])
-threshold("weekly", pending_weekly, previous_weekly, weekly_pct, weekly_reset, os.environ["MIGRATION_WEEKLY_MESSAGE"])
-reset("5h", five_reset, last_five_reset, 5 * 60 * 60, limit_id,
+threshold("5h", pending_five, previous_five, five_pct, five_reset, os.environ["MIGRATION_FIVE_MESSAGE"], five_limit_id)
+threshold("weekly", pending_weekly, previous_weekly, weekly_pct, weekly_reset, os.environ["MIGRATION_WEEKLY_MESSAGE"], weekly_limit_id)
+reset("5h", five_reset, last_five_reset, 5 * 60 * 60, five_limit_id,
       "*Codex 5h limit reset.* A new usage cycle is available.")
 reset("weekly", weekly_reset, last_weekly_reset, 7 * 24 * 60 * 60,
-      weekly_limit_id or limit_id, "*Codex weekly limit reset.* A new usage cycle is available.")
+      weekly_limit_id, "*Codex weekly limit reset.* A new usage cycle is available.")
 print(json.dumps({"completed_at": now, "alerts": alerts}))
 PYEOF
 )" || return 1
@@ -1603,8 +1658,11 @@ check_thresholds() {
   local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold
   local original_pending cycle_key covered_json registration_status disabled_notified
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 initialize_script_baseline=0
-  local observed_weekly_reset=0 five_h_observation_valid=0 weekly_observation_valid=0 process_weekly_sample=1 state_loaded=0
-  local initialize_5h_baseline=0 observed_5h_reset=0
+  local observed_weekly_reset=0 five_h_observation_valid=0 weekly_observation_valid=0
+  local process_5h_sample=1 process_weekly_sample=1 state_loaded=0
+  local initialize_5h_baseline=0 observed_5h_reset=0 observed_5h_reset_candidate=0
+  local five_h_reset_expire_cycle=""
+  local discard_other_group_terminal=0
   local resumed_after_disabled=0 resume_delivery_attempted=0
   local journal_source_state_version=1 raw_source_state_version
   local -a script_thresholds=()
@@ -1690,10 +1748,31 @@ check_thresholds() {
     five_h_observation_valid=1
   fi
 
+  # Detect this candidate before a missing delivery journal is reconstructed.
+  # Otherwise migration can turn the very sample that proves a local observed
+  # reset into a stale network reset (and threshold) occurrence.
+  if (( five_h_observation_valid == 1 )) \
+    && [[ -n "$observed_5h_limit_id" && "$limit_id" == "$observed_5h_limit_id" ]] \
+    && is_observed_5h_reset "$observed_5h_pct" "$five_h_pct" \
+      "$observed_5h_reset_at" "$five_h_reset_at"; then
+    observed_5h_reset_candidate=1
+  fi
+  # Terminal events from a different owner are deferred for partial samples.
+  # A complete sample that starts a new group may acknowledge those events,
+  # but must never apply their remaining percentage or reset marker to the new
+  # group's detector state.
+  if (( five_h_observation_valid == 1 )) && [[ "$observed_5h_limit_id" != "$limit_id" ]]; then
+    discard_other_group_terminal=1
+  elif (( weekly_observation_valid == 1 )) && [[ "$observed_weekly_limit_id" != "$limit_id" ]]; then
+    discard_other_group_terminal=1
+  fi
+
 
   if [[ ! -e "$ALERT_DELIVERIES_FILE" ]]; then
     if ! initialize_alert_delivery_journal "$journal_source_state_version" "$scraped_at_epoch" "$limit_id" \
-      "$five_h_pct" "$weekly_pct" "$five_h_reset" "$weekly_reset"; then
+      "$five_h_pct" "$weekly_pct" "$five_h_reset" "$weekly_reset" "$observed_5h_reset_candidate" \
+      "$observed_5h_limit_id" "$five_h_armed_limit_id" \
+      "$observed_weekly_limit_id" "$weekly_armed_limit_id"; then
       ALERT_PROCESSING_ERROR="alert journal initialization failed"
       return 1
     fi
@@ -1704,13 +1783,13 @@ check_thresholds() {
     return 1
   fi
 
-  if ! reconcile_alert_deliveries "$scraped_at_epoch"; then
+  if ! reconcile_alert_deliveries "$scraped_at_epoch" "$limit_id" "$discard_other_group_terminal"; then
     ALERT_PROCESSING_ERROR="alert reconciliation failed"
     return 1
   fi
   if [[ "${ALERTS_ENABLED:-1}" == 1 && "$resumed_after_disabled" == 0 ]]; then
     if ! python3 "$ALERTS_PY" expire "$ALERT_DELIVERIES_FILE" --now "$scraped_at_epoch" \
-      || ! reconcile_alert_deliveries "$scraped_at_epoch"; then
+      || ! reconcile_alert_deliveries "$scraped_at_epoch" "$limit_id" "$discard_other_group_terminal"; then
       ALERT_PROCESSING_ERROR="alert expiration failed"
       return 1
     fi
@@ -1784,11 +1863,31 @@ check_thresholds() {
       observed_5h_reset_at="$five_h_reset_at"
       observed_5h_limit_id="$limit_id"
       initialize_5h_baseline=1
+      if (( state_loaded == 1 )); then
+        # State from before the owner-aware format has no trustworthy 5h
+        # baseline.  Establish this complete sample as the baseline without
+        # crossing its old percentage or firing a hook for it.
+        process_5h_sample=0
+        prev_5h_pct="$five_h_pct"
+        notified_5h_thresholds=""
+        pending_5h_threshold=""
+        script_prev_5h_pct="$five_h_pct"
+        attempted_script_5h_actions=""
+      fi
     elif [[ "$observed_5h_limit_id" != "$limit_id" ]]; then
       observed_5h_pct="$five_h_pct"
       observed_5h_reset_at="$five_h_reset_at"
       observed_5h_limit_id="$limit_id"
       initialize_5h_baseline=1
+      process_5h_sample=0
+      # A complete sample from a new limit group is a fresh baseline.  Clear
+      # all threshold/hook state that belonged to the previous owner before
+      # the sample can reach either detector.
+      prev_5h_pct="$five_h_pct"
+      notified_5h_thresholds=""
+      pending_5h_threshold=""
+      script_prev_5h_pct="$five_h_pct"
+      attempted_script_5h_actions=""
       # A scheduled cycle belongs to its original group. Do not deliver it
       # while processing a complete observation from another group.
       if [[ -n "$five_h_armed_limit_id" && "$five_h_armed_limit_id" != "$limit_id" ]]; then
@@ -1798,13 +1897,34 @@ check_thresholds() {
         attempted_script_5h_reset_actions=""
       fi
     fi
+  elif [[ -n "$observed_5h_limit_id" && "$limit_id" != "$observed_5h_limit_id" ]]; then
+    # A partial row from another group has no reset deadline to establish a
+    # coherent observation.  Keep the old group's baseline and suppress both
+    # network thresholds and local 5h hooks for this sample.
+    process_5h_sample=0
+  elif (( state_loaded == 1 )) && [[ -z "$observed_5h_limit_id" ]]; then
+    # Legacy state has no complete owner-aware observation yet.  A partial row
+    # cannot establish which group's baseline it belongs to, so defer all 5h
+    # threshold and hook processing until a complete sample arrives.
+    process_5h_sample=0
+  elif (( state_loaded == 0 )) && [[ -z "$observed_5h_limit_id" \
+        && "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+    # A brand-new detector may legitimately start from partial 5h samples. Bind
+    # that threshold baseline to the sample's owner immediately so later
+    # partial samples can be compared safely without looking like legacy state.
+    observed_5h_limit_id="$limit_id"
   fi
 
   # The old state format did not persist the owner of an armed 5-hour cycle.
-  # Treat such a cycle as belonging to the current observation for backwards
-  # compatibility; newly persisted cycles always carry the owner explicitly.
+  # Keep it for a coherent existing group, but never attach an ownerless arm to
+  # a fresh or suppressed group; newly persisted cycles carry the owner.
   if (( five_h_armed_reset_at > 0 )) && [[ -z "$five_h_armed_limit_id" ]]; then
-    if [[ -n "$observed_5h_limit_id" && "$observed_5h_limit_id" != "$limit_id" ]]; then
+    if (( state_loaded == 1 && (initialize_5h_baseline == 1 || process_5h_sample == 0 \
+          || five_h_observation_valid == 0) )) \
+      || [[ -n "$observed_5h_limit_id" && "$observed_5h_limit_id" != "$limit_id" ]]; then
+      # An ownerless legacy arm cannot be safely assigned to a fresh group or
+      # to a suppressed partial row; discard it rather than emitting a reset
+      # for the wrong limit owner.
       five_h_armed_reset_at=0
       script_5h_reset_attempted_at=0
       attempted_script_5h_reset_actions=""
@@ -1843,9 +1963,30 @@ check_thresholds() {
       "$observed_5h_reset_at" "$five_h_reset_at" \
     && ! ( (( five_h_armed_reset_at > 0 && scraped_at_epoch >= five_h_armed_reset_at )) \
            && [[ "$five_h_armed_limit_id" == "$limit_id" ]] ); then
+    if (( five_h_armed_reset_at > 0 )); then
+      # A pending threshold may still belong to the consumed scheduled cycle
+      # that this observed refill supersedes.  Preserve that cycle key before
+      # replacing the arm with the local observation anchor.
+      five_h_reset_expire_cycle="limit:${limit_id}|reset:${five_h_armed_reset_at}"
+    else
+      five_h_reset_expire_cycle="limit:${limit_id}|reset:${five_h_reset_at}"
+    fi
     five_h_armed_reset_at="$scraped_at_epoch"
     five_h_armed_limit_id="$limit_id"
     observed_5h_reset=1
+  fi
+
+  # Observed 5h resets are local evidence: invalidate any stale threshold
+  # occurrence first, but never register a network reset occurrence.  Keeping
+  # this operation ahead of due delivery makes a journal failure fail closed.
+  if (( observed_5h_reset == 1 )); then
+    if ! invalidate_pending_thresholds 5h "$five_h_reset_expire_cycle" "$limit_id" "$scraped_at_epoch" \
+      || ! reconcile_alert_deliveries "$scraped_at_epoch" "$limit_id" "$discard_other_group_terminal"; then
+      status=1
+      ALERT_PROCESSING_ERROR="alert threshold invalidation failed"
+    fi
+    pending_5h_threshold=""
+    notified_5h_thresholds=""
   fi
 
   # Reset delivery is retried while the reset still belongs to a plausible cycle.
@@ -1992,7 +2133,8 @@ check_thresholds() {
   # every threshold crossed during the pause without creating a journal entry;
   # any delivery that was already pending in the journal remains untouched.
   if [[ "${ALERTS_ENABLED:-1}" != 1 ]]; then
-    if [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+    if (( process_5h_sample == 1 )) \
+      && [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
       disabled_notified="${notified_5h_thresholds}"
       for t in "${thresholds[@]}"; do
         if python3 - "$prev_5h_pct" "$five_h_pct" "$t" <<'PYEOF'
@@ -2029,7 +2171,8 @@ PYEOF
 
   # The first observation uses 100% as its baseline. A multi-threshold drop emits
   # one alert for the most critical crossed threshold and marks all crossed levels.
-  if [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+  if (( process_5h_sample == 1 )) \
+    && [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
     original_pending="$pending_5h_threshold"
     critical="$pending_5h_threshold"
     for t in "${thresholds[@]}"; do
@@ -2183,7 +2326,7 @@ PYEOF
       if ! deliver_due_alerts "$scraped_at_epoch"; then
         NETWORK_DELIVERY_ERROR=1
       fi
-      if ! reconcile_alert_deliveries "$scraped_at_epoch"; then
+      if ! reconcile_alert_deliveries "$scraped_at_epoch" "$limit_id" "$discard_other_group_terminal"; then
         NETWORK_DELIVERY_ERROR=1
         ALERT_PROCESSING_ERROR="alert reconciliation failed"
       fi
@@ -2224,7 +2367,8 @@ PYEOF
       done
     fi
 
-    if (( script_state_error == 0 && initialize_script_baseline == 0 )) \
+    if (( script_state_error == 0 && initialize_script_baseline == 0 \
+          && initialize_5h_baseline == 0 && process_5h_sample == 1 )) \
       && [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
       mapfile -t script_thresholds < <(
         printf '%s\n' "${ALERT_SCRIPT_RULE_EVENTS[@]}" \
