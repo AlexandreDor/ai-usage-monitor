@@ -45,6 +45,24 @@ export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_TELEGRAM_STATUS=200
 check_thresholds 70 100 later unknown '' '' 2000000001 >/dev/null
 assert_eq "" "$(awk -F= '$1 == "pending_5h_threshold" {print $2}' "$STATE_FILE")" "pending threshold not cleared after retry"
 
+# An observed full 5-hour cycle is local evidence only: configured network
+# channels must not receive or retain a reset occurrence.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-silent"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+DISCORD_WEBHOOK='https://discord.com/api/webhooks/123/token'
+TELEGRAM_BOT_TOKEN='' TELEGRAM_CHAT_ID=''
+old_five_deadline=$((2000000100 + 300))
+new_five_deadline=$((old_five_deadline + 900))
+check_thresholds 100 100 later unknown "$old_five_deadline" '' 2000000100 group-a >/dev/null
+check_thresholds 100 100 later unknown "$new_five_deadline" '' 2000001000 group-a >/dev/null
+[[ ! -e "$FAKE_CURL_LOG" ]] || fail "observed 5h reset emitted an HTTP request"
+assert_eq 0 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["alerts"]))' "$ALERT_DELIVERIES_FILE")" \
+  "observed 5h reset was queued in the network journal"
+ALERT_THRESHOLDS=75
+TELEGRAM_BOT_TOKEN='123:token'
+TELEGRAM_CHAT_ID=-456
+
 # Delivery is tracked independently: Discord is not replayed after succeeding.
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-partial"

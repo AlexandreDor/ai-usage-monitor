@@ -149,6 +149,19 @@ def _weekly_reset(previous_pct: float, current_pct: float,
     )
 
 
+def _observed_five_hour_reset(previous_pct: float, current_pct: float,
+                              previous_reset: int | None,
+                              current_reset: int | None) -> bool:
+    """Recognize a full 5-hour cycle whose quota stayed at 100%."""
+    if previous_reset is None or current_reset is None:
+        return False
+    return (
+        previous_pct == 100
+        and current_pct == 100
+        and current_reset > previous_reset
+    )
+
+
 def _scheduled_crossing(state: dict[str, Any], current_epoch: int) -> bool:
     previous_epoch = _epoch(state.get("last_epoch"))
     previous_reset = _epoch(state.get("last_reset_at"))
@@ -239,10 +252,13 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     recognized_weekly = window == "weekly" and _weekly_reset(
         previous_pct, current_pct, previous_reset, current_reset
     )
+    recognized_five_hour = window == "5h" and _observed_five_hour_reset(
+        previous_pct, current_pct, previous_reset, current_reset
+    )
     reset_in_past = current_reset is not None and current_reset <= epoch
 
     anomaly: tuple[str, str] | None = None
-    if not scheduled_crossing and not recognized_weekly:
+    if not scheduled_crossing and not recognized_weekly and not recognized_five_hour:
         # A deadline that has just crossed the sampling instant is a planned
         # reset, not a malformed movement.  A deadline already in the past on
         # both sides is also not a new movement.

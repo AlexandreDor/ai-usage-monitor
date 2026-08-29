@@ -71,6 +71,37 @@ check_thresholds 80 70 "later" "later" "$((now + 300))" "$((now + 3600))" "$now"
 assert_alert_count 0
 [[ "$(state_value state_version)" == "5" ]] || fail "state was not migrated"
 
+# A full 5-hour cycle is observable from a deadline advance even when the
+# quota stays at 100%. It is anchored to the first observation carrying the
+# new deadline and is acknowledged locally without a network occurrence.
+reset_case
+old_five_deadline=$((now + 300))
+new_five_deadline=$((old_five_deadline + 15 * 60))
+check_thresholds 100 100 later later "$old_five_deadline" '' "$now" group-a
+check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 900))" group-a
+assert_alert_count 0
+assert_eq 0 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["alerts"]))' "$ALERT_DELIVERIES_FILE")" \
+  "observed 5h reset created a network journal occurrence"
+check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 1800))" group-a
+assert_alert_count 0
+check_thresholds 100 100 later later "$((new_five_deadline - 60))" '' "$((now + 2700))" group-a
+assert_alert_count 0
+
+# Partial observations and group changes only establish a complete baseline;
+# neither can be compared as evidence of a full 5-hour reset.
+reset_case
+check_thresholds 100 100 later later '' '' "$now" group-a
+check_thresholds 100 100 later later "$old_five_deadline" '' "$((now + 900))" group-a
+check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 1800))" group-b
+assert_alert_count 0
+
+# An existing state without the new baseline fields migrates silently and
+# takes its first complete observation as the baseline.
+reset_case
+printf 'state_version=5\nlimit_id_contract_version=1\nprev_5h_pct=100\nprev_weekly_pct=100\n' > "$STATE_FILE"
+check_thresholds 100 100 later later "$old_five_deadline" '' "$now" group-a
+assert_alert_count 0
+
 # A reset older than its whole window is discarded rather than reported late.
 reset_case
 check_thresholds 80 100 "later" "unknown" "$((now + 300))" "" "$now"

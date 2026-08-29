@@ -112,6 +112,22 @@ check_thresholds 40 100 later unknown "$((now + 500))" '' "$((now + 21))"
 assert_eq 2 "$(wc -l < "$HOOK_LOG")" "new cycle threshold did not execute"
 assert_contains "$(tail -n 1 "$HOOK_LOG")" '50|5h|threshold|1|' "new cycle threshold context"
 
+# A 100% -> 100% deadline advance is an observed 5-hour reset and runs the
+# reset hook once with the observation as its event anchor.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:reset'
+validate_config
+old_five_deadline=$((now + 300))
+new_five_deadline=$((old_five_deadline + 15 * 60))
+check_thresholds 100 100 later later "$old_five_deadline" '' "$now" group-a
+check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 900))" group-a
+check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 1800))" group-a
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" "observed 5h reset script was replayed"
+assert_contains "$(head -n 1 "$HOOK_LOG")" '|5h|reset|1|' "observed 5h reset event contract"
+assert_contains "$(head -n 1 "$HOOK_LOG")" "|eof|present|100|$((now + 900))|later|$((now + 900))|" "observed reset hook context"
+assert_contains "$(head -n 1 "$HOOK_LOG")" "|$((now + 900))|" "observed reset was not anchored to its observation"
+
 # An observed early weekly refill follows the same notification and one-shot
 # script path as a scheduled reset.
 reset_case
@@ -227,5 +243,26 @@ assert_eq 40 "$(state_value script_prev_5h_pct)" "disabled script baseline did n
 ALERTS_ENABLED=1
 check_thresholds 30 100 later unknown "$((now + 300))" '' "$((now + 2))"
 [[ ! -e "$HOOK_LOG" ]] || fail "disabled-period script action replayed after re-enable"
+
+# An observed 100% -> 100% 5-hour reset is acknowledged while alerts are
+# disabled: the hook action is journaled but not executed, and re-enabling
+# alerts must not replay that action.
+reset_case
+ALERTS_ENABLED=0
+# shellcheck disable=SC2034
+ALERT_SCRIPT_1="$HOOK_ONE"
+# shellcheck disable=SC2034
+ALERT_SCRIPT_1_EVENTS='5h:reset'
+validate_config
+old_five_deadline=$((now + 300))
+new_five_deadline=$((old_five_deadline + 900))
+check_thresholds 100 100 later unknown "$old_five_deadline" '' "$now" group-a
+check_thresholds 100 100 later unknown "$new_five_deadline" '' "$((now + 900))" group-a
+[[ ! -e "$HOOK_LOG" ]] || fail "disabled observed 5h reset executed its hook"
+[[ -n "$(state_value attempted_script_5h_reset_actions)" ]] || fail "disabled observed 5h reset action was not acknowledged"
+assert_eq "$((now + 900))" "$(state_value script_5h_reset_attempted_at)" "disabled observed reset anchor was not persisted"
+ALERTS_ENABLED=1
+check_thresholds 100 100 later unknown "$new_five_deadline" '' "$((now + 1800))" group-a
+[[ ! -e "$HOOK_LOG" ]] || fail "re-enabled alerts replayed the disabled observed 5h reset hook"
 
 printf 'PASS: monitor alert script tests\n'

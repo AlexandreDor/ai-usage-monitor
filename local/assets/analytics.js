@@ -14,7 +14,7 @@ const state = {
   availableModels: [],
   modelAvailabilityResolved: false,
   modelFallbackNotice: false,
-  resetType: 'all',
+  resetType: 'weekly',
   resetOffset: 0,
   breakdownOffset: 0,
   breakdownLimit: BREAKDOWN_PAGE_SIZE,
@@ -36,6 +36,10 @@ let tokenDatasets = [];
 let lastPayload = null;
 let currentPeriod = {};
 let refreshSequence = 0;
+// Keep legend choices across payloads that temporarily omit a dataset (for
+// example, an all-null 5-hour series or a period without reset markers).
+// Entries are only updated for datasets currently exposed by the chart.
+let limitDatasetVisibility = new Map();
 
 function byId(id) { return document.getElementById(id); }
 function safeNumber(value) {
@@ -296,6 +300,52 @@ function updateTokenOverlay() {
   limitsChart.update('none');
 }
 
+function chartDatasetVisibility(instance) {
+  const visibility = new Map();
+  for (const [index, dataset] of (instance?.data?.datasets || []).entries()) {
+    if (!dataset?.datasetKey) continue;
+    let visible = dataset.hidden !== true;
+    try {
+      if (typeof instance.isDatasetVisible === 'function') {
+        visible = instance.isDatasetVisible(index);
+      } else {
+        const meta = typeof instance.getDatasetMeta === 'function'
+          ? instance.getDatasetMeta(index)
+          : null;
+        if (meta?.hidden !== null && meta?.hidden !== undefined) visible = !meta.hidden;
+      }
+    } catch (_error) {
+      // Dataset.hidden remains a safe fallback during chart replacement.
+    }
+    visibility.set(dataset.datasetKey, visible);
+  }
+  return visibility;
+}
+
+function applyChartDatasetVisibility(instance, datasets, visibility) {
+  for (const [index, dataset] of datasets.entries()) {
+    if (!dataset?.datasetKey || !visibility.has(dataset.datasetKey)) continue;
+    const visible = visibility.get(dataset.datasetKey);
+    dataset.hidden = !visible;
+    try {
+      const meta = typeof instance.getDatasetMeta === 'function'
+        ? instance.getDatasetMeta(index)
+        : null;
+      if (meta) meta.hidden = visible ? null : true;
+    } catch (_error) {
+      // Dataset.hidden remains authoritative when metadata is unavailable.
+    }
+  }
+}
+
+function rememberChartDatasetVisibility(instance) {
+  const current = chartDatasetVisibility(instance);
+  for (const [datasetKey, visible] of current) {
+    limitDatasetVisibility.set(datasetKey, visible);
+  }
+  return new Map(limitDatasetVisibility);
+}
+
 function markerDataset(markers, window) {
   const values = markers
     .filter(marker => marker && (marker.window === window || marker.kind === window))
@@ -306,6 +356,7 @@ function markerDataset(markers, window) {
   const data = [];
   for (const x of values) data.push({ x, y: 0 }, { x, y: 100 }, { x, y: null });
   return {
+    datasetKey: `reset-${window}`,
     label,
     data,
     borderColor: window === '5h' ? '#fbbf24' : '#f0abfc',
@@ -316,6 +367,7 @@ function markerDataset(markers, window) {
     spanGaps: false,
     resetMarker: true,
     timeSliceExcluded: true,
+    hidden: window === '5h',
   };
 }
 function renderLimitTable(points) {
@@ -333,6 +385,7 @@ function renderLimitTable(points) {
   }
 }
 function renderLimits(data = {}) {
+  const visibility = rememberChartDatasetVisibility(limitsChart);
   limitPoints = Array.isArray(data.series) ? data.series : [];
   const markers = Array.isArray(data.reset_markers)
     ? data.reset_markers
@@ -357,30 +410,36 @@ function renderLimits(data = {}) {
     : t('noLimitSamples');
   const limitCandidates = [
     {
+      datasetKey: 'five-hour',
       label: t('fiveHourRemaining'),
       data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.five_h_pct) })),
       borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,.10)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false,
       valueKind: 'percent',
+      hidden: visibility.has('five-hour') ? !visibility.get('five-hour') : true,
     },
     {
+      datasetKey: 'weekly',
       label: t('weeklyRemaining'),
       data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.weekly_pct) })),
       borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.07)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false,
       valueKind: 'percent',
     },
     {
+      datasetKey: 'ideal-weekly',
       label: t('idealWeeklyPace'),
       data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.ideal_weekly_pct) })),
       borderColor: '#a7f3d0', backgroundColor: 'transparent', fill: false, borderWidth: 2, borderDash: [8, 6], pointRadius: 0, tension: 0, spanGaps: false,
       valueKind: 'percent',
     },
     {
+      datasetKey: 'forecast-24h',
       label: t('forecast24h'),
       data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.forecast_chance_24h_pct) })),
       borderColor: '#a78bfa', backgroundColor: 'transparent', fill: false, borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: false,
       valueKind: 'percent',
     },
     {
+      datasetKey: 'forecast-6h',
       label: t('forecast6h'),
       data: limitPoints.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.forecast_chance_6h_pct) })),
       borderColor: '#fbbf24', backgroundColor: 'transparent', fill: false, borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: false,
@@ -392,6 +451,10 @@ function renderLimits(data = {}) {
     const dataset = markerDataset(markers, window);
     if (dataset) limitDatasets.push(dataset);
   }
+  for (const dataset of limitDatasets) {
+    if (!dataset.datasetKey || !visibility.has(dataset.datasetKey)) continue;
+    dataset.hidden = !visibility.get(dataset.datasetKey);
+  }
   if (typeof Chart !== 'function' || !limitPoints.length) {
     if (limitsChart) { limitsChart.destroy(); limitsChart = null; }
     updateTokenOverlay();
@@ -399,6 +462,7 @@ function renderLimits(data = {}) {
   }
   if (limitsChart) {
     limitsChart.data.datasets = [...limitDatasets];
+    applyChartDatasetVisibility(limitsChart, limitsChart.data.datasets, visibility);
     applyChartBounds(limitsChart.options, limitPoints);
     limitsChart.update('none');
     updateTokenOverlay();
@@ -940,6 +1004,7 @@ byId('select-gpt-5-6').addEventListener('click', () => {
   state.breakdownOffset = 0;
   refresh();
 });
+byId('reset-filter').value = state.resetType;
 byId('reset-filter').addEventListener('change', event => { state.resetType = event.target.value; state.resetOffset = 0; refresh(); });
 byId('apply-dates').addEventListener('click', () => {
   state.fromDate = byId('from-date').value; state.toDate = byId('to-date').value; state.resetOffset = 0; state.breakdownOffset = 0;
