@@ -36,6 +36,10 @@ let tokenDatasets = [];
 let lastPayload = null;
 let currentPeriod = {};
 let refreshSequence = 0;
+// Keep legend choices across payloads that temporarily omit a dataset (for
+// example, an all-null 5-hour series or a period without reset markers).
+// Entries are only updated for datasets currently exposed by the chart.
+let limitDatasetVisibility = new Map();
 
 function byId(id) { return document.getElementById(id); }
 function safeNumber(value) {
@@ -334,6 +338,14 @@ function applyChartDatasetVisibility(instance, datasets, visibility) {
   }
 }
 
+function rememberChartDatasetVisibility(instance) {
+  const current = chartDatasetVisibility(instance);
+  for (const [datasetKey, visible] of current) {
+    limitDatasetVisibility.set(datasetKey, visible);
+  }
+  return new Map(limitDatasetVisibility);
+}
+
 function markerDataset(markers, window) {
   const values = markers
     .filter(marker => marker && (marker.window === window || marker.kind === window))
@@ -373,7 +385,7 @@ function renderLimitTable(points) {
   }
 }
 function renderLimits(data = {}) {
-  const visibility = chartDatasetVisibility(limitsChart);
+  const visibility = rememberChartDatasetVisibility(limitsChart);
   limitPoints = Array.isArray(data.series) ? data.series : [];
   const markers = Array.isArray(data.reset_markers)
     ? data.reset_markers
