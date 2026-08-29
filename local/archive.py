@@ -415,7 +415,11 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
         # A deadline crossing alone is not enough evidence across a long gap.
         if gap <= 0 or gap > max(3_600, expected_interval * 2):
             continue
-        if previous[6] != current[6]:
+        # Legacy snapshots may have no limit owner at all.  They remain useful
+        # archive rows, but comparing two ownerless snapshots would fabricate
+        # a reset because ``None == None``.  Derived events require one known,
+        # coherent limit group on both sides of the pair.
+        if previous[6] is None or current[6] is None or previous[6] != current[6]:
             continue
         for window, pct_index, reset_index in windows:
             reset_at = previous[reset_index]
@@ -451,6 +455,19 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
     for current in rows:
         current_pct, current_deadline = current[1], current[2]
         if not isinstance(current_pct, (int, float)) or not isinstance(current_deadline, int):
+            # A partial observation from another (or unknown) group breaks the
+            # retained complete baseline.  Keeping A across A -> B(partial) ->
+            # A would compare non-adjacent groups and fabricate an observed
+            # refill; partials from the same owner remain tolerated.
+            if (
+                previous_five is not None
+                and (
+                    current[6] is None
+                    or previous_five[6] is None
+                    or current[6] != previous_five[6]
+                )
+            ):
+                previous_five = None
             continue
         if previous_five is None:
             previous_five = current
@@ -460,7 +477,9 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
         previous_pct, previous_deadline = previous[1], previous[2]
         scheduled_crossing = (previous_deadline, previous[6]) in scheduled_5h_cycles
         if (
-            previous[6] == current[6]
+            previous[6] is not None
+            and current[6] is not None
+            and previous[6] == current[6]
             and isinstance(previous_pct, (int, float))
             and isinstance(previous_deadline, int)
             and not scheduled_crossing
@@ -486,6 +505,18 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
     for current in rows:
         current_pct, current_deadline = current[3], current[4]
         if not isinstance(current_pct, (int, float)) or not isinstance(current_deadline, int):
+            # As for 5h above, an owner change hidden in a partial row must
+            # invalidate the previous complete baseline.  Same-owner partial
+            # rows are harmless and continue to be skipped.
+            if (
+                previous_weekly is not None
+                and (
+                    current[6] is None
+                    or previous_weekly[6] is None
+                    or current[6] != previous_weekly[6]
+                )
+            ):
+                previous_weekly = None
             continue
         if previous_weekly is None:
             previous_weekly = current
@@ -497,7 +528,9 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
         refill_change = current_pct - previous_pct
         scheduled_crossing = (previous_deadline, previous[6]) in scheduled_weekly_cycles
         if (
-            previous[6] == current[6]
+            previous[6] is not None
+            and current[6] is not None
+            and previous[6] == current[6]
             and isinstance(previous_pct, (int, float))
             and isinstance(previous_deadline, int)
             and not scheduled_crossing

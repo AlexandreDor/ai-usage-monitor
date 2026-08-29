@@ -55,10 +55,162 @@ TELEGRAM_BOT_TOKEN='' TELEGRAM_CHAT_ID=''
 old_five_deadline=$((2000000100 + 300))
 new_five_deadline=$((old_five_deadline + 900))
 check_thresholds 100 100 later unknown "$old_five_deadline" '' 2000000100 group-a >/dev/null
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+path.unlink()
+PYEOF
 check_thresholds 100 100 later unknown "$new_five_deadline" '' 2000001000 group-a >/dev/null
 [[ ! -e "$FAKE_CURL_LOG" ]] || fail "observed 5h reset emitted an HTTP request"
 assert_eq 0 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["alerts"]))' "$ALERT_DELIVERIES_FILE")" \
   "observed 5h reset was queued in the network journal"
+ALERT_THRESHOLDS=75
+TELEGRAM_BOT_TOKEN='123:token'
+TELEGRAM_CHAT_ID=-456
+
+# An observed refill also invalidates a pending threshold attached to the
+# already-armed cycle (not only an unarmed threshold).  It must remain local:
+# the stale threshold is terminalized/acknowledged, no HTTP is attempted, and
+# no network reset occurrence is created.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-armed-silent"
+ALERTS_ENABLED=0
+ALERT_THRESHOLDS=75
+armed_observation_at=2000001100
+armed_old_deadline=$((armed_observation_at + 3600))
+armed_new_deadline=$((armed_old_deadline + 900))
+check_thresholds 100 100 later unknown "$armed_old_deadline" '' "$armed_observation_at" group-a >/dev/null
+armed_limit_id="$(canonicalize_alert_limit_id group-a)"
+python3 - "$STATE_FILE" "$armed_old_deadline" "$armed_limit_id" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+values = {}
+for line in path.read_text(encoding="utf-8").splitlines():
+    key, separator, value = line.partition("=")
+    if separator:
+        values[key] = value
+values["five_h_armed_reset_at"] = sys.argv[2]
+values["five_h_armed_limit_id"] = sys.argv[3]
+path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+PYEOF
+ALERTS_ENABLED=1
+register_network_alert threshold 5h 75 "limit:${armed_limit_id}|reset:${armed_old_deadline}" \
+  "stale armed threshold" \
+  "{\"limit_id\":\"${armed_limit_id}\",\"remaining_pct\":70,\"reset_epoch\":${armed_old_deadline},\"covered_thresholds\":[75]}" \
+  "$((armed_observation_at + 1))" "$armed_old_deadline" false >/dev/null
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+check_thresholds 100 100 later unknown "$armed_new_deadline" '' "$((armed_observation_at + 900))" group-a >/dev/null
+[[ ! -e "$FAKE_CURL_LOG" ]] || fail "armed observed 5h refill emitted an HTTP request"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 1, items
+threshold = items[0]
+assert threshold["kind"] == "threshold", threshold
+assert threshold["status"] == "failed", threshold
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["channels"]["discord"]["error_class"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+assert not any(item["kind"] == "reset" for item in items), items
+PYEOF
+ALERTS_ENABLED=1
+
+# Reconstructing a missing journal must keep legacy occurrences bound to the
+# owner persisted in state.  A complete sample from group-b initializes a new
+# baseline and must not rewrite A's threshold/reset to B.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-migration-group-switch"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+migration_switch_now=2000003000
+migration_a_reset=$((migration_switch_now + 300))
+migration_b_reset=$((migration_switch_now + 1200))
+migration_a_id="$(canonicalize_alert_limit_id group-a)"
+migration_b_id="$(canonicalize_alert_limit_id group-b)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=80' 'prev_weekly_pct=100' \
+  'observed_5h_pct=80' "observed_5h_reset_at=${migration_a_reset}" \
+  "observed_5h_limit_id=${migration_a_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  "five_h_armed_reset_at=${migration_a_reset}" \
+  "five_h_armed_limit_id=${migration_a_id}" \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=50' 'pending_weekly_threshold=' > "$STATE_FILE"
+check_thresholds 100 100 later unknown "$migration_b_reset" '' "$migration_switch_now" group-b >/dev/null
+python3 - "$ALERT_DELIVERIES_FILE" "$migration_a_id" "$migration_b_id" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert not items, items
+PYEOF
+ALERT_THRESHOLDS=75
+
+# A terminal delivery from group-a must not rewrite group-b's fresh baseline.
+# The next B threshold must still be detected from B's own complete sample.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-reconcile-group-switch"
+export FAKE_CURL_DISCORD_STATUS=503 FAKE_CURL_DISCORD_EXIT=0
+DISCORD_WEBHOOK='https://discord.com/api/webhooks/123/token'
+TELEGRAM_BOT_TOKEN='' TELEGRAM_CHAT_ID=''
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+p3_now=2000007000
+p3_a_reset=$((p3_now + 3600))
+p3_b_reset=$((p3_now + 7200))
+p3_a_id="$(canonicalize_alert_limit_id group-a)"
+p3_b_id="$(canonicalize_alert_limit_id group-b)"
+check_thresholds 100 100 later unknown "$p3_a_reset" '' "$p3_now" group-a >/dev/null
+check_thresholds 40 100 later unknown "$p3_a_reset" '' "$((p3_now + 1))" group-a >/dev/null 2>&1 || true
+assert_eq pending "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.status)" \
+  "group-a threshold was not left pending after delivery failure"
+export FAKE_CURL_DISCORD_STATUS=204
+check_thresholds 80 100 later unknown "$p3_b_reset" '' "$((p3_now + 2))" group-b >/dev/null
+assert_eq 80 "$(awk -F= '$1 == "prev_5h_pct" {print $2}' "$STATE_FILE")" \
+  "terminal group-a delivery polluted group-b baseline"
+assert_eq '' "$(awk -F= '$1 == "pending_5h_threshold" {print $2}' "$STATE_FILE")" \
+  "group switch left an orphaned pending marker"
+check_thresholds 40 100 later unknown "$p3_b_reset" '' "$((p3_now + 3))" group-b >/dev/null
+python3 - "$ALERT_DELIVERIES_FILE" "$p3_a_id" "$p3_b_id" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 2, items
+assert items[0]["event_data"]["limit_id"] == sys.argv[2], items
+assert items[1]["event_data"]["limit_id"] == sys.argv[3], items
+assert items[0]["status"] == "delivered", items
+assert items[1]["status"] == "delivered", items
+assert items[1]["selector"] == "50", items
+PYEOF
+
+# If A becomes terminal while B is only a partial observation, defer its
+# acknowledgment.  Returning to A can then reconcile and clear A's marker
+# without creating a duplicate or a marker owned by B.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-reconcile-partial-return"
+export FAKE_CURL_DISCORD_STATUS=503 FAKE_CURL_DISCORD_EXIT=0
+ALERT_THRESHOLDS=50
+p3_return_now=2000010000
+p3_return_reset=$((p3_return_now + 3600))
+check_thresholds 100 100 later unknown "$p3_return_reset" '' "$p3_return_now" group-a >/dev/null
+check_thresholds 40 100 later unknown "$p3_return_reset" '' "$((p3_return_now + 1))" group-a >/dev/null 2>&1 || true
+export FAKE_CURL_DISCORD_STATUS=204
+check_thresholds 80 100 unknown unknown '' '' "$((p3_return_now + 2))" group-b >/dev/null
+assert_eq 50 "$(awk -F= '$1 == "pending_5h_threshold" {print $2}' "$STATE_FILE")" \
+  "partial group-b sample changed the A pending marker"
+check_thresholds 40 100 later unknown "$p3_return_reset" '' "$((p3_return_now + 3))" group-a >/dev/null
+assert_eq '' "$(awk -F= '$1 == "pending_5h_threshold" {print $2}' "$STATE_FILE")" \
+  "return to group-a left a terminal marker blocked"
 ALERT_THRESHOLDS=75
 TELEGRAM_BOT_TOKEN='123:token'
 TELEGRAM_CHAT_ID=-456
@@ -98,6 +250,7 @@ export FAKE_CURL_DISCORD_STATUS=204
 legacy_reset=$((2000000250 + 300))
 printf '%s\n' \
   'state_version=4' 'prev_5h_pct=80' 'prev_weekly_pct=100' \
+  'five_h_armed_limit_id=default' \
   "five_h_armed_reset_at=${legacy_reset}" 'weekly_armed_reset_at=0' \
   'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
   'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
@@ -160,6 +313,7 @@ PYEOF
 printf '%s\n' \
   'state_version=4' 'prev_5h_pct=80' 'prev_weekly_pct=100' \
   "observed_weekly_limit_id=${legacy_digest_id}" \
+  "five_h_armed_limit_id=${legacy_digest_id}" \
   "weekly_armed_limit_id=${legacy_digest_id}" \
   "five_h_armed_reset_at=${legacy_journal_reset}" 'weekly_armed_reset_at=0' \
   'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
@@ -350,6 +504,7 @@ ALERTS_ENABLED=0
 ALERT_THRESHOLDS=75
 printf '%s\n' \
   'state_version=4' 'prev_5h_pct=80' 'prev_weekly_pct=100' \
+  'five_h_armed_limit_id=default' \
   "five_h_armed_reset_at=${migration_reset}" 'weekly_armed_reset_at=0' \
   'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
   'notified_5h_thresholds=' 'notified_weekly_thresholds=' \

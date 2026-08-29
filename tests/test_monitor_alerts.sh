@@ -87,6 +87,52 @@ assert_alert_count 0
 check_thresholds 100 100 later later "$((new_five_deadline - 60))" '' "$((now + 2700))" group-a
 assert_alert_count 0
 
+# Reconstructing a missing delivery journal from the observed-reset sample
+# must not manufacture a 5h network reset or its old threshold occurrence.
+reset_case
+DISCORD_WEBHOOK=dummy-webhook
+ALERTS_ENABLED=0
+check_thresholds 100 100 later later "$old_five_deadline" '' "$now" group-a
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+path.unlink()
+PYEOF
+check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 900))" group-a
+assert_eq 0 "$(python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+print(sum(1 for item in json.load(open(sys.argv[1]))["alerts"] if item["window"] == "5h"))
+PYEOF
+)" "missing journal reconstructed an observed 5h network occurrence"
+DISCORD_WEBHOOK=""
+ALERTS_ENABLED=1
+
+# A local observed refill expires a pending threshold before any due delivery,
+# while leaving no reset occurrence in the network journal.
+reset_case
+DISCORD_WEBHOOK=dummy-webhook
+ALERTS_ENABLED=0
+check_thresholds 100 100 later later "$old_five_deadline" '' "$now" group-a
+ALERTS_ENABLED=1
+group_a_limit_id="$(canonicalize_alert_limit_id group-a)"
+register_network_alert threshold 5h 50 "limit:${group_a_limit_id}|unarmed" \
+  "stale" "{\"limit_id\":\"${group_a_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":0,\"covered_thresholds\":[50]}" \
+  "$((now + 1))" 0 false
+ALERTS_ENABLED=0
+check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 900))" group-a
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+items = json.load(open(sys.argv[1]))["alerts"]
+assert len(items) == 1, items
+assert items[0]["terminal_reason"] == "expired_after_reset", items[0]
+assert items[0]["channels"]["discord"]["error_class"] == "expired_after_reset", items[0]
+PYEOF
+DISCORD_WEBHOOK=""
+ALERTS_ENABLED=1
+
 # Partial observations and group changes only establish a complete baseline;
 # neither can be compared as evidence of a full 5-hour reset.
 reset_case
@@ -94,6 +140,15 @@ check_thresholds 100 100 later later '' '' "$now" group-a
 check_thresholds 100 100 later later "$old_five_deadline" '' "$((now + 900))" group-a
 check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 1800))" group-b
 assert_alert_count 0
+
+# A partial 5h observation from another limit group cannot be compared against
+# the previous group's percentage baseline.
+reset_case
+ALERT_THRESHOLDS=50
+check_thresholds 100 100 later later "$old_five_deadline" '' "$now" group-a
+check_thresholds 40 100 unknown unknown '' '' "$((now + 1))" group-b
+assert_alert_count 0
+ALERT_THRESHOLDS=0
 
 # An existing state without the new baseline fields migrates silently and
 # takes its first complete observation as the baseline.
@@ -160,6 +215,36 @@ ALERT_THRESHOLDS=50
 check_thresholds 100 80 "unknown" "later" "" "$old_weekly_deadline" "$now" "group-a"
 check_thresholds 100 40 "unknown" "unknown" "" "" "$((now + 1))" "group-b"
 assert_alert_count 0
+ALERT_THRESHOLDS=0
+
+# A legacy ownerless 5h arm must not be attached to a partial observation from
+# a new group.  In particular, a stale arm from v4 cannot fabricate a reset for
+# group-b when the sample has no reset deadline.
+reset_case
+printf '%s\n' \
+  'state_version=4' 'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  "five_h_armed_reset_at=$now" 'weekly_armed_reset_at=0' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+check_thresholds 80 100 unknown unknown '' '' "$((now + 301))" group-b
+assert_alert_count 0
+assert_eq 0 "$(state_value five_h_armed_reset_at)" \
+  "ownerless legacy arm was attributed to a partial sample"
+
+# A loaded ownerless legacy baseline must not compare a partial 5h sample to
+# its stale percentage.  The first complete owner-aware sample will establish
+# the new baseline; this row must create neither a network alert nor a marker.
+reset_case
+ALERT_THRESHOLDS=50
+printf '%s\n' \
+  'state_version=4' 'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'five_h_armed_reset_at=0' 'weekly_armed_reset_at=0' \
+  'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+check_thresholds 40 100 unknown unknown '' '' "$((now + 302))" group-b
+assert_alert_count 0
+assert_eq 100 "$(state_value prev_5h_pct)" \
+  "ownerless legacy partial sample crossed a 5h threshold"
 ALERT_THRESHOLDS=0
 
 # A partial sample after the old deadline reports the scheduled reset once and
