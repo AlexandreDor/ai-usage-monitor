@@ -14,11 +14,12 @@ reset probabilities from the independent Codex Forecast service.
 
 ### Live quota dashboard
 
-- Current remaining quota for the active 5-hour and weekly windows.
+- Current remaining quota for the active weekly window by default; the 5-hour
+  series remains available from the chart legend when needed.
 - Reset dates and weekly pace compared with ideal consumption.
 - Rolling history chart generated from local quota and Forecast snapshots.
-- Accessible quota gauges expose localized names and value text for the 5-hour
-  and weekly remaining windows.
+- The optional 5-hour series and selectors retain localized names and value
+  text when enabled.
 - Mouse and touch exploration by nearest time slice, with a vertical cursor and
   one tooltip for every visible quota series at that time.
 - Automatic refresh based on the monitor collection interval.
@@ -40,7 +41,8 @@ The local Analytics page provides:
 - quota history, ideal weekly pace, and Forecast probabilities for 24 hours, 7,
   30, or 90 days, one year, all retained data, or a custom date range;
 - detected 5-hour and weekly reset history, including scheduled and early
-  weekly resets, with the last Forecast probabilities observed less than 45
+  weekly resets (weekly history is selected by default; All and 5-hour remain
+  available), with the last Forecast probabilities observed less than 45
   minutes before each reset when available;
 - local token consumption from Codex, OpenCode, and Hermes;
 - uncached input, cache read, cache write, output, reasoning, and total token
@@ -96,8 +98,11 @@ period-wide token or cost totals.
 - Configurable low-quota thresholds for the 5-hour and weekly windows.
 - One alert for the most critical threshold when several levels are crossed in
   a single collection.
-- Automatic notifications for scheduled 5-hour and weekly resets.
-- Detection of conservative early weekly refills.
+- Automatic notifications for scheduled 5-hour and weekly resets. A full
+  5-hour cycle observed as 100% → 100% with a later deadline is recorded and
+  runs local `5h:reset` hooks, but stays silent on Discord/Telegram.
+- Detection of conservative early weekly refills and full 5-hour cycles whose
+  quota stays at 100% while the reset deadline advances.
 - Discord and Telegram delivery with independent durable state per channel.
 - Bounded retries for temporary network errors without replaying a channel that
   already succeeded.
@@ -472,6 +477,12 @@ failure or timeout is logged but not retried and does not stop later scripts.
 Personal scripts can be stored under `local/scripts/`, whose contents are
 ignored by Git except for `.gitkeep`.
 
+The `5h:reset` selector runs for scheduled resets and for the observed full
+5-hour reset described above. Each newly observed deadline is anchored to the
+first snapshot that reports it and is run once; repeated snapshots with that
+deadline are ignored. `ALERTS_ENABLED=0` acknowledges the event and records the
+script action without executing it.
+
 Scripts receive:
 
 | Variable | Content |
@@ -504,8 +515,13 @@ transactionally to v4 on their next writable monitor cycle; `--check` does not
 open or migrate the archive.
 The detector tolerates quota noise up to 5 percentage points and reset-date
 movement up to 30 minutes; a disappeared reset date is confirmed after two
-valid observations. Planned deadline crossings and the recognized weekly
-refill pattern are excluded. Anomaly rows remain local even when no channel is
+valid observations. Planned deadline crossings, the recognized weekly refill
+pattern, and the recognized full 5-hour pattern are excluded. A 5-hour reset
+with 100% remaining is recognized only from two complete observations in the
+same limit group, with a strictly later valid deadline; the first observation
+carrying the new deadline anchors the event. Repeating that deadline is
+idempotent, while a deadline that stays the same, moves backwards, or belongs
+to another group does not trigger a reset. Anomaly rows remain local even when no channel is
 configured, and an interrupted journal registration is retried on a later
 cycle. Journaled anomaly records and inactive detector state follow
 `ARCHIVE_RETENTION_DAYS`; an anomaly still awaiting journal registration is

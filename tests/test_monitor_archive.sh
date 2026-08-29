@@ -375,6 +375,41 @@ with sqlite3.connect(sys.argv[1]) as connection:
 PYEOF
 )" "long observation gap invented a reset"
 
+# A complete 100% -> 100% 5-hour observation with a later deadline is retained
+# as an observed reset and remains idempotent when the archive is rebuilt.
+rm -f "$ARCHIVE_FILE"
+five_observed_before=$((BASE - 900))
+five_observed_previous_deadline=$((BASE + 4 * 3600))
+five_observed_current_deadline=$((five_observed_previous_deadline + 900))
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_observed_previous_deadline" "$(iso_at "$five_observed_before")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_observed_current_deadline" "$(iso_at "$BASE")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '1' "$(python3 - "$ARCHIVE_FILE" "$BASE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    row = connection.execute(
+        "SELECT detection_method, before_pct, after_pct FROM reset_events "
+        "WHERE window = '5h' AND reset_at_epoch = ?", (int(sys.argv[2]),)
+    ).fetchone()
+assert row == ("observed_refill", 100.0, 100.0), row
+print(1)
+PYEOF
+)" "full 5h observed reset was not derived"
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_observed_current_deadline" "$(iso_at "$BASE")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '1' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("SELECT COUNT(*) FROM reset_events WHERE window = '5h'").fetchone()[0])
+PYEOF
+)" "observed 5h reset reconstruction created duplicates"
+
 # An early weekly refill with a materially advanced deadline is classified as
 # a random reset rather than a scheduled end-of-week reset.
 rm -f "$ARCHIVE_FILE"

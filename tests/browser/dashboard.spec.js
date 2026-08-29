@@ -70,6 +70,7 @@ test('works offline and exposes no serious or critical accessibility violations'
 
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   await expect(page.locator('#weekly-pct')).toHaveText('36%');
+  await expect(page.locator('#five-hour-card')).toBeHidden();
   await expect(page.locator('#five-hour-title')).toHaveText('5-Hour Limit');
   await expect(page.locator('#weekly-title')).toHaveText('Weekly Limit');
   await expect(page.locator('.limit-card').first()).toHaveAttribute('aria-labelledby', 'five-hour-title');
@@ -417,7 +418,6 @@ test('explores the nearest dashboard time slice across the full chart height', a
   await page.mouse.move(box.x + target.x, box.y + target.y);
 
   await expect.poll(() => page.evaluate(() => chart.tooltip.dataPoints?.map(item => item.dataset.label))).toEqual([
-    '5h Limit %',
     'Weekly Limit %',
     'Forecast 24h',
     'Forecast 6h',
@@ -431,7 +431,7 @@ test('explores the nearest dashboard time slice across the full chart height', a
     cursorRegistered: Boolean(Chart.registry.plugins.get('timeSliceCursor')),
   }));
   expect(selection.title).toEqual(['02/08/2026 02:00']);
-  expect(selection.body).toEqual(['5h Limit %: 60%', 'Weekly Limit %: 40%', 'Forecast 24h: 76%', 'Forecast 6h: 10%']);
+  expect(selection.body).toEqual(['Weekly Limit %: 40%', 'Forecast 24h: 76%', 'Forecast 6h: 10%']);
   expect(selection.caretX).toBeCloseTo(selection.expectedX, 1);
   expect(selection.mode).toBe('timeSlice');
   expect(selection.cursorRegistered).toBe(true);
@@ -737,6 +737,8 @@ test('renders detailed analytics, reset markers and cost mode by default', async
   await expect(page.locator('#collector-grid')).toContainText('database unavailable');
   await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#tokens-chart-card')).toBeHidden();
+  await expect(page.locator('#reset-filter')).toHaveValue('weekly');
+  await expect.poll(() => page.evaluate(() => new URLSearchParams(queryString()).get('reset_type'))).toBe('weekly');
   await expect(page.locator('#resets-body tr').first().locator('td')).toHaveCount(8);
   await expect(page.locator('#resets-body tr').first().locator('td').last()).toHaveText('Forecast 24h: 64% · Forecast 6h: 22%');
 
@@ -745,6 +747,16 @@ test('renders detailed analytics, reset markers and cost mode by default', async
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.label === 'codex')?.data[0]?.y)).toBe(11.25);
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.label === 'Ideal weekly pace')?.data[1]?.y)).toBe(51.2);
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.filter(dataset => dataset.valueKind === 'percent').length)).toBe(5);
+  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.datasetKey === 'five-hour')?.hidden)).toBe(true);
+  await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.find(dataset => dataset.datasetKey === 'reset-5h')?.hidden)).toBe(true);
+  await page.evaluate(() => {
+    const index = limitsChart.data.datasets.findIndex(dataset => dataset.datasetKey === 'five-hour');
+    limitsChart.show(index);
+    limitsChart.update('none');
+  });
+  await expect.poll(() => page.evaluate(() => limitsChart.isDatasetVisible(limitsChart.data.datasets.findIndex(dataset => dataset.datasetKey === 'five-hour')))).toBe(true);
+  await page.evaluate(() => refresh());
+  await expect.poll(() => page.evaluate(() => limitsChart.isDatasetVisible(limitsChart.data.datasets.findIndex(dataset => dataset.datasetKey === 'five-hour')))).toBe(true);
   await page.locator('#toggle-token-overlay').click();
   await expect(page.locator('#tokens-chart-card')).toBeVisible();
   await expect(page.locator('#tokens-chart-card #token-metric-toggle')).toHaveCount(1);
@@ -925,7 +937,6 @@ test('groups visible Analytics units and excludes missing values and reset marke
   await moveToSlice();
 
   await expect.poll(() => page.evaluate(() => limitsChart.tooltip.body?.map(item => item.lines[0]))).toEqual([
-    '5-hour remaining: 55%',
     'Ideal weekly pace: 51.2%',
     'Forecast 24h: 70%',
     'Forecast 6h: 30%',

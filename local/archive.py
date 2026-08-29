@@ -403,6 +403,7 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
     ).fetchall()
     connection.execute("DELETE FROM reset_events")
     windows = (("5h", 1, 2), ("weekly", 3, 4))
+    scheduled_5h_cycles = set()
     scheduled_weekly_cycles = set()
     for previous, current in zip(rows, rows[1:]):
         gap = current[0] - previous[0]
@@ -438,6 +439,45 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
                 )
                 if window == "weekly":
                     scheduled_weekly_cycles.add((reset_at, previous[6]))
+                else:
+                    scheduled_5h_cycles.add((reset_at, previous[6]))
+
+    # A 5-hour reset can be observed even when the quota remains full. Compare
+    # only complete observations from one limit group and anchor the event to
+    # the first sample carrying the advanced deadline. A scheduled crossing
+    # already identified above owns that transition, preventing two markers
+    # for the same reset.
+    previous_five = None
+    for current in rows:
+        current_pct, current_deadline = current[1], current[2]
+        if not isinstance(current_pct, (int, float)) or not isinstance(current_deadline, int):
+            continue
+        if previous_five is None:
+            previous_five = current
+            continue
+
+        previous = previous_five
+        previous_pct, previous_deadline = previous[1], previous[2]
+        scheduled_crossing = (previous_deadline, previous[6]) in scheduled_5h_cycles
+        if (
+            previous[6] == current[6]
+            and isinstance(previous_pct, (int, float))
+            and isinstance(previous_deadline, int)
+            and not scheduled_crossing
+            and previous_pct == 100
+            and current_pct == 100
+            and current_deadline > previous_deadline
+        ):
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO reset_events (
+                    window, reset_at_epoch, observed_at_epoch,
+                    before_pct, after_pct, detection_method
+                ) VALUES ('5h', ?, ?, ?, ?, 'observed_refill')
+                """,
+                (current[0], current[0], previous_pct, current_pct),
+            )
+        previous_five = current
 
     # A refill plus a later deadline remains positive reset evidence after a
     # long gap or partial samples. Compare coherent observations from the same

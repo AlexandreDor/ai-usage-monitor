@@ -1105,6 +1105,36 @@ raise SystemExit(0 if detected else 1)
 PYEOF
 }
 
+# A 5-hour reset can be observed even when the quota was never consumed.  In
+# that case the only positive evidence is two complete observations at 100%
+# with the same limit group and a strictly later reset deadline.  The first
+# observation carrying the new deadline is used as the event anchor because
+# the exact reset instant is not observable.
+is_observed_5h_reset() {
+  local previous_pct="$1"
+  local current_pct="$2"
+  local previous_reset_at="$3"
+  local current_reset_at="$4"
+
+  python3 - "$previous_pct" "$current_pct" "$previous_reset_at" "$current_reset_at" <<'PYEOF'
+import sys
+
+try:
+    previous_pct, current_pct = map(float, sys.argv[1:3])
+    previous_reset_at, current_reset_at = map(int, sys.argv[3:5])
+except (TypeError, ValueError):
+    raise SystemExit(1)
+
+detected = (
+    previous_pct == 100
+    and current_pct == 100
+    and previous_reset_at > 0
+    and current_reset_at > previous_reset_at
+)
+raise SystemExit(0 if detected else 1)
+PYEOF
+}
+
 csv_contains() {
   local list="$1" wanted="$2"
   [[ ",${list}," == *",${wanted},"* ]]
@@ -1164,7 +1194,8 @@ marker = values.get("limit_id_contract_version")
 if marker is not None:
     if marker != "1" or version < 5:
         raise SystemExit("invalid alert state limit ID contract marker")
-    for key in ("observed_weekly_limit_id", "weekly_armed_limit_id"):
+    for key in ("observed_5h_limit_id", "observed_weekly_limit_id",
+                "five_h_armed_limit_id", "weekly_armed_limit_id"):
         value = values.get(key, "")
         if value and not re.fullmatch(r"limit-[0-9a-f]{64}", value):
             raise SystemExit(f"marked alert state contains a raw {key}")
@@ -1178,7 +1209,8 @@ def opaque(value):
         return value
     return "limit-" + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
 
-for key in ("observed_weekly_limit_id", "weekly_armed_limit_id"):
+for key in ("observed_5h_limit_id", "observed_weekly_limit_id",
+            "five_h_armed_limit_id", "weekly_armed_limit_id"):
     if key in values:
         values[key] = opaque(values[key])
 
@@ -1189,7 +1221,8 @@ for line in lines:
     key, _, value = line.partition("=")
     if key in {"state_version", "limit_id_contract_version"}:
         continue
-    if key in {"observed_weekly_limit_id", "weekly_armed_limit_id"}:
+    if key in {"observed_5h_limit_id", "observed_weekly_limit_id",
+               "five_h_armed_limit_id", "weekly_armed_limit_id"}:
         value = values[key]
     output.append(f"{key}={value}")
 encoded = ("\n".join(output) + "\n").encode("utf-8")
@@ -1232,10 +1265,14 @@ persist_alert_state() {
     'limit_id_contract_version=1' \
     "prev_5h_pct=${prev_5h_pct}" \
     "prev_weekly_pct=${prev_weekly_pct}" \
+    "observed_5h_pct=${observed_5h_pct}" \
+    "observed_5h_reset_at=${observed_5h_reset_at}" \
+    "observed_5h_limit_id=${observed_5h_limit_id}" \
     "observed_weekly_pct=${observed_weekly_pct}" \
     "observed_weekly_reset_at=${observed_weekly_reset_at}" \
     "observed_weekly_limit_id=${observed_weekly_limit_id}" \
     "five_h_armed_reset_at=${five_h_armed_reset_at}" \
+    "five_h_armed_limit_id=${five_h_armed_limit_id}" \
     "weekly_armed_reset_at=${weekly_armed_reset_at}" \
     "weekly_armed_limit_id=${weekly_armed_limit_id}" \
     "last_notified_5h_reset_at=${last_notified_5h_reset_at}" \
@@ -1361,6 +1398,7 @@ reconcile_alert_deliveries() {
       last_notified_5h_reset_at="$reset_epoch"
       if [[ "$five_h_armed_reset_at" == "$reset_epoch" ]]; then
         five_h_armed_reset_at=0
+        five_h_armed_limit_id=""
         notified_5h_thresholds=""
         pending_5h_threshold=""
         prev_5h_pct=100
@@ -1406,6 +1444,7 @@ initialize_alert_delivery_journal() {
   if (( five_h_armed_reset_at > 0 && now > five_h_armed_reset_at + 5 * 60 * 60 )); then
     last_notified_5h_reset_at="$five_h_armed_reset_at"
     five_h_armed_reset_at=0
+    five_h_armed_limit_id=""
     notified_5h_thresholds=""
     pending_5h_threshold=""
     prev_5h_pct=100
@@ -1535,10 +1574,14 @@ check_thresholds() {
   local state_version=1
   local prev_5h_pct=100
   local prev_weekly_pct=100
+  local observed_5h_pct=""
+  local observed_5h_reset_at=0
+  local observed_5h_limit_id=""
   local observed_weekly_pct=""
   local observed_weekly_reset_at=0
   local observed_weekly_limit_id=""
   local five_h_armed_reset_at=0
+  local five_h_armed_limit_id=""
   local weekly_armed_reset_at=0
   local weekly_armed_limit_id=""
   local last_notified_5h_reset_at=0
@@ -1560,7 +1603,8 @@ check_thresholds() {
   local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold
   local original_pending cycle_key covered_json registration_status disabled_notified
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 initialize_script_baseline=0
-  local observed_weekly_reset=0 weekly_observation_valid=0 process_weekly_sample=1 state_loaded=0
+  local observed_weekly_reset=0 five_h_observation_valid=0 weekly_observation_valid=0 process_weekly_sample=1 state_loaded=0
+  local initialize_5h_baseline=0 observed_5h_reset=0
   local resumed_after_disabled=0 resume_delivery_attempted=0
   local journal_source_state_version=1 raw_source_state_version
   local -a script_thresholds=()
@@ -1582,12 +1626,12 @@ check_thresholds() {
           [[ "$state_value" =~ ^[0-9]+$ ]] || { ALERT_PROCESSING_ERROR="invalid alert state version"; return 1; }
           state_version="$state_value"
           ;;
-        prev_5h_pct|prev_weekly_pct|observed_weekly_pct|script_prev_5h_pct|script_prev_weekly_pct)
+        prev_5h_pct|prev_weekly_pct|observed_5h_pct|observed_weekly_pct|script_prev_5h_pct|script_prev_weekly_pct)
           if [[ "$state_value" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
           fi
           ;;
-        observed_weekly_reset_at|five_h_armed_reset_at|weekly_armed_reset_at|last_notified_5h_reset_at|last_notified_weekly_reset_at)
+        observed_5h_reset_at|observed_weekly_reset_at|five_h_armed_reset_at|weekly_armed_reset_at|last_notified_5h_reset_at|last_notified_weekly_reset_at)
           if [[ "$state_value" =~ ^[0-9]+$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
           fi
@@ -1601,7 +1645,7 @@ check_thresholds() {
         alerts_disabled_since)
           [[ "$state_value" =~ ^[0-9]+$ ]] && alerts_disabled_since="$state_value"
           ;;
-        observed_weekly_limit_id|weekly_armed_limit_id)
+        observed_5h_limit_id|observed_weekly_limit_id|five_h_armed_limit_id|weekly_armed_limit_id)
           printf -v "$state_key" '%s' "$state_value"
           ;;
         script_tracking_initialized)
@@ -1640,6 +1684,10 @@ check_thresholds() {
   [[ -n "$pace" ]] && pace_suffix=$'\n'"*Pace vs ideal:* ${pace}"
   if [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ && "$weekly_reset_at" =~ ^[0-9]+$ ]]; then
     weekly_observation_valid=1
+  fi
+  if [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ && "$five_h_reset_at" =~ ^[0-9]+$ ]] \
+    && (( five_h_reset_at > 0 )); then
+    five_h_observation_valid=1
   fi
 
 
@@ -1726,6 +1774,45 @@ check_thresholds() {
     attempted_script_weekly_reset_actions=""
   fi
 
+  # Keep a durable complete 5-hour observation so a refill that leaves the
+  # quota at 100% can still be recognized. A missing deadline, a first
+  # observation, or a different limit group only establishes a new baseline;
+  # none of those situations is evidence of a reset.
+  if (( five_h_observation_valid == 1 )); then
+    if [[ -z "$observed_5h_limit_id" ]]; then
+      observed_5h_pct="$five_h_pct"
+      observed_5h_reset_at="$five_h_reset_at"
+      observed_5h_limit_id="$limit_id"
+      initialize_5h_baseline=1
+    elif [[ "$observed_5h_limit_id" != "$limit_id" ]]; then
+      observed_5h_pct="$five_h_pct"
+      observed_5h_reset_at="$five_h_reset_at"
+      observed_5h_limit_id="$limit_id"
+      initialize_5h_baseline=1
+      # A scheduled cycle belongs to its original group. Do not deliver it
+      # while processing a complete observation from another group.
+      if [[ -n "$five_h_armed_limit_id" && "$five_h_armed_limit_id" != "$limit_id" ]]; then
+        five_h_armed_reset_at=0
+        five_h_armed_limit_id=""
+        script_5h_reset_attempted_at=0
+        attempted_script_5h_reset_actions=""
+      fi
+    fi
+  fi
+
+  # The old state format did not persist the owner of an armed 5-hour cycle.
+  # Treat such a cycle as belonging to the current observation for backwards
+  # compatibility; newly persisted cycles always carry the owner explicitly.
+  if (( five_h_armed_reset_at > 0 )) && [[ -z "$five_h_armed_limit_id" ]]; then
+    if [[ -n "$observed_5h_limit_id" && "$observed_5h_limit_id" != "$limit_id" ]]; then
+      five_h_armed_reset_at=0
+      script_5h_reset_attempted_at=0
+      attempted_script_5h_reset_actions=""
+    else
+      five_h_armed_limit_id="$limit_id"
+    fi
+  fi
+
   # Codex can refill the weekly window before its previously announced
   # deadline. Match the archive's conservative detection rule so alerts and
   # reset history agree: require both a quota refill and a materially later
@@ -1746,13 +1833,35 @@ check_thresholds() {
     observed_weekly_limit_id="$limit_id"
   fi
 
+  # A complete 100% -> 100% observation with a later deadline is an observed
+  # 5-hour reset. If an already armed scheduled cycle crossed in this sample,
+  # let that normal path own the event so history and notifications cannot
+  # double count the same reset.
+  if (( initialize_5h_baseline == 0 && five_h_observation_valid == 1 )) \
+    && [[ "$limit_id" == "$observed_5h_limit_id" ]] \
+    && is_observed_5h_reset "$observed_5h_pct" "$five_h_pct" \
+      "$observed_5h_reset_at" "$five_h_reset_at" \
+    && ! ( (( five_h_armed_reset_at > 0 && scraped_at_epoch >= five_h_armed_reset_at )) \
+           && [[ "$five_h_armed_limit_id" == "$limit_id" ]] ); then
+    five_h_armed_reset_at="$scraped_at_epoch"
+    five_h_armed_limit_id="$limit_id"
+    observed_5h_reset=1
+  fi
+
   # Reset delivery is retried while the reset still belongs to a plausible cycle.
-  if (( five_h_armed_reset_at > 0 && scraped_at_epoch >= five_h_armed_reset_at )); then
+  if (( five_h_armed_reset_at > 0 && scraped_at_epoch >= five_h_armed_reset_at )) \
+    && [[ "$five_h_armed_limit_id" == "$limit_id" ]]; then
     due_5h_reset_at="$five_h_armed_reset_at"
     reset_age=$(( scraped_at_epoch - five_h_armed_reset_at ))
     if (( reset_age <= 5 * 60 * 60 && last_notified_5h_reset_at != five_h_armed_reset_at )); then
       cycle_key="limit:${limit_id}|reset:${five_h_armed_reset_at}"
-      if journal_has_pending_alert reset 5h reset "$cycle_key"; then
+      if (( observed_5h_reset == 1 )); then
+        # A full 5-hour window can be observed without any quota movement.
+        # This is useful local reset evidence and still drives hooks, but it
+        # must remain silent on the network and must not create a delivery
+        # occurrence that could be replayed later.
+        last_notified_5h_reset_at="$five_h_armed_reset_at"
+      elif journal_has_pending_alert reset 5h reset "$cycle_key"; then
         if [[ "${ALERTS_ENABLED:-1}" != 1 ]]; then
           # Keep the queued delivery intact, but advance local detector state
           # while notifications are disabled.  Re-enabling must not replay a
@@ -1782,6 +1891,7 @@ check_thresholds() {
     fi
     if (( reset_age > 5 * 60 * 60 || last_notified_5h_reset_at == five_h_armed_reset_at )); then
       five_h_armed_reset_at=0
+      five_h_armed_limit_id=""
       notified_5h_thresholds=""
       pending_5h_threshold=""
       prev_5h_pct=100
@@ -1867,6 +1977,7 @@ check_thresholds() {
     && percentage_below_full "$five_h_pct" \
     && (( five_h_reset_at > scraped_at_epoch && five_h_reset_at <= scraped_at_epoch + 6 * 60 * 60 )); then
     five_h_armed_reset_at="$five_h_reset_at"
+    five_h_armed_limit_id="$limit_id"
   fi
 
   if (( weekly_armed_reset_at == 0 )) \
@@ -2049,6 +2160,11 @@ PYEOF
 
   # Journal a complete observation before any hook can persist or act on this
   # cycle. Notification retry state remains independent in prev_weekly_pct.
+  if (( five_h_observation_valid == 1 )); then
+    observed_5h_pct="$five_h_pct"
+    observed_5h_reset_at="$five_h_reset_at"
+    observed_5h_limit_id="$limit_id"
+  fi
   if (( weekly_observation_valid == 1 )); then
     observed_weekly_pct="$weekly_pct"
     observed_weekly_reset_at="$weekly_reset_at"
