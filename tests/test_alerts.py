@@ -259,6 +259,55 @@ class AlertJournalTests(unittest.TestCase):
         ))
         alerts.validate_document(self.document, allow_legacy=False)
 
+    def test_observed_weekly_recovery_reuses_pending_reset_retry(self):
+        weekly_id = alerts.canonicalize_limit_id("default")
+        weekly_cycle = f"limit:{weekly_id}|reset:400"
+        request_value = reset_request(
+            window="weekly", created=400, cycle="limit:default|reset:400",
+        )
+        request_value["expire_threshold_cycle"] = None
+        reset = alerts.expire_observed_owner_cycle(
+            self.document, "weekly", "default", 401,
+            preserve_cycle=weekly_cycle,
+            new_reset_request={
+                **request_value,
+                "cycle_key": weekly_cycle,
+                "event_data": {
+                    "limit_id": weekly_id,
+                    "reset_epoch": 400,
+                },
+            },
+        )
+        self.assertEqual(1, reset)
+        occurrence = self.document["alerts"][0]
+        occurrence["channels"]["discord"]["attempt_count"] = 1
+        occurrence["channels"]["discord"]["last_attempt_at"] = 401
+        occurrence["channels"]["discord"]["next_attempt_at"] = 500
+        occurrence["channels"]["discord"]["error_class"] = "server_error"
+
+        retry_request = {
+            **request_value,
+            "created_at": 402,
+            "expires_at": 700,
+            "message": "reconstructed weekly reset",
+            "cycle_key": weekly_cycle,
+            "event_data": {
+                "limit_id": weekly_id,
+                "reset_epoch": 400,
+            },
+        }
+        changed = alerts.expire_observed_owner_cycle(
+            self.document, "weekly", "default", 402,
+            preserve_cycle=retry_request["cycle_key"],
+            new_reset_request=retry_request,
+        )
+
+        self.assertEqual(0, changed)
+        self.assertIs(occurrence, self.document["alerts"][0])
+        self.assertEqual(1, occurrence["channels"]["discord"]["attempt_count"])
+        self.assertEqual("pending", occurrence["status"])
+        alerts.validate_document(self.document, allow_legacy=False)
+
     def test_interrupt_pending_owner_terminalizes_both_windows_idempotently(self):
         five_threshold_request = request(
             "50", channels=["discord"], cycle="limit:default|reset:100",

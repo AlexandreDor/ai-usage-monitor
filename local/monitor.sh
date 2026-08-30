@@ -1828,7 +1828,7 @@ check_thresholds() {
   local attempted_script_5h_reset_actions=""
   local attempted_script_weekly_reset_actions=""
   local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold
-  local original_pending cycle_key covered_json registration_status disabled_notified
+  local original_pending cycle_key covered_json registration_status disabled_notified transaction_epoch
   local weekly_cycle_key weekly_request_json
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 initialize_script_baseline=0
   local observed_weekly_reset=0 five_h_observation_valid=0 weekly_observation_valid=0
@@ -1837,6 +1837,7 @@ check_thresholds() {
   local observed_5h_scheduled_due=0
   local observed_5h_superseded_reset_at=0 observed_5h_local_tombstone=0
   local observed_5h_reset_recovery=0 observed_5h_atomic_done=0
+  local observed_5h_initial_no_arm=0
   local observed_weekly_reset_recovery=0 weekly_intent_succeeded=1
   local observed_weekly_scheduled_due=0 weekly_atomic_done=0
   local interrupted_5h_owner="" interrupted_5h_reset_at=0
@@ -1992,6 +1993,12 @@ check_thresholds() {
         # Only a not-yet-due arm is superseded by local observed evidence.
         observed_5h_superseded_reset_at="$five_h_armed_reset_at"
       fi
+    else
+      # No trustworthy arm identifies the consumed cycle.  The observed
+      # baseline deadline is the only durable pre-reset anchor available; the
+      # transaction below will close that owner cycle before any journal
+      # reconstruction or delivery can occur.
+      observed_5h_initial_no_arm=1
     fi
   fi
   # The due path must perform the owner-scoped threshold expiry on every poll,
@@ -2067,6 +2074,51 @@ check_thresholds() {
     echo "[ERROR] Alert delivery journal is invalid; no notification was sent." >&2
     ALERT_PROCESSING_ERROR="invalid alert delivery journal"
     return 1
+  fi
+
+  # Close an observed 5-hour cycle immediately after the journal is known to
+  # exist, before interruption reconciliation or any detector work can
+  # persist.  A restored arm is authoritative when it is explicitly owned by
+  # this sample; otherwise the observed baseline deadline is the conservative
+  # pre-reset anchor.  In the no-arm case, install and persist a synthetic
+  # local arm right after the write-ahead transaction so a later restart can
+  # still execute the local hook exactly once without registering a network
+  # reset.
+  if (( observed_5h_reset_candidate == 1 )); then
+    transaction_epoch=0
+    if (( observed_5h_initial_no_arm == 0 && observed_5h_superseded_reset_at == 0 )); then
+      observed_5h_superseded_reset_at="$observed_5h_reset_at"
+    fi
+    if (( observed_5h_initial_no_arm == 0 )); then
+      transaction_epoch="$observed_5h_superseded_reset_at"
+    fi
+    if ! expire_observed_owner_cycle 5h "$limit_id" "$scraped_at_epoch" \
+      "$transaction_epoch"; then
+      if (( observed_5h_initial_no_arm == 1 )); then
+        # Preserve a durable local-only recovery arm even when the journal
+        # transaction itself failed.  The next poll will retry the owner
+        # transaction before it can deliver the stale threshold.
+        five_h_armed_reset_at="$scraped_at_epoch"
+        five_h_armed_limit_id="$limit_id"
+        persist_observed_5h_intent "$scraped_at_epoch" || :
+      elif (( observed_5h_superseded_reset_at > 0 )); then
+        persist_observed_5h_intent "$observed_5h_superseded_reset_at" || :
+      fi
+      ALERT_PROCESSING_ERROR="local reset threshold transaction failed"
+      return 1
+    fi
+    observed_5h_atomic_done=1
+    if (( observed_5h_initial_no_arm == 1 )); then
+      five_h_armed_reset_at="$scraped_at_epoch"
+      five_h_armed_limit_id="$limit_id"
+      last_notified_5h_reset_at="$scraped_at_epoch"
+      local_observed_5h_reset_at="$scraped_at_epoch"
+      observed_5h_local_tombstone=1
+      observed_5h_reset=1
+    elif ! persist_observed_5h_intent "$observed_5h_superseded_reset_at"; then
+      ALERT_PROCESSING_ERROR="local reset intent persistence failed"
+      return 1
+    fi
   fi
 
   # Write interruption tombstones before reconciliation or detector-state

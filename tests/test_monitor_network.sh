@@ -1905,4 +1905,109 @@ assert_eq pending "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.disco
 assert_eq threshold "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.kind)" \
   "legacy migration did not preserve the pending threshold"
 
+# Weekly observed-reset recovery must preserve the pending occurrence created
+# before a transient 503.  Rebuilding it at the next poll has a different
+# observation time, but the same immutable cycle and event data.
+rm -f "${STATE_FILE}" "${ALERT_DELIVERIES_FILE}" "${FAKE_CURL_LOG}"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-weekly-retry-reuse"
+export FAKE_CURL_DISCORD_STATUS_SEQUENCE=503,204
+unset FAKE_CURL_DISCORD_STATUS
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=5
+weekly_reuse_now=2000002250
+weekly_reuse_old=$((weekly_reuse_now + 3600))
+weekly_reuse_new=$((weekly_reuse_old + 3600))
+weekly_reuse_id="$(canonicalize_alert_limit_id group-a)"
+check_thresholds 100 40 unknown later '' "${weekly_reuse_old}" \
+  "${weekly_reuse_now}" group-a >/dev/null
+ALERT_THRESHOLDS=50
+register_network_alert threshold weekly 50 \
+  "limit:${weekly_reuse_id}|reset:${weekly_reuse_old}" \
+  "weekly retry stale threshold" \
+  "{\"limit_id\":\"${weekly_reuse_id}\",\"remaining_pct\":40,\"reset_epoch\":${weekly_reuse_old},\"covered_thresholds\":[50]}" \
+  "$((weekly_reuse_now + 1))" "$((weekly_reuse_old + 7 * 24 * 60 * 60))" false >/dev/null
+check_thresholds 100 100 unknown later '' "${weekly_reuse_new}" \
+  "$((weekly_reuse_now + 1))" group-a >/dev/null 2>&1 || true
+assert_eq pending "$(json_field "${ALERT_DELIVERIES_FILE}" alerts.1.channels.discord.status)" \
+  "weekly 503 reset occurrence was not left pending"
+assert_eq 1 "$(json_field "${ALERT_DELIVERIES_FILE}" alerts.1.channels.discord.attempt_count)" \
+  "weekly 503 reset attempt was not recorded"
+check_thresholds 100 100 unknown later '' "${weekly_reuse_new}" \
+  "$((weekly_reuse_now + 2))" group-a >/dev/null
+assert_eq 2 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "weekly reset recovery did not retry exactly once"
+assert_eq 1 "$(python3 - "${ALERT_DELIVERIES_FILE}" <<'PYEOF'
+import json
+import sys
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+print(sum(item["kind"] == "reset" for item in items))
+PYEOF
+)" "weekly recovery rebuilt a duplicate reset occurrence"
+assert_eq delivered "$(json_field "${ALERT_DELIVERIES_FILE}" alerts.1.status)" \
+  "weekly reset recovery did not deliver the original occurrence"
+
+# A reset observed from a restored baseline can have no durable arm yet.  The
+# first observed poll must persist a local-only arm before the final detector
+# write; if the process stops at that boundary, a changed restart sample still
+# runs the hook once and never creates a scheduled network reset.
+rm -f "${STATE_FILE}" "${ALERT_DELIVERIES_FILE}" "${FAKE_CURL_LOG}"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-no-arm-hook-recovery"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+no_arm_hook="${TEST_ROOT}/observed-no-arm-hook.sh"
+no_arm_hook_log="${TEST_ROOT}/observed-no-arm-hook.log"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' 'printf "hook|%s|%s\n" "${CODEX_ALERT_EVENT}" "${CODEX_ALERT_WINDOW}" >> "${NO_ARM_HOOK_LOG}"' > "${no_arm_hook}"
+chmod 700 "${no_arm_hook}"
+export NO_ARM_HOOK_LOG="${no_arm_hook_log}"
+no_arm_hook_now=2000002300
+no_arm_hook_old=$((no_arm_hook_now + 1800))
+no_arm_hook_new=$((no_arm_hook_old + 900))
+check_thresholds 100 100 later unknown "${no_arm_hook_old}" '' \
+  "${no_arm_hook_now}" group-a >/dev/null
+printf '{"schema_version":2,"limit_id_contract_version":1,"legacy_migration":{"source_state_version":5,"completed_at":%s},"alerts":[]}\n' \
+  "${no_arm_hook_now}" > "${ALERT_DELIVERIES_FILE}"
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_no_arm_original /')"
+(
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1="${no_arm_hook}"
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1_EVENTS='5h:reset'
+  validate_config
+  no_arm_persist_calls=0
+  persist_alert_state() {
+    no_arm_persist_calls=$((no_arm_persist_calls + 1))
+    if (( no_arm_persist_calls == 2 )); then
+      exit 99
+    fi
+    persist_alert_state_no_arm_original
+  }
+  check_thresholds 100 100 later unknown "${no_arm_hook_new}" '' \
+    "$((no_arm_hook_now + 1))" group-a >/dev/null
+) >/dev/null 2>&1 || true
+assert_eq "$((no_arm_hook_now + 1))" "$(awk -F= '$1 == "local_observed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "no-arm observed reset marker was not written before final persistence"
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "no-arm observed reset emitted HTTP before restart"
+eval "$(declare -f persist_alert_state_no_arm_original | sed '1s/^persist_alert_state_no_arm_original /persist_alert_state /')"
+(
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1="${no_arm_hook}"
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1_EVENTS='5h:reset'
+  validate_config
+  check_thresholds 80 100 later unknown "${no_arm_hook_new}" '' \
+    "$((no_arm_hook_old + 1))" group-a >/dev/null
+) >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "no-arm observed recovery emitted HTTP"
+assert_eq 1 "$(wc -l < "${no_arm_hook_log}")" \
+  "no-arm observed recovery did not execute one local hook"
+check_thresholds 80 100 later unknown "${no_arm_hook_new}" '' \
+  "$((no_arm_hook_old + 2))" group-a >/dev/null
+assert_eq 1 "$(wc -l < "${no_arm_hook_log}")" \
+  "no-arm observed recovery replayed its local hook"
+
 printf 'PASS: monitor network tests\n'

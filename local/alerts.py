@@ -469,6 +469,38 @@ def _same_registration(existing: dict[str, Any], incoming: dict[str, Any]) -> bo
     return all(existing[key] == incoming[key] for key in immutable) and set(existing["channels"]) == set(incoming["channels"])
 
 
+def _register_or_reuse_observed_reset(document: dict[str, Any],
+                                      request: dict[str, Any]) -> dict[str, Any]:
+    """Register a weekly observed-reset request without rebuilding retries.
+
+    The detector can reconstruct an observed weekly reset after the first
+    delivery attempt has failed.  Its current poll time and configured
+    channels are not immutable event data, so feeding a freshly-built request
+    to ``register`` would look like an alert-id collision.  Reuse an existing
+    reset occurrence only when its owner, window, cycle, selector and reset
+    epoch are identical; all other identity collisions remain errors.
+    """
+
+    incoming = _request_alert(request)
+    for existing in document["alerts"]:
+        if existing["alert_id"] != incoming["alert_id"]:
+            continue
+        if _same_registration(existing, incoming):
+            return existing
+        if (existing["kind"] == "reset"
+                and existing["window"] == incoming["window"]
+                and existing["selector"] == "reset"
+                and existing["cycle_key"] == incoming["cycle_key"]
+                and existing["event_data"] == incoming["event_data"]):
+            # Preserve channel retry state, message, creation time and
+            # expiry.  A terminal row is authoritative and must not be
+            # resurrected by a later recovery poll.
+            return existing
+        raise JournalError("alert_id collision with different content")
+    document["alerts"].append(incoming)
+    return incoming
+
+
 def _terminate(item: dict[str, Any], reason: str, now: int,
                error_class: str, replacement: str | None = None) -> None:
     for channel in item["channels"].values():
@@ -791,7 +823,7 @@ def expire_observed_owner_cycle(document: dict[str, Any], window: str,
         )
     if new_reset_request is not None:
         before = len(document["alerts"])
-        register(document, new_reset_request)
+        _register_or_reuse_observed_reset(document, new_reset_request)
         changed += len(document["alerts"]) > before
     return int(changed)
 
