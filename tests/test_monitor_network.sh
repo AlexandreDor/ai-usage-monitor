@@ -657,9 +657,10 @@ assert_eq "$((reconcile_fail_old + 1))" "$(json_field "$ALERT_DELIVERIES_FILE" a
   "reconcile retry did not acknowledge the local-only tombstone"
 
 # The final detector-state write can fail after the write-ahead row,
-# reconciliation, and delivery-stage state write have succeeded. The durable
-# tombstone must suppress the observed reset on recovery and leave its hook
-# retryable even though this final write is lost.
+# reconciliation, and delivery-stage state write have succeeded. Detect the
+# durable marker itself instead of relying on a persistence-call count, whose
+# number varies with runtime/CLI paths. The durable tombstone must suppress
+# the observed reset on recovery and leave its hook retryable.
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-final-persist-failure"
 export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
@@ -695,13 +696,15 @@ validate_config
 # shellcheck disable=SC2317,SC2329,SC2001
 eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_final_original /')"
 (
-  final_persist_calls=0
+  final_marker_persisted=0
   persist_alert_state() {
-    final_persist_calls=$((final_persist_calls + 1))
-    if (( final_persist_calls == 4 )); then
+    if (( final_marker_persisted == 1 )); then
       return 1
     fi
-    persist_alert_state_final_original
+    persist_alert_state_final_original || return 1
+    if grep -Fqx "last_notified_5h_reset_at=$final_fail_now" "$STATE_FILE"; then
+      final_marker_persisted=1
+    fi
   }
   check_thresholds 100 100 later unknown "$final_fail_new" '' "$final_fail_now" group-a >/dev/null
 ) >/dev/null 2>&1 || true
