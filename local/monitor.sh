@@ -1032,6 +1032,18 @@ invalidate_pending_thresholds() {
     "$window" "$cycle_key" "$limit_id" --now "$now"
 }
 
+interrupt_pending_owner() {
+  local limit_id="$1" now="$2"
+  python3 "$ALERTS_PY" interrupt-owner "$ALERT_DELIVERIES_FILE" \
+    "$limit_id" --now "$now"
+}
+
+interrupt_pending_other_owners() {
+  local current_limit_id="$1" now="$2"
+  python3 "$ALERTS_PY" interrupt-other-owners "$ALERT_DELIVERIES_FILE" \
+    "$current_limit_id" --now "$now"
+}
+
 weekly_pace_vs_ideal() {
   local weekly_pct="$1"
   local weekly_reset_at="$2"
@@ -1373,13 +1385,19 @@ reconcile_alert_deliveries() {
   # fields that Bash would otherwise collapse when parsing tab-separated rows.
   while IFS=$'\x1f' read -r alert_id kind window reason event_limit_id selector remaining reset_epoch covered; do
     [[ -n "$alert_id" ]] || continue
+    if [[ "$reason" == owner_interrupted ]]; then
+      # An interrupted owner's occurrence is intentionally terminal and must
+      # never apply its remaining percentage or reset marker to a later group.
+      ack_ids+=("$alert_id")
+      continue
+    fi
     if [[ ( "$kind" == threshold || "$kind" == reset ) \
           && -n "$current_limit_id" && "$event_limit_id" != "$current_limit_id" ]]; then
       if [[ "$discard_other" == 1 ]]; then
         # A complete group switch makes the previous detector state obsolete.
-        # A partial sample leaves the terminal occurrence unacknowledged so a
-        # later sample from its owner can reconcile it without polluting the
-        # current group's baseline.
+        # The owner-interruption path also uses this mode after terminalizing
+        # all old pending events, so their payload never pollutes the current
+        # group's baseline.
         ack_ids+=("$alert_id")
         continue
       fi
@@ -1587,8 +1605,8 @@ def threshold(window, selector, previous, remaining, reset, message, event_limit
         "replace_pending_thresholds": True, "expire_threshold_cycle": None,
     })
 
-def reset(window, reset_at, last_reset, validity, event_limit_id, message):
-    if (not channels or not event_limit_id or not reset_at or reset_at > now or reset_at == last_reset
+def reset(window, reset_at, last_reset, validity, event_limit_id, message, allow):
+    if (not channels or not event_limit_id or not allow or not reset_at or reset_at > now or reset_at == last_reset
             or now > reset_at + validity or (window == "5h" and skip_five)):
         return
     cycle = f"legacy-v{version}|limit:{event_limit_id}|reset:{reset_at}"
@@ -1603,9 +1621,9 @@ def reset(window, reset_at, last_reset, validity, event_limit_id, message):
 threshold("5h", pending_five, previous_five, five_pct, five_reset, os.environ["MIGRATION_FIVE_MESSAGE"], five_limit_id)
 threshold("weekly", pending_weekly, previous_weekly, weekly_pct, weekly_reset, os.environ["MIGRATION_WEEKLY_MESSAGE"], weekly_limit_id)
 reset("5h", five_reset, last_five_reset, 5 * 60 * 60, five_limit_id,
-      "*Codex 5h limit reset.* A new usage cycle is available.")
+      "*Codex 5h limit reset.* A new usage cycle is available.", allow_five)
 reset("weekly", weekly_reset, last_weekly_reset, 7 * 24 * 60 * 60,
-      weekly_limit_id, "*Codex weekly limit reset.* A new usage cycle is available.")
+      weekly_limit_id, "*Codex weekly limit reset.* A new usage cycle is available.", allow_weekly)
 print(json.dumps({"completed_at": now, "alerts": alerts}))
 PYEOF
 )" || return 1
@@ -1766,8 +1784,6 @@ check_thresholds() {
   elif (( weekly_observation_valid == 1 )) && [[ "$observed_weekly_limit_id" != "$limit_id" ]]; then
     discard_other_group_terminal=1
   fi
-
-
   if [[ ! -e "$ALERT_DELIVERIES_FILE" ]]; then
     if ! initialize_alert_delivery_journal "$journal_source_state_version" "$scraped_at_epoch" "$limit_id" \
       "$five_h_pct" "$weekly_pct" "$five_h_reset" "$weekly_reset" "$observed_5h_reset_candidate" \
@@ -1793,6 +1809,16 @@ check_thresholds() {
       ALERT_PROCESSING_ERROR="alert expiration failed"
       return 1
     fi
+  fi
+
+  # The state file may have lost its owner fields while the delivery journal
+  # still contains pending events.  Interrupt every threshold/reset owner
+  # other than this current sample's owner before any detector mutation or due
+  # delivery; this is one atomic journal operation and is safe to repeat.
+  if ! interrupt_pending_other_owners "$limit_id" "$scraped_at_epoch" \
+    || ! reconcile_alert_deliveries "$scraped_at_epoch" "$limit_id" 1; then
+    ALERT_PROCESSING_ERROR="alert owner interruption failed"
+    return 1
   fi
 
   # Full cycles have already processed this row while archiving; live cycles
@@ -1845,7 +1871,22 @@ check_thresholds() {
       attempted_script_weekly_reset_actions=""
     fi
   elif [[ -n "$observed_weekly_limit_id" && "$limit_id" != "$observed_weekly_limit_id" ]]; then
+    # A partial row from another owner breaks continuity just as a complete
+    # group switch does.  Keeping the old baseline would let a later return
+    # to that owner look like a reset and cross its scheduled detector state.
     process_weekly_sample=0
+    observed_weekly_pct=""
+    observed_weekly_reset_at=0
+    observed_weekly_limit_id=""
+    weekly_armed_reset_at=0
+    weekly_armed_limit_id=""
+    prev_weekly_pct=100
+    notified_weekly_thresholds=""
+    pending_weekly_threshold=""
+    script_prev_weekly_pct=100
+    attempted_script_weekly_actions=""
+    script_weekly_reset_attempted_at=0
+    attempted_script_weekly_reset_actions=""
   fi
   if (( weekly_armed_reset_at > 0 )) && [[ -z "$weekly_armed_limit_id" ]]; then
     weekly_armed_reset_at=0
@@ -1899,9 +1940,23 @@ check_thresholds() {
     fi
   elif [[ -n "$observed_5h_limit_id" && "$limit_id" != "$observed_5h_limit_id" ]]; then
     # A partial row from another group has no reset deadline to establish a
-    # coherent observation.  Keep the old group's baseline and suppress both
-    # network thresholds and local 5h hooks for this sample.
+    # coherent observation.  Break the old baseline so a later return to that
+    # owner starts fresh rather than looking like a reset.  Clear all detector
+    # state that could otherwise cross the interruption, while preserving the
+    # same-owner partial-sample behavior above.
     process_5h_sample=0
+    observed_5h_pct=""
+    observed_5h_reset_at=0
+    observed_5h_limit_id=""
+    five_h_armed_reset_at=0
+    five_h_armed_limit_id=""
+    prev_5h_pct=100
+    notified_5h_thresholds=""
+    pending_5h_threshold=""
+    script_prev_5h_pct=100
+    attempted_script_5h_actions=""
+    script_5h_reset_attempted_at=0
+    attempted_script_5h_reset_actions=""
   elif (( state_loaded == 1 )) && [[ -z "$observed_5h_limit_id" ]]; then
     # Legacy state has no complete owner-aware observation yet.  A partial row
     # cannot establish which group's baseline it belongs to, so defer all 5h
@@ -1982,8 +2037,11 @@ check_thresholds() {
   if (( observed_5h_reset == 1 )); then
     if ! invalidate_pending_thresholds 5h "$five_h_reset_expire_cycle" "$limit_id" "$scraped_at_epoch" \
       || ! reconcile_alert_deliveries "$scraped_at_epoch" "$limit_id" "$discard_other_group_terminal"; then
-      status=1
       ALERT_PROCESSING_ERROR="alert threshold invalidation failed"
+      # Do not clear the observed arm or persist any detector advancement when
+      # expiry/reconciliation fails.  The same observed proof must retry on the
+      # next poll before any due delivery or local hook can run.
+      return 1
     fi
     pending_5h_threshold=""
     notified_5h_thresholds=""

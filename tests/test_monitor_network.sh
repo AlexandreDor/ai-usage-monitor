@@ -15,6 +15,10 @@ export PATH="${FAKE_BIN}:$PATH"
 export FAKE_CURL_LOG="${TEST_ROOT}/curl.log"
 response="${TEST_ROOT}/response"
 
+fake_curl_count() {
+  [[ -f "$1" ]] && cat "$1" || printf '0\n'
+}
+
 export FAKE_CURL_STATUS=204 FAKE_CURL_EXIT=0
 http_request Test 204 'url = "https://example.invalid"' POST "$response"
 
@@ -120,6 +124,67 @@ assert not any(item["kind"] == "reset" for item in items), items
 PYEOF
 ALERTS_ENABLED=1
 
+# Expiry of stale thresholds is fail-closed.  If the atomic invalidation path
+# fails, the observed proof and arm remain durable so the next identical sample
+# retries before any delivery; the successful retry remains local-only.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-expire-retry"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+retry_observation_at=2000002100
+retry_old_deadline=$((retry_observation_at + 3600))
+retry_new_deadline=$((retry_old_deadline + 900))
+check_thresholds 100 100 later unknown "$retry_old_deadline" '' "$retry_observation_at" group-a >/dev/null
+retry_limit_id="$(canonicalize_alert_limit_id group-a)"
+python3 - "$STATE_FILE" "$retry_old_deadline" "$retry_limit_id" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+values = {}
+for line in path.read_text(encoding="utf-8").splitlines():
+    key, separator, value = line.partition("=")
+    if separator:
+        values[key] = value
+values["five_h_armed_reset_at"] = sys.argv[2]
+values["five_h_armed_limit_id"] = sys.argv[3]
+values["pending_5h_threshold"] = "50"
+path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+PYEOF
+register_network_alert threshold 5h 50 "limit:${retry_limit_id}|reset:${retry_old_deadline}" \
+  "stale retry threshold" \
+  "{\"limit_id\":\"${retry_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${retry_old_deadline},\"covered_thresholds\":[50]}" \
+  "$((retry_observation_at + 1))" "$retry_old_deadline" false >/dev/null
+# shellcheck disable=SC2317,SC2329
+invalidate_pending_thresholds() { return 1; }
+if check_thresholds 100 100 later unknown "$retry_new_deadline" '' "$((retry_observation_at + 900))" group-a >/dev/null 2>&1; then
+  fail "observed reset invalidation failure was accepted"
+fi
+[[ ! -e "$FAKE_CURL_LOG" ]] || fail "failed invalidation attempted network delivery"
+assert_eq "$retry_old_deadline" "$(awk -F= '$1 == "observed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "failed invalidation advanced the observed baseline"
+assert_eq "$retry_old_deadline" "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "failed invalidation advanced the reset arm"
+invalidate_pending_thresholds() {
+  local window="$1" cycle_key="$2" limit_id="$3" now="$4"
+  python3 "$ALERTS_PY" expire-thresholds "$ALERT_DELIVERIES_FILE" \
+    "$window" "$cycle_key" "$limit_id" --now "$now"
+}
+check_thresholds 100 100 later unknown "$retry_new_deadline" '' "$((retry_observation_at + 901))" group-a >/dev/null
+[[ ! -e "$FAKE_CURL_LOG" ]] || fail "successful observed reset emitted an HTTP request"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 1, items
+assert items[0]["kind"] == "threshold", items
+assert items[0]["terminal_reason"] == "expired_after_reset", items
+assert items[0]["channels"]["discord"]["error_class"] == "expired_after_reset", items
+assert not any(item["kind"] == "reset" for item in items), items
+PYEOF
+
 # Reconstructing a missing journal must keep legacy occurrences bound to the
 # owner persisted in state.  A complete sample from group-b initializes a new
 # baseline and must not rewrite A's threshold/reset to B.
@@ -129,8 +194,8 @@ export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
 ALERTS_ENABLED=1
 ALERT_THRESHOLDS=50
 migration_switch_now=2000003000
-migration_a_reset=$((migration_switch_now + 300))
-migration_b_reset=$((migration_switch_now + 1200))
+migration_a_reset=$((migration_switch_now - 300))
+migration_b_reset=$((migration_switch_now - 100))
 migration_a_id="$(canonicalize_alert_limit_id group-a)"
 migration_b_id="$(canonicalize_alert_limit_id group-b)"
 printf '%s\n' \
@@ -138,14 +203,16 @@ printf '%s\n' \
   'prev_5h_pct=80' 'prev_weekly_pct=100' \
   'observed_5h_pct=80' "observed_5h_reset_at=${migration_a_reset}" \
   "observed_5h_limit_id=${migration_a_id}" \
-  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  'observed_weekly_pct=80' "observed_weekly_reset_at=${migration_a_reset}" \
+  "observed_weekly_limit_id=${migration_a_id}" \
   "five_h_armed_reset_at=${migration_a_reset}" \
   "five_h_armed_limit_id=${migration_a_id}" \
-  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  "weekly_armed_reset_at=${migration_a_reset}" "weekly_armed_limit_id=${migration_a_id}" \
   'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
   'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
-  'pending_5h_threshold=50' 'pending_weekly_threshold=' > "$STATE_FILE"
-check_thresholds 100 100 later unknown "$migration_b_reset" '' "$migration_switch_now" group-b >/dev/null
+  'pending_5h_threshold=50' 'pending_weekly_threshold=50' > "$STATE_FILE"
+check_thresholds 100 100 later later "$migration_b_reset" "$migration_b_reset" "$migration_switch_now" group-b >/dev/null
+[[ ! -e "$FAKE_CURL_LOG" ]] || fail "missing-journal group switch delivered an owner-a reset"
 python3 - "$ALERT_DELIVERIES_FILE" "$migration_a_id" "$migration_b_id" <<'PYEOF'
 import json
 import sys
@@ -154,6 +221,111 @@ items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
 assert not items, items
 PYEOF
 ALERT_THRESHOLDS=75
+
+# A legacy v4 detector state can have no owner fields even though the existing
+# journal still carries pending events for A.  Both a complete and a partial B
+# sample must interrupt those events before due delivery; returning to A must
+# not replay them.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-ownerless-complete"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+ownerless_now=2000003500
+ownerless_a_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=4' 'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'five_h_armed_reset_at=0' 'weekly_armed_reset_at=0' \
+  'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$ownerless_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 4
+register_network_alert threshold 5h 50 "limit:${ownerless_a_id}|unarmed" \
+  "ownerless stale 5h threshold" \
+  "{\"limit_id\":\"${ownerless_a_id}\",\"remaining_pct\":40,\"reset_epoch\":0,\"covered_thresholds\":[50]}" \
+  "$ownerless_now" 0 false >/dev/null
+register_network_alert reset weekly reset "limit:${ownerless_a_id}|reset:$((ownerless_now - 100))" \
+  "ownerless stale weekly reset" \
+  "{\"limit_id\":\"${ownerless_a_id}\",\"reset_epoch\":$((ownerless_now - 100))}" \
+  "$ownerless_now" "$((ownerless_now + 7 * 24 * 60 * 60))" false >/dev/null
+check_thresholds 100 100 later later "$((ownerless_now - 100))" "$((ownerless_now - 100))" \
+  "$ownerless_now" group-b >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "ownerless complete B sample delivered A's pending event"
+python3 - "$ALERT_DELIVERIES_FILE" "$ownerless_a_id" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+owner_items = [item for item in items if item["event_data"]["limit_id"] == sys.argv[2]]
+assert len(owner_items) == 2, items
+assert all(item["terminal_reason"] == "owner_interrupted" for item in owner_items), owner_items
+assert all(item["detector_acknowledged_at"] is not None for item in owner_items), owner_items
+PYEOF
+check_thresholds 100 100 later later "$((ownerless_now + 3600))" "$((ownerless_now + 3600))" \
+  "$((ownerless_now + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "ownerless complete B events replayed after returning to A"
+
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-ownerless-partial"
+printf '%s\n' \
+  'state_version=4' 'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'five_h_armed_reset_at=0' 'weekly_armed_reset_at=0' \
+  'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$ownerless_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 4
+register_network_alert reset 5h reset "limit:${ownerless_a_id}|reset:$((ownerless_now + 3600))" \
+  "ownerless stale 5h reset" \
+  "{\"limit_id\":\"${ownerless_a_id}\",\"reset_epoch\":$((ownerless_now + 3600))}" \
+  "$ownerless_now" "$((ownerless_now + 8 * 60 * 60))" false >/dev/null
+register_network_alert threshold weekly 50 "limit:${ownerless_a_id}|unarmed" \
+  "ownerless stale weekly threshold" \
+  "{\"limit_id\":\"${ownerless_a_id}\",\"remaining_pct\":40,\"reset_epoch\":0,\"covered_thresholds\":[50]}" \
+  "$ownerless_now" 0 false >/dev/null
+check_thresholds 80 100 unknown unknown '' '' "$((ownerless_now + 1))" group-b >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "ownerless partial B sample delivered A's pending event"
+python3 - "$ALERT_DELIVERIES_FILE" "$ownerless_a_id" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+owner_items = [item for item in items if item["event_data"]["limit_id"] == sys.argv[2]]
+assert len(owner_items) == 2, items
+assert all(item["terminal_reason"] == "owner_interrupted" for item in owner_items), owner_items
+assert all(item["detector_acknowledged_at"] is not None for item in owner_items), owner_items
+PYEOF
+check_thresholds 100 100 later later "$((ownerless_now + 7200))" "$((ownerless_now + 7200))" \
+  "$((ownerless_now + 2))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "ownerless partial B events replayed after returning to A"
+
+# Live continuity is also broken by a partial row from another owner.  When A
+# returns with a complete row, both windows must establish fresh baselines
+# rather than replaying an observed reset (5h local or weekly network).
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-live-partial-return"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+live_now=2000004000
+live_old_reset=$((live_now + 3600))
+live_new_reset=$((live_old_reset + 900))
+check_thresholds 100 100 later later "$live_old_reset" "$live_old_reset" "$live_now" group-a >/dev/null
+check_thresholds 80 80 unknown unknown '' '' "$((live_now + 1))" group-b >/dev/null
+check_thresholds 100 100 later later "$live_new_reset" "$live_new_reset" "$((live_now + 2))" group-a >/dev/null
+[[ ! -e "$FAKE_CURL_LOG" ]] || fail "live partial owner switch emitted a reset request"
+python3 - "$ALERT_DELIVERIES_FILE" "$STATE_FILE" <<'PYEOF'
+import json
+import pathlib
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert not any(item["kind"] == "reset" for item in items), items
+state = dict(line.split("=", 1) for line in pathlib.Path(sys.argv[2]).read_text().splitlines() if "=" in line)
+assert state["last_notified_5h_reset_at"] == "0", state
+assert state["last_notified_weekly_reset_at"] == "0", state
+PYEOF
 
 # A terminal delivery from group-a must not rewrite group-b's fresh baseline.
 # The next B threshold must still be detected from B's own complete sample.
@@ -175,6 +347,8 @@ assert_eq pending "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.disco
   "group-a threshold was not left pending after delivery failure"
 export FAKE_CURL_DISCORD_STATUS=204
 check_thresholds 80 100 later unknown "$p3_b_reset" '' "$((p3_now + 2))" group-b >/dev/null
+assert_eq 1 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" \
+  "complete owner switch replayed the interrupted A alert"
 assert_eq 80 "$(awk -F= '$1 == "prev_5h_pct" {print $2}' "$STATE_FILE")" \
   "terminal group-a delivery polluted group-b baseline"
 assert_eq '' "$(awk -F= '$1 == "pending_5h_threshold" {print $2}' "$STATE_FILE")" \
@@ -186,31 +360,60 @@ import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
 assert len(items) == 2, items
-assert items[0]["event_data"]["limit_id"] == sys.argv[2], items
-assert items[1]["event_data"]["limit_id"] == sys.argv[3], items
-assert items[0]["status"] == "delivered", items
-assert items[1]["status"] == "delivered", items
-assert items[1]["selector"] == "50", items
+by_owner = {item["event_data"]["limit_id"]: item for item in items}
+assert set(by_owner) == {sys.argv[2], sys.argv[3]}, items
+assert by_owner[sys.argv[2]]["status"] == "failed", items
+assert by_owner[sys.argv[2]]["terminal_reason"] == "owner_interrupted", items
+assert by_owner[sys.argv[2]]["detector_acknowledged_at"] is not None, items
+assert by_owner[sys.argv[3]]["status"] == "delivered", items
+assert by_owner[sys.argv[3]]["selector"] == "50", items
 PYEOF
 
-# If A becomes terminal while B is only a partial observation, defer its
-# acknowledgment.  Returning to A can then reconcile and clear A's marker
-# without creating a duplicate or a marker owned by B.
+# A partial observation from another owner breaks live continuity durably.  All
+# pending A threshold/reset occurrences in both windows are terminalized before
+# due delivery; they must not survive the interruption or be replayed on return.
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-reconcile-partial-return"
 export FAKE_CURL_DISCORD_STATUS=503 FAKE_CURL_DISCORD_EXIT=0
 ALERT_THRESHOLDS=50
 p3_return_now=2000010000
 p3_return_reset=$((p3_return_now + 3600))
-check_thresholds 100 100 later unknown "$p3_return_reset" '' "$p3_return_now" group-a >/dev/null
-check_thresholds 40 100 later unknown "$p3_return_reset" '' "$((p3_return_now + 1))" group-a >/dev/null 2>&1 || true
+p3_return_weekly_reset=$((p3_return_now + 4 * 24 * 60 * 60))
+p3_return_id="$(canonicalize_alert_limit_id group-a)"
+check_thresholds 100 100 later later "$p3_return_reset" "$p3_return_weekly_reset" "$p3_return_now" group-a >/dev/null
+check_thresholds 40 100 later later "$p3_return_reset" "$p3_return_weekly_reset" "$((p3_return_now + 1))" group-a >/dev/null 2>&1 || true
+register_network_alert reset 5h reset "limit:${p3_return_id}|reset:${p3_return_reset}" \
+  "stale 5h reset" "{\"limit_id\":\"${p3_return_id}\",\"reset_epoch\":${p3_return_reset}}" \
+  "$((p3_return_now + 1))" "$((p3_return_reset + 5 * 60 * 60))" false >/dev/null
+register_network_alert threshold weekly 50 "limit:${p3_return_id}|unarmed" \
+  "stale weekly threshold" \
+  "{\"limit_id\":\"${p3_return_id}\",\"remaining_pct\":40,\"reset_epoch\":0,\"covered_thresholds\":[50]}" \
+  "$((p3_return_now + 1))" 0 false >/dev/null
+register_network_alert reset weekly reset "limit:${p3_return_id}|reset:${p3_return_weekly_reset}" \
+  "stale weekly reset" "{\"limit_id\":\"${p3_return_id}\",\"reset_epoch\":${p3_return_weekly_reset}}" \
+  "$((p3_return_now + 1))" "$((p3_return_weekly_reset + 7 * 24 * 60 * 60))" false >/dev/null
 export FAKE_CURL_DISCORD_STATUS=204
 check_thresholds 80 100 unknown unknown '' '' "$((p3_return_now + 2))" group-b >/dev/null
-assert_eq 50 "$(awk -F= '$1 == "pending_5h_threshold" {print $2}' "$STATE_FILE")" \
-  "partial group-b sample changed the A pending marker"
-check_thresholds 40 100 later unknown "$p3_return_reset" '' "$((p3_return_now + 3))" group-a >/dev/null
+assert_eq 1 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" \
+  "interrupted owner pending alerts were delivered during a partial sample"
+python3 - "$ALERT_DELIVERIES_FILE" "$p3_return_id" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+owner_items = [item for item in items if item["event_data"]["limit_id"] == sys.argv[2]]
+assert len(owner_items) == 4, items
+assert all(item["status"] == "failed" for item in owner_items), owner_items
+assert all(item["terminal_reason"] == "owner_interrupted" for item in owner_items), owner_items
+assert all(item["detector_acknowledged_at"] is not None for item in owner_items), owner_items
+PYEOF
 assert_eq '' "$(awk -F= '$1 == "pending_5h_threshold" {print $2}' "$STATE_FILE")" \
-  "return to group-a left a terminal marker blocked"
+  "partial group-b sample retained the interrupted A marker"
+check_thresholds 40 100 later unknown "$p3_return_reset" '' "$((p3_return_now + 3))" group-a >/dev/null
+assert_eq 1 "$(<"${FAKE_CURL_COUNT_DIR}/discord")" \
+  "interrupted owner pending alerts were replayed after returning to A"
+assert_eq '' "$(awk -F= '$1 == "pending_5h_threshold" {print $2}' "$STATE_FILE")" \
+  "return to group-a recreated an interrupted pending marker"
 ALERT_THRESHOLDS=75
 TELEGRAM_BOT_TOKEN='123:token'
 TELEGRAM_CHAT_ID=-456
