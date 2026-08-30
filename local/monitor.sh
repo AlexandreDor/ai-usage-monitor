@@ -1838,7 +1838,6 @@ check_thresholds() {
   local observed_5h_superseded_reset_at=0 observed_5h_local_tombstone=0
   local observed_5h_reset_recovery=0 observed_5h_atomic_done=0
   local observed_weekly_reset_recovery=0 weekly_intent_succeeded=1
-  local observed_weekly_superseded_reset_at=0
   local observed_weekly_scheduled_due=0 weekly_atomic_done=0
   local interrupted_5h_owner="" interrupted_5h_reset_at=0
   local interrupted_weekly_owner="" interrupted_weekly_reset_at=0
@@ -2405,10 +2404,6 @@ check_thresholds() {
     && [[ "$limit_id" == "$observed_weekly_limit_id" ]] \
     && is_random_weekly_reset "$observed_weekly_pct" "$weekly_pct" \
       "$observed_weekly_reset_at" "$weekly_reset_at"; then
-    if (( weekly_armed_reset_at > 0 )) \
-      && [[ "$weekly_armed_limit_id" == "$limit_id" ]]; then
-      observed_weekly_superseded_reset_at="$weekly_armed_reset_at"
-    fi
     weekly_armed_reset_at="$scraped_at_epoch"
     weekly_armed_limit_id="$limit_id"
     observed_weekly_reset=1
