@@ -2115,6 +2115,16 @@ check_thresholds() {
       local_observed_5h_reset_at="$scraped_at_epoch"
       observed_5h_local_tombstone=1
       observed_5h_reset=1
+      # The journal transaction is the first write-ahead barrier.  Persist the
+      # synthetic arm immediately as well: a crash before the later detector
+      # write must still leave durable proof that this reset was observed and
+      # local-only, so recovery can run the hook without scheduling a network
+      # reset.  There is no guarantee for an interruption before either store
+      # receives its first write; every subsequent poll remains fail-closed.
+      if ! persist_observed_5h_intent "$scraped_at_epoch"; then
+        ALERT_PROCESSING_ERROR="local reset intent persistence failed"
+        return 1
+      fi
     elif ! persist_observed_5h_intent "$observed_5h_superseded_reset_at"; then
       ALERT_PROCESSING_ERROR="local reset intent persistence failed"
       return 1

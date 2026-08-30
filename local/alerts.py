@@ -481,20 +481,52 @@ def _register_or_reuse_observed_reset(document: dict[str, Any],
     epoch are identical; all other identity collisions remain errors.
     """
 
+    if not isinstance(request, dict):
+        raise JournalError("observed reset request must be an object")
+    raw_event = request.get("event_data")
+    raw_limit_id = raw_event.get("limit_id") if isinstance(raw_event, dict) else None
+    canonical_limit_id = canonicalize_limit_id(raw_limit_id)
+    cycle_key = request.get("cycle_key")
+    if (request.get("kind") != "reset" or request.get("selector") != "reset"
+            or request.get("window") not in WINDOWS
+            or not isinstance(cycle_key, str) or canonical_limit_id is None
+            or not isinstance(raw_event, dict)
+            or set(raw_event) != {"limit_id", "reset_epoch"}
+            or not _is_int(raw_event.get("reset_epoch"))):
+        raise JournalError("invalid observed reset request identity")
+    normalized_cycle = _replace_limit_segment(
+        cycle_key, raw_limit_id, canonical_limit_id,
+    )
+    if (not isinstance(request.get("channels"), list)
+            or not request["channels"]
+            or any(channel not in CHANNELS for channel in request["channels"])
+            or len(set(request["channels"])) != len(request["channels"])):
+        raise JournalError("registration requires configured channels")
+    expected_event = {
+        "limit_id": canonical_limit_id,
+        "reset_epoch": raw_event["reset_epoch"],
+    }
+
+    def equivalent_cycle(left: str, right: str) -> bool:
+        return _same_cycle(left, right) or _same_cycle(right, left)
+
+    # Search by durable event identity before validating created/expires.  A
+    # recovery poll can legitimately be later than the original reset's
+    # expiry; rebuilding that request would fail validation and is unnecessary
+    # because the existing occurrence owns all retry/terminal state.
+    for existing in document["alerts"]:
+        if (existing["kind"] == "reset"
+                and existing["window"] == request["window"]
+                and existing["selector"] == "reset"
+                and existing["event_data"] == expected_event
+                and equivalent_cycle(existing["cycle_key"], normalized_cycle)):
+            return existing
+
     incoming = _request_alert(request)
     for existing in document["alerts"]:
         if existing["alert_id"] != incoming["alert_id"]:
             continue
         if _same_registration(existing, incoming):
-            return existing
-        if (existing["kind"] == "reset"
-                and existing["window"] == incoming["window"]
-                and existing["selector"] == "reset"
-                and existing["cycle_key"] == incoming["cycle_key"]
-                and existing["event_data"] == incoming["event_data"]):
-            # Preserve channel retry state, message, creation time and
-            # expiry.  A terminal row is authoritative and must not be
-            # resurrected by a later recovery poll.
             return existing
         raise JournalError("alert_id collision with different content")
     document["alerts"].append(incoming)

@@ -1918,7 +1918,7 @@ weekly_reuse_now=2000002250
 weekly_reuse_old=$((weekly_reuse_now + 3600))
 weekly_reuse_new=$((weekly_reuse_old + 3600))
 weekly_reuse_id="$(canonicalize_alert_limit_id group-a)"
-check_thresholds 100 40 unknown later '' "${weekly_reuse_old}" \
+ALERTS_ENABLED=0 check_thresholds 100 40 unknown later '' "${weekly_reuse_old}" \
   "${weekly_reuse_now}" group-a >/dev/null
 ALERT_THRESHOLDS=50
 register_network_alert threshold weekly 50 \

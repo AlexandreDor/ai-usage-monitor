@@ -308,6 +308,41 @@ class AlertJournalTests(unittest.TestCase):
         self.assertEqual("pending", occurrence["status"])
         alerts.validate_document(self.document, allow_legacy=False)
 
+    def test_observed_weekly_recovery_reuses_legacy_cycle_after_expiry(self):
+        weekly_id = alerts.canonicalize_limit_id("default")
+        legacy_cycle = f"legacy-v4|limit:{weekly_id}|reset:400"
+        existing_request = reset_request(
+            window="weekly", created=400, cycle=legacy_cycle,
+        )
+        existing_request["event_data"]["limit_id"] = weekly_id
+        existing_request["expire_threshold_cycle"] = None
+        existing = alerts.register(self.document, existing_request)
+        existing["channels"]["discord"]["attempt_count"] = 1
+        existing["channels"]["discord"]["last_attempt_at"] = 401
+        existing["channels"]["discord"]["next_attempt_at"] = 0
+        existing["channels"]["discord"]["error_class"] = "server_error"
+
+        modern_cycle = f"limit:{weekly_id}|reset:400"
+        recovery_request = reset_request(
+            window="weekly", created=1000, cycle=modern_cycle,
+        )
+        recovery_request["event_data"]["limit_id"] = weekly_id
+        recovery_request["event_data"]["reset_epoch"] = 400
+        recovery_request["expires_at"] = 400
+        recovery_request["expire_threshold_cycle"] = None
+
+        changed = alerts.expire_observed_owner_cycle(
+            self.document, "weekly", weekly_id, 1001,
+            preserve_cycle=modern_cycle,
+            new_reset_request=recovery_request,
+        )
+
+        self.assertEqual(0, changed)
+        self.assertEqual(1, len(self.document["alerts"]))
+        self.assertIs(existing, self.document["alerts"][0])
+        self.assertEqual(1, existing["channels"]["discord"]["attempt_count"])
+        alerts.validate_document(self.document, allow_legacy=False)
+
     def test_interrupt_pending_owner_terminalizes_both_windows_idempotently(self):
         five_threshold_request = request(
             "50", channels=["discord"], cycle="limit:default|reset:100",
