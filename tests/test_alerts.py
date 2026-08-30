@@ -343,6 +343,80 @@ class AlertJournalTests(unittest.TestCase):
         self.assertEqual(1, existing["channels"]["discord"]["attempt_count"])
         alerts.validate_document(self.document, allow_legacy=False)
 
+    def test_observed_weekly_recovery_collapses_legacy_and_modern_pending(self):
+        weekly_id = alerts.canonicalize_limit_id("default")
+        legacy = reset_request(
+            window="weekly", cycle=f"legacy-v4|limit:default|reset:400",
+        )
+        legacy["expire_threshold_cycle"] = None
+        legacy_item = alerts.register(self.document, legacy)
+        modern = reset_request(
+            window="weekly", cycle=f"limit:{weekly_id}|reset:400",
+        )
+        modern["event_data"]["limit_id"] = weekly_id
+        modern["expire_threshold_cycle"] = None
+        modern_item = alerts.register(self.document, modern)
+
+        changed = alerts.expire_observed_owner_cycle(
+            self.document, "weekly", weekly_id, 500,
+            preserve_cycle=modern["cycle_key"],
+            new_reset_request=modern,
+        )
+
+        self.assertEqual(1, changed)
+        self.assertEqual("pending", modern_item["status"])
+        self.assertEqual("failed", legacy_item["status"])
+        self.assertEqual("superseded", legacy_item["terminal_reason"])
+        self.assertEqual(modern_item["alert_id"], legacy_item["replacement_alert_id"])
+        self.assertEqual(1, sum(item["status"] == "pending"
+                                 for item in self.document["alerts"]))
+        alerts.validate_document(self.document, allow_legacy=False)
+
+    def test_observed_weekly_terminal_cycle_prevents_pending_legacy_resurrection(self):
+        weekly_id = alerts.canonicalize_limit_id("default")
+        modern = reset_request(
+            window="weekly", cycle=f"limit:{weekly_id}|reset:500",
+        )
+        modern["event_data"]["limit_id"] = weekly_id
+        modern["event_data"]["reset_epoch"] = 500
+        modern["created_at"] = 500
+        modern["expires_at"] = 1000
+        modern["expire_threshold_cycle"] = None
+        delivered = alerts.register(self.document, modern)
+        channel = delivered["channels"]["discord"]
+        channel["status"] = "delivered"
+        channel["attempt_count"] = 1
+        channel["last_attempt_at"] = 501
+        delivered["status"] = "delivered"
+        delivered["terminal_reason"] = "delivered"
+        delivered["completed_at"] = 501
+
+        legacy = reset_request(
+            window="weekly", cycle="legacy-v4|limit:default|reset:500",
+        )
+        legacy["event_data"]["reset_epoch"] = 500
+        legacy["expire_threshold_cycle"] = None
+        pending = alerts.register(self.document, legacy)
+        request_value = {
+            **modern,
+            "created_at": 600,
+            "expires_at": 700,
+            "message": "recovery after terminal reset",
+        }
+
+        changed = alerts.expire_observed_owner_cycle(
+            self.document, "weekly", weekly_id, 600,
+            preserve_cycle=modern["cycle_key"],
+            new_reset_request=request_value,
+        )
+
+        self.assertEqual(1, changed)
+        self.assertEqual("delivered", delivered["terminal_reason"])
+        self.assertEqual("failed", pending["status"])
+        self.assertEqual("superseded", pending["terminal_reason"])
+        self.assertEqual(2, len(self.document["alerts"]))
+        alerts.validate_document(self.document, allow_legacy=False)
+
     def test_interrupt_pending_owner_terminalizes_both_windows_idempotently(self):
         five_threshold_request = request(
             "50", channels=["discord"], cycle="limit:default|reset:100",

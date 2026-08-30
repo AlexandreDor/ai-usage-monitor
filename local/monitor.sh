@@ -1523,9 +1523,12 @@ reconcile_alert_deliveries() {
   # fields that Bash would otherwise collapse when parsing tab-separated rows.
   while IFS=$'\x1f' read -r alert_id kind window reason event_limit_id selector remaining reset_epoch covered; do
     [[ -n "$alert_id" ]] || continue
-    if [[ "$reason" == owner_interrupted || "$reason" == local_observed ]]; then
+    if [[ "$reason" == owner_interrupted || "$reason" == local_observed \
+          || "$reason" == superseded || "$reason" == expired_after_reset ]]; then
       # An interrupted owner's occurrence is intentionally terminal and must
       # never apply its remaining percentage or reset marker to a later group.
+      # Duplicate/superseded reset rows are likewise bookkeeping-only; the
+      # surviving equivalent occurrence owns detector state.
       ack_ids+=("$alert_id")
       continue
     fi
@@ -2001,6 +2004,34 @@ check_thresholds() {
       observed_5h_initial_no_arm=1
     fi
   fi
+  # Establish the local-only write-ahead intent before touching the delivery
+  # journal.  This is deliberately the first durable action after an observed
+  # candidate is classified (scheduled-due candidates were excluded above):
+  # a crash cannot leave an observed reset looking like a scheduled reset while
+  # journal initialization/migration is still in progress.  The synthetic arm
+  # supplies a durable hook anchor when the restored state had no arm.
+  if (( observed_5h_reset_candidate == 1 )); then
+    if (( observed_5h_initial_no_arm == 1 )); then
+      five_h_armed_reset_at="$scraped_at_epoch"
+      five_h_armed_limit_id="$limit_id"
+      last_notified_5h_reset_at="$scraped_at_epoch"
+      local_observed_5h_reset_at="$scraped_at_epoch"
+      observed_5h_local_tombstone=1
+      observed_5h_reset=1
+      transaction_epoch=0
+      if ! persist_observed_5h_intent "$scraped_at_epoch"; then
+        ALERT_PROCESSING_ERROR="local reset intent persistence failed"
+        return 1
+      fi
+    else
+      observed_5h_superseded_reset_at="$five_h_armed_reset_at"
+      transaction_epoch="$observed_5h_superseded_reset_at"
+      if ! persist_observed_5h_intent "$observed_5h_superseded_reset_at"; then
+        ALERT_PROCESSING_ERROR="local reset intent persistence failed"
+        return 1
+      fi
+    fi
+  fi
   # The due path must perform the owner-scoped threshold expiry on every poll,
   # not only when this sample still proves an observed refill.  A changed or
   # partial retry after an expiry failure must not deliver the stale threshold
@@ -2085,50 +2116,12 @@ check_thresholds() {
   # still execute the local hook exactly once without registering a network
   # reset.
   if (( observed_5h_reset_candidate == 1 )); then
-    transaction_epoch=0
-    if (( observed_5h_initial_no_arm == 0 && observed_5h_superseded_reset_at == 0 )); then
-      observed_5h_superseded_reset_at="$observed_5h_reset_at"
-    fi
-    if (( observed_5h_initial_no_arm == 0 )); then
-      transaction_epoch="$observed_5h_superseded_reset_at"
-    fi
     if ! expire_observed_owner_cycle 5h "$limit_id" "$scraped_at_epoch" \
       "$transaction_epoch"; then
-      if (( observed_5h_initial_no_arm == 1 )); then
-        # Preserve a durable local-only recovery arm even when the journal
-        # transaction itself failed.  The next poll will retry the owner
-        # transaction before it can deliver the stale threshold.
-        five_h_armed_reset_at="$scraped_at_epoch"
-        five_h_armed_limit_id="$limit_id"
-        persist_observed_5h_intent "$scraped_at_epoch" || :
-      elif (( observed_5h_superseded_reset_at > 0 )); then
-        persist_observed_5h_intent "$observed_5h_superseded_reset_at" || :
-      fi
       ALERT_PROCESSING_ERROR="local reset threshold transaction failed"
       return 1
     fi
     observed_5h_atomic_done=1
-    if (( observed_5h_initial_no_arm == 1 )); then
-      five_h_armed_reset_at="$scraped_at_epoch"
-      five_h_armed_limit_id="$limit_id"
-      last_notified_5h_reset_at="$scraped_at_epoch"
-      local_observed_5h_reset_at="$scraped_at_epoch"
-      observed_5h_local_tombstone=1
-      observed_5h_reset=1
-      # The journal transaction is the first write-ahead barrier.  Persist the
-      # synthetic arm immediately as well: a crash before the later detector
-      # write must still leave durable proof that this reset was observed and
-      # local-only, so recovery can run the hook without scheduling a network
-      # reset.  There is no guarantee for an interruption before either store
-      # receives its first write; every subsequent poll remains fail-closed.
-      if ! persist_observed_5h_intent "$scraped_at_epoch"; then
-        ALERT_PROCESSING_ERROR="local reset intent persistence failed"
-        return 1
-      fi
-    elif ! persist_observed_5h_intent "$observed_5h_superseded_reset_at"; then
-      ALERT_PROCESSING_ERROR="local reset intent persistence failed"
-      return 1
-    fi
   fi
 
   # Write interruption tombstones before reconciliation or detector-state
@@ -2455,6 +2448,48 @@ check_thresholds() {
     # that threshold baseline to the sample's owner immediately so later
     # partial samples can be compared safely without looking like legacy state.
     observed_5h_limit_id="$limit_id"
+  fi
+
+  # A recovery marker is useful only while its weekly reset occurrence could
+  # still be delivered.  If the marker survived a failed transaction but the
+  # seven-day delivery window is already gone, do not rebuild an invalid
+  # request (reset_epoch + 7d is before this poll).  With no journal row there
+  # is nothing to retry; establish this sample as a fresh baseline and clear
+  # the marker so later polls are not blocked forever.  Existing rows are left
+  # for the normal expiration/reconciliation pass, which keeps their durable
+  # retry/terminal history authoritative.
+  if (( observed_weekly_reset_recovery == 1 && weekly_armed_reset_at > 0 \
+        && scraped_at_epoch > weekly_armed_reset_at + 7 * 24 * 60 * 60 )); then
+    weekly_cycle_key="limit:${limit_id}|reset:${weekly_armed_reset_at}"
+    if ! journal_has_pending_alert reset weekly reset "$weekly_cycle_key" \
+      && ! journal_has_terminal_alert reset weekly reset "$weekly_cycle_key"; then
+      observed_weekly_reset_recovery=0
+      observed_weekly_reset=0
+      local_observed_weekly_reset_at=0
+      weekly_armed_reset_at=0
+      weekly_armed_limit_id=""
+      due_weekly_reset_at=0
+      notified_weekly_thresholds=""
+      pending_weekly_threshold=""
+      script_weekly_reset_attempted_at=0
+      attempted_script_weekly_reset_actions=""
+      attempted_script_weekly_actions=""
+      if (( weekly_observation_valid == 1 )); then
+        process_weekly_sample=0
+        prev_weekly_pct="$weekly_pct"
+        script_prev_weekly_pct="$weekly_pct"
+        observed_weekly_pct="$weekly_pct"
+        observed_weekly_reset_at="$weekly_reset_at"
+        observed_weekly_limit_id="$limit_id"
+      else
+        process_weekly_sample=0
+        prev_weekly_pct=100
+        script_prev_weekly_pct=100
+        observed_weekly_pct=""
+        observed_weekly_reset_at=0
+        observed_weekly_limit_id=""
+      fi
+    fi
   fi
 
   # Codex can refill the weekly window before its previously announced

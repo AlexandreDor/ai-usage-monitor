@@ -470,7 +470,7 @@ def _same_registration(existing: dict[str, Any], incoming: dict[str, Any]) -> bo
 
 
 def _register_or_reuse_observed_reset(document: dict[str, Any],
-                                      request: dict[str, Any]) -> dict[str, Any]:
+                                      request: dict[str, Any]) -> tuple[dict[str, Any], int]:
     """Register a weekly observed-reset request without rebuilding retries.
 
     The detector can reconstruct an observed weekly reset after the first
@@ -510,27 +510,61 @@ def _register_or_reuse_observed_reset(document: dict[str, Any],
     def equivalent_cycle(left: str, right: str) -> bool:
         return _same_cycle(left, right) or _same_cycle(right, left)
 
+    matches = [
+        existing for existing in document["alerts"]
+        if (existing["kind"] == "reset"
+            and existing["window"] == request["window"]
+            and existing["selector"] == "reset"
+            and existing["event_data"] == expected_event
+            and equivalent_cycle(existing["cycle_key"], normalized_cycle))
+    ]
+    if matches:
+        # A terminal row is authoritative: in particular, a delivered or
+        # local-observed row must never be resurrected by a later recovery
+        # request.  If every matching row is pending, prefer the canonical
+        # modern cycle so a legacy duplicate is retired deterministically.
+        terminal = [item for item in matches if item["status"] != "pending"]
+        if terminal:
+            authority = next(
+                (item for item in terminal if item["terminal_reason"] == "delivered"),
+                terminal[0],
+            )
+        else:
+            authority = min(
+                matches,
+                key=lambda item: (
+                    item["cycle_key"] != normalized_cycle,
+                    item["created_at"],
+                    item["alert_id"],
+                ),
+            )
+        completed_at = request.get("created_at")
+        if not _is_int(completed_at):
+            completed_at = max(item["created_at"] for item in matches)
+        changed = 0
+        for duplicate in matches:
+            if duplicate is authority or duplicate["status"] != "pending":
+                continue
+            _terminate(
+                duplicate, "superseded", completed_at, "superseded",
+                authority["alert_id"],
+            )
+            changed += 1
+        return authority, changed
+
     # Search by durable event identity before validating created/expires.  A
     # recovery poll can legitimately be later than the original reset's
     # expiry; rebuilding that request would fail validation and is unnecessary
     # because the existing occurrence owns all retry/terminal state.
-    for existing in document["alerts"]:
-        if (existing["kind"] == "reset"
-                and existing["window"] == request["window"]
-                and existing["selector"] == "reset"
-                and existing["event_data"] == expected_event
-                and equivalent_cycle(existing["cycle_key"], normalized_cycle)):
-            return existing
-
     incoming = _request_alert(request)
     for existing in document["alerts"]:
         if existing["alert_id"] != incoming["alert_id"]:
             continue
         if _same_registration(existing, incoming):
-            return existing
+            return existing, 0
         raise JournalError("alert_id collision with different content")
     document["alerts"].append(incoming)
-    return incoming
+    return incoming, 1
 
 
 def _terminate(item: dict[str, Any], reason: str, now: int,
@@ -854,9 +888,10 @@ def expire_observed_owner_cycle(document: dict[str, Any], window: str,
             document, window, canonical_limit_id, superseded_reset_epoch, now,
         )
     if new_reset_request is not None:
-        before = len(document["alerts"])
-        _register_or_reuse_observed_reset(document, new_reset_request)
-        changed += len(document["alerts"]) > before
+        _, registration_changed = _register_or_reuse_observed_reset(
+            document, new_reset_request,
+        )
+        changed += registration_changed
     return int(changed)
 
 

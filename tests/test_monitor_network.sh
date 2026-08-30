@@ -67,8 +67,14 @@ path.unlink()
 PYEOF
 check_thresholds 100 100 later unknown "$new_five_deadline" '' 2000001000 group-a >/dev/null
 [[ ! -e "$FAKE_CURL_LOG" ]] || fail "observed 5h reset emitted an HTTP request"
-assert_eq 0 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["alerts"]))' "$ALERT_DELIVERIES_FILE")" \
-  "observed 5h reset was queued in the network journal"
+assert_eq 0 "$(python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+print(sum(item["kind"] == "reset" and item["status"] == "pending" for item in items))
+PYEOF
+)" "observed 5h reset was queued in the network journal"
 ALERT_THRESHOLDS=75
 TELEGRAM_BOT_TOKEN='123:token'
 TELEGRAM_CHAT_ID=-456
@@ -166,7 +172,7 @@ import json
 import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
-assert len(items) == 1, items
+assert len(items) == 2, items
 threshold = items[0]
 assert threshold["kind"] == "threshold", threshold
 assert threshold["event_data"]["limit_id"] == sys.argv[2], threshold
@@ -175,7 +181,9 @@ assert threshold["status"] == "failed", threshold
 assert threshold["terminal_reason"] == "expired_after_reset", threshold
 assert threshold["channels"]["discord"]["error_class"] == "expired_after_reset", threshold
 assert threshold["detector_acknowledged_at"] is not None, threshold
-assert not any(item["kind"] == "reset" for item in items), items
+tombstone = next(item for item in items if item["kind"] == "reset")
+assert tombstone["terminal_reason"] == "local_observed", tombstone
+assert tombstone["status"] == "failed", tombstone
 PYEOF
 check_thresholds 100 100 later unknown "$restored_new_deadline" '' \
   "$((restored_now + 2))" group-a >/dev/null
@@ -777,7 +785,7 @@ import json
 import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
-expected_count = 2 if sys.argv[4] else 1
+expected_count = 3 if sys.argv[4] else 2
 assert len(items) == expected_count, items
 threshold = next(item for item in items if item["kind"] == "threshold")
 assert threshold["kind"] == "threshold", threshold
@@ -788,12 +796,24 @@ assert threshold["terminal_reason"] == "expired_after_reset", threshold
 assert threshold["channels"]["discord"]["error_class"] == "expired_after_reset", threshold
 assert threshold["detector_acknowledged_at"] is not None, threshold
 if sys.argv[4]:
-    tombstone = next(item for item in items if item["kind"] == "reset")
+    tombstone = next(item for item in items
+                     if item["kind"] == "reset"
+                     and item["event_data"]["limit_id"] == sys.argv[4])
     assert tombstone["event_data"]["limit_id"] == sys.argv[4], tombstone
     assert tombstone["event_data"]["reset_epoch"] == int(sys.argv[3]), tombstone
     assert tombstone["terminal_reason"] == "owner_interrupted", tombstone
-    assert tombstone["status"] == "failed", tombstone
-    assert tombstone["detector_acknowledged_at"] is not None, tombstone
+else:
+    tombstone = next(item for item in items if item["kind"] == "reset")
+    assert tombstone["event_data"]["limit_id"] == sys.argv[2], tombstone
+    assert tombstone["terminal_reason"] == "local_observed", tombstone
+assert tombstone["status"] == "failed", tombstone
+assert tombstone["detector_acknowledged_at"] is not None, tombstone
+if sys.argv[4]:
+    local_tombstone = next(item for item in items
+                           if item["kind"] == "reset"
+                           and item["event_data"]["limit_id"] == sys.argv[2])
+    assert local_tombstone["terminal_reason"] == "local_observed", local_tombstone
+    assert local_tombstone["status"] == "failed", local_tombstone
 PYEOF
   check_thresholds 100 100 later unknown "$case_new_deadline" '' \
     "$((case_now + 2))" group-a >/dev/null
@@ -2009,5 +2029,60 @@ check_thresholds 80 100 later unknown "${no_arm_hook_new}" '' \
   "$((no_arm_hook_old + 2))" group-a >/dev/null
 assert_eq 1 "$(wc -l < "${no_arm_hook_log}")" \
   "no-arm observed recovery replayed its local hook"
+
+# A weekly recovery marker with no journal occurrence must not be rebuilt after
+# its delivery window has expired. In particular, the reconstructed request
+# would have expires_at before created_at and could otherwise block every
+# subsequent poll.
+rm -f "${STATE_FILE}" "${ALERT_DELIVERIES_FILE}" "${FAKE_CURL_LOG}"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-weekly-expired-marker"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+weekly_expired_now=2000003600
+weekly_expired_epoch=$((weekly_expired_now - 8 * 24 * 60 * 60))
+weekly_expired_id="$(canonicalize_alert_limit_id group-a)"
+python3 - "${STATE_FILE}" "${weekly_expired_epoch}" "${weekly_expired_id}" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+epoch = sys.argv[2]
+limit_id = sys.argv[3]
+values = {
+    "state_version": "5", "limit_id_contract_version": "1",
+    "prev_5h_pct": "100", "prev_weekly_pct": "100",
+    "observed_5h_pct": "", "observed_5h_reset_at": "0", "observed_5h_limit_id": "",
+    "observed_weekly_pct": "100", "observed_weekly_reset_at": epoch,
+    "observed_weekly_limit_id": limit_id,
+    "five_h_armed_reset_at": "0", "five_h_armed_limit_id": "",
+    "weekly_armed_reset_at": epoch, "weekly_armed_limit_id": limit_id,
+    "last_notified_5h_reset_at": "0", "last_notified_weekly_reset_at": "0",
+    "local_observed_5h_reset_at": "0", "local_observed_weekly_reset_at": epoch,
+    "notified_5h_thresholds": "", "notified_weekly_thresholds": "",
+    "pending_5h_threshold": "", "pending_weekly_threshold": "",
+}
+path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+PYEOF
+printf '{"schema_version":2,"limit_id_contract_version":1,"legacy_migration":{"source_state_version":5,"completed_at":%s},"alerts":[]}\n' \
+  "${weekly_expired_now}" > "${ALERT_DELIVERIES_FILE}"
+check_thresholds 80 80 unknown later '' "$((weekly_expired_epoch + 1))" \
+  "${weekly_expired_now}" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "expired weekly recovery marker emitted HTTP"
+assert_eq 0 "$(awk -F= '$1 == "weekly_armed_reset_at" {print $2}' "${STATE_FILE}")" \
+  "expired weekly recovery arm was not cleared"
+assert_eq 0 "$(awk -F= '$1 == "local_observed_weekly_reset_at" {print $2}' "${STATE_FILE}")" \
+  "expired weekly recovery marker was not cleared"
+assert_eq 0 "$(python3 - "${ALERT_DELIVERIES_FILE}" <<'PYEOF'
+import json
+import sys
+print(len(json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]))
+PYEOF
+)" "expired weekly recovery rebuilt an occurrence"
+check_thresholds 80 80 unknown later '' "$((weekly_expired_epoch + 1))" \
+  "$((weekly_expired_now + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "expired weekly recovery blocked the following poll"
 
 printf 'PASS: monitor network tests\n'

@@ -73,22 +73,28 @@ assert_alert_count 0
 
 # A full 5-hour cycle is observable from a deadline advance even when the
 # quota stays at 100%. It is anchored to the first observation carrying the
-# new deadline and is acknowledged locally without a network occurrence.
+# new deadline and is acknowledged locally without a deliverable network occurrence.
 reset_case
 old_five_deadline=$((now + 300))
 new_five_deadline=$((old_five_deadline + 15 * 60))
 check_thresholds 100 100 later later "$old_five_deadline" '' "$now" group-a
 check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 900))" group-a
 assert_alert_count 0
-assert_eq 0 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["alerts"]))' "$ALERT_DELIVERIES_FILE")" \
-  "observed 5h reset created a network journal occurrence"
+assert_eq 0 "$(python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+print(sum(item["kind"] == "reset" and item["status"] == "pending" for item in items))
+PYEOF
+)" "observed 5h reset created a network journal occurrence"
 check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 1800))" group-a
 assert_alert_count 0
 check_thresholds 100 100 later later "$((new_five_deadline - 60))" '' "$((now + 2700))" group-a
 assert_alert_count 0
 
 # Reconstructing a missing delivery journal from the observed-reset sample
-# must not manufacture a 5h network reset or its old threshold occurrence.
+# must not manufacture a deliverable 5h network reset or its old threshold occurrence.
 reset_case
 DISCORD_WEBHOOK=dummy-webhook
 ALERTS_ENABLED=0
@@ -103,14 +109,15 @@ check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 900))" gr
 assert_eq 0 "$(python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
 import json
 import sys
-print(sum(1 for item in json.load(open(sys.argv[1]))["alerts"] if item["window"] == "5h"))
+print(sum(1 for item in json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+         if item["window"] == "5h" and item["status"] == "pending"))
 PYEOF
 )" "missing journal reconstructed an observed 5h network occurrence"
 DISCORD_WEBHOOK=""
 ALERTS_ENABLED=1
 
 # A local observed refill expires a pending threshold before any due delivery,
-# while leaving no reset occurrence in the network journal.
+# while leaving no deliverable reset occurrence in the network journal.
 reset_case
 DISCORD_WEBHOOK=dummy-webhook
 ALERTS_ENABLED=0
@@ -126,9 +133,13 @@ python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
 import json
 import sys
 items = json.load(open(sys.argv[1]))["alerts"]
-assert len(items) == 1, items
-assert items[0]["terminal_reason"] == "expired_after_reset", items[0]
-assert items[0]["channels"]["discord"]["error_class"] == "expired_after_reset", items[0]
+assert len(items) == 2, items
+threshold = next(item for item in items if item["kind"] == "threshold")
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["channels"]["discord"]["error_class"] == "expired_after_reset", threshold
+tombstone = next(item for item in items if item["kind"] == "reset")
+assert tombstone["terminal_reason"] == "local_observed", tombstone
+assert tombstone["status"] == "failed", tombstone
 PYEOF
 DISCORD_WEBHOOK=""
 ALERTS_ENABLED=1
