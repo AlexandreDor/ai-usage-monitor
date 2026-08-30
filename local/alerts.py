@@ -39,11 +39,11 @@ ALERT_STATUSES = CHANNEL_STATUSES
 ERROR_CLASSES = {
     "client_error", "rate_limited", "server_error", "timeout",
     "transport_error", "invalid_response", "channel_unconfigured",
-    "superseded", "expired_after_reset",
+    "superseded", "expired_after_reset", "owner_interrupted",
 }
 TERMINAL_REASONS = {
     "delivered", "permanent_failure", "superseded",
-    "expired_after_reset", "channel_unconfigured",
+    "expired_after_reset", "channel_unconfigured", "owner_interrupted",
 }
 OPAQUE_LIMIT_ID_RE = re.compile(r"limit-[0-9a-f]{64}\Z")
 LEGACY_NAMESPACE_RE = re.compile(r"legacy-v[0-9]+\Z")
@@ -547,6 +547,61 @@ def expire_pending_thresholds(document: dict[str, Any], window: str,
     return expired
 
 
+def interrupt_pending_owner(document: dict[str, Any], limit_id: str, now: int) -> int:
+    """Terminalize pending threshold/reset occurrences for an interrupted owner.
+
+    This is deliberately broader than reset-threshold expiration: a partial
+    sample from another limit group invalidates every pending detector event
+    from the old owner in both windows.  Anomalies and other owners remain
+    untouched, and repeating the operation is a no-op after the first write.
+    """
+
+    if not isinstance(limit_id, str) or not limit_id or not _is_int(now):
+        raise JournalError("invalid owner interruption request")
+    canonical_limit_id = canonicalize_limit_id(limit_id)
+    if canonical_limit_id is None:
+        raise JournalError("owner interruption limit ID is invalid")
+
+    interrupted = 0
+    for item in document["alerts"]:
+        if (item["kind"] not in {"threshold", "reset"}
+                or item["status"] != "pending"
+                or item["event_data"].get("limit_id") != canonical_limit_id):
+            continue
+        _terminate(item, "owner_interrupted", now, "owner_interrupted")
+        interrupted += 1
+    return interrupted
+
+
+def interrupt_pending_other_owners(document: dict[str, Any], current_limit_id: str,
+                                   now: int) -> int:
+    """Terminalize pending detector events owned by any other limit group.
+
+    The comparison and all terminal transitions happen against one loaded
+    journal before it is atomically written by the CLI.  This closes the gap
+    where a journal can contain an older owner's pending event while the
+    detector state has lost that owner's identity.  Anomalies are deliberately
+    excluded: their durable detector has independent ownership semantics.
+    """
+
+    if (not isinstance(current_limit_id, str) or not current_limit_id
+            or not _is_int(now)):
+        raise JournalError("invalid current owner interruption request")
+    canonical_current_limit_id = canonicalize_limit_id(current_limit_id)
+    if canonical_current_limit_id is None:
+        raise JournalError("current owner interruption limit ID is invalid")
+
+    interrupted = 0
+    for item in document["alerts"]:
+        if (item["kind"] not in {"threshold", "reset"}
+                or item["status"] != "pending"
+                or item["event_data"].get("limit_id") == canonical_current_limit_id):
+            continue
+        _terminate(item, "owner_interrupted", now, "owner_interrupted")
+        interrupted += 1
+    return interrupted
+
+
 def register(document: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
     incoming = _request_alert(request)
     expire_cycle = request.get("expire_threshold_cycle")
@@ -717,6 +772,18 @@ def command(args: argparse.Namespace) -> None:
         )
         if expired:
             atomic_write(path, document)
+    elif args.action in {"interrupt-owner", "interrupt-pending-owner"}:
+        migrated = migrate_document(document, args.now)
+        interrupted = interrupt_pending_owner(migrated, args.limit_id, args.now)
+        if migrated is not document or interrupted:
+            atomic_write(path, migrated)
+    elif args.action in {"interrupt-other-owners", "interrupt-pending-other-owners"}:
+        migrated = migrate_document(document, args.now)
+        interrupted = interrupt_pending_other_owners(
+            migrated, args.current_limit_id, args.now,
+        )
+        if migrated is not document or interrupted:
+            atomic_write(path, migrated)
     elif args.action == "due":
         configured = _configured_channels(_read_stdin(None))
         changed = False
@@ -814,6 +881,18 @@ def parser() -> argparse.ArgumentParser:
     expire_thresholds_parser.add_argument("cycle_key")
     expire_thresholds_parser.add_argument("limit_id")
     expire_thresholds_parser.add_argument("--now", type=int, required=True)
+    interrupt_owner_parser = sub.add_parser(
+        "interrupt-owner", aliases=["interrupt-pending-owner"],
+    )
+    interrupt_owner_parser.add_argument("journal")
+    interrupt_owner_parser.add_argument("limit_id")
+    interrupt_owner_parser.add_argument("--now", type=int, required=True)
+    interrupt_other_parser = sub.add_parser(
+        "interrupt-other-owners", aliases=["interrupt-pending-other-owners"],
+    )
+    interrupt_other_parser.add_argument("journal")
+    interrupt_other_parser.add_argument("current_limit_id")
+    interrupt_other_parser.add_argument("--now", type=int, required=True)
     migrate_parser = sub.add_parser("migrate")
     migrate_parser.add_argument("journal")
     migrate_parser.add_argument("--at", type=int, required=True)

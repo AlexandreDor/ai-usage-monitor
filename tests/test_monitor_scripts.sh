@@ -144,6 +144,34 @@ assert_eq 1 "$(wc -l < "$NOTIFICATION_LOG")" "observed weekly reset notification
 check_thresholds 100 100 unknown later '' "$new_weekly_deadline" "$((now + 1800))"
 assert_eq 1 "$(wc -l < "$HOOK_LOG")" "observed weekly reset script was replayed"
 
+# Expiry failures must not consume the observed 5h proof or run its hook.  The
+# next identical observation retries the invalidation and then executes the
+# one-shot hook exactly once.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:reset'
+validate_config
+retry_old_five_deadline=$((now + 3600))
+retry_new_five_deadline=$((retry_old_five_deadline + 900))
+check_thresholds 100 100 later unknown "$retry_old_five_deadline" '' "$now" group-a
+# shellcheck disable=SC2317,SC2329
+invalidate_pending_thresholds() { return 1; }
+if check_thresholds 100 100 later unknown "$retry_new_five_deadline" '' "$((now + 900))" group-a >/dev/null 2>&1; then
+  fail "failed observed reset invalidation was accepted"
+fi
+[[ ! -e "$HOOK_LOG" ]] || fail "failed observed reset invalidation ran a hook"
+assert_eq "$retry_old_five_deadline" "$(state_value observed_5h_reset_at)" \
+  "failed observed reset advanced the baseline"
+invalidate_pending_thresholds() {
+  local window="$1" cycle_key="$2" limit_id="$3" now="$4"
+  python3 "$ALERTS_PY" expire-thresholds "$ALERT_DELIVERIES_FILE" \
+    "$window" "$cycle_key" "$limit_id" --now "$now"
+}
+check_thresholds 100 100 later unknown "$retry_new_five_deadline" '' "$((now + 901))" group-a
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" "successful observed reset hook did not execute"
+check_thresholds 100 100 later unknown "$retry_new_five_deadline" '' "$((now + 1800))" group-a
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" "successful observed reset hook was replayed"
+
 # Partial data from another group cannot cross script thresholds.
 reset_case
 ALERT_SCRIPT_1="$HOOK_ONE"
@@ -162,6 +190,20 @@ validate_config
 check_thresholds 100 100 later later "$old_five_deadline" '' "$now" group-a
 check_thresholds 40 100 unknown unknown '' '' "$((now + 1))" group-b
 [[ ! -e "$HOOK_LOG" ]] || fail "partial 5h observation crossed limit groups"
+
+# A complete A -> partial B -> complete A sequence starts a fresh live
+# baseline for both windows; neither observed reset hook may cross the gap.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:reset,weekly:reset'
+validate_config
+continuity_old_reset=$((now + 3600))
+continuity_new_reset=$((continuity_old_reset + 900))
+check_thresholds 100 100 later later "$continuity_old_reset" "$continuity_old_reset" "$now" group-a
+check_thresholds 80 80 unknown unknown '' '' "$((now + 1))" group-b
+check_thresholds 100 100 later later "$continuity_new_reset" "$continuity_new_reset" "$((now + 2))" group-a
+[[ ! -e "$HOOK_LOG" ]] || fail "live partial owner switch ran a reset hook"
+[[ ! -e "$NOTIFICATION_LOG" ]] || fail "live partial owner switch sent a reset notification"
 
 # A loaded ownerless legacy state must also suppress local 5h hooks for a
 # partial sample; there is no durable group identity to compare yet.

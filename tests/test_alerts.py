@@ -4,6 +4,8 @@ import json
 import os
 import pathlib
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -121,6 +123,93 @@ class AlertJournalTests(unittest.TestCase):
         self.assertEqual("expired_after_reset", stale["terminal_reason"])
         self.assertEqual("expired_after_reset", stale["channels"]["discord"]["error_class"])
         self.assertEqual("pending", other["status"])
+
+    def test_interrupt_pending_owner_terminalizes_both_windows_idempotently(self):
+        five_threshold_request = request(
+            "50", channels=["discord"], cycle="limit:default|reset:100",
+        )
+        five_threshold_request["event_data"]["reset_epoch"] = 100
+        five_threshold = alerts.register(self.document, five_threshold_request)
+        weekly_threshold_request = request(
+            "25", channels=["discord"], cycle="limit:default|reset:100",
+        )
+        weekly_threshold_request["window"] = "weekly"
+        weekly_threshold_request["event_data"]["reset_epoch"] = 100
+        weekly_threshold = alerts.register(self.document, weekly_threshold_request)
+        five_reset = alerts.register(self.document, reset_request())
+        weekly_reset = alerts.register(
+            self.document, reset_request("weekly", cycle="limit:default|reset:200"),
+        )
+
+        other_threshold_request = request(
+            "10", channels=["discord"], cycle="limit:other|unarmed",
+        )
+        other_threshold_request["event_data"]["limit_id"] = "other"
+        other_threshold = alerts.register(self.document, other_threshold_request)
+        anomaly_request = {
+            "kind": "anomaly", "window": "weekly", "selector": "reset_shift",
+            "cycle_key": "limit:default|anomaly:interrupt-test",
+            "message": "weekly reset date moved",
+            "event_data": {
+                "limit_id": "default", "reset_epoch": 200,
+                "before_pct": 40, "after_pct": 40,
+                "before_reset_at": 500, "after_reset_at": 200,
+                "detected_at_epoch": 100,
+            },
+            "created_at": 100, "expires_at": 0,
+            "channels": ["discord"], "replace_pending_thresholds": False,
+            "expire_threshold_cycle": None,
+        }
+        anomaly = alerts.register(self.document, anomaly_request)
+
+        self.assertEqual(1, alerts.interrupt_pending_other_owners(self.document, "default", 300))
+        self.assertEqual("failed", other_threshold["status"])
+        self.assertEqual("owner_interrupted", other_threshold["terminal_reason"])
+        for item in (five_threshold, weekly_threshold, five_reset, weekly_reset):
+            self.assertEqual("pending", item["status"])
+        self.assertEqual(4, alerts.interrupt_pending_owner(self.document, "default", 300))
+        for item in (five_threshold, weekly_threshold, five_reset, weekly_reset):
+            self.assertEqual("failed", item["status"])
+            self.assertEqual("owner_interrupted", item["terminal_reason"])
+            self.assertEqual("owner_interrupted", item["channels"]["discord"]["error_class"])
+        self.assertEqual("pending", anomaly["status"])
+        alerts.validate_document(self.document, allow_legacy=False)
+        self.assertEqual(0, alerts.interrupt_pending_other_owners(self.document, "default", 301))
+        self.assertEqual(0, alerts.interrupt_pending_owner(self.document, "default", 301))
+
+    def test_interrupt_owner_cli_migrates_legacy_journal_before_writing(self):
+        item = alerts.register(self.document, request("50", channels=["discord"]))
+        raw_limit_id = "legacy-owner"
+        item["event_data"]["limit_id"] = raw_limit_id
+        item["cycle_key"] = f"limit:{raw_limit_id}|unarmed"
+        item["alert_id"] = alerts.alert_id(
+            item["kind"], item["window"], item["selector"],
+            item["cycle_key"], "alert-v1",
+        )
+        legacy = {
+            "schema_version": 1,
+            "legacy_migration": {
+                "source_state_version": 4, "completed_at": 100,
+            },
+            "alerts": [item],
+        }
+        self.path.write_text(json.dumps(legacy), encoding="utf-8")
+
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "local" / "alerts.py"),
+             "interrupt-owner", str(self.path), raw_limit_id, "--now", "300"],
+            check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        migrated = alerts.load(self.path, allow_legacy=False)
+        self.assertEqual(2, migrated["schema_version"])
+        self.assertEqual("failed", migrated["alerts"][0]["status"])
+        self.assertEqual("owner_interrupted", migrated["alerts"][0]["terminal_reason"])
+        self.assertEqual(
+            alerts.opaque_limit_id_from_raw(raw_limit_id),
+            migrated["alerts"][0]["event_data"]["limit_id"],
+        )
+
 
     def test_channels_reach_aggregate_terminal_state_independently(self):
         item = alerts.register(self.document, request())
