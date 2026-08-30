@@ -1329,22 +1329,73 @@ import json
 import sys
 
 event_kind, window, threshold, remaining_pct, reset_at, reset_label, scraped_at, message, limit_id, cycle_key = sys.argv[1:]
+reset_epoch = int(reset_at) if reset_at else 0
 context = {
     "event_kind": event_kind,
     "window": window,
     "threshold": threshold,
     "remaining_pct": remaining_pct,
-    "reset_epoch": int(reset_at),
+    "reset_epoch": reset_epoch,
     "reset_label": reset_label,
     "scraped_at": int(scraped_at),
     "message": message,
     "limit_id": limit_id,
     "cycle_key": cycle_key,
 }
+
 encoded = base64.b64encode(
     json.dumps(context, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-).decode("ascii")
+).decode("ascii").rstrip("=")
 print(encoded)
+PYEOF
+}
+
+decode_alert_script_context() {
+  local encoded="$1"
+  python3 - "$encoded" <<'PYEOF'
+import base64
+import binascii
+import json
+import sys
+
+encoded = sys.argv[1]
+try:
+    if len(encoded) % 4 == 1:
+        raise ValueError("invalid base64 length")
+    padded = encoded + "=" * ((-len(encoded)) % 4)
+    decoded = base64.b64decode(padded, validate=True)
+    context = json.loads(decoded.decode("utf-8"))
+except (binascii.Error, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(context, dict):
+    raise SystemExit(1)
+required = {
+    "event_kind", "window", "threshold", "remaining_pct", "reset_epoch",
+    "reset_label", "scraped_at", "message", "limit_id", "cycle_key",
+}
+if set(context) != required:
+    raise SystemExit(1)
+if not isinstance(context["message"], str):
+    raise SystemExit(1)
+print(json.dumps(context, separators=(",", ":"), ensure_ascii=False))
+PYEOF
+}
+
+decode_alert_script_message() {
+  local encoded="$1"
+  python3 - "$encoded" <<'PYEOF'
+import base64
+import binascii
+import sys
+
+try:
+    encoded = sys.argv[1]
+    if len(encoded) % 4 == 1:
+        raise ValueError("invalid base64 length")
+    padded = encoded + "=" * ((-len(encoded)) % 4)
+    print(base64.b64decode(padded, validate=True).decode("utf-8"), end="")
+except (binascii.Error, UnicodeDecodeError, ValueError):
+    raise SystemExit(1)
 PYEOF
 }
 
@@ -1354,7 +1405,8 @@ pending_script_context_has() {
   [[ -n "$contexts" ]] || return 1
   IFS=',' read -r -a entries <<< "$contexts"
   for entry in "${entries[@]}"; do
-    [[ "${entry%%:*}" == "$wanted" ]] && return 0
+    [[ "$entry" == *:* && -n "${entry#*:}" \
+      && "${entry%%:*}" == "$wanted" ]] && return 0
   done
   return 1
 }
@@ -1430,6 +1482,26 @@ clear_weekly_reset_script_actions() {
   attempted_script_weekly_reset_actions=""
   pending_script_weekly_reset_actions=""
   suppressed_script_weekly_reset_actions=""
+}
+
+has_unfinished_reset_script_actions() {
+  local window="$1" rule_position action_id event completed_name suppressed_name
+  for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_IDS[@]}; rule_position++ )); do
+    event="${ALERT_SCRIPT_RULE_EVENTS[$rule_position]}"
+    [[ "$event" == "${window}:reset" ]] || continue
+    action_id="${ALERT_SCRIPT_RULE_IDS[$rule_position]}"
+    if [[ "$window" == 5h ]]; then
+      completed_name=attempted_script_5h_reset_actions
+      suppressed_name=suppressed_script_5h_reset_actions
+    else
+      completed_name=attempted_script_weekly_reset_actions
+      suppressed_name=suppressed_script_weekly_reset_actions
+    fi
+    csv_contains "${!completed_name}" "$action_id" && continue
+    csv_contains "${!suppressed_name}" "$action_id" && continue
+    return 0
+  done
+  return 1
 }
 
 canonicalize_alert_limit_id() {
@@ -1602,7 +1674,22 @@ persist_alert_state() {
     rm -f "$state_tmp"
     return 1
   fi
-  if ! mv -f "$state_tmp" "$STATE_FILE"; then
+  if ! python3 - "$state_tmp" "$STATE_FILE" <<'PYEOF'
+import os
+import pathlib
+import sys
+
+temporary, destination = map(pathlib.Path, sys.argv[1:])
+with temporary.open("rb") as handle:
+    os.fsync(handle.fileno())
+os.replace(temporary, destination)
+directory_fd = os.open(destination.parent, os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PYEOF
+  then
     rm -f "$state_tmp"
     return 1
   fi
@@ -1612,17 +1699,23 @@ persist_observed_5h_intent() {
   local reset_epoch="$1"
   local previous_last="$last_notified_5h_reset_at"
   local previous_marker="$local_observed_5h_reset_at"
+  local previous_arm="$five_h_armed_reset_at"
+  local previous_owner="$five_h_armed_limit_id"
   (( reset_epoch > 0 )) || return 1
   if (( five_h_armed_reset_at == reset_epoch )) \
     && [[ "$five_h_armed_limit_id" == "$limit_id" ]]; then
     last_notified_5h_reset_at="$reset_epoch"
   fi
   local_observed_5h_reset_at="$reset_epoch"
-  if ! persist_alert_state; then
-    last_notified_5h_reset_at="$previous_last"
-    local_observed_5h_reset_at="$previous_marker"
-    return 1
-  fi
+  # A transient state-write failure must not discard the only observation that
+  # proves a local reset.  Retry the complete intent once while all of its
+  # fields are still in memory; a persistent failure remains fail-closed.
+  if persist_alert_state || persist_alert_state; then return 0; fi
+  last_notified_5h_reset_at="$previous_last"
+  local_observed_5h_reset_at="$previous_marker"
+  five_h_armed_reset_at="$previous_arm"
+  five_h_armed_limit_id="$previous_owner"
+  return 1
 }
 
 run_alert_script() {
@@ -1791,20 +1884,121 @@ find_alert_script_rule_position() {
   return 1
 }
 
+resume_legacy_pending_alert_scripts() {
+  local rule_position action_id event_kind event_name window selector pending_name
+  local completed_name suppressed_name pending_value threshold remaining_pct
+  local reset_at reset_label message owner_id
+  for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_IDS[@]}; rule_position++ )); do
+    action_id="${ALERT_SCRIPT_RULE_IDS[$rule_position]}"
+    window="${ALERT_SCRIPT_RULE_EVENTS[$rule_position]%%:*}"
+    event_name="${ALERT_SCRIPT_RULE_EVENTS[$rule_position]#*:}"
+    if [[ "$event_name" == reset ]]; then
+      event_kind=reset
+      selector=reset
+    else
+      event_kind=threshold
+      selector="$event_name"
+    fi
+    case "${event_kind}:${window}" in
+      reset:5h)
+        pending_name=pending_script_5h_reset_actions
+        completed_name=attempted_script_5h_reset_actions
+        suppressed_name=suppressed_script_5h_reset_actions
+        owner_id="$five_h_armed_limit_id"
+        [[ "$owner_id" == "$limit_id" || "$observed_5h_limit_id" == "$limit_id" ]] || continue
+        reset_at="$script_5h_reset_attempted_at"
+        if ! [[ "$reset_at" =~ ^[0-9]+$ ]] || ! (( reset_at > 0 )); then
+          reset_at="$five_h_armed_reset_at"
+        fi
+        if ! [[ "$reset_at" =~ ^[0-9]+$ ]] || ! (( reset_at > 0 )); then
+          continue
+        fi
+        threshold=""
+        remaining_pct="$five_h_pct"
+        [[ "$remaining_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] || remaining_pct="$observed_5h_pct"
+        reset_label="$five_h_reset"
+        message="Codex 5h limit reset. A new usage cycle is available."
+        ;;
+      reset:weekly)
+        pending_name=pending_script_weekly_reset_actions
+        completed_name=attempted_script_weekly_reset_actions
+        suppressed_name=suppressed_script_weekly_reset_actions
+        owner_id="$weekly_armed_limit_id"
+        [[ "$owner_id" == "$limit_id" || "$observed_weekly_limit_id" == "$limit_id" ]] || continue
+        reset_at="$script_weekly_reset_attempted_at"
+        if ! [[ "$reset_at" =~ ^[0-9]+$ ]] || ! (( reset_at > 0 )); then
+          reset_at="$weekly_armed_reset_at"
+        fi
+        if ! [[ "$reset_at" =~ ^[0-9]+$ ]] || ! (( reset_at > 0 )); then
+          continue
+        fi
+        threshold=""
+        remaining_pct="$weekly_pct"
+        [[ "$remaining_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] || remaining_pct="$observed_weekly_pct"
+        reset_label="$weekly_reset"
+        message="Codex weekly limit reset. A new usage cycle is available."
+        ;;
+      threshold:5h|threshold:weekly)
+        if [[ "$window" == 5h ]]; then
+          pending_name=pending_script_5h_actions
+          completed_name=attempted_script_5h_actions
+          suppressed_name=suppressed_script_5h_actions
+          owner_id="$observed_5h_limit_id"
+          remaining_pct="$five_h_pct"
+          reset_at="$five_h_reset_at"
+          reset_label="$five_h_reset"
+          [[ "$remaining_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] || remaining_pct="$observed_5h_pct"
+        else
+          pending_name=pending_script_weekly_actions
+          completed_name=attempted_script_weekly_actions
+          suppressed_name=suppressed_script_weekly_actions
+          owner_id="$observed_weekly_limit_id"
+          remaining_pct="$weekly_pct"
+          reset_at="$weekly_reset_at"
+          reset_label="$weekly_reset"
+          [[ "$remaining_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] || remaining_pct="$observed_weekly_pct"
+        fi
+        [[ "$owner_id" == "$limit_id" ]] || continue
+        threshold="$selector"
+        message="Codex ${window} limit at ${remaining_pct}% remaining (crossed ${threshold}% threshold)."
+        ;;
+      *)
+        continue
+        ;;
+    esac
+    pending_value="${!pending_name}"
+    csv_contains "$pending_value" "$action_id" || continue
+    pending_script_context_has "$pending_script_contexts" "$action_id" && continue
+    # The pre-context state format stored only the action ID.  Reconstruct from
+    # the durable detector anchor when one exists, then immediately upgrade the
+    # marker to the autonomous context before invoking the hook.
+    attempt_alert_script "$rule_position" "$completed_name" "$pending_name" \
+      "$suppressed_name" "$event_kind" "$window" "$threshold" "$remaining_pct" \
+      "$reset_at" "$reset_label" "$scraped_at_epoch" "$message" || return 1
+  done
+}
+
 resume_pending_alert_scripts() {
   local entry action_id encoded context_json rule_position
   local event_kind window threshold remaining_pct reset_at reset_label scraped_at
   local message_encoded context_limit_id cycle_key message completed_name pending_name suppressed_name
   local -a entries=()
   [[ "${ALERTS_ENABLED:-1}" == 1 ]] || return 0
-  [[ -n "$pending_script_contexts" ]] || return 0
-  IFS=',' read -r -a entries <<< "$pending_script_contexts"
+  if [[ -n "$pending_script_contexts" ]]; then
+    IFS=',' read -r -a entries <<< "$pending_script_contexts"
+  fi
   for entry in "${entries[@]}"; do
     [[ -n "$entry" ]] || continue
     action_id="${entry%%:*}"
+    if [[ "$entry" != *:* ]]; then
+      # State versions before autonomous contexts only recorded the action ID.
+      # There is no safe way to reconstruct its immutable invocation here, so
+      # retain the marker for the detector path to upgrade deterministically.
+      continue
+    fi
     encoded="${entry#*:}"
     rule_position="$(find_alert_script_rule_position "$action_id")" || continue
-    context_json="$(printf '%s' "$encoded" | base64 --decode)" || {
+    context_json="$(decode_alert_script_context "$encoded")" || {
       ALERT_PROCESSING_ERROR="alert script context decoding failed"
       return 1
     }
@@ -1825,10 +2019,11 @@ print(
 )
 PYEOF
     )
-    message="$(printf '%s' "$message_encoded" | base64 --decode)" || {
+    message="$(decode_alert_script_message "$message_encoded")" || {
       ALERT_PROCESSING_ERROR="alert script message decoding failed"
       return 1
     }
+    [[ "$event_kind" == threshold && "$reset_at" == 0 ]] && reset_at=""
     [[ "$context_limit_id" == "$limit_id" ]] || continue
     [[ "$cycle_key" == "limit:${context_limit_id}|"* ]] || continue
     case "${event_kind}:${window}" in
@@ -1860,6 +2055,7 @@ PYEOF
       "$suppressed_name" "$event_kind" "$window" "$threshold" "$remaining_pct" \
       "$reset_at" "$reset_label" "$scraped_at" "$message" || return 1
   done
+  resume_legacy_pending_alert_scripts
 }
 
 reconcile_alert_deliveries() {
@@ -2371,11 +2567,22 @@ check_thresholds() {
         observed_5h_superseded_reset_at="$five_h_armed_reset_at"
       fi
     else
-      # No trustworthy arm identifies the consumed cycle.  The observed
-      # baseline deadline is the only durable pre-reset anchor available; the
-      # transaction below will close that owner cycle before any journal
-      # reconstruction or delivery can occur.
-      observed_5h_initial_no_arm=1
+      if (( local_observed_5h_reset_at > 0 )) \
+        && [[ "$local_observed_5h_reset_at" == "$observed_5h_reset_at" ]]; then
+        # The arm was retired after its hook completed, but the old observed
+        # baseline is still on disk because the recovery poll had no deadline.
+        # Reuse its tombstone instead of treating the next complete sample as
+        # a second reset.
+        observed_5h_reset_candidate=0
+        observed_5h_reset_recovery=1
+        observed_5h_superseded_reset_at="$local_observed_5h_reset_at"
+      else
+        # No trustworthy arm identifies the consumed cycle.  The observed
+        # baseline deadline is the only durable pre-reset anchor available; the
+        # transaction below will close that owner cycle before any journal
+        # reconstruction or delivery can occur.
+        observed_5h_initial_no_arm=1
+      fi
     fi
   fi
   # Establish the local-only write-ahead intent before touching the delivery
@@ -2609,7 +2816,11 @@ check_thresholds() {
       # before delivery; if this complementary write also fails, fail closed
       # with no detector or delivery advancement.
       if (( observed_5h_superseded_reset_at == 0 )); then
-        observed_5h_superseded_reset_at="$observed_5h_reset_at"
+        if (( five_h_armed_reset_at > 0 )); then
+          observed_5h_superseded_reset_at="$five_h_armed_reset_at"
+        else
+          observed_5h_superseded_reset_at="$observed_5h_reset_at"
+        fi
       fi
       if (( observed_5h_superseded_reset_at > 0 )); then
         persist_observed_5h_intent "$observed_5h_superseded_reset_at" || :
@@ -2711,6 +2922,8 @@ check_thresholds() {
     script_tracking_initialized=0
     clear_5h_script_actions
     clear_weekly_script_actions
+    clear_5h_reset_script_actions
+    clear_weekly_reset_script_actions
   elif (( script_tracking_initialized == 0 )); then
     initialize_script_baseline=1
     [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && script_prev_5h_pct="$five_h_pct"
@@ -2731,6 +2944,7 @@ check_thresholds() {
       observed_weekly_reset_at="$weekly_reset_at"
       observed_weekly_limit_id="$limit_id"
       local_observed_weekly_reset_at=0
+      clear_weekly_reset_script_actions
     else
       process_weekly_sample=0
     fi
@@ -2791,6 +3005,7 @@ check_thresholds() {
         pending_5h_threshold=""
         script_prev_5h_pct="$five_h_pct"
         clear_5h_script_actions
+        clear_5h_reset_script_actions
       fi
     elif [[ "$observed_5h_limit_id" != "$limit_id" ]]; then
       observed_5h_pct="$five_h_pct"
@@ -2809,7 +3024,7 @@ check_thresholds() {
       clear_5h_script_actions
       # A scheduled cycle belongs to its original group. Do not deliver it
       # while processing a complete observation from another group.
-      if [[ -n "$five_h_armed_limit_id" && "$five_h_armed_limit_id" != "$limit_id" ]]; then
+      if [[ "$five_h_armed_limit_id" != "$limit_id" ]]; then
         five_h_armed_reset_at=0
         five_h_armed_limit_id=""
         script_5h_reset_attempted_at=0
@@ -2914,7 +3129,7 @@ check_thresholds() {
       && [[ "$(configured_alert_channels_json)" != "[]" ]]; then
       pending_observed_weekly_reset_at="$weekly_armed_reset_at"
       pending_observed_weekly_reset_limit_id="$limit_id"
-      if ! persist_alert_state; then
+      if ! persist_alert_state && ! persist_alert_state; then
         ALERT_PROCESSING_ERROR="weekly reset intent persistence failed"
         return 1
       fi
@@ -2952,7 +3167,7 @@ check_thresholds() {
         && [[ "$local_observed_weekly_reset_at" != "$weekly_armed_reset_at" ]]; then
         previous_local_observed_weekly_reset_at="$local_observed_weekly_reset_at"
         local_observed_weekly_reset_at="$weekly_armed_reset_at"
-        if ! persist_alert_state; then
+        if ! persist_alert_state && ! persist_alert_state; then
           local_observed_weekly_reset_at="$previous_local_observed_weekly_reset_at"
           weekly_intent_succeeded=0
         fi
@@ -2976,7 +3191,7 @@ check_thresholds() {
       && [[ "$local_observed_weekly_reset_at" != "$weekly_armed_reset_at" ]]; then
       previous_local_observed_weekly_reset_at="$local_observed_weekly_reset_at"
       local_observed_weekly_reset_at="$weekly_armed_reset_at"
-      if ! persist_alert_state; then
+      if ! persist_alert_state && ! persist_alert_state; then
         local_observed_weekly_reset_at="$previous_local_observed_weekly_reset_at"
         weekly_intent_succeeded=0
       fi
@@ -3101,13 +3316,18 @@ check_thresholds() {
     # historical clear-on-ack behavior.
     if (( reset_age > 5 * 60 * 60 )) \
       || (( last_notified_5h_reset_at == five_h_armed_reset_at && observed_5h_reset == 0 )); then
-      [[ "$local_observed_5h_reset_at" == "$five_h_armed_reset_at" ]] \
-        && local_observed_5h_reset_at=0
-      five_h_armed_reset_at=0
-      five_h_armed_limit_id=""
-      notified_5h_thresholds=""
-      pending_5h_threshold=""
-      prev_5h_pct=100
+      # Keep the arm until every configured reset hook is durably completed or
+      # explicitly suppressed.  The arm is the recovery anchor for a crash or
+      # failed intent write between network acknowledgement and hook launch.
+      if ! has_unfinished_reset_script_actions 5h; then
+        [[ "$local_observed_5h_reset_at" == "$five_h_armed_reset_at" ]] \
+          && local_observed_5h_reset_at=0
+        five_h_armed_reset_at=0
+        five_h_armed_limit_id=""
+        notified_5h_thresholds=""
+        pending_5h_threshold=""
+        prev_5h_pct=100
+      fi
     fi
     if (( script_5h_reset_attempted_at != due_5h_reset_at )); then
       script_5h_reset_attempted_at="$due_5h_reset_at"
@@ -3177,16 +3397,18 @@ check_thresholds() {
       last_notified_weekly_reset_at="$weekly_armed_reset_at"
     fi
     if (( reset_age > 7 * 24 * 60 * 60 || last_notified_weekly_reset_at == weekly_armed_reset_at )); then
-      [[ "$local_observed_weekly_reset_at" == "$weekly_armed_reset_at" ]] \
-        && local_observed_weekly_reset_at=0
-      weekly_armed_reset_at=0
-      weekly_armed_limit_id=""
-      notified_weekly_thresholds=""
-      pending_weekly_threshold=""
-      if (( observed_weekly_reset == 1 )); then
-        prev_weekly_pct="$weekly_pct"
-      else
-        prev_weekly_pct=100
+      if ! has_unfinished_reset_script_actions weekly; then
+        [[ "$local_observed_weekly_reset_at" == "$weekly_armed_reset_at" ]] \
+          && local_observed_weekly_reset_at=0
+        weekly_armed_reset_at=0
+        weekly_armed_limit_id=""
+        notified_weekly_thresholds=""
+        pending_weekly_threshold=""
+        if (( observed_weekly_reset == 1 )); then
+          prev_weekly_pct="$weekly_pct"
+        else
+          prev_weekly_pct=100
+        fi
       fi
     fi
     if (( script_weekly_reset_attempted_at != due_weekly_reset_at )); then
@@ -3444,8 +3666,7 @@ PYEOF
       [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && script_prev_5h_pct="$five_h_pct"
       [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && script_prev_weekly_pct="$weekly_pct"
     fi
-    if (( script_state_error == 0 && due_5h_reset_at > 0 \
-          && scraped_at_epoch - due_5h_reset_at <= 5 * 60 * 60 )); then
+    if (( script_state_error == 0 && due_5h_reset_at > 0 )); then
       for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_INDICES[@]}; rule_position++ )); do
         if [[ "${ALERT_SCRIPT_RULE_EVENTS[$rule_position]}" == "5h:reset" ]]; then
           attempt_alert_script "$rule_position" attempted_script_5h_reset_actions \
@@ -3460,7 +3681,7 @@ PYEOF
         fi
       done
     fi
-    if (( script_state_error == 0 && due_weekly_reset_at > 0 && scraped_at_epoch - due_weekly_reset_at <= 7 * 24 * 60 * 60 )); then
+    if (( script_state_error == 0 && due_weekly_reset_at > 0 )); then
       for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_INDICES[@]}; rule_position++ )); do
         if [[ "${ALERT_SCRIPT_RULE_EVENTS[$rule_position]}" == "weekly:reset" ]]; then
           attempt_alert_script "$rule_position" attempted_script_weekly_reset_actions \
@@ -3539,6 +3760,45 @@ PYEOF
         fi
       done
       (( script_state_error == 0 && script_hook_error == 0 )) && script_prev_weekly_pct="$weekly_pct"
+    fi
+  fi
+
+  # A reset arm is deliberately retained through the pre-hook state write so a
+  # crash cannot lose the hook opportunity.  Once all matching hooks are
+  # durably completed (or suppressed while disabled), retire that recovery
+  # anchor in this same cycle instead of waiting for a later poll.
+  if (( five_h_armed_reset_at > 0 && due_5h_reset_at == five_h_armed_reset_at )) \
+    && [[ "$five_h_armed_limit_id" == "$limit_id" ]] \
+    && (( last_notified_5h_reset_at == five_h_armed_reset_at )) \
+    && ! has_unfinished_reset_script_actions 5h; then
+    # Keep an old observed baseline marker until a complete post-recovery
+    # sample replaces it; otherwise a missing-deadline retry followed by the
+    # next full sample could manufacture a second local tombstone.  A synthetic
+    # no-arm marker is not such a baseline and can be retired immediately.
+    if [[ "$local_observed_5h_reset_at" == "$five_h_armed_reset_at" \
+          && "$observed_5h_reset_at" != "$five_h_armed_reset_at" ]]; then
+      local_observed_5h_reset_at=0
+    fi
+    five_h_armed_reset_at=0
+    five_h_armed_limit_id=""
+    notified_5h_thresholds=""
+    pending_5h_threshold=""
+    prev_5h_pct=100
+  fi
+  if (( weekly_armed_reset_at > 0 && due_weekly_reset_at == weekly_armed_reset_at )) \
+    && [[ "$weekly_armed_limit_id" == "$limit_id" ]] \
+    && (( last_notified_weekly_reset_at == weekly_armed_reset_at )) \
+    && ! has_unfinished_reset_script_actions weekly; then
+    [[ "$local_observed_weekly_reset_at" == "$weekly_armed_reset_at" ]] \
+      && local_observed_weekly_reset_at=0
+    weekly_armed_reset_at=0
+    weekly_armed_limit_id=""
+    notified_weekly_thresholds=""
+    pending_weekly_threshold=""
+    if (( observed_weekly_reset == 1 )); then
+      prev_weekly_pct="$weekly_pct"
+    else
+      prev_weekly_pct=100
     fi
   fi
 

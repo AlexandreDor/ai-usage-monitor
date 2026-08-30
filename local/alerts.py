@@ -115,6 +115,21 @@ def _replace_limit_segment(cycle_key: str, old_limit_id: str,
     return "|".join(segments)
 
 
+def _cycle_reset_epoch(cycle_key: str) -> int | None:
+    """Return the reset epoch encoded by a cycle key, when it has one."""
+
+    reset_segments = [segment for segment in cycle_key.split("|")
+                      if segment.startswith("reset:")]
+    if len(reset_segments) > 1:
+        raise JournalError("cycle key contains multiple reset epochs")
+    if not reset_segments:
+        return None
+    raw_epoch = reset_segments[0].split(":", 1)[1]
+    if not raw_epoch.isdigit():
+        raise JournalError("cycle key contains an invalid reset epoch")
+    return int(raw_epoch)
+
+
 def empty_journal(source_version: int, completed_at: int) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -152,7 +167,8 @@ def _validate_channel(name: str, channel: Any) -> None:
         raise JournalError("delivered channel has an error")
 
 
-def _validate_alert(item: Any, *, require_opaque_limit_id: bool = False) -> None:
+def _validate_alert(item: Any, *, require_opaque_limit_id: bool = False,
+                    enforce_cycle_identity: bool = True) -> None:
     if not isinstance(item, dict):
         raise JournalError("alert must be an object")
     required = {
@@ -194,6 +210,17 @@ def _validate_alert(item: Any, *, require_opaque_limit_id: bool = False) -> None
         raise JournalError("event limit_id is not an opaque identifier")
     if not _is_int(event.get("reset_epoch")):
         raise JournalError("invalid event reset_epoch")
+    if enforce_cycle_identity:
+        cycle_reset_epoch = _cycle_reset_epoch(item["cycle_key"])
+        has_unarmed_segment = "unarmed" in item["cycle_key"].split("|")
+        if cycle_reset_epoch is not None and event["reset_epoch"] != cycle_reset_epoch:
+            raise JournalError("event reset_epoch is inconsistent with cycle key")
+        if has_unarmed_segment and cycle_reset_epoch is not None:
+            raise JournalError("cycle key cannot be both reset and unarmed")
+        if has_unarmed_segment and event["reset_epoch"] != 0:
+            raise JournalError("unarmed cycle has a reset epoch")
+        if item["kind"] == "reset" and cycle_reset_epoch is None:
+            raise JournalError("reset cycle key lacks a reset epoch")
     if item["kind"] == "threshold":
         if set(event) != {"limit_id", "remaining_pct", "reset_epoch", "covered_thresholds"}:
             raise JournalError("invalid threshold event_data")
@@ -289,7 +316,11 @@ def validate_document(document: Any, *, allow_legacy: bool = True) -> dict[str, 
         raise JournalError("alerts must be an array")
     seen: set[str] = set()
     for item in document["alerts"]:
-        _validate_alert(item, require_opaque_limit_id=version == SCHEMA_VERSION)
+        _validate_alert(
+            item,
+            require_opaque_limit_id=version == SCHEMA_VERSION,
+            enforce_cycle_identity=version == SCHEMA_VERSION,
+        )
         if item["alert_id"] in seen:
             raise JournalError("duplicate alert_id")
         seen.add(item["alert_id"])
@@ -338,6 +369,14 @@ def migrate_document(document: dict[str, Any], completed_at: int) -> dict[str, A
         item["cycle_key"] = _migrate_cycle_key(
             item["cycle_key"], old_limit_id, new_limit_id
         )
+        # Legacy journals did not require the cycle key and event payload to
+        # agree.  Preserve the durable cycle identity while normalizing the
+        # redundant reset field before validating the modern document.
+        cycle_reset_epoch = _cycle_reset_epoch(item["cycle_key"])
+        if cycle_reset_epoch is not None:
+            item["event_data"]["reset_epoch"] = cycle_reset_epoch
+        elif "unarmed" in item["cycle_key"].split("|"):
+            item["event_data"]["reset_epoch"] = 0
         item["alert_id"] = alert_id(
             item["kind"], item["window"], item["selector"], item["cycle_key"], namespace
         )
@@ -392,14 +431,11 @@ def atomic_write(path: pathlib.Path, document: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        except OSError:
-            pass
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         try:
             os.close(fd)

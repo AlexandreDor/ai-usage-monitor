@@ -17,12 +17,20 @@ assert SPEC.loader
 SPEC.loader.exec_module(alerts)
 
 
+def cycle_reset_epoch(cycle):
+    for segment in cycle.split("|"):
+        if segment.startswith("reset:"):
+            return int(segment.split(":", 1)[1])
+    return 0
+
+
 def request(selector="25", channels=None, created=100, cycle="limit:default|reset:200"):
+    reset_epoch = cycle_reset_epoch(cycle)
     return {
         "kind": "threshold", "window": "5h", "selector": selector,
         "cycle_key": cycle, "message": f"immutable {selector}",
         "event_data": {"limit_id": "default", "remaining_pct": 20,
-                       "reset_epoch": 200, "covered_thresholds": [50, 25]},
+                       "reset_epoch": reset_epoch, "covered_thresholds": [50, 25]},
         "created_at": created, "expires_at": 200,
         "channels": channels or ["discord", "telegram"],
         "replace_pending_thresholds": True, "expire_threshold_cycle": None,
@@ -30,10 +38,11 @@ def request(selector="25", channels=None, created=100, cycle="limit:default|rese
 
 
 def reset_request(window="5h", created=200, cycle="limit:default|reset:200"):
+    reset_epoch = cycle_reset_epoch(cycle)
     return {
         "kind": "reset", "window": window, "selector": "reset",
         "cycle_key": cycle, "message": f"{window} reset",
-        "event_data": {"limit_id": "default", "reset_epoch": created},
+        "event_data": {"limit_id": "default", "reset_epoch": reset_epoch},
         "created_at": created, "expires_at": created + 100,
         "channels": ["discord"], "replace_pending_thresholds": False,
         "expire_threshold_cycle": cycle,

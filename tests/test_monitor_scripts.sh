@@ -195,8 +195,8 @@ assert_eq "$weekly_crash_action_id" "$(state_value pending_script_weekly_reset_a
   "weekly crash did not preserve a pending local hook intent"
 assert_eq "" "$(state_value attempted_script_weekly_reset_actions)" \
   "weekly crash marked the local hook completed before execution"
-assert_eq 0 "$(state_value weekly_armed_reset_at)" \
-  "weekly crash did not cover the acknowledged arm cleanup"
+assert_eq "$((now + 900))" "$(state_value weekly_armed_reset_at)" \
+  "weekly crash did not retain the reset anchor for hook recovery"
 [[ ! -e "$HOOK_LOG" ]] || fail "weekly crash window executed the local hook before restart"
 check_thresholds 100 100 unknown later '' "$crash_new_weekly_deadline" "$((now + 901))" group-a
 assert_eq 1 "$(wc -l < "$HOOK_LOG")" "weekly restart did not retry the pending local hook"
