@@ -154,19 +154,19 @@ validate_config
 retry_old_five_deadline=$((now + 3600))
 retry_new_five_deadline=$((retry_old_five_deadline + 900))
 check_thresholds 100 100 later unknown "$retry_old_five_deadline" '' "$now" group-a
-# shellcheck disable=SC2317,SC2329
-invalidate_pending_thresholds() { return 1; }
+# Inject failure at the atomic observed-reset transaction actually used by
+# monitor.sh.  The old invalidate_pending_thresholds_for_owner hook is no
+# longer on this path.
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_original /')"
+expire_observed_owner_cycle() { return 1; }
 if check_thresholds 100 100 later unknown "$retry_new_five_deadline" '' "$((now + 900))" group-a >/dev/null 2>&1; then
   fail "failed observed reset invalidation was accepted"
 fi
 [[ ! -e "$HOOK_LOG" ]] || fail "failed observed reset invalidation ran a hook"
 assert_eq "$retry_old_five_deadline" "$(state_value observed_5h_reset_at)" \
   "failed observed reset advanced the baseline"
-invalidate_pending_thresholds() {
-  local window="$1" cycle_key="$2" limit_id="$3" now="$4"
-  python3 "$ALERTS_PY" expire-thresholds "$ALERT_DELIVERIES_FILE" \
-    "$window" "$cycle_key" "$limit_id" --now "$now"
-}
+eval "$(declare -f expire_observed_owner_cycle_original | sed '1s/^expire_observed_owner_cycle_original /expire_observed_owner_cycle /')"
 check_thresholds 100 100 later unknown "$retry_new_five_deadline" '' "$((now + 901))" group-a
 assert_eq 1 "$(wc -l < "$HOOK_LOG")" "successful observed reset hook did not execute"
 check_thresholds 100 100 later unknown "$retry_new_five_deadline" '' "$((now + 1800))" group-a

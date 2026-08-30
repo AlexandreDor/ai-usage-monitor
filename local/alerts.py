@@ -39,11 +39,12 @@ ALERT_STATUSES = CHANNEL_STATUSES
 ERROR_CLASSES = {
     "client_error", "rate_limited", "server_error", "timeout",
     "transport_error", "invalid_response", "channel_unconfigured",
-    "superseded", "expired_after_reset", "owner_interrupted",
+    "superseded", "expired_after_reset", "owner_interrupted", "local_observed",
 }
 TERMINAL_REASONS = {
     "delivered", "permanent_failure", "superseded",
     "expired_after_reset", "channel_unconfigured", "owner_interrupted",
+    "local_observed",
 }
 OPAQUE_LIMIT_ID_RE = re.compile(r"limit-[0-9a-f]{64}\Z")
 LEGACY_NAMESPACE_RE = re.compile(r"legacy-v[0-9]+\Z")
@@ -547,6 +548,35 @@ def expire_pending_thresholds(document: dict[str, Any], window: str,
     return expired
 
 
+def expire_pending_thresholds_for_owner(document: dict[str, Any], window: str,
+                                        limit_id: str, now: int) -> int:
+    """Terminalize every pending threshold for one owner and window.
+
+    An observed refill is evidence that the detector's pre-reset cycle has
+    ended, but a restored arm/deadline may no longer identify that cycle.  In
+    that case the journal's durable event owner is the authority, so expire
+    all pending thresholds for the current owner in the affected window.  Do
+    not broaden this to resets, anomalies, or another owner.
+    """
+
+    if (window not in WINDOWS or not isinstance(limit_id, str)
+            or not limit_id or not _is_int(now)):
+        raise JournalError("invalid owner threshold expiration request")
+    canonical_limit_id = canonicalize_limit_id(limit_id)
+    if canonical_limit_id is None:
+        raise JournalError("owner threshold expiration limit ID is invalid")
+
+    expired = 0
+    for existing in document["alerts"]:
+        if (existing["kind"] == "threshold"
+                and existing["window"] == window
+                and existing["status"] == "pending"
+                and existing["event_data"].get("limit_id") == canonical_limit_id):
+            _terminate(existing, "expired_after_reset", now, "expired_after_reset")
+            expired += 1
+    return expired
+
+
 def interrupt_pending_owner(document: dict[str, Any], limit_id: str, now: int) -> int:
     """Terminalize pending threshold/reset occurrences for an interrupted owner.
 
@@ -600,6 +630,179 @@ def interrupt_pending_other_owners(document: dict[str, Any], current_limit_id: s
         _terminate(item, "owner_interrupted", now, "owner_interrupted")
         interrupted += 1
     return interrupted
+
+
+def suppress_local_reset_cycle(document: dict[str, Any], window: str,
+                               limit_id: str, reset_epoch: int, now: int,
+                               reason: str = "local_observed") -> int:
+    """Durably suppress one scheduled reset superseded by observed evidence.
+
+    The terminal journal row is a write-ahead tombstone for a local-only
+    observed 5-hour refill.  It is intentionally terminal from creation, so
+    ``due`` can never select it, even when alerts are disabled or no channel is
+    configured.  If a pending occurrence for the same owner/cycle already
+    exists, terminalize it in place; otherwise append an idempotent marker.
+    """
+
+    if (window not in WINDOWS or reason not in {"local_observed", "owner_interrupted"}
+            or not isinstance(limit_id, str) or not limit_id
+            or not _is_int(reset_epoch) or not _is_int(now)):
+        raise JournalError("invalid reset cycle suppression request")
+    canonical_limit_id = canonicalize_limit_id(limit_id)
+    if canonical_limit_id is None:
+        raise JournalError("reset cycle suppression limit ID is invalid")
+    cycle_key = f"limit:{canonical_limit_id}|reset:{reset_epoch}"
+    validity = 5 * 60 * 60 if window == "5h" else 7 * 24 * 60 * 60
+    message = (
+        "Observed local reset; scheduled notification suppressed."
+        if reason == "local_observed"
+        else "Limit owner interrupted; scheduled notification suppressed."
+    )
+    changed = 0
+    matched = False
+    for existing in document["alerts"]:
+        if (existing["kind"] != "reset" or existing["window"] != window
+                or existing["selector"] != "reset"
+                or existing["event_data"].get("limit_id") != canonical_limit_id
+                or not _same_cycle(existing["cycle_key"], cycle_key)):
+            continue
+        matched = True
+        if existing["status"] == "pending":
+            _terminate(existing, reason, now, reason)
+            changed += 1
+        elif reason == "owner_interrupted" and existing["terminal_reason"] == "local_observed":
+            # An owner interruption is stronger than an earlier local-only
+            # classification for the same cycle.  A crash can leave the local
+            # tombstone behind while the detector arm is restored under the
+            # interrupted owner; promote only this specific collision so the
+            # return path cannot execute a local hook.  Delivered/permanent
+            # terminal events are intentionally immutable.
+            for channel in existing["channels"].values():
+                if (channel["status"] == "failed"
+                        and channel["error_class"] == "local_observed"):
+                    channel["error_class"] = "owner_interrupted"
+            existing["message"] = message
+            existing["terminal_reason"] = "owner_interrupted"
+            existing["completed_at"] = now
+            existing["replacement_alert_id"] = None
+            changed += 1
+    if matched:
+        return changed
+
+    tombstone = _request_alert({
+        "kind": "reset",
+        "window": window,
+        "selector": "reset",
+        "cycle_key": cycle_key,
+        "message": message,
+        "event_data": {
+            "limit_id": canonical_limit_id,
+            "reset_epoch": reset_epoch,
+        },
+        "created_at": now,
+        "expires_at": max(now, reset_epoch + validity),
+        # Terminal markers use the complete known channel set and are never
+        # passed to due; this keeps the schema independent of configuration.
+        "channels": sorted(CHANNELS),
+    })
+    _terminate(tombstone, reason, now, reason)
+    document["alerts"].append(tombstone)
+    return 1
+
+
+def expire_owner_thresholds_and_suppress_reset(document: dict[str, Any],
+                                               window: str, limit_id: str,
+                                               reset_epoch: int, now: int) -> int:
+    """Atomically expire an owner's thresholds and suppress its reset cycle.
+
+    The caller writes the resulting document once.  A zero ``reset_epoch``
+    means that no reset tombstone is needed (for example an observed reset
+    with no durable arm), while threshold invalidation remains part of the
+    same journal transaction.
+    """
+
+    if not _is_int(reset_epoch):
+        raise JournalError("invalid atomic reset epoch")
+    changed = expire_pending_thresholds_for_owner(document, window, limit_id, now)
+    if reset_epoch:
+        changed += suppress_local_reset_cycle(
+            document, window, limit_id, reset_epoch, now,
+        )
+    return changed
+
+
+def expire_observed_owner_cycle(document: dict[str, Any], window: str,
+                                limit_id: str, now: int,
+                                superseded_reset_epoch: int = 0,
+                                preserve_cycle: str | None = None,
+                                new_reset_request: dict[str, Any] | None = None) -> int:
+    """Close stale owner events and optionally publish a new reset atomically.
+
+    Observed evidence consumes the detector's prior cycle.  Thresholds and
+    pending reset rows for that owner/window must therefore be terminalized in
+    the same journal transaction.  ``preserve_cycle`` is used by weekly
+    observed refills: the new reset occurrence is created in this transaction
+    and is the only pending reset row retained for the owner.  A 5h observed
+    refill passes the superseded arm epoch instead and gets a local-only
+    tombstone when no matching reset row already exists.
+    """
+
+    if (window not in WINDOWS or not isinstance(limit_id, str)
+            or not limit_id or not _is_int(now)
+            or not _is_int(superseded_reset_epoch)):
+        raise JournalError("invalid observed owner cycle request")
+    canonical_limit_id = canonicalize_limit_id(limit_id)
+    if canonical_limit_id is None:
+        raise JournalError("observed owner cycle limit ID is invalid")
+    if preserve_cycle is not None:
+        if not isinstance(preserve_cycle, str) or not preserve_cycle:
+            raise JournalError("observed owner preserve cycle is invalid")
+        try:
+            _limit_segment_index(preserve_cycle, canonical_limit_id)
+        except JournalError:
+            raise JournalError("observed owner preserve cycle has wrong owner") from None
+    if new_reset_request is not None:
+        if (new_reset_request.get("kind") != "reset"
+                or new_reset_request.get("window") != window
+                or new_reset_request.get("event_data", {}).get("limit_id")
+                != canonical_limit_id):
+            raise JournalError("observed owner reset request has wrong owner")
+        if preserve_cycle is None or not _same_cycle(
+                new_reset_request.get("cycle_key", ""), preserve_cycle):
+            raise JournalError("observed owner reset request is not preserved")
+
+    changed = expire_pending_thresholds_for_owner(
+        document, window, canonical_limit_id, now,
+    )
+    for existing in document["alerts"]:
+        if (existing["kind"] != "reset" or existing["window"] != window
+                or existing["status"] != "pending"
+                or existing["event_data"].get("limit_id") != canonical_limit_id):
+            continue
+        if preserve_cycle is not None and _same_cycle(
+                existing["cycle_key"], preserve_cycle):
+            continue
+        _terminate(existing, "local_observed", now, "local_observed")
+        changed += 1
+
+    if superseded_reset_epoch:
+        changed += suppress_local_reset_cycle(
+            document, window, canonical_limit_id, superseded_reset_epoch, now,
+        )
+    if new_reset_request is not None:
+        before = len(document["alerts"])
+        register(document, new_reset_request)
+        changed += len(document["alerts"]) > before
+    return int(changed)
+
+
+def interrupt_reset_cycle(document: dict[str, Any], window: str,
+                          limit_id: str, reset_epoch: int, now: int) -> int:
+    """Durably suppress a reset cycle interrupted by another owner."""
+
+    return suppress_local_reset_cycle(
+        document, window, limit_id, reset_epoch, now, "owner_interrupted",
+    )
 
 
 def register(document: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
@@ -767,11 +970,40 @@ def command(args: argparse.Namespace) -> None:
         atomic_write(path, document)
         print(json.dumps(item, separators=(",", ":"), ensure_ascii=False))
     elif args.action in {"expire-thresholds", "expire-threshold"}:
+        migrated = migrate_document(document, args.now)
         expired = expire_pending_thresholds(
-            document, args.window, args.cycle_key, args.limit_id, args.now,
+            migrated, args.window, args.cycle_key, args.limit_id, args.now,
         )
-        if expired:
-            atomic_write(path, document)
+        if migrated is not document or expired:
+            atomic_write(path, migrated)
+    elif args.action in {"expire-owner-thresholds", "expire-thresholds-owner"}:
+        migrated = migrate_document(document, args.now)
+        expired = expire_pending_thresholds_for_owner(
+            migrated, args.window, args.limit_id, args.now,
+        )
+        if migrated is not document or expired:
+            atomic_write(path, migrated)
+    elif args.action in {
+        "expire-owner-thresholds-and-reset",
+        "expire-thresholds-and-local-reset",
+    }:
+        migrated = migrate_document(document, args.now)
+        changed = expire_owner_thresholds_and_suppress_reset(
+            migrated, args.window, args.limit_id, args.reset_epoch, args.now,
+        )
+        if migrated is not document or changed:
+            atomic_write(path, migrated)
+    elif args.action in {"expire-observed-owner", "expire-owner-observed-cycle"}:
+        migrated = migrate_document(document, args.now)
+        request = _read_stdin({})
+        if request is not None and not isinstance(request, dict):
+            raise JournalError("observed owner reset request must be an object")
+        changed = expire_observed_owner_cycle(
+            migrated, args.window, args.limit_id, args.now,
+            args.superseded_reset_epoch, args.preserve_cycle, request or None,
+        )
+        if migrated is not document or changed:
+            atomic_write(path, migrated)
     elif args.action in {"interrupt-owner", "interrupt-pending-owner"}:
         migrated = migrate_document(document, args.now)
         interrupted = interrupt_pending_owner(migrated, args.limit_id, args.now)
@@ -783,6 +1015,20 @@ def command(args: argparse.Namespace) -> None:
             migrated, args.current_limit_id, args.now,
         )
         if migrated is not document or interrupted:
+            atomic_write(path, migrated)
+    elif args.action in {"suppress-local-reset", "tombstone-local-reset"}:
+        migrated = migrate_document(document, args.now)
+        changed = suppress_local_reset_cycle(
+            migrated, args.window, args.limit_id, args.reset_epoch, args.now,
+        )
+        if migrated is not document or changed:
+            atomic_write(path, migrated)
+    elif args.action in {"interrupt-reset-cycle", "tombstone-owner-reset"}:
+        migrated = migrate_document(document, args.now)
+        changed = interrupt_reset_cycle(
+            migrated, args.window, args.limit_id, args.reset_epoch, args.now,
+        )
+        if migrated is not document or changed:
             atomic_write(path, migrated)
     elif args.action == "due":
         configured = _configured_channels(_read_stdin(None))
@@ -881,6 +1127,31 @@ def parser() -> argparse.ArgumentParser:
     expire_thresholds_parser.add_argument("cycle_key")
     expire_thresholds_parser.add_argument("limit_id")
     expire_thresholds_parser.add_argument("--now", type=int, required=True)
+    expire_owner_thresholds_parser = sub.add_parser(
+        "expire-owner-thresholds", aliases=["expire-thresholds-owner"],
+    )
+    expire_owner_thresholds_parser.add_argument("journal")
+    expire_owner_thresholds_parser.add_argument("window", choices=sorted(WINDOWS))
+    expire_owner_thresholds_parser.add_argument("limit_id")
+    expire_owner_thresholds_parser.add_argument("--now", type=int, required=True)
+    expire_owner_atomic_parser = sub.add_parser(
+        "expire-owner-thresholds-and-reset",
+        aliases=["expire-thresholds-and-local-reset"],
+    )
+    expire_owner_atomic_parser.add_argument("journal")
+    expire_owner_atomic_parser.add_argument("window", choices=sorted(WINDOWS))
+    expire_owner_atomic_parser.add_argument("limit_id")
+    expire_owner_atomic_parser.add_argument("reset_epoch", type=int)
+    expire_owner_atomic_parser.add_argument("--now", type=int, required=True)
+    expire_observed_parser = sub.add_parser(
+        "expire-observed-owner", aliases=["expire-owner-observed-cycle"],
+    )
+    expire_observed_parser.add_argument("journal")
+    expire_observed_parser.add_argument("window", choices=sorted(WINDOWS))
+    expire_observed_parser.add_argument("limit_id")
+    expire_observed_parser.add_argument("--superseded-reset-epoch", type=int, default=0)
+    expire_observed_parser.add_argument("--preserve-cycle")
+    expire_observed_parser.add_argument("--now", type=int, required=True)
     interrupt_owner_parser = sub.add_parser(
         "interrupt-owner", aliases=["interrupt-pending-owner"],
     )
@@ -893,6 +1164,22 @@ def parser() -> argparse.ArgumentParser:
     interrupt_other_parser.add_argument("journal")
     interrupt_other_parser.add_argument("current_limit_id")
     interrupt_other_parser.add_argument("--now", type=int, required=True)
+    local_reset_parser = sub.add_parser(
+        "suppress-local-reset", aliases=["tombstone-local-reset"],
+    )
+    local_reset_parser.add_argument("journal")
+    local_reset_parser.add_argument("window", choices=sorted(WINDOWS))
+    local_reset_parser.add_argument("limit_id")
+    local_reset_parser.add_argument("reset_epoch", type=int)
+    local_reset_parser.add_argument("--now", type=int, required=True)
+    interrupt_reset_parser = sub.add_parser(
+        "interrupt-reset-cycle", aliases=["tombstone-owner-reset"],
+    )
+    interrupt_reset_parser.add_argument("journal")
+    interrupt_reset_parser.add_argument("window", choices=sorted(WINDOWS))
+    interrupt_reset_parser.add_argument("limit_id")
+    interrupt_reset_parser.add_argument("reset_epoch", type=int)
+    interrupt_reset_parser.add_argument("--now", type=int, required=True)
     migrate_parser = sub.add_parser("migrate")
     migrate_parser.add_argument("journal")
     migrate_parser.add_argument("--at", type=int, required=True)

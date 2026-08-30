@@ -124,6 +124,141 @@ class AlertJournalTests(unittest.TestCase):
         self.assertEqual("expired_after_reset", stale["channels"]["discord"]["error_class"])
         self.assertEqual("pending", other["status"])
 
+    def test_expire_pending_thresholds_for_owner_ignores_cycle_and_other_kinds(self):
+        arm_cycle = alerts.register(
+            self.document,
+            request("50", channels=["discord"], cycle="limit:default|reset:300"),
+        )
+        old_cycle = alerts.register(
+            self.document,
+            request("25", channels=["discord"], cycle="limit:default|reset:200"),
+        )
+        weekly_request = request(
+            "10", channels=["discord"], cycle="limit:default|reset:300",
+        )
+        weekly_request["window"] = "weekly"
+        weekly = alerts.register(self.document, weekly_request)
+        reset = alerts.register(
+            self.document, reset_request(cycle="limit:default|reset:999"),
+        )
+        other_request = request(
+            "5", channels=["discord"], cycle="limit:other|reset:300",
+        )
+        other_request["event_data"]["limit_id"] = "other"
+        other = alerts.register(self.document, other_request)
+
+        expired = alerts.expire_pending_thresholds_for_owner(
+            self.document, "5h", "default", 400,
+        )
+
+        self.assertEqual(2, expired)
+        for item in (arm_cycle, old_cycle):
+            self.assertEqual("failed", item["status"])
+            self.assertEqual("expired_after_reset", item["terminal_reason"])
+            self.assertEqual(
+                "expired_after_reset", item["channels"]["discord"]["error_class"],
+            )
+        self.assertEqual("pending", weekly["status"])
+        self.assertEqual("pending", reset["status"])
+        self.assertEqual("pending", other["status"])
+
+    def test_expire_owner_thresholds_and_suppress_reset_is_one_document_operation(self):
+        threshold = alerts.register(
+            self.document,
+            request("50", channels=["discord"], cycle="limit:default|reset:200"),
+        )
+        reset_request_value = reset_request(cycle="limit:default|reset:200")
+        reset_request_value["expire_threshold_cycle"] = None
+        reset = alerts.register(self.document, reset_request_value)
+        other = request(
+            "25", channels=["discord"], cycle="limit:other|reset:200",
+        )
+        other["event_data"]["limit_id"] = "other"
+        other = alerts.register(self.document, other)
+
+        changed = alerts.expire_owner_thresholds_and_suppress_reset(
+            self.document, "5h", "default", 200, 300,
+        )
+
+        self.assertEqual(2, changed)
+        self.assertEqual("expired_after_reset", threshold["terminal_reason"])
+        self.assertEqual("local_observed", reset["terminal_reason"])
+        self.assertEqual("pending", other["status"])
+        alerts.validate_document(self.document, allow_legacy=False)
+
+    def test_expire_owner_thresholds_and_suppress_reset_without_arm_has_no_reset_row(self):
+        threshold = alerts.register(
+            self.document,
+            request("50", channels=["discord"], cycle="limit:default|unarmed"),
+        )
+
+        changed = alerts.expire_owner_thresholds_and_suppress_reset(
+            self.document, "5h", "default", 0, 300,
+        )
+
+        self.assertEqual(1, changed)
+        self.assertEqual("expired_after_reset", threshold["terminal_reason"])
+        self.assertFalse(any(item["kind"] == "reset" for item in self.document["alerts"]))
+        alerts.validate_document(self.document, allow_legacy=False)
+
+    def test_expire_observed_owner_cycle_closes_pending_reset_rows(self):
+        threshold = alerts.register(
+            self.document,
+            request("50", channels=["discord"], cycle="limit:default|reset:200"),
+        )
+        reset = reset_request(cycle="limit:default|reset:200")
+        reset["expire_threshold_cycle"] = None
+        reset = alerts.register(self.document, reset)
+
+        changed = alerts.expire_observed_owner_cycle(
+            self.document, "5h", "default", 300, 200,
+        )
+
+        self.assertEqual(2, changed)
+        self.assertEqual("expired_after_reset", threshold["terminal_reason"])
+        self.assertEqual("local_observed", reset["terminal_reason"])
+        self.assertEqual(2, len(self.document["alerts"]))
+        alerts.validate_document(self.document, allow_legacy=False)
+
+    def test_expire_observed_owner_cycle_preserves_and_registers_new_weekly_reset(self):
+        old_threshold = request(
+            "50", channels=["discord"], cycle="limit:default|reset:200",
+        )
+        old_threshold["window"] = "weekly"
+        old_threshold = alerts.register(self.document, old_threshold)
+        old_reset = reset_request(
+            window="weekly", cycle="limit:default|reset:200",
+        )
+        old_reset["expire_threshold_cycle"] = None
+        old_reset = alerts.register(self.document, old_reset)
+        new_request = reset_request(
+            window="weekly", created=400, cycle="limit:default|reset:400",
+        )
+        new_request["expire_threshold_cycle"] = None
+        weekly_id = alerts.canonicalize_limit_id("default")
+        weekly_cycle = f"limit:{weekly_id}|reset:400"
+        new_request["cycle_key"] = weekly_cycle
+        new_request["event_data"]["limit_id"] = weekly_id
+
+        changed = alerts.expire_observed_owner_cycle(
+            self.document, "weekly", "default", 401,
+            preserve_cycle=weekly_cycle,
+            new_reset_request=new_request,
+        )
+
+        self.assertEqual(3, changed)
+        self.assertEqual("expired_after_reset", old_threshold["terminal_reason"])
+        self.assertEqual("local_observed", old_reset["terminal_reason"])
+        new_reset = next(item for item in self.document["alerts"]
+                         if item["cycle_key"] == weekly_cycle)
+        self.assertEqual("pending", new_reset["status"])
+        self.assertEqual(0, alerts.expire_observed_owner_cycle(
+            self.document, "weekly", "default", 402,
+            preserve_cycle=weekly_cycle,
+            new_reset_request=new_request,
+        ))
+        alerts.validate_document(self.document, allow_legacy=False)
+
     def test_interrupt_pending_owner_terminalizes_both_windows_idempotently(self):
         five_threshold_request = request(
             "50", channels=["discord"], cycle="limit:default|reset:100",
@@ -209,6 +344,198 @@ class AlertJournalTests(unittest.TestCase):
             alerts.opaque_limit_id_from_raw(raw_limit_id),
             migrated["alerts"][0]["event_data"]["limit_id"],
         )
+
+    def test_suppress_local_reset_cycle_writes_terminal_idempotent_tombstone(self):
+        changed = alerts.suppress_local_reset_cycle(
+            self.document, "5h", "default", 200, 150,
+        )
+        self.assertEqual(1, changed)
+        self.assertEqual(1, len(self.document["alerts"]))
+        tombstone = self.document["alerts"][0]
+        self.assertEqual("reset", tombstone["kind"])
+        self.assertEqual("failed", tombstone["status"])
+        self.assertEqual("local_observed", tombstone["terminal_reason"])
+        self.assertTrue(all(
+            channel["status"] == "failed"
+            and channel["error_class"] == "local_observed"
+            for channel in tombstone["channels"].values()
+        ))
+        self.assertEqual(0, alerts.suppress_local_reset_cycle(
+            self.document, "5h", "default", 200, 151,
+        ))
+        alerts.validate_document(self.document, allow_legacy=False)
+
+    def test_suppress_local_reset_cycle_terminalizes_pending_without_touching_other_owner(self):
+        pending = alerts.register(
+            self.document, reset_request(cycle="limit:default|reset:200"),
+        )
+        other = reset_request(cycle="limit:other|reset:200")
+        other["event_data"]["limit_id"] = "other"
+        other = alerts.register(self.document, other)
+
+        self.assertEqual(1, alerts.suppress_local_reset_cycle(
+            self.document, "5h", "default", 200, 300,
+        ))
+        self.assertEqual("failed", pending["status"])
+        self.assertEqual("local_observed", pending["terminal_reason"])
+        self.assertEqual("pending", other["status"])
+
+    def test_owner_interruption_promotes_local_observed_tombstone(self):
+        tombstone = alerts.suppress_local_reset_cycle(
+            self.document, "5h", "default", 200, 300,
+        )
+        self.assertEqual(1, tombstone)
+        item = self.document["alerts"][0]
+        item["detector_acknowledged_at"] = 300
+
+        self.assertEqual(1, alerts.interrupt_reset_cycle(
+            self.document, "5h", "default", 200, 301,
+        ))
+        self.assertEqual("owner_interrupted", item["terminal_reason"])
+        self.assertEqual(301, item["completed_at"])
+        self.assertEqual(
+            "Limit owner interrupted; scheduled notification suppressed.",
+            item["message"],
+        )
+        self.assertTrue(all(
+            channel["status"] == "failed"
+            and channel["error_class"] == "owner_interrupted"
+            for channel in item["channels"].values()
+        ))
+        self.assertEqual(0, alerts.interrupt_reset_cycle(
+            self.document, "5h", "default", 200, 302,
+        ))
+        alerts.validate_document(self.document, allow_legacy=False)
+
+        weekly_document = alerts.empty_journal(4, 100)
+        self.assertEqual(1, alerts.suppress_local_reset_cycle(
+            weekly_document, "weekly", "default", 400, 300,
+        ))
+        weekly_item = weekly_document["alerts"][0]
+        self.assertEqual(1, alerts.interrupt_reset_cycle(
+            weekly_document, "weekly", "default", 400, 301,
+        ))
+        self.assertEqual("owner_interrupted", weekly_item["terminal_reason"])
+        self.assertTrue(all(
+            channel["error_class"] == "owner_interrupted"
+            for channel in weekly_item["channels"].values()
+        ))
+        self.assertEqual(0, alerts.interrupt_reset_cycle(
+            weekly_document, "weekly", "default", 400, 302,
+        ))
+        alerts.validate_document(weekly_document, allow_legacy=False)
+
+    def test_interrupt_reset_cycle_writes_synthetic_tombstone_idempotently(self):
+        pending = alerts.register(
+            self.document, reset_request(cycle="limit:default|reset:200"),
+        )
+        self.assertEqual(1, alerts.interrupt_reset_cycle(
+            self.document, "5h", "default", 200, 300,
+        ))
+        self.assertEqual("owner_interrupted", pending["terminal_reason"])
+        self.assertEqual(0, alerts.interrupt_reset_cycle(
+            self.document, "5h", "default", 200, 301,
+        ))
+
+        self.assertEqual(1, alerts.interrupt_reset_cycle(
+            self.document, "weekly", "default", 400, 401,
+        ))
+        synthetic = self.document["alerts"][-1]
+        self.assertEqual("weekly", synthetic["window"])
+        self.assertEqual("owner_interrupted", synthetic["terminal_reason"])
+        self.assertEqual("failed", synthetic["status"])
+        self.assertEqual(0, alerts.interrupt_reset_cycle(
+            self.document, "weekly", "default", 400, 402,
+        ))
+        alerts.validate_document(self.document, allow_legacy=False)
+
+    def test_interrupt_reset_cycle_preserves_delivered_different_reason(self):
+        delivered = alerts.register(
+            self.document, reset_request(cycle="limit:default|reset:500"),
+        )
+        for channel in delivered["channels"].values():
+            channel["status"] = "delivered"
+            channel["error_class"] = None
+        alerts._recompute(delivered, 500)
+        self.assertEqual("delivered", delivered["terminal_reason"])
+        self.assertEqual(0, alerts.interrupt_reset_cycle(
+            self.document, "5h", "default", 500, 501,
+        ))
+        self.assertEqual("delivered", delivered["terminal_reason"])
+        alerts.validate_document(self.document, allow_legacy=False)
+
+    def test_suppress_local_reset_cli_migrates_legacy_journal(self):
+        item = alerts.register(
+            self.document, reset_request(cycle="limit:default|reset:200"),
+        )
+        raw_limit_id = "legacy-owner"
+        item["event_data"]["limit_id"] = raw_limit_id
+        item["cycle_key"] = f"limit:{raw_limit_id}|reset:200"
+        item["alert_id"] = alerts.alert_id(
+            item["kind"], item["window"], item["selector"],
+            item["cycle_key"], "alert-v1",
+        )
+        legacy = {
+            "schema_version": 1,
+            "legacy_migration": {"source_state_version": 4, "completed_at": 100},
+            "alerts": [item],
+        }
+        self.path.write_text(json.dumps(legacy), encoding="utf-8")
+
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "local" / "alerts.py"),
+             "suppress-local-reset", str(self.path), "5h", raw_limit_id,
+             "200", "--now", "300"],
+            check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        migrated = alerts.load(self.path, allow_legacy=False)
+        self.assertEqual(2, migrated["schema_version"])
+        self.assertEqual("failed", migrated["alerts"][0]["status"])
+        self.assertEqual("local_observed", migrated["alerts"][0]["terminal_reason"])
+        self.assertEqual(
+            alerts.opaque_limit_id_from_raw(raw_limit_id),
+            migrated["alerts"][0]["event_data"]["limit_id"],
+        )
+
+    def test_expire_thresholds_cli_migrates_legacy_owner_and_cycle_before_writing(self):
+        item = alerts.register(
+            self.document,
+            request("50", channels=["discord"], cycle="limit:default|reset:200"),
+        )
+        raw_limit_id = "legacy-owner"
+        raw_cycle = f"limit:{raw_limit_id}|reset:200"
+        item["event_data"]["limit_id"] = raw_limit_id
+        item["cycle_key"] = raw_cycle
+        item["alert_id"] = alerts.alert_id(
+            item["kind"], item["window"], item["selector"], raw_cycle, "alert-v1",
+        )
+        legacy = {
+            "schema_version": 1,
+            "legacy_migration": {
+                "source_state_version": 4, "completed_at": 100,
+            },
+            "alerts": [item],
+        }
+        self.path.write_text(json.dumps(legacy), encoding="utf-8")
+        canonical_limit_id = alerts.opaque_limit_id_from_raw(raw_limit_id)
+        canonical_cycle = f"limit:{canonical_limit_id}|reset:200"
+
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "local" / "alerts.py"),
+             "expire-thresholds", str(self.path), "5h", canonical_cycle,
+             canonical_limit_id, "--now", "300"],
+            check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        migrated = alerts.load(self.path, allow_legacy=False)
+        migrated_item = migrated["alerts"][0]
+        self.assertEqual(2, migrated["schema_version"])
+        self.assertEqual("failed", migrated_item["status"])
+        self.assertEqual("expired_after_reset", migrated_item["terminal_reason"])
+        self.assertEqual("expired_after_reset", migrated_item["channels"]["discord"]["error_class"])
+        self.assertEqual(canonical_limit_id, migrated_item["event_data"]["limit_id"])
+        self.assertEqual(canonical_cycle, migrated_item["cycle_key"])
 
 
     def test_channels_reach_aggregate_terminal_state_independently(self):
