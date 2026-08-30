@@ -1277,6 +1277,45 @@ csv_contains() {
   [[ ",${list}," == *",${wanted},"* ]]
 }
 
+csv_without() {
+  local list="$1" unwanted="$2" item result=""
+  local -a items=()
+  IFS=',' read -r -a items <<< "$list"
+  for item in "${items[@]}"; do
+    [[ -n "$item" && "$item" != "$unwanted" ]] || continue
+    result="${result:+${result},}${item}"
+  done
+  printf '%s' "$result"
+}
+
+# These helpers use Bash's dynamic function scope: they are called only while
+# check_thresholds owns the corresponding local state variables. Keeping the
+# four lifecycle lists together prevents an owner/cycle reset from leaving a
+# stale pending or suppressed action behind.
+clear_5h_script_actions() {
+  attempted_script_5h_actions=""
+  pending_script_5h_actions=""
+  suppressed_script_5h_actions=""
+}
+
+clear_weekly_script_actions() {
+  attempted_script_weekly_actions=""
+  pending_script_weekly_actions=""
+  suppressed_script_weekly_actions=""
+}
+
+clear_5h_reset_script_actions() {
+  attempted_script_5h_reset_actions=""
+  pending_script_5h_reset_actions=""
+  suppressed_script_5h_reset_actions=""
+}
+
+clear_weekly_reset_script_actions() {
+  attempted_script_weekly_reset_actions=""
+  pending_script_weekly_reset_actions=""
+  suppressed_script_weekly_reset_actions=""
+}
+
 canonicalize_alert_limit_id() {
   python3 - "$1" <<'PYEOF'
 import hashlib
@@ -1426,10 +1465,18 @@ persist_alert_state() {
     "script_prev_weekly_pct=${script_prev_weekly_pct}" \
     "attempted_script_5h_actions=${attempted_script_5h_actions}" \
     "attempted_script_weekly_actions=${attempted_script_weekly_actions}" \
+    "pending_script_5h_actions=${pending_script_5h_actions}" \
+    "pending_script_weekly_actions=${pending_script_weekly_actions}" \
+    "suppressed_script_5h_actions=${suppressed_script_5h_actions}" \
+    "suppressed_script_weekly_actions=${suppressed_script_weekly_actions}" \
     "script_5h_reset_attempted_at=${script_5h_reset_attempted_at}" \
     "script_weekly_reset_attempted_at=${script_weekly_reset_attempted_at}" \
     "attempted_script_5h_reset_actions=${attempted_script_5h_reset_actions}" \
-    "attempted_script_weekly_reset_actions=${attempted_script_weekly_reset_actions}" > "$state_tmp"; then
+    "attempted_script_weekly_reset_actions=${attempted_script_weekly_reset_actions}" \
+    "pending_script_5h_reset_actions=${pending_script_5h_reset_actions}" \
+    "pending_script_weekly_reset_actions=${pending_script_weekly_reset_actions}" \
+    "suppressed_script_5h_reset_actions=${suppressed_script_5h_reset_actions}" \
+    "suppressed_script_weekly_reset_actions=${suppressed_script_weekly_reset_actions}" > "$state_tmp"; then
     rm -f "$state_tmp"
     return 1
   fi
@@ -1460,6 +1507,7 @@ run_alert_script() {
   local rule_position="$1" event_kind="$2" window="$3" threshold="$4" remaining_pct="$5"
   local reset_at="$6" reset_label="$7" scraped_at="$8" message="$9"
   local rule_index="${ALERT_SCRIPT_RULE_INDICES[$rule_position]}"
+  local action_id="${ALERT_SCRIPT_RULE_IDS[$rule_position]}"
   local path="${ALERT_SCRIPT_RULE_PATHS[$rule_position]}" working_directory exit_code=0 event_label
   working_directory="$(dirname "$path")"
   event_label="${window}:${threshold:-reset}"
@@ -1482,6 +1530,7 @@ run_alert_script() {
           "CODEX_ALERT_SCRAPED_AT=${scraped_at}" \
           "CODEX_ALERT_MESSAGE=${message}" \
           "CODEX_ALERT_CODEX_BIN=${CODEX_BIN:-codex}" \
+          "CODEX_ALERT_ACTION_ID=${action_id}" \
           "CODEX_ALERT_RULE_INDEX=${rule_index}" \
           "$path" </dev/null
   ) || exit_code=$?
@@ -1489,25 +1538,83 @@ run_alert_script() {
   if (( exit_code == 0 )); then
     echo "[OK] Script rule ${rule_index} completed."
   elif (( exit_code == 124 || exit_code == 137 )); then
-    echo "[WARN] Script rule ${rule_index} timed out after ${ALERT_SCRIPT_TIMEOUT_SECONDS}s; action will not be retried." >&2
+    echo "[WARN] Script rule ${rule_index} timed out after ${ALERT_SCRIPT_TIMEOUT_SECONDS}s; action remains pending and will be retried." >&2
   else
-    echo "[WARN] Script rule ${rule_index} failed with exit code ${exit_code}; action will not be retried." >&2
+    echo "[WARN] Script rule ${rule_index} failed with exit code ${exit_code}; action remains pending and will be retried." >&2
   fi
-  return 0
+  return "$exit_code"
 }
 
 attempt_alert_script() {
-  local rule_position="$1" attempted_list_name="$2"
-  shift 2
-  local action_id="${ALERT_SCRIPT_RULE_IDS[$rule_position]}" previous_list="${!attempted_list_name}"
-  csv_contains "$previous_list" "$action_id" && return 0
-  printf -v "$attempted_list_name" '%s' "${previous_list:+${previous_list},}${action_id}"
+  local rule_position="$1" completed_list_name="$2" pending_list_name="$3" suppressed_list_name="$4"
+  shift 4
+  local action_id="${ALERT_SCRIPT_RULE_IDS[$rule_position]}"
+  local previous_completed="${!completed_list_name}"
+  local previous_pending="${!pending_list_name}"
+  local previous_suppressed="${!suppressed_list_name}"
+  local updated_list
+
+  # Existing attempted_script_* values are the backward-compatible completed
+  # ledger. Pending intent is separate: a crash after its write must not be
+  # mistaken for a completed hook.
+  csv_contains "$previous_completed" "$action_id" && return 0
+  csv_contains "$previous_suppressed" "$action_id" && return 0
+
+  if [[ "${ALERTS_ENABLED:-1}" != 1 ]]; then
+    # Suppression is an explicit operator decision, not a successful hook.
+    # Keep it separate so a pending enabled action remains retryable after a
+    # temporary disable, while a newly observed disabled action is not replayed
+    # when alerts are enabled again.
+    if csv_contains "$previous_pending" "$action_id"; then
+      ALERT_PROCESSING_ERROR="alert script action is pending while alerts are disabled"
+      return 1
+    fi
+    printf -v "$suppressed_list_name" '%s' "${previous_suppressed:+${previous_suppressed},}${action_id}"
+    if ! persist_alert_state; then
+      printf -v "$suppressed_list_name" '%s' "$previous_suppressed"
+      ALERT_PROCESSING_ERROR="alert script suppression persistence failed"
+      echo "[ERROR] Could not journal suppressed alert script action." >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  if ! csv_contains "$previous_pending" "$action_id"; then
+    printf -v "$pending_list_name" '%s' "${previous_pending:+${previous_pending},}${action_id}"
+    if ! persist_alert_state; then
+      printf -v "$pending_list_name" '%s' "$previous_pending"
+      echo "[ERROR] Could not journal alert script intent; script was not started." >&2
+      ALERT_PROCESSING_ERROR="alert script intent persistence failed"
+      return 1
+    fi
+  fi
+
+  # The pending intent is durable before this call. If the process dies here,
+  # the next poll sees the pending ID and retries. A successful hook is only
+  # considered complete after the following atomic state write.
+  if ! run_alert_script "$rule_position" "$@"; then
+    ALERT_PROCESSING_ERROR="alert script action failed; pending retry"
+    SCRIPT_HOOK_FAILED=1
+    # A hook failure is an expected, retryable delivery outcome. Keep the
+    # monitor cycle alive and leave the pending intent durable; callers use the
+    # flag to avoid advancing the corresponding script baseline.
+    return 0
+  fi
+
+  updated_list="$(csv_without "${!pending_list_name}" "$action_id")"
+  printf -v "$pending_list_name" '%s' "$updated_list"
+  printf -v "$completed_list_name" '%s' "${previous_completed:+${previous_completed},}${action_id}"
   if ! persist_alert_state; then
-    printf -v "$attempted_list_name" '%s' "$previous_list"
-    echo "[ERROR] Could not journal alert script action; script was not started." >&2
+    # Do not acknowledge a hook until its completion is durable. The pending
+    # marker remains the recovery source and a crash/failure in this write may
+    # replay a hook that already took effect; hooks should use the stable action
+    # ID when they can provide their own idempotence.
+    printf -v "$pending_list_name" '%s' "${previous_pending:-${action_id}}"
+    printf -v "$completed_list_name" '%s' "$previous_completed"
+    ALERT_PROCESSING_ERROR="alert script completion persistence failed; pending retry"
+    echo "[ERROR] Could not journal completed alert script action; action remains pending." >&2
     return 1
   fi
-  run_alert_script "$rule_position" "$@"
 }
 
 reconcile_alert_deliveries() {
@@ -1826,14 +1933,22 @@ check_thresholds() {
   local script_prev_weekly_pct=100
   local attempted_script_5h_actions=""
   local attempted_script_weekly_actions=""
+  local pending_script_5h_actions=""
+  local pending_script_weekly_actions=""
+  local suppressed_script_5h_actions=""
+  local suppressed_script_weekly_actions=""
   local script_5h_reset_attempted_at=0
   local script_weekly_reset_attempted_at=0
   local attempted_script_5h_reset_actions=""
   local attempted_script_weekly_reset_actions=""
+  local pending_script_5h_reset_actions=""
+  local pending_script_weekly_reset_actions=""
+  local suppressed_script_5h_reset_actions=""
+  local suppressed_script_weekly_reset_actions=""
   local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold
   local original_pending cycle_key covered_json registration_status disabled_notified transaction_epoch
   local weekly_cycle_key weekly_request_json
-  local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 initialize_script_baseline=0
+  local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 script_hook_error=0 initialize_script_baseline=0
   local observed_weekly_reset=0 five_h_observation_valid=0 weekly_observation_valid=0
   local process_5h_sample=1 process_weekly_sample=1 state_loaded=0
   local initialize_5h_baseline=0 observed_5h_reset=0 observed_5h_reset_candidate=0
@@ -1851,6 +1966,7 @@ check_thresholds() {
   local journal_source_state_version=1 raw_source_state_version
   local -a script_thresholds=()
   ALERT_PROCESSING_ERROR=""
+  SCRIPT_HOOK_FAILED=0
   if [[ -f "$STATE_FILE" ]]; then
     raw_source_state_version="$(awk -F= '$1 == "state_version" {print $2; exit}' "$STATE_FILE")"
     if [[ "$raw_source_state_version" =~ ^[0-9]+$ ]]; then
@@ -1894,6 +2010,9 @@ check_thresholds() {
           [[ "$state_value" == 0 || "$state_value" == 1 ]] && script_tracking_initialized="$state_value"
           ;;
         attempted_script_5h_actions|attempted_script_weekly_actions|attempted_script_5h_reset_actions|attempted_script_weekly_reset_actions)
+          [[ "$state_value" =~ ^([a-f0-9]{24},)*[a-f0-9]{0,24}$ ]] && printf -v "$state_key" '%s' "$state_value"
+          ;;
+        pending_script_5h_actions|pending_script_weekly_actions|pending_script_5h_reset_actions|pending_script_weekly_reset_actions|suppressed_script_5h_actions|suppressed_script_weekly_actions|suppressed_script_5h_reset_actions|suppressed_script_weekly_reset_actions)
           [[ "$state_value" =~ ^([a-f0-9]{24},)*[a-f0-9]{0,24}$ ]] && printf -v "$state_key" '%s' "$state_value"
           ;;
         script_5h_reset_attempted_at|script_weekly_reset_attempted_at)
@@ -1942,8 +2061,8 @@ check_thresholds() {
       && local_observed_5h_reset_at=0
     five_h_armed_reset_at=0
     script_5h_reset_attempted_at=0
-    attempted_script_5h_reset_actions=""
-    attempted_script_5h_actions=""
+    clear_5h_reset_script_actions
+    clear_5h_script_actions
   elif (( five_h_armed_reset_at > 0 )) \
     && [[ "$five_h_armed_limit_id" != "$limit_id" ]]; then
     interrupted_5h_owner="$five_h_armed_limit_id"
@@ -1953,7 +2072,8 @@ check_thresholds() {
     five_h_armed_reset_at=0
     five_h_armed_limit_id=""
     script_5h_reset_attempted_at=0
-    attempted_script_5h_reset_actions=""
+    clear_5h_reset_script_actions
+    clear_5h_script_actions
   fi
   if (( weekly_armed_reset_at > 0 )) \
     && [[ -z "$weekly_armed_limit_id" ]]; then
@@ -1961,8 +2081,8 @@ check_thresholds() {
       && local_observed_weekly_reset_at=0
     weekly_armed_reset_at=0
     script_weekly_reset_attempted_at=0
-    attempted_script_weekly_reset_actions=""
-    attempted_script_weekly_actions=""
+    clear_weekly_reset_script_actions
+    clear_weekly_script_actions
   elif (( weekly_armed_reset_at > 0 )) \
     && [[ "$weekly_armed_limit_id" != "$limit_id" ]]; then
     interrupted_weekly_owner="$weekly_armed_limit_id"
@@ -1972,7 +2092,8 @@ check_thresholds() {
     weekly_armed_reset_at=0
     weekly_armed_limit_id=""
     script_weekly_reset_attempted_at=0
-    attempted_script_weekly_reset_actions=""
+    clear_weekly_reset_script_actions
+    clear_weekly_script_actions
   fi
 
   # Detect this candidate before a missing delivery journal is reconstructed.
@@ -2159,8 +2280,8 @@ check_thresholds() {
     pending_5h_threshold=""
     prev_5h_pct=100
     script_5h_reset_attempted_at=0
-    attempted_script_5h_reset_actions=""
-    attempted_script_5h_actions=""
+    clear_5h_reset_script_actions
+    clear_5h_script_actions
     script_prev_5h_pct=100
   fi
   if (( weekly_armed_reset_at > 0 )) \
@@ -2175,8 +2296,8 @@ check_thresholds() {
     pending_weekly_threshold=""
     prev_weekly_pct=100
     script_weekly_reset_attempted_at=0
-    attempted_script_weekly_reset_actions=""
-    attempted_script_weekly_actions=""
+    clear_weekly_reset_script_actions
+    clear_weekly_script_actions
     script_prev_weekly_pct=100
   fi
 
@@ -2310,8 +2431,8 @@ check_thresholds() {
 
   if (( ${#ALERT_SCRIPT_RULE_INDICES[@]} == 0 )); then
     script_tracking_initialized=0
-    attempted_script_5h_actions=""
-    attempted_script_weekly_actions=""
+    clear_5h_script_actions
+    clear_weekly_script_actions
   elif (( script_tracking_initialized == 0 )); then
     initialize_script_baseline=1
     [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && script_prev_5h_pct="$five_h_pct"
@@ -2327,7 +2448,7 @@ check_thresholds() {
       notified_weekly_thresholds=""
       pending_weekly_threshold=""
       script_prev_weekly_pct="$weekly_pct"
-      attempted_script_weekly_actions=""
+      clear_weekly_script_actions
       observed_weekly_pct="$weekly_pct"
       observed_weekly_reset_at="$weekly_reset_at"
       observed_weekly_limit_id="$limit_id"
@@ -2341,7 +2462,7 @@ check_thresholds() {
     notified_weekly_thresholds=""
     pending_weekly_threshold=""
     script_prev_weekly_pct="$weekly_pct"
-    attempted_script_weekly_actions=""
+    clear_weekly_script_actions
     observed_weekly_pct="$weekly_pct"
     observed_weekly_reset_at="$weekly_reset_at"
     observed_weekly_limit_id="$limit_id"
@@ -2350,7 +2471,7 @@ check_thresholds() {
       weekly_armed_reset_at=0
       weekly_armed_limit_id=""
       script_weekly_reset_attempted_at=0
-      attempted_script_weekly_reset_actions=""
+      clear_weekly_reset_script_actions
     fi
   elif [[ -n "$observed_weekly_limit_id" && "$limit_id" != "$observed_weekly_limit_id" ]]; then
     # A partial row from another owner breaks continuity just as a complete
@@ -2367,9 +2488,9 @@ check_thresholds() {
     notified_weekly_thresholds=""
     pending_weekly_threshold=""
     script_prev_weekly_pct=100
-    attempted_script_weekly_actions=""
+    clear_weekly_script_actions
     script_weekly_reset_attempted_at=0
-    attempted_script_weekly_reset_actions=""
+    clear_weekly_reset_script_actions
   fi
   # Keep a durable complete 5-hour observation so a refill that leaves the
   # quota at 100% can still be recognized. A missing deadline, a first
@@ -2391,7 +2512,7 @@ check_thresholds() {
         notified_5h_thresholds=""
         pending_5h_threshold=""
         script_prev_5h_pct="$five_h_pct"
-        attempted_script_5h_actions=""
+        clear_5h_script_actions
       fi
     elif [[ "$observed_5h_limit_id" != "$limit_id" ]]; then
       observed_5h_pct="$five_h_pct"
@@ -2407,14 +2528,14 @@ check_thresholds() {
       notified_5h_thresholds=""
       pending_5h_threshold=""
       script_prev_5h_pct="$five_h_pct"
-      attempted_script_5h_actions=""
+      clear_5h_script_actions
       # A scheduled cycle belongs to its original group. Do not deliver it
       # while processing a complete observation from another group.
       if [[ -n "$five_h_armed_limit_id" && "$five_h_armed_limit_id" != "$limit_id" ]]; then
         five_h_armed_reset_at=0
         five_h_armed_limit_id=""
         script_5h_reset_attempted_at=0
-        attempted_script_5h_reset_actions=""
+        clear_5h_reset_script_actions
       fi
     fi
   elif [[ -n "$observed_5h_limit_id" && "$limit_id" != "$observed_5h_limit_id" ]]; then
@@ -2434,9 +2555,9 @@ check_thresholds() {
     notified_5h_thresholds=""
     pending_5h_threshold=""
     script_prev_5h_pct=100
-    attempted_script_5h_actions=""
+    clear_5h_script_actions
     script_5h_reset_attempted_at=0
-    attempted_script_5h_reset_actions=""
+    clear_5h_reset_script_actions
   elif (( state_loaded == 1 )) && [[ -z "$observed_5h_limit_id" ]]; then
     # Legacy state has no complete owner-aware observation yet.  A partial row
     # cannot establish which group's baseline it belongs to, so defer all 5h
@@ -2472,8 +2593,8 @@ check_thresholds() {
       notified_weekly_thresholds=""
       pending_weekly_threshold=""
       script_weekly_reset_attempted_at=0
-      attempted_script_weekly_reset_actions=""
-      attempted_script_weekly_actions=""
+      clear_weekly_reset_script_actions
+      clear_weekly_script_actions
       if (( weekly_observation_valid == 1 )); then
         process_weekly_sample=0
         prev_weekly_pct="$weekly_pct"
@@ -2631,8 +2752,8 @@ check_thresholds() {
       pending_5h_threshold=""
       prev_5h_pct=100
       script_5h_reset_attempted_at=0
-      attempted_script_5h_reset_actions=""
-      attempted_script_5h_actions=""
+      clear_5h_reset_script_actions
+      clear_5h_script_actions
       script_prev_5h_pct=100
     else
     due_5h_reset_at="$five_h_armed_reset_at"
@@ -2691,8 +2812,8 @@ check_thresholds() {
     fi
     if (( script_5h_reset_attempted_at != due_5h_reset_at )); then
       script_5h_reset_attempted_at="$due_5h_reset_at"
-      attempted_script_5h_reset_actions=""
-      attempted_script_5h_actions=""
+      clear_5h_reset_script_actions
+      clear_5h_script_actions
       script_prev_5h_pct=100
     fi
   fi
@@ -2711,8 +2832,8 @@ check_thresholds() {
       pending_weekly_threshold=""
       prev_weekly_pct=100
       script_weekly_reset_attempted_at=0
-      attempted_script_weekly_reset_actions=""
-      attempted_script_weekly_actions=""
+      clear_weekly_reset_script_actions
+      clear_weekly_script_actions
       script_prev_weekly_pct=100
     else
     due_weekly_reset_at="$weekly_armed_reset_at"
@@ -2771,8 +2892,8 @@ check_thresholds() {
     fi
     if (( script_weekly_reset_attempted_at != due_weekly_reset_at )); then
       script_weekly_reset_attempted_at="$due_weekly_reset_at"
-      attempted_script_weekly_reset_actions=""
-      attempted_script_weekly_actions=""
+      clear_weekly_reset_script_actions
+      clear_weekly_script_actions
       if (( observed_weekly_reset == 1 )); then
         script_prev_weekly_pct="$weekly_pct"
       else
@@ -3021,9 +3142,14 @@ PYEOF
       for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_INDICES[@]}; rule_position++ )); do
         if [[ "${ALERT_SCRIPT_RULE_EVENTS[$rule_position]}" == "5h:reset" ]]; then
           attempt_alert_script "$rule_position" attempted_script_5h_reset_actions \
+            pending_script_5h_reset_actions suppressed_script_5h_reset_actions \
             reset 5h "" "$five_h_pct" "$due_5h_reset_at" "$five_h_reset" "$scraped_at_epoch" \
             "Codex 5h limit reset. A new usage cycle is available." \
-            || { script_state_error=1; status=1; ALERT_PROCESSING_ERROR="alert state persistence failed"; break; }
+            || { script_state_error=1; status=1; [[ -n "$ALERT_PROCESSING_ERROR" ]] \
+              || ALERT_PROCESSING_ERROR="alert script action failed; pending retry"; break; }
+          if (( SCRIPT_HOOK_FAILED == 1 )); then
+            script_hook_error=1
+          fi
         fi
       done
     fi
@@ -3031,9 +3157,14 @@ PYEOF
       for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_INDICES[@]}; rule_position++ )); do
         if [[ "${ALERT_SCRIPT_RULE_EVENTS[$rule_position]}" == "weekly:reset" ]]; then
           attempt_alert_script "$rule_position" attempted_script_weekly_reset_actions \
+            pending_script_weekly_reset_actions suppressed_script_weekly_reset_actions \
             reset weekly "" "$weekly_pct" "$due_weekly_reset_at" "$weekly_reset" "$scraped_at_epoch" \
             "Codex weekly limit reset. A new usage cycle is available." \
-            || { script_state_error=1; status=1; ALERT_PROCESSING_ERROR="alert state persistence failed"; break; }
+            || { script_state_error=1; status=1; [[ -n "$ALERT_PROCESSING_ERROR" ]] \
+              || ALERT_PROCESSING_ERROR="alert script action failed; pending retry"; break; }
+          if (( SCRIPT_HOOK_FAILED == 1 )); then
+            script_hook_error=1
+          fi
         fi
       done
     fi
@@ -3056,14 +3187,19 @@ PYEOF
           for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_INDICES[@]}; rule_position++ )); do
             if [[ "${ALERT_SCRIPT_RULE_EVENTS[$rule_position]}" == "5h:${script_threshold}" ]]; then
               attempt_alert_script "$rule_position" attempted_script_5h_actions \
+                pending_script_5h_actions suppressed_script_5h_actions \
                 threshold 5h "$script_threshold" "$five_h_pct" "$five_h_reset_at" "$five_h_reset" "$scraped_at_epoch" \
                 "Codex 5h limit at ${five_h_pct}% remaining (crossed ${script_threshold}% threshold)." \
-                || { script_state_error=1; status=1; ALERT_PROCESSING_ERROR="alert state persistence failed"; break 2; }
+                || { script_state_error=1; status=1; [[ -n "$ALERT_PROCESSING_ERROR" ]] \
+                  || ALERT_PROCESSING_ERROR="alert script action failed; pending retry"; break 2; }
+              if (( SCRIPT_HOOK_FAILED == 1 )); then
+                script_hook_error=1
+              fi
             fi
           done
         fi
       done
-      (( script_state_error == 0 )) && script_prev_5h_pct="$five_h_pct"
+      (( script_state_error == 0 && script_hook_error == 0 )) && script_prev_5h_pct="$five_h_pct"
     fi
 
     if (( script_state_error == 0 && initialize_script_baseline == 0 && process_weekly_sample == 1 )) \
@@ -3083,14 +3219,19 @@ PYEOF
           for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_INDICES[@]}; rule_position++ )); do
             if [[ "${ALERT_SCRIPT_RULE_EVENTS[$rule_position]}" == "weekly:${script_threshold}" ]]; then
               attempt_alert_script "$rule_position" attempted_script_weekly_actions \
+                pending_script_weekly_actions suppressed_script_weekly_actions \
                 threshold weekly "$script_threshold" "$weekly_pct" "$weekly_reset_at" "$weekly_reset" "$scraped_at_epoch" \
                 "Codex weekly limit at ${weekly_pct}% remaining (crossed ${script_threshold}% threshold)." \
-                || { script_state_error=1; status=1; ALERT_PROCESSING_ERROR="alert state persistence failed"; break 2; }
+                || { script_state_error=1; status=1; [[ -n "$ALERT_PROCESSING_ERROR" ]] \
+                  || ALERT_PROCESSING_ERROR="alert script action failed; pending retry"; break 2; }
+              if (( SCRIPT_HOOK_FAILED == 1 )); then
+                script_hook_error=1
+              fi
             fi
           done
         fi
       done
-      (( script_state_error == 0 )) && script_prev_weekly_pct="$weekly_pct"
+      (( script_state_error == 0 && script_hook_error == 0 )) && script_prev_weekly_pct="$weekly_pct"
     fi
   fi
 

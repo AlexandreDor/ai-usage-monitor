@@ -30,9 +30,9 @@ write_recording_hook() {
     'stdin_state=eof' \
     'if IFS= read -r value; then stdin_state=data; fi' \
     'journal_state=missing' \
-    'grep -Eq "^attempted_script_(5h|weekly).*[=,][a-f0-9]{24}" "$STATE_FILE_FOR_HOOK" && journal_state=present' \
+    'grep -Eq "^(attempted|pending|suppressed)_script_(5h|weekly).*[=,][a-f0-9]{24}" "$STATE_FILE_FOR_HOOK" && journal_state=present' \
     'secret_state="${DISCORD_WEBHOOK-unset}:${TELEGRAM_BOT_TOKEN-unset}:${TELEGRAM_CHAT_ID-unset}:${GITHUB_PAT-unset}:${GITHUB_GIST_ID-unset}"' \
-    'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n" "$CODEX_ALERT_THRESHOLD" "$CODEX_ALERT_WINDOW" "$CODEX_ALERT_EVENT" "$CODEX_ALERT_RULE_INDEX" "$PWD" "$secret_state" "$stdin_state" "$journal_state" "$CODEX_ALERT_REMAINING_PCT" "$CODEX_ALERT_RESET_AT" "$CODEX_ALERT_RESET_LABEL" "$CODEX_ALERT_SCRAPED_AT" "$CODEX_ALERT_MESSAGE" >> "$HOOK_LOG"' \
+    'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n" "$CODEX_ALERT_THRESHOLD" "$CODEX_ALERT_WINDOW" "$CODEX_ALERT_EVENT" "$CODEX_ALERT_RULE_INDEX" "$PWD" "$secret_state" "$stdin_state" "$journal_state" "$CODEX_ALERT_REMAINING_PCT" "$CODEX_ALERT_RESET_AT" "$CODEX_ALERT_RESET_LABEL" "$CODEX_ALERT_SCRAPED_AT" "$CODEX_ALERT_MESSAGE" "$CODEX_ALERT_ACTION_ID" >> "$HOOK_LOG"' \
     > "$path"
   chmod 700 "$path"
 }
@@ -91,6 +91,9 @@ assert_eq 0 "$(count_file_lines "$NOTIFICATION_LOG")" "independent script thresh
 first_line="$(head -n 1 "$HOOK_LOG")"
 assert_contains "$first_line" "|threshold|1|$(dirname "$HOOK_ONE")|unset:unset:unset:unset:unset|eof|present|20|" "hook environment contract"
 assert_contains "$first_line" '|later|' "reset label was not exposed"
+assert_contains "$first_line" '|threshold|' "first hook event was not recorded"
+[[ "$(awk -F'|' '{print $14}' <<<"$first_line")" =~ ^[a-f0-9]{24}$ ]] \
+  || fail "stable hook action ID was not exposed"
 
 # An oscillation around an already attempted level does not replay it.
 check_thresholds 30 20 later later "$((now + 300))" "$((now + 3600))" "$((now + 2))"
@@ -127,6 +130,45 @@ assert_eq 1 "$(wc -l < "$HOOK_LOG")" "observed 5h reset script was replayed"
 assert_contains "$(head -n 1 "$HOOK_LOG")" '|5h|reset|1|' "observed 5h reset event contract"
 assert_contains "$(head -n 1 "$HOOK_LOG")" "|eof|present|100|$((now + 900))|later|$((now + 900))|" "observed reset hook context"
 assert_contains "$(head -n 1 "$HOOK_LOG")" "|$((now + 900))|" "observed reset was not anchored to its observation"
+
+# A crash after the durable pending intent but before run_alert_script must
+# leave the action non-terminal. The restart retries the same local-only reset
+# hook; it must not create a network reset occurrence. The stable rule ID is
+# exposed so a hook can deduplicate an effect if it crashed after doing work
+# but before the completion state was persisted.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:reset'
+validate_config
+crash_old_five_deadline=$((now + 300))
+crash_new_five_deadline=$((crash_old_five_deadline + 900))
+check_thresholds 100 100 later later "$crash_old_five_deadline" '' "$now" group-a
+(
+  # shellcheck disable=SC2329
+  run_alert_script() { exit 99; }
+  check_thresholds 100 100 later later "$crash_new_five_deadline" '' "$((now + 900))" group-a
+) >/dev/null 2>&1 || true
+crash_action_id="${ALERT_SCRIPT_RULE_IDS[0]}"
+assert_eq "$crash_action_id" "$(state_value pending_script_5h_reset_actions)" \
+  "crash window did not preserve a pending local hook intent"
+assert_eq "" "$(state_value attempted_script_5h_reset_actions)" \
+  "crash window marked the local hook completed before execution"
+[[ ! -e "$HOOK_LOG" ]] || fail "crash window executed the local hook before restart"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert not any(item["kind"] == "reset" and item["status"] == "pending" for item in items), items
+PYEOF
+check_thresholds 100 100 later later "$crash_new_five_deadline" '' "$((now + 901))" group-a
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" "restart did not retry the pending local hook"
+assert_eq "" "$(state_value pending_script_5h_reset_actions)" \
+  "successful local hook remained pending"
+assert_eq "$crash_action_id" "$(state_value attempted_script_5h_reset_actions)" \
+  "successful local hook was not marked completed"
+check_thresholds 100 100 later later "$crash_new_five_deadline" '' "$((now + 1800))" group-a
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" "completed local hook was replayed"
 
 # An observed early weekly refill follows the same notification and one-shot
 # script path as a scheduled reset.
@@ -251,8 +293,8 @@ check_thresholds 100 100 unknown unknown '' '' "$((now + 12))" >/dev/null || tru
 assert_eq 1 "$(wc -l < "$HOOK_LOG")" "failed notification replayed reset script"
 assert_eq 2 "$(wc -l < "$NOTIFICATION_LOG")" "notification was not retried"
 
-# Script failures and timeouts warn once, do not fail alert processing, and do
-# not prevent later actions for the same threshold.
+# Script failures and timeouts remain pending for retry, do not prevent later
+# actions for the same threshold, and successful actions are not replayed.
 reset_case
 ALERT_SCRIPT_TIMEOUT_SECONDS=1
 # Indexed variables are consumed indirectly by monitor.sh.
@@ -278,7 +320,7 @@ assert_contains "$(<"$HOOK_LOG")" 'fail|50|1' "failing script did not run"
 assert_contains "$(<"$HOOK_LOG")" '50|5h|threshold|3|' "script after failures did not run"
 before_retry="$(wc -l < "$HOOK_LOG")"
 check_thresholds 40 100 later unknown "$((now + 300))" '' "$((now + 2))" >/dev/null
-assert_eq "$before_retry" "$(wc -l < "$HOOK_LOG")" "failed script action was retried"
+assert_eq "$((before_retry + 1))" "$(wc -l < "$HOOK_LOG")" "failed script action was not retried"
 
 # Version 2 state migrates without replaying a threshold already below baseline.
 reset_case
@@ -325,7 +367,7 @@ new_five_deadline=$((old_five_deadline + 900))
 check_thresholds 100 100 later unknown "$old_five_deadline" '' "$now" group-a
 check_thresholds 100 100 later unknown "$new_five_deadline" '' "$((now + 900))" group-a
 [[ ! -e "$HOOK_LOG" ]] || fail "disabled observed 5h reset executed its hook"
-[[ -n "$(state_value attempted_script_5h_reset_actions)" ]] || fail "disabled observed 5h reset action was not acknowledged"
+[[ -n "$(state_value suppressed_script_5h_reset_actions)" ]] || fail "disabled observed 5h reset action was not recorded as suppressed"
 assert_eq "$((now + 900))" "$(state_value script_5h_reset_attempted_at)" "disabled observed reset anchor was not persisted"
 ALERTS_ENABLED=1
 check_thresholds 100 100 later unknown "$new_five_deadline" '' "$((now + 1800))" group-a

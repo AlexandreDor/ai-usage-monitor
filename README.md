@@ -472,8 +472,10 @@ ALERT_SCRIPT_2_EVENTS=5h:50,5h:25,weekly:20
 | `ALERT_SCRIPT_<N>_EVENTS` | empty | Comma-separated `5h:reset`, `weekly:reset`, `5h:<0..100>`, or `weekly:<0..100>` selectors. |
 
 Indices may be sparse. Several scripts can handle the same event, and one
-script can handle several events. A configured script action is attempted once;
-failure or timeout is logged but not retried and does not stop later scripts.
+script can handle several events. A configured script action persists a pending
+intent before execution and clears it only after a successful return and state
+write. Failures and timeouts remain pending for a later poll and do not stop
+later scripts.
 Personal scripts can be stored under `local/scripts/`, whose contents are
 ignored by Git except for `.gitkeep`.
 
@@ -495,7 +497,16 @@ Scripts receive:
 | `CODEX_ALERT_RESET_LABEL` | Human-readable reset date when known |
 | `CODEX_ALERT_SCRAPED_AT` | Observation Unix timestamp |
 | `CODEX_ALERT_MESSAGE` | Human-readable alert text |
+| `CODEX_ALERT_ACTION_ID` | Stable 24-character ID of the configured script/event rule |
 | `CODEX_ALERT_RULE_INDEX` | Matching rule number |
+
+The pending intent is deliberately write-ahead: a crash after it is persisted
+but before the hook starts is replayed on the next poll. A crash after the hook
+has taken effect but before its successful completion is persisted can produce
+one duplicate execution; hooks with externally visible side effects should use
+`CODEX_ALERT_ACTION_ID` together with the event fields to implement their own
+idempotence. Observed local 5-hour resets remain local-only during retries:
+replaying their hook never creates a network reset occurrence.
 
 ### History and collection
 
