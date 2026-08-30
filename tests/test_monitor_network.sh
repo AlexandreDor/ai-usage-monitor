@@ -466,9 +466,10 @@ register_network_alert threshold 5h 50 \
   "restart stale threshold" \
   "{\"limit_id\":\"${restart_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${restart_old_deadline},\"covered_thresholds\":[50]}" \
   "$((restart_now + 1))" "$((restart_old_deadline + 5 * 60 * 60))" false >/dev/null
-# Preserve the real implementation under a test-only wrapper so the third
-# persist call models a process stop after the observed marker has been
-# durably written and before the local hook's own journal write.
+# Preserve the real implementation under a test-only wrapper so the process
+# stops after the observed marker is present on disk and before the local
+# hook's own journal write.  Checking the durable marker itself keeps this
+# crash point independent of unrelated persistence calls added to the monitor.
 # shellcheck disable=SC2317,SC2329,SC2001
 eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_original /')"
 (
@@ -477,10 +478,9 @@ eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_a
   # shellcheck disable=SC2034
   ALERT_SCRIPT_1_EVENTS='5h:reset'
   validate_config
-  restart_persist_calls=0
   persist_alert_state() {
-    restart_persist_calls=$((restart_persist_calls + 1))
-    if (( restart_persist_calls == 3 )); then
+    if [[ -f "$STATE_FILE" ]] \
+      && grep -Fqx "last_notified_5h_reset_at=$((restart_now + 1))" "$STATE_FILE"; then
       exit 99
     fi
     persist_alert_state_original
