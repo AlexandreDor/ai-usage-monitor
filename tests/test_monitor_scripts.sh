@@ -145,7 +145,10 @@ crash_new_five_deadline=$((crash_old_five_deadline + 900))
 check_thresholds 100 100 later later "$crash_old_five_deadline" '' "$now" group-a
 (
   # shellcheck disable=SC2329
-  run_alert_script() { exit 99; }
+  run_alert_script() {
+    local crash_exit=99
+    exit "$crash_exit"
+  }
   check_thresholds 100 100 later later "$crash_new_five_deadline" '' "$((now + 900))" group-a
 ) >/dev/null 2>&1 || true
 crash_action_id="${ALERT_SCRIPT_RULE_IDS[0]}"
@@ -169,6 +172,40 @@ assert_eq "$crash_action_id" "$(state_value attempted_script_5h_reset_actions)" 
   "successful local hook was not marked completed"
 check_thresholds 100 100 later later "$crash_new_five_deadline" '' "$((now + 1800))" group-a
 assert_eq 1 "$(wc -l < "$HOOK_LOG")" "completed local hook was replayed"
+
+# The same autonomous pending context must recover a weekly observed reset even
+# after the weekly arm was acknowledged and cleared before the hook launch.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='weekly:reset'
+validate_config
+crash_old_weekly_deadline=$((now + 4 * 24 * 60 * 60))
+crash_new_weekly_deadline=$((crash_old_weekly_deadline + 3 * 24 * 60 * 60))
+check_thresholds 100 28 unknown later '' "$crash_old_weekly_deadline" "$now" group-a
+(
+  # shellcheck disable=SC2329
+  run_alert_script() {
+    local crash_exit=99
+    exit "$crash_exit"
+  }
+  check_thresholds 100 100 unknown later '' "$crash_new_weekly_deadline" "$((now + 900))" group-a
+) >/dev/null 2>&1 || true
+weekly_crash_action_id="${ALERT_SCRIPT_RULE_IDS[0]}"
+assert_eq "$weekly_crash_action_id" "$(state_value pending_script_weekly_reset_actions)" \
+  "weekly crash did not preserve a pending local hook intent"
+assert_eq "" "$(state_value attempted_script_weekly_reset_actions)" \
+  "weekly crash marked the local hook completed before execution"
+assert_eq 0 "$(state_value weekly_armed_reset_at)" \
+  "weekly crash did not cover the acknowledged arm cleanup"
+[[ ! -e "$HOOK_LOG" ]] || fail "weekly crash window executed the local hook before restart"
+check_thresholds 100 100 unknown later '' "$crash_new_weekly_deadline" "$((now + 901))" group-a
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" "weekly restart did not retry the pending local hook"
+assert_eq "" "$(state_value pending_script_weekly_reset_actions)" \
+  "successful weekly local hook remained pending"
+assert_eq "$weekly_crash_action_id" "$(state_value attempted_script_weekly_reset_actions)" \
+  "successful weekly local hook was not marked completed"
+check_thresholds 100 100 unknown later '' "$crash_new_weekly_deadline" "$((now + 1800))" group-a
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" "completed weekly local hook was replayed"
 
 # An observed early weekly refill follows the same notification and one-shot
 # script path as a scheduled reset.
@@ -321,6 +358,47 @@ assert_contains "$(<"$HOOK_LOG")" '50|5h|threshold|3|' "script after failures di
 before_retry="$(wc -l < "$HOOK_LOG")"
 check_thresholds 40 100 later unknown "$((now + 300))" '' "$((now + 2))" >/dev/null
 assert_eq "$((before_retry + 1))" "$(wc -l < "$HOOK_LOG")" "failed script action was not retried"
+
+# A successful hook whose completion journal write fails remains pending and is
+# retried from its autonomous context; the completion retry is idempotent by
+# action ID and does not create another threshold action.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:50'
+validate_config
+check_thresholds 80 100 later unknown "$((now + 300))" '' "$now"
+eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_completion_original /')"
+eval "$(declare -f run_alert_script | sed '1s/^run_alert_script /run_alert_script_completion_original /')"
+completion_failure_marker="${TEST_ROOT}/completion-failure.marker"
+# shellcheck disable=SC2034
+persist_alert_state() {
+  if [[ -e "$completion_failure_marker" ]]; then
+    rm -f "$completion_failure_marker"
+    return 1
+  fi
+  persist_alert_state_completion_original
+}
+# shellcheck disable=SC2329
+run_alert_script() {
+  run_alert_script_completion_original "$@"
+  : > "$completion_failure_marker"
+}
+check_thresholds 40 100 later unknown "$((now + 300))" '' "$((now + 1))" >/dev/null 2>&1 || true
+eval "$(declare -f persist_alert_state_completion_original | sed '1s/^persist_alert_state_completion_original /persist_alert_state /')"
+eval "$(declare -f run_alert_script_completion_original | sed '1s/^run_alert_script_completion_original /run_alert_script /')"
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" "completion failure did not execute the hook"
+assert_eq "" "$(state_value attempted_script_5h_actions)" \
+  "completion failure acknowledged the hook prematurely"
+assert_eq "${ALERT_SCRIPT_RULE_IDS[0]}" "$(state_value pending_script_5h_actions)" \
+  "completion failure did not retain the pending hook"
+check_thresholds 40 100 later unknown "$((now + 300))" '' "$((now + 2))"
+assert_eq 2 "$(wc -l < "$HOOK_LOG")" "completion failure was not retried"
+assert_eq "" "$(state_value pending_script_5h_actions)" \
+  "completion retry remained pending"
+assert_eq "${ALERT_SCRIPT_RULE_IDS[0]}" "$(state_value attempted_script_5h_actions)" \
+  "completion retry was not acknowledged"
+check_thresholds 40 100 later unknown "$((now + 300))" '' "$((now + 3))"
+assert_eq 2 "$(wc -l < "$HOOK_LOG")" "completed threshold hook was replayed"
 
 # Version 2 state migrates without replaying a threshold already below baseline.
 reset_case

@@ -1854,6 +1854,62 @@ PYEOF
 assert_eq 0 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["alerts"]))' "$ALERT_DELIVERIES_FILE")" \
   "disabled anomaly was queued"
 
+# A weekly refill observed while alerting is disabled is local-only.  Recreate
+# the durable pre-cleanup state to model a crash after its local marker write;
+# re-enabling alerts must not turn that marker into a network reset.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-disabled-observed-weekly"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERT_THRESHOLDS=0
+ALERTS_ENABLED=0
+weekly_disabled_now=2000001000
+weekly_disabled_old=$((weekly_disabled_now + 4 * 24 * 60 * 60))
+weekly_disabled_new=$((weekly_disabled_old + 3 * 24 * 60 * 60))
+weekly_disabled_id="$(canonicalize_alert_limit_id group-a)"
+check_thresholds 100 40 unknown later '' "$weekly_disabled_old" \
+  "$weekly_disabled_now" group-a >/dev/null
+check_thresholds 100 100 unknown later '' "$weekly_disabled_new" \
+  "$((weekly_disabled_now + 1))" group-a >/dev/null
+python3 - "$STATE_FILE" "$((weekly_disabled_now + 1))" "$weekly_disabled_id" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+values = {}
+for line in path.read_text(encoding="utf-8").splitlines():
+    key, separator, value = line.partition("=")
+    if separator:
+        values[key] = value
+values["weekly_armed_reset_at"] = sys.argv[2]
+values["weekly_armed_limit_id"] = sys.argv[3]
+values["last_notified_weekly_reset_at"] = "0"
+values["local_observed_weekly_reset_at"] = sys.argv[2]
+values["pending_observed_weekly_reset_at"] = "0"
+values["pending_observed_weekly_reset_limit_id"] = ""
+path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+PYEOF
+assert_eq 0 "$(python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+print(len(json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]))
+PYEOF
+)" "disabled weekly observation was queued before re-enable"
+ALERTS_ENABLED=1
+check_thresholds 100 100 unknown later '' "$weekly_disabled_new" \
+  "$((weekly_disabled_now + 2))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "disabled weekly observation was delivered after re-enable"
+assert_eq 0 "$(python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+print(len(json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]))
+PYEOF
+)" "disabled weekly observation rebuilt a reset occurrence"
+assert_eq 0 "$(awk -F= '$1 == "weekly_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "disabled weekly marker retained a reset arm"
+assert_eq 0 "$(awk -F= '$1 == "local_observed_weekly_reset_at" {print $2}' "$STATE_FILE")" \
+  "disabled weekly marker was not consumed locally"
+
 # A delivery that was already pending before the pause remains pending and
 # resumes after re-enabling without being treated as an unconfigured channel.
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"

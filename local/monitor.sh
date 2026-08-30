@@ -1067,6 +1067,35 @@ raise SystemExit(0 if any(item["kind"] == "reset" and item["window"] == window
 PYEOF
 }
 
+journal_has_network_reset_occurrence() {
+  local window="$1" cycle_key="$2" limit_id="$3" reset_epoch="$4"
+  [[ -f "$ALERT_DELIVERIES_FILE" ]] || return 1
+  python3 - "$ALERT_DELIVERIES_FILE" "$window" "$cycle_key" "$limit_id" "$reset_epoch" <<'PYEOF'
+import json
+import pathlib
+import sys
+
+path, window, cycle, limit_id, reset_epoch = sys.argv[1:]
+document = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+reset_epoch = int(reset_epoch)
+
+def same_cycle(value):
+    return value == cycle or (value.startswith("legacy-v") and "|" in value
+                              and value.split("|", 1)[1] == cycle)
+
+raise SystemExit(0 if any(
+    item["kind"] == "reset"
+    and item["window"] == window
+    and item["selector"] == "reset"
+    and item["event_data"].get("limit_id") == limit_id
+    and item["event_data"].get("reset_epoch") == reset_epoch
+    and same_cycle(item["cycle_key"])
+    and item["terminal_reason"] != "local_observed"
+    for item in document["alerts"]
+) else 1)
+PYEOF
+}
+
 journal_has_owner_interrupted_reset() {
   local window="$1" cycle_key="$2" limit_id="$3"
   python3 - "$ALERT_DELIVERIES_FILE" "$window" "$cycle_key" "$limit_id" <<'PYEOF'
@@ -1288,29 +1317,116 @@ csv_without() {
   printf '%s' "$result"
 }
 
+encode_alert_script_context() {
+  local event_kind="$1" window="$2" threshold="$3" remaining_pct="$4"
+  local reset_at="$5" reset_label="$6" scraped_at="$7" message="$8"
+  local owner_limit_id="$9" cycle_key="${10}"
+  python3 - "$event_kind" "$window" "$threshold" "$remaining_pct" \
+    "$reset_at" "$reset_label" "$scraped_at" "$message" \
+    "$owner_limit_id" "$cycle_key" <<'PYEOF'
+import base64
+import json
+import sys
+
+event_kind, window, threshold, remaining_pct, reset_at, reset_label, scraped_at, message, limit_id, cycle_key = sys.argv[1:]
+context = {
+    "event_kind": event_kind,
+    "window": window,
+    "threshold": threshold,
+    "remaining_pct": remaining_pct,
+    "reset_epoch": int(reset_at),
+    "reset_label": reset_label,
+    "scraped_at": int(scraped_at),
+    "message": message,
+    "limit_id": limit_id,
+    "cycle_key": cycle_key,
+}
+encoded = base64.b64encode(
+    json.dumps(context, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+).decode("ascii")
+print(encoded)
+PYEOF
+}
+
+pending_script_context_has() {
+  local contexts="$1" wanted="$2" entry
+  local -a entries=()
+  [[ -n "$contexts" ]] || return 1
+  IFS=',' read -r -a entries <<< "$contexts"
+  for entry in "${entries[@]}"; do
+    [[ "${entry%%:*}" == "$wanted" ]] && return 0
+  done
+  return 1
+}
+
+pending_script_context_set() {
+  local contexts="$1" wanted="$2" encoded="$3" entry result="" replaced=0
+  local -a entries=()
+  if [[ -n "$contexts" ]]; then
+    IFS=',' read -r -a entries <<< "$contexts"
+  fi
+  for entry in "${entries[@]}"; do
+    [[ -n "$entry" ]] || continue
+    if [[ "${entry%%:*}" == "$wanted" ]]; then
+      entry="${wanted}:${encoded}"
+      replaced=1
+    fi
+    result="${result:+${result},}${entry}"
+  done
+  (( replaced == 1 )) || result="${result:+${result},}${wanted}:${encoded}"
+  printf '%s' "$result"
+}
+
+pending_script_context_remove() {
+  local contexts="$1" unwanted="$2" entry result=""
+  local -a entries=()
+  [[ -n "$contexts" ]] || return 0
+  IFS=',' read -r -a entries <<< "$contexts"
+  for entry in "${entries[@]}"; do
+    [[ -n "$entry" && "${entry%%:*}" != "$unwanted" ]] || continue
+    result="${result:+${result},}${entry}"
+  done
+  printf '%s' "$result"
+}
+
+remove_pending_script_contexts_for_list() {
+  local list="$1" item
+  local -a items=()
+  [[ -n "$list" ]] || return 0
+  IFS=',' read -r -a items <<< "$list"
+  for item in "${items[@]}"; do
+    [[ -n "$item" ]] || continue
+    pending_script_contexts="$(pending_script_context_remove "$pending_script_contexts" "$item")"
+  done
+}
+
 # These helpers use Bash's dynamic function scope: they are called only while
 # check_thresholds owns the corresponding local state variables. Keeping the
 # four lifecycle lists together prevents an owner/cycle reset from leaving a
 # stale pending or suppressed action behind.
 clear_5h_script_actions() {
+  remove_pending_script_contexts_for_list "$pending_script_5h_actions"
   attempted_script_5h_actions=""
   pending_script_5h_actions=""
   suppressed_script_5h_actions=""
 }
 
 clear_weekly_script_actions() {
+  remove_pending_script_contexts_for_list "$pending_script_weekly_actions"
   attempted_script_weekly_actions=""
   pending_script_weekly_actions=""
   suppressed_script_weekly_actions=""
 }
 
 clear_5h_reset_script_actions() {
+  remove_pending_script_contexts_for_list "$pending_script_5h_reset_actions"
   attempted_script_5h_reset_actions=""
   pending_script_5h_reset_actions=""
   suppressed_script_5h_reset_actions=""
 }
 
 clear_weekly_reset_script_actions() {
+  remove_pending_script_contexts_for_list "$pending_script_weekly_reset_actions"
   attempted_script_weekly_reset_actions=""
   pending_script_weekly_reset_actions=""
   suppressed_script_weekly_reset_actions=""
@@ -1371,7 +1487,8 @@ if marker is not None:
     if marker != "1" or version < 5:
         raise SystemExit("invalid alert state limit ID contract marker")
     for key in ("observed_5h_limit_id", "observed_weekly_limit_id",
-                "five_h_armed_limit_id", "weekly_armed_limit_id"):
+                "five_h_armed_limit_id", "weekly_armed_limit_id",
+                "pending_observed_weekly_reset_limit_id"):
         value = values.get(key, "")
         if value and not re.fullmatch(r"limit-[0-9a-f]{64}", value):
             raise SystemExit(f"marked alert state contains a raw {key}")
@@ -1386,7 +1503,8 @@ def opaque(value):
     return "limit-" + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
 
 for key in ("observed_5h_limit_id", "observed_weekly_limit_id",
-            "five_h_armed_limit_id", "weekly_armed_limit_id"):
+            "five_h_armed_limit_id", "weekly_armed_limit_id",
+            "pending_observed_weekly_reset_limit_id"):
     if key in values:
         values[key] = opaque(values[key])
 
@@ -1398,7 +1516,8 @@ for line in lines:
     if key in {"state_version", "limit_id_contract_version"}:
         continue
     if key in {"observed_5h_limit_id", "observed_weekly_limit_id",
-               "five_h_armed_limit_id", "weekly_armed_limit_id"}:
+               "five_h_armed_limit_id", "weekly_armed_limit_id",
+               "pending_observed_weekly_reset_limit_id"}:
         value = values[key]
     output.append(f"{key}={value}")
 encoded = ("\n".join(output) + "\n").encode("utf-8")
@@ -1455,6 +1574,8 @@ persist_alert_state() {
     "last_notified_weekly_reset_at=${last_notified_weekly_reset_at}" \
     "local_observed_5h_reset_at=${local_observed_5h_reset_at}" \
     "local_observed_weekly_reset_at=${local_observed_weekly_reset_at}" \
+    "pending_observed_weekly_reset_at=${pending_observed_weekly_reset_at}" \
+    "pending_observed_weekly_reset_limit_id=${pending_observed_weekly_reset_limit_id}" \
     "notified_5h_thresholds=${notified_5h_thresholds}" \
     "notified_weekly_thresholds=${notified_weekly_thresholds}" \
     "pending_5h_threshold=${pending_5h_threshold}" \
@@ -1467,6 +1588,7 @@ persist_alert_state() {
     "attempted_script_weekly_actions=${attempted_script_weekly_actions}" \
     "pending_script_5h_actions=${pending_script_5h_actions}" \
     "pending_script_weekly_actions=${pending_script_weekly_actions}" \
+    "pending_script_contexts=${pending_script_contexts}" \
     "suppressed_script_5h_actions=${suppressed_script_5h_actions}" \
     "suppressed_script_weekly_actions=${suppressed_script_weekly_actions}" \
     "script_5h_reset_attempted_at=${script_5h_reset_attempted_at}" \
@@ -1548,17 +1670,21 @@ run_alert_script() {
 attempt_alert_script() {
   local rule_position="$1" completed_list_name="$2" pending_list_name="$3" suppressed_list_name="$4"
   shift 4
+  local event_kind="$1" window="$2" threshold="$3" remaining_pct="$4"
+  local reset_at="$5" reset_label="$6" scraped_at="$7" message="$8"
   local action_id="${ALERT_SCRIPT_RULE_IDS[$rule_position]}"
   local previous_completed="${!completed_list_name}"
   local previous_pending="${!pending_list_name}"
   local previous_suppressed="${!suppressed_list_name}"
-  local updated_list
+  local previous_contexts="$pending_script_contexts"
+  local updated_list cycle_key context_encoded
 
   # Existing attempted_script_* values are the backward-compatible completed
   # ledger. Pending intent is separate: a crash after its write must not be
   # mistaken for a completed hook.
   csv_contains "$previous_completed" "$action_id" && return 0
   csv_contains "$previous_suppressed" "$action_id" && return 0
+  csv_contains "$script_actions_started" "$action_id" && return 0
 
   if [[ "${ALERTS_ENABLED:-1}" != 1 ]]; then
     # Suppression is an explicit operator decision, not a successful hook.
@@ -1581,10 +1707,44 @@ attempt_alert_script() {
 
   if ! csv_contains "$previous_pending" "$action_id"; then
     printf -v "$pending_list_name" '%s' "${previous_pending:+${previous_pending},}${action_id}"
+    cycle_key="limit:${limit_id}|unarmed"
+    if [[ "$reset_at" =~ ^[0-9]+$ ]] && (( reset_at > 0 )); then
+      cycle_key="limit:${limit_id}|reset:${reset_at}"
+    fi
+    if ! context_encoded="$(encode_alert_script_context "$event_kind" "$window" \
+        "$threshold" "$remaining_pct" "$reset_at" "$reset_label" "$scraped_at" \
+        "$message" "$limit_id" "$cycle_key")"; then
+      printf -v "$pending_list_name" '%s' "$previous_pending"
+      ALERT_PROCESSING_ERROR="alert script context encoding failed"
+      return 1
+    fi
+    pending_script_contexts="$(pending_script_context_set "$pending_script_contexts" \
+      "$action_id" "$context_encoded")"
     if ! persist_alert_state; then
       printf -v "$pending_list_name" '%s' "$previous_pending"
+      pending_script_contexts="$previous_contexts"
       echo "[ERROR] Could not journal alert script intent; script was not started." >&2
       ALERT_PROCESSING_ERROR="alert script intent persistence failed"
+      return 1
+    fi
+  elif ! pending_script_context_has "$pending_script_contexts" "$action_id"; then
+    # Upgrade a legacy ID-only pending marker before running it.  The context
+    # then remains autonomous even if this poll clears its detector arm.
+    cycle_key="limit:${limit_id}|unarmed"
+    if [[ "$reset_at" =~ ^[0-9]+$ ]] && (( reset_at > 0 )); then
+      cycle_key="limit:${limit_id}|reset:${reset_at}"
+    fi
+    if ! context_encoded="$(encode_alert_script_context "$event_kind" "$window" \
+        "$threshold" "$remaining_pct" "$reset_at" "$reset_label" "$scraped_at" \
+        "$message" "$limit_id" "$cycle_key")"; then
+      ALERT_PROCESSING_ERROR="alert script context encoding failed"
+      return 1
+    fi
+    pending_script_contexts="$(pending_script_context_set "$pending_script_contexts" \
+      "$action_id" "$context_encoded")"
+    if ! persist_alert_state; then
+      pending_script_contexts="$previous_contexts"
+      ALERT_PROCESSING_ERROR="alert script context persistence failed"
       return 1
     fi
   fi
@@ -1592,6 +1752,7 @@ attempt_alert_script() {
   # The pending intent is durable before this call. If the process dies here,
   # the next poll sees the pending ID and retries. A successful hook is only
   # considered complete after the following atomic state write.
+  script_actions_started="${script_actions_started:+${script_actions_started},}${action_id}"
   if ! run_alert_script "$rule_position" "$@"; then
     ALERT_PROCESSING_ERROR="alert script action failed; pending retry"
     SCRIPT_HOOK_FAILED=1
@@ -1604,6 +1765,7 @@ attempt_alert_script() {
   updated_list="$(csv_without "${!pending_list_name}" "$action_id")"
   printf -v "$pending_list_name" '%s' "$updated_list"
   printf -v "$completed_list_name" '%s' "${previous_completed:+${previous_completed},}${action_id}"
+  pending_script_contexts="$(pending_script_context_remove "$pending_script_contexts" "$action_id")"
   if ! persist_alert_state; then
     # Do not acknowledge a hook until its completion is durable. The pending
     # marker remains the recovery source and a crash/failure in this write may
@@ -1611,10 +1773,93 @@ attempt_alert_script() {
     # ID when they can provide their own idempotence.
     printf -v "$pending_list_name" '%s' "${previous_pending:-${action_id}}"
     printf -v "$completed_list_name" '%s' "$previous_completed"
+    pending_script_contexts="$previous_contexts"
     ALERT_PROCESSING_ERROR="alert script completion persistence failed; pending retry"
     echo "[ERROR] Could not journal completed alert script action; action remains pending." >&2
     return 1
   fi
+}
+
+find_alert_script_rule_position() {
+  local wanted="$1" rule_position
+  for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_IDS[@]}; rule_position++ )); do
+    if [[ "${ALERT_SCRIPT_RULE_IDS[$rule_position]}" == "$wanted" ]]; then
+      printf '%s' "$rule_position"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resume_pending_alert_scripts() {
+  local entry action_id encoded context_json rule_position
+  local event_kind window threshold remaining_pct reset_at reset_label scraped_at
+  local message_encoded context_limit_id cycle_key message completed_name pending_name suppressed_name
+  local -a entries=()
+  [[ "${ALERTS_ENABLED:-1}" == 1 ]] || return 0
+  [[ -n "$pending_script_contexts" ]] || return 0
+  IFS=',' read -r -a entries <<< "$pending_script_contexts"
+  for entry in "${entries[@]}"; do
+    [[ -n "$entry" ]] || continue
+    action_id="${entry%%:*}"
+    encoded="${entry#*:}"
+    rule_position="$(find_alert_script_rule_position "$action_id")" || continue
+    context_json="$(printf '%s' "$encoded" | base64 --decode)" || {
+      ALERT_PROCESSING_ERROR="alert script context decoding failed"
+      return 1
+    }
+    IFS=$'\x1f' read -r event_kind window threshold remaining_pct reset_at reset_label \
+      scraped_at message_encoded context_limit_id cycle_key < <(
+      python3 - "$context_json" <<'PYEOF'
+import base64
+import json
+import sys
+
+context = json.loads(sys.argv[1])
+print(
+    context["event_kind"], context["window"], context["threshold"],
+    context["remaining_pct"], context["reset_epoch"], context["reset_label"],
+    context["scraped_at"],
+    base64.b64encode(context["message"].encode("utf-8")).decode("ascii"),
+    context["limit_id"], context["cycle_key"], sep="\x1f",
+)
+PYEOF
+    )
+    message="$(printf '%s' "$message_encoded" | base64 --decode)" || {
+      ALERT_PROCESSING_ERROR="alert script message decoding failed"
+      return 1
+    }
+    [[ "$context_limit_id" == "$limit_id" ]] || continue
+    [[ "$cycle_key" == "limit:${context_limit_id}|"* ]] || continue
+    case "${event_kind}:${window}" in
+      reset:5h)
+        completed_name=attempted_script_5h_reset_actions
+        pending_name=pending_script_5h_reset_actions
+        suppressed_name=suppressed_script_5h_reset_actions
+        ;;
+      reset:weekly)
+        completed_name=attempted_script_weekly_reset_actions
+        pending_name=pending_script_weekly_reset_actions
+        suppressed_name=suppressed_script_weekly_reset_actions
+        ;;
+      threshold:5h)
+        completed_name=attempted_script_5h_actions
+        pending_name=pending_script_5h_actions
+        suppressed_name=suppressed_script_5h_actions
+        ;;
+      threshold:weekly)
+        completed_name=attempted_script_weekly_actions
+        pending_name=pending_script_weekly_actions
+        suppressed_name=suppressed_script_weekly_actions
+        ;;
+      *)
+        continue
+        ;;
+    esac
+    attempt_alert_script "$rule_position" "$completed_name" "$pending_name" \
+      "$suppressed_name" "$event_kind" "$window" "$threshold" "$remaining_pct" \
+      "$reset_at" "$reset_label" "$scraped_at" "$message" || return 1
+  done
 }
 
 reconcile_alert_deliveries() {
@@ -1923,6 +2168,8 @@ check_thresholds() {
   local last_notified_weekly_reset_at=0
   local local_observed_5h_reset_at=0
   local local_observed_weekly_reset_at=0
+  local pending_observed_weekly_reset_at=0
+  local pending_observed_weekly_reset_limit_id=""
   local notified_5h_thresholds=""
   local notified_weekly_thresholds=""
   local pending_5h_threshold=""
@@ -1945,10 +2192,12 @@ check_thresholds() {
   local pending_script_weekly_reset_actions=""
   local suppressed_script_5h_reset_actions=""
   local suppressed_script_weekly_reset_actions=""
+  local pending_script_contexts=""
   local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold
   local original_pending cycle_key covered_json registration_status disabled_notified transaction_epoch
   local weekly_cycle_key weekly_request_json
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 script_hook_error=0 initialize_script_baseline=0
+  local weekly_network_request=0 script_actions_started=""
   local observed_weekly_reset=0 five_h_observation_valid=0 weekly_observation_valid=0
   local process_5h_sample=1 process_weekly_sample=1 state_loaded=0
   local initialize_5h_baseline=0 observed_5h_reset=0 observed_5h_reset_candidate=0
@@ -1989,7 +2238,7 @@ check_thresholds() {
             printf -v "$state_key" '%s' "$state_value"
           fi
           ;;
-        observed_5h_reset_at|observed_weekly_reset_at|five_h_armed_reset_at|weekly_armed_reset_at|last_notified_5h_reset_at|last_notified_weekly_reset_at|local_observed_5h_reset_at|local_observed_weekly_reset_at)
+        observed_5h_reset_at|observed_weekly_reset_at|five_h_armed_reset_at|weekly_armed_reset_at|last_notified_5h_reset_at|last_notified_weekly_reset_at|local_observed_5h_reset_at|local_observed_weekly_reset_at|pending_observed_weekly_reset_at)
           if [[ "$state_value" =~ ^[0-9]+$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
           fi
@@ -2003,7 +2252,7 @@ check_thresholds() {
         alerts_disabled_since)
           [[ "$state_value" =~ ^[0-9]+$ ]] && alerts_disabled_since="$state_value"
           ;;
-        observed_5h_limit_id|observed_weekly_limit_id|five_h_armed_limit_id|weekly_armed_limit_id)
+        observed_5h_limit_id|observed_weekly_limit_id|five_h_armed_limit_id|weekly_armed_limit_id|pending_observed_weekly_reset_limit_id)
           printf -v "$state_key" '%s' "$state_value"
           ;;
         script_tracking_initialized)
@@ -2014,6 +2263,10 @@ check_thresholds() {
           ;;
         pending_script_5h_actions|pending_script_weekly_actions|pending_script_5h_reset_actions|pending_script_weekly_reset_actions|suppressed_script_5h_actions|suppressed_script_weekly_actions|suppressed_script_5h_reset_actions|suppressed_script_weekly_reset_actions)
           [[ "$state_value" =~ ^([a-f0-9]{24},)*[a-f0-9]{0,24}$ ]] && printf -v "$state_key" '%s' "$state_value"
+          ;;
+        pending_script_contexts)
+          [[ -z "$state_value" || "$state_value" =~ ^([a-f0-9]{24}:[A-Za-z0-9+/=]+,)*[a-f0-9]{24}:[A-Za-z0-9+/=]+$ ]] \
+            && printf -v "$state_key" '%s' "$state_value"
           ;;
         script_5h_reset_attempted_at|script_weekly_reset_attempted_at)
           [[ "$state_value" =~ ^[0-9]+$ ]] && printf -v "$state_key" '%s' "$state_value"
@@ -2181,20 +2434,45 @@ check_thresholds() {
     observed_5h_superseded_reset_at="$local_observed_5h_reset_at"
     (( five_h_observation_valid == 0 )) && process_5h_sample=0
   fi
-  # Weekly observed-reset evidence also needs a durable recovery path.  The
-  # marker is paired with the persisted observation owner; never attach it to
-  # a different current group.  Recreate the observation anchor only when the
-  # arm was lost during a crash, so the next cycle can expire stale thresholds
-  # before delivery and still retry the legitimate weekly reset.
-  if (( local_observed_weekly_reset_at > 0 )) \
-    && [[ "$observed_weekly_limit_id" == "$limit_id" ]]; then
-    observed_weekly_reset_recovery=1
-    if (( weekly_armed_reset_at == 0 )); then
-      weekly_armed_reset_at="$local_observed_weekly_reset_at"
+  # A weekly observed reset that was enabled with a configured network channel
+  # gets a write-ahead identity before the delivery journal is touched.  It is
+  # the recovery source if the journal write or the following state write is
+  # interrupted; unlike the local marker below, it is allowed to create the
+  # missing network occurrence with the original immutable cycle key.
+  if (( pending_observed_weekly_reset_at > 0 )); then
+    if [[ "$pending_observed_weekly_reset_limit_id" == "$limit_id" ]]; then
+      observed_weekly_reset_recovery=1
+      weekly_armed_reset_at="$pending_observed_weekly_reset_at"
       weekly_armed_limit_id="$limit_id"
+      observed_weekly_reset=1
+      (( weekly_observation_valid == 0 )) && process_weekly_sample=0
+    else
+      # A pending intent belongs to its recorded owner.  Never attach it to a
+      # different limit group after an owner switch; the journal reconciliation
+      # below handles any already-created occurrence independently.
+      pending_observed_weekly_reset_at=0
+      pending_observed_weekly_reset_limit_id=""
     fi
-    observed_weekly_reset=1
-    (( weekly_observation_valid == 0 )) && process_weekly_sample=0
+  elif (( local_observed_weekly_reset_at > 0 )) \
+    && [[ "$observed_weekly_limit_id" == "$limit_id" ]]; then
+    # A local marker without a matching network occurrence is an explicit
+    # suppression (not an invitation to reconstruct a reset after a pause).
+    # Only a corresponding non-local journal row may be recovered here.
+    weekly_cycle_key="limit:${limit_id}|reset:${local_observed_weekly_reset_at}"
+    if journal_has_network_reset_occurrence weekly "$weekly_cycle_key" "$limit_id" \
+      "$local_observed_weekly_reset_at"; then
+      observed_weekly_reset_recovery=1
+      if (( weekly_armed_reset_at == 0 )); then
+        weekly_armed_reset_at="$local_observed_weekly_reset_at"
+        weekly_armed_limit_id="$limit_id"
+      fi
+      observed_weekly_reset=1
+      (( weekly_observation_valid == 0 )) && process_weekly_sample=0
+    else
+      [[ "$weekly_armed_reset_at" == "$local_observed_weekly_reset_at" ]] \
+        && { weekly_armed_reset_at=0; weekly_armed_limit_id=""; }
+      local_observed_weekly_reset_at=0
+    fi
   fi
   # As with 5h, a due same-owner weekly arm must expire stale thresholds on
   # every poll before the scheduled reset can be delivered.  This is kept
@@ -2620,6 +2898,7 @@ check_thresholds() {
   # exact reset instant is unknown.
   if (( observed_weekly_reset_at > 0 )) \
     && [[ "$limit_id" == "$observed_weekly_limit_id" ]] \
+    && (( observed_weekly_reset_recovery == 0 )) \
     && is_random_weekly_reset "$observed_weekly_pct" "$weekly_pct" \
       "$observed_weekly_reset_at" "$weekly_reset_at"; then
     weekly_armed_reset_at="$scraped_at_epoch"
@@ -2631,6 +2910,15 @@ check_thresholds() {
     observed_weekly_pct="$weekly_pct"
     observed_weekly_reset_at="$weekly_reset_at"
     observed_weekly_limit_id="$limit_id"
+    if [[ "${ALERTS_ENABLED:-1}" == 1 ]] \
+      && [[ "$(configured_alert_channels_json)" != "[]" ]]; then
+      pending_observed_weekly_reset_at="$weekly_armed_reset_at"
+      pending_observed_weekly_reset_limit_id="$limit_id"
+      if ! persist_alert_state; then
+        ALERT_PROCESSING_ERROR="weekly reset intent persistence failed"
+        return 1
+      fi
+    fi
   fi
 
   # A random weekly refill is also reset evidence for the threshold detector.
@@ -2640,8 +2928,10 @@ check_thresholds() {
   if (( observed_weekly_reset == 1 || observed_weekly_reset_recovery == 1 )); then
     weekly_cycle_key="limit:${limit_id}|reset:${weekly_armed_reset_at}"
     weekly_request_json='{}'
+    weekly_network_request=0
     if [[ "${ALERTS_ENABLED:-1}" == 1 ]] \
       && [[ "$(configured_alert_channels_json)" != "[]" ]]; then
+      weekly_network_request=1
       if ! weekly_request_json="$(network_reset_request_json weekly "$limit_id" \
           "$weekly_armed_reset_at" "$scraped_at_epoch")"; then
         ALERT_PROCESSING_ERROR="weekly reset request construction failed"
@@ -2671,6 +2961,15 @@ check_thresholds() {
       return 1
     fi
     weekly_atomic_done=1
+    if (( weekly_network_request == 1 )) \
+      && [[ "$pending_observed_weekly_reset_at" == "$weekly_armed_reset_at" ]] \
+      && [[ "$pending_observed_weekly_reset_limit_id" == "$limit_id" ]]; then
+      # The journal now owns the immutable network occurrence.  Clearing the
+      # write-ahead identity is safe because the final state write below keeps
+      # the observed marker and the journal can still suppress any duplicate.
+      pending_observed_weekly_reset_at=0
+      pending_observed_weekly_reset_limit_id=""
+    fi
     # Persist the observed anchor only after the journal write-ahead row.  A
     # failure is still fail-closed; the journal already prevents stale replay.
     if (( weekly_armed_reset_at > 0 )) \
@@ -3132,13 +3431,21 @@ PYEOF
   # Notifications above are always attempted before local scripts. Script actions
   # have their own journal and never inherit transport retry semantics.
   if (( ${#ALERT_SCRIPT_RULE_INDICES[@]} > 0 )); then
+    # Pending hook intents carry their complete invocation context.  Re-enumerate
+    # them before consulting detector due state, because an observed reset may
+    # have acknowledged and cleared its arm before the process crashed.
+    if ! resume_pending_alert_scripts; then
+      script_state_error=1
+      status=1
+    fi
     # A reset can be detected during the activation sample. Preserve the sample
     # itself as the baseline so already-consumed quota is not replayed later.
     if (( initialize_script_baseline == 1 )); then
       [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && script_prev_5h_pct="$five_h_pct"
       [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && script_prev_weekly_pct="$weekly_pct"
     fi
-    if (( due_5h_reset_at > 0 && scraped_at_epoch - due_5h_reset_at <= 5 * 60 * 60 )); then
+    if (( script_state_error == 0 && due_5h_reset_at > 0 \
+          && scraped_at_epoch - due_5h_reset_at <= 5 * 60 * 60 )); then
       for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_INDICES[@]}; rule_position++ )); do
         if [[ "${ALERT_SCRIPT_RULE_EVENTS[$rule_position]}" == "5h:reset" ]]; then
           attempt_alert_script "$rule_position" attempted_script_5h_reset_actions \
