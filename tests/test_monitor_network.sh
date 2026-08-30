@@ -702,7 +702,7 @@ eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_a
       return 1
     fi
     persist_alert_state_final_original || return 1
-    if grep -Fqx "last_notified_5h_reset_at=$final_fail_now" "$STATE_FILE"; then
+    if [[ "$last_notified_5h_reset_at" == "$final_fail_now" ]]; then
       final_marker_persisted=1
     fi
   }
