@@ -466,24 +466,18 @@ register_network_alert threshold 5h 50 \
   "restart stale threshold" \
   "{\"limit_id\":\"${restart_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${restart_old_deadline},\"covered_thresholds\":[50]}" \
   "$((restart_now + 1))" "$((restart_old_deadline + 5 * 60 * 60))" false >/dev/null
-# Preserve the real implementation under a test-only wrapper so the process
-# stops after the observed marker is present on disk and before the local
-# hook's own journal write.  Checking the durable marker itself keeps this
-# crash point independent of unrelated persistence calls added to the monitor.
-# shellcheck disable=SC2317,SC2329,SC2001
-eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_original /')"
+# Stop from the hook invocation itself: the write-ahead marker and pending
+# context have already been persisted, while the hook has not run yet. This
+# crash point is independent of unrelated persistence calls in the monitor.
 (
   # shellcheck disable=SC2034
   ALERT_SCRIPT_1="$restart_hook"
   # shellcheck disable=SC2034
   ALERT_SCRIPT_1_EVENTS='5h:reset'
   validate_config
-  persist_alert_state() {
-    if [[ -f "$STATE_FILE" ]] \
-      && grep -Fqx "last_notified_5h_reset_at=$((restart_now + 1))" "$STATE_FILE"; then
-      exit 99
-    fi
-    persist_alert_state_original
+  # shellcheck disable=SC2329
+  run_alert_script() {
+    exit 99
   }
   check_thresholds 100 100 later unknown "$restart_new_deadline" '' \
     "$((restart_now + 1))" group-a >/dev/null
