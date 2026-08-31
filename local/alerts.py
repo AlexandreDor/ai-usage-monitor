@@ -464,7 +464,9 @@ def _request_alert(request: dict[str, Any]) -> dict[str, Any]:
     channels = request.get("channels")
     if kind not in KINDS or window not in WINDOWS or not isinstance(cycle_key, str):
         raise JournalError("invalid registration request")
-    if not isinstance(channels, list) or not channels or any(channel not in CHANNELS for channel in channels):
+    if (not isinstance(channels, list) or not channels
+            or any(not isinstance(channel, str) or channel not in CHANNELS
+                   for channel in channels)):
         raise JournalError("registration requires configured channels")
     if len(set(channels)) != len(channels):
         raise JournalError("duplicate registration channel")
@@ -517,6 +519,8 @@ def _merge_observed_reset_channels(authority: dict[str, Any],
     kept so that its retry schedule remains authoritative.  Failed metadata is
     deliberately not copied over a pending channel: the failed row remains in
     the journal, while the pending authority keeps that channel retryable.
+    Channels present only on another pending equivalent row are added to the
+    authority, so selecting one occurrence cannot discard configured channels.
     """
 
     def candidates(name: str, status: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -534,18 +538,23 @@ def _merge_observed_reset_channels(authority: dict[str, Any],
         )
 
     changed = False
-    for name, current in authority["channels"].items():
+    channel_names = sorted({
+        name for item in matches for name in item["channels"]
+    })
+    for name in channel_names:
+        current = authority["channels"].get(name)
         delivered = candidates(name, "delivered")
         replacement: dict[str, Any] | None = None
         if delivered:
             # Keep the complete successful attempt record, not just its
             # status, so counters and response metadata remain coherent.
             replacement = max(delivered, key=newest_attempt)[1]
-        elif current["status"] != "pending":
+        elif current is None or current["status"] != "pending":
             pending = candidates(name, "pending")
             if pending:
                 replacement = max(pending, key=newest_attempt)[1]
         if replacement is not None and current != replacement:
+            _validate_channel(name, replacement)
             authority["channels"][name] = copy.deepcopy(replacement)
             changed = True
     return changed
@@ -581,7 +590,8 @@ def _register_or_reuse_observed_reset(document: dict[str, Any],
     )
     if (not isinstance(request.get("channels"), list)
             or not request["channels"]
-            or any(channel not in CHANNELS for channel in request["channels"])
+            or any(not isinstance(channel, str) or channel not in CHANNELS
+                   for channel in request["channels"])
             or len(set(request["channels"])) != len(request["channels"])):
         raise JournalError("registration requires configured channels")
     expected_event = {
@@ -601,14 +611,34 @@ def _register_or_reuse_observed_reset(document: dict[str, Any],
             and equivalent_cycle(existing["cycle_key"], normalized_cycle))
     ]
     if matches:
-        # A delivered row is authoritative and must never be resurrected by a
-        # later recovery request.  If no delivery succeeded, keep a pending
-        # row authoritative so a retry is not lost; prefer the canonical
-        # modern cycle so a legacy duplicate is retired deterministically.
+        # Keep a pending row authoritative when it carries a channel not
+        # covered by an equivalent delivery.  Otherwise a delivered row is
+        # authoritative and must never be resurrected; when no delivery
+        # succeeded, prefer the canonical modern cycle so a legacy duplicate
+        # is retired deterministically.
         terminal = [item for item in matches if item["status"] != "pending"]
         delivered = [item for item in terminal if item["terminal_reason"] == "delivered"]
         pending = [item for item in matches if item["status"] == "pending"]
-        if delivered:
+        delivered_channels = {
+            name
+            for item in matches
+            for name, channel in item["channels"].items()
+            if channel["status"] == "delivered"
+        }
+        pending_with_uncovered_channels = [
+            item for item in pending
+            if set(item["channels"]) - delivered_channels
+        ]
+        if pending_with_uncovered_channels:
+            authority = min(
+                pending_with_uncovered_channels,
+                key=lambda item: (
+                    item["cycle_key"] != normalized_cycle,
+                    item["created_at"],
+                    item["alert_id"],
+                ),
+            )
+        elif delivered:
             authority = next(
                 item for item in matches if item["terminal_reason"] == "delivered"
             )
@@ -1053,7 +1083,9 @@ def _configured_channels(payload: Any) -> set[str]:
         values = payload.get("configured_channels", payload.get("channels", []))
     else:
         raise JournalError("invalid configured channels")
-    if not isinstance(values, list) or any(value not in CHANNELS for value in values):
+    if (not isinstance(values, list)
+            or any(not isinstance(value, str) or value not in CHANNELS
+                   for value in values)):
         raise JournalError("invalid configured channels")
     return set(values)
 
