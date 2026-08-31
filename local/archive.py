@@ -432,7 +432,17 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             if not isinstance(previous[pct_index], (int, float)) \
                     or not isinstance(current[pct_index], (int, float)):
                 continue
-            if previous[0] < reset_at <= current[0]:
+            current_reset_at = current[reset_index]
+            if (
+                previous[0] < reset_at <= current[0]
+                and (
+                    window != "weekly"
+                    or (
+                        isinstance(current_reset_at, int)
+                        and current_reset_at > reset_at
+                    )
+                )
+            ):
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO reset_events (
@@ -540,6 +550,8 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             and current[6] is not None
             and previous[6] == current[6]
             and isinstance(previous_deadline, int)
+            and isinstance(current_deadline, int)
+            and current_deadline > previous_deadline
             and previous[0] < previous_deadline <= current[0]
         ):
             # The complete baseline can span same-owner partial snapshots.

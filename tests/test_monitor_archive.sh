@@ -333,7 +333,8 @@ reset_at=$((BASE - 50))
 printf '{"five_h_pct":5,"weekly_pct":7,"five_h_reset_at":%s,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$reset_at" "$reset_at" "$(iso_at "$before")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
-snapshot_at "$BASE" 100 100 | python3 "$ARCHIVE_SCRIPT" \
+printf '{"five_h_pct":100,"weekly_pct":100,"five_h_reset_at":%s,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$((reset_at + 900))" "$((reset_at + 900))" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
 assert_eq '2' "$(python3 - "$ARCHIVE_FILE" "$reset_at" <<'PYEOF'
 import sqlite3
@@ -347,7 +348,9 @@ assert rows == [("5h", 5.0, 100.0), ("weekly", 7.0, 100.0)], rows
 print(len(rows))
 PYEOF
 )" "reset events were not derived from the crossing"
-archive_at "$BASE"
+printf '{"five_h_pct":100,"weekly_pct":100,"five_h_reset_at":%s,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$((reset_at + 900))" "$((reset_at + 900))" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
 assert_eq '2' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
 import sqlite3
 import sys
@@ -598,6 +601,73 @@ assert total_count == 1, total_count
 print(":".join(map(str, (*row, random_count))))
 PYEOF
 )" "partial sample after deadline produced a duplicate or wrong scheduled crossing"
+
+# A weekly pair that crosses the previous deadline but repeats it cannot be a
+# scheduled reset.  This is the archive counterpart of live's strict deadline
+# advancement requirement.
+rm -f "$ARCHIVE_FILE"
+non_advanced_before=$((BASE - 100))
+non_advanced_deadline=$((BASE - 50))
+printf '{"weekly_pct":40,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$non_advanced_deadline" "$(iso_at "$non_advanced_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$non_advanced_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute(
+        "SELECT COUNT(*) FROM reset_events WHERE window = 'weekly'"
+    ).fetchone()[0])
+PYEOF
+)" "equal weekly deadlines fabricated a scheduled crossing"
+
+rm -f "$ARCHIVE_FILE"
+non_advanced_current_deadline=$((non_advanced_deadline - 30))
+printf '{"weekly_pct":40,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$non_advanced_deadline" "$(iso_at "$non_advanced_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$non_advanced_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute(
+        "SELECT COUNT(*) FROM reset_events WHERE window = 'weekly'"
+    ).fetchone()[0])
+PYEOF
+)" "backward weekly deadline fabricated a scheduled crossing"
+
+# The same full-to-full transition is also rejected when the observations are
+# farther apart than the shared evidence bound, even though the old deadline
+# is crossed and the current deadline advances.
+rm -f "$ARCHIVE_FILE"
+printf '[]\n' > "$HISTORY_FILE"
+long_gap_full_before=$((BASE - 100000))
+long_gap_full_deadline=$((BASE - 50000))
+long_gap_full_current_deadline=$((long_gap_full_deadline + 7 * 24 * 60 * 60))
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$long_gap_full_deadline" "$(iso_at "$long_gap_full_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$long_gap_full_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute(
+        "SELECT COUNT(*) FROM reset_events WHERE window = 'weekly'"
+    ).fetchone()[0])
+PYEOF
+)" "long-gap weekly full-to-full pair diverged from live"
 
 # Scheduled reconstruction never combines observations from different groups.
 rm -f "$ARCHIVE_FILE"

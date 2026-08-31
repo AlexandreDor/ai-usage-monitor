@@ -1271,6 +1271,27 @@ raise SystemExit(0 if detected else 1)
 PYEOF
 }
 
+is_reset_observation_gap_acceptable() {
+  local previous_at="$1" current_at="$2" previous_interval="$3" current_interval="$4"
+  python3 - "$previous_at" "$current_at" "$previous_interval" "$current_interval" <<'PYEOF'
+import sys
+
+try:
+    previous_at, current_at, previous_interval, current_interval = map(int, sys.argv[1:])
+except (TypeError, ValueError):
+    raise SystemExit(1)
+
+# A missing prior sample is the backward-compatible bootstrap case. Once a
+# prior timestamp exists, use the same conservative bound as archive.py.
+if previous_at <= 0:
+    raise SystemExit(0)
+gap = current_at - previous_at
+intervals = [value for value in (previous_interval, current_interval) if value > 0]
+expected_interval = max(intervals, default=900)
+raise SystemExit(0 if 0 < gap <= max(3_600, expected_interval * 2) else 1)
+PYEOF
+}
+
 # A 5-hour reset can be observed even when the quota was never consumed.  In
 # that case the only positive evidence is two complete observations at 100%
 # with the same limit group and a strictly later reset deadline.  The first
@@ -1516,6 +1537,10 @@ interrupted_script_identity_has() {
   pending_script_context_has "$identities" "$wanted" "$encoded"
 }
 
+interrupted_script_failsafe_path() {
+  printf '%s.interrupted' "$STATE_FILE"
+}
+
 mark_interrupted_script_list() {
   local list="$1" owner_id="$2" reset_epoch="$3"
   local item entry encoded identity_encoded cycle_key
@@ -1597,14 +1622,25 @@ mark_interrupted_script_window() {
     && "$interrupted_script_actions" == "$previous_actions" ]]; then
     return 0
   fi
-  if ! persist_alert_state; then
-    interrupted_script_contexts="$previous_contexts"
-    interrupted_script_identities="$previous_identities"
-    interrupted_script_actions="$previous_actions"
-    ALERT_PROCESSING_ERROR="interrupted alert script tombstone persistence failed"
-    echo "[ERROR] Could not journal interrupted alert script actions." >&2
-    return 1
+  # A transient state-write failure is retried just like the other critical
+  # detector intents. If the state writer remains unavailable, keep the
+  # proposed marker in a separate, atomically-written fail-safe journal before
+  # allowing the caller to clear the old pending action. This is needed because
+  # the old state file is precisely the durable replay source at this crash
+  # boundary; an in-memory rollback alone cannot protect the next process.
+  if persist_alert_state || persist_alert_state; then
+    return 0
   fi
+  if persist_interrupted_script_failsafe; then
+    interrupted_script_failsafe_loaded=1
+    return 0
+  fi
+  interrupted_script_contexts="$previous_contexts"
+  interrupted_script_identities="$previous_identities"
+  interrupted_script_actions="$previous_actions"
+  ALERT_PROCESSING_ERROR="interrupted alert script tombstone persistence failed"
+  echo "[ERROR] Could not journal interrupted alert script actions." >&2
+  return 1
 }
 
 remove_pending_script_contexts_for_list() {
@@ -1796,8 +1832,8 @@ PYEOF
 }
 
 persist_alert_state_file() {
-  local state_tmp="$1"
-  if ! python3 - "$state_tmp" "$STATE_FILE" <<'PYEOF'
+  local state_tmp="$1" destination="${2:-$STATE_FILE}"
+  if ! python3 - "$state_tmp" "$destination" <<'PYEOF'
 import os
 import pathlib
 import sys
@@ -1818,6 +1854,105 @@ PYEOF
   fi
 }
 
+persist_interrupted_script_failsafe() {
+  local failsafe_file state_tmp
+  failsafe_file="$(interrupted_script_failsafe_path)" || return 1
+  state_tmp="$(mktemp "${failsafe_file}.tmp.XXXXXX")" || return 1
+  if ! printf '%s\n' \
+    'format_version=1' \
+    "interrupted_script_contexts=${interrupted_script_contexts}" \
+    "interrupted_script_identities=${interrupted_script_identities}" \
+    "interrupted_script_actions=${interrupted_script_actions}" > "$state_tmp"; then
+    rm -f -- "$state_tmp"
+    return 1
+  fi
+  persist_alert_state_file "$state_tmp" "$failsafe_file"
+}
+
+load_interrupted_script_failsafe() {
+  local failsafe_file state_key state_value
+  local failsafe_contexts="" failsafe_identities="" failsafe_actions=""
+  local seen_format=0 seen_contexts=0 seen_identities=0 seen_actions=0
+  local entry item encoded
+  local -a entries=()
+  failsafe_file="$(interrupted_script_failsafe_path)" || return 1
+  [[ -e "$failsafe_file" ]] || return 0
+  [[ -f "$failsafe_file" ]] || return 1
+  while IFS='=' read -r state_key state_value; do
+    [[ -n "$state_key" ]] || return 1
+    case "$state_key" in
+      format_version)
+        (( seen_format == 0 )) || return 1
+        [[ "$state_value" == 1 ]] || return 1
+        seen_format=1
+        ;;
+      interrupted_script_contexts)
+        (( seen_contexts == 0 )) || return 1
+        [[ -z "$state_value" || "$state_value" =~ ^([a-f0-9]{24}:[A-Za-z0-9+/=]+,)*[a-f0-9]{24}:[A-Za-z0-9+/=]+$ ]] || return 1
+        failsafe_contexts="$state_value"
+        seen_contexts=1
+        ;;
+      interrupted_script_identities)
+        (( seen_identities == 0 )) || return 1
+        [[ -z "$state_value" || "$state_value" =~ ^([a-f0-9]{24}:[A-Za-z0-9+/=]+,)*[a-f0-9]{24}:[A-Za-z0-9+/=]+$ ]] || return 1
+        failsafe_identities="$state_value"
+        seen_identities=1
+        ;;
+      interrupted_script_actions)
+        (( seen_actions == 0 )) || return 1
+        [[ "$state_value" =~ ^([a-f0-9]{24},)*[a-f0-9]{0,24}$ ]] || return 1
+        failsafe_actions="$state_value"
+        seen_actions=1
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done < "$failsafe_file"
+  (( seen_format == 1 && seen_contexts == 1 && seen_identities == 1 && seen_actions == 1 )) || return 1
+
+  if [[ -n "$failsafe_contexts" ]]; then
+    IFS=',' read -r -a entries <<< "$failsafe_contexts"
+    for entry in "${entries[@]}"; do
+      item="${entry%%:*}"
+      encoded="${entry#*:}"
+      [[ "$entry" == *:* && -n "$encoded" ]] || return 1
+      if ! pending_script_context_entry "$interrupted_script_contexts" "$item" >/dev/null; then
+        interrupted_script_contexts="$(pending_script_context_set \
+          "$interrupted_script_contexts" "$item" "$encoded")"
+      fi
+    done
+  fi
+  if [[ -n "$failsafe_identities" ]]; then
+    IFS=',' read -r -a entries <<< "$failsafe_identities"
+    for entry in "${entries[@]}"; do
+      item="${entry%%:*}"
+      encoded="${entry#*:}"
+      [[ "$entry" == *:* && -n "$encoded" ]] || return 1
+      if ! pending_script_context_entry "$interrupted_script_identities" "$item" >/dev/null; then
+        interrupted_script_identities="$(pending_script_context_set \
+          "$interrupted_script_identities" "$item" "$encoded")"
+      fi
+    done
+  fi
+  if [[ -n "$failsafe_actions" ]]; then
+    IFS=',' read -r -a entries <<< "$failsafe_actions"
+    for item in "${entries[@]}"; do
+      [[ -n "$item" ]] || continue
+      if ! csv_contains "$interrupted_script_actions" "$item"; then
+        interrupted_script_actions="${interrupted_script_actions:+${interrupted_script_actions},}${item}"
+      fi
+    done
+  fi
+  interrupted_script_failsafe_loaded=1
+}
+
+clear_interrupted_script_failsafe() {
+  local failsafe_file
+  failsafe_file="$(interrupted_script_failsafe_path)" || return 1
+  [[ ! -e "$failsafe_file" ]] || rm -f -- "$failsafe_file"
+}
+
 persist_alert_state() {
   local state_tmp
   state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || return 1
@@ -1832,6 +1967,8 @@ persist_alert_state() {
     "observed_weekly_pct=${observed_weekly_pct}" \
     "observed_weekly_reset_at=${observed_weekly_reset_at}" \
     "observed_weekly_limit_id=${observed_weekly_limit_id}" \
+    "last_sampled_at_epoch=${last_sampled_at_epoch}" \
+    "last_sample_interval_seconds=${last_sample_interval_seconds}" \
     "five_h_armed_reset_at=${five_h_armed_reset_at}" \
     "five_h_armed_limit_id=${five_h_armed_limit_id}" \
     "weekly_armed_reset_at=${weekly_armed_reset_at}" \
@@ -2554,9 +2691,14 @@ check_thresholds() {
   local weekly_reset_at="$6"
   local scraped_at_epoch="$7"
   local limit_id="${8:-default}"
+  local sample_interval_seconds="${9:-900}"
   if ! limit_id="$(canonicalize_alert_limit_id "$limit_id")"; then
     ALERT_PROCESSING_ERROR="invalid alert limit ID"
     return 1
+  fi
+  if [[ ! "$sample_interval_seconds" =~ ^[1-9][0-9]{0,4}$ ]] \
+    || (( sample_interval_seconds > 86400 )); then
+    sample_interval_seconds=900
   fi
 
   local state_version=1
@@ -2568,6 +2710,8 @@ check_thresholds() {
   local observed_weekly_pct=""
   local observed_weekly_reset_at=0
   local observed_weekly_limit_id=""
+  local last_sampled_at_epoch=0
+  local last_sample_interval_seconds=900
   local five_h_armed_reset_at=0
   local five_h_armed_limit_id=""
   local weekly_armed_reset_at=0
@@ -2604,6 +2748,7 @@ check_thresholds() {
   local interrupted_script_contexts=""
   local interrupted_script_identities=""
   local interrupted_script_actions=""
+  local interrupted_script_failsafe_loaded=0
   local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold
   local original_pending cycle_key covered_json registration_status disabled_notified transaction_epoch
   local weekly_cycle_key weekly_request_json
@@ -2618,6 +2763,7 @@ check_thresholds() {
   local observed_5h_initial_no_arm=0
   local observed_weekly_reset_recovery=0 weekly_intent_succeeded=1
   local observed_weekly_scheduled_due=0 weekly_atomic_done=0
+  local weekly_gap_within_archive_bound=1
   local interrupted_5h_owner="" interrupted_5h_reset_at=0
   local interrupted_weekly_owner="" interrupted_weekly_reset_at=0
   local previous_local_observed_weekly_reset_at=0
@@ -2651,6 +2797,17 @@ check_thresholds() {
           ;;
         observed_5h_reset_at|observed_weekly_reset_at|five_h_armed_reset_at|weekly_armed_reset_at|last_notified_5h_reset_at|last_notified_weekly_reset_at|local_observed_5h_reset_at|local_observed_weekly_reset_at|pending_observed_weekly_reset_at)
           if [[ "$state_value" =~ ^[0-9]+$ ]]; then
+            printf -v "$state_key" '%s' "$state_value"
+          fi
+          ;;
+        last_sampled_at_epoch)
+          if [[ "$state_value" =~ ^(0|[1-9][0-9]{0,11})$ ]]; then
+            printf -v "$state_key" '%s' "$state_value"
+          fi
+          ;;
+        last_sample_interval_seconds)
+          if [[ "$state_value" =~ ^[1-9][0-9]{0,4}$ ]] \
+            && (( state_value <= 86400 )); then
             printf -v "$state_key" '%s' "$state_value"
           fi
           ;;
@@ -2688,6 +2845,11 @@ check_thresholds() {
           ;;
       esac
     done < "$STATE_FILE"
+  fi
+  if ! load_interrupted_script_failsafe; then
+    echo "[ERROR] Interrupted alert script fail-safe journal is invalid; alerts are disabled." >&2
+    ALERT_PROCESSING_ERROR="interrupted alert script fail-safe journal is invalid"
+    return 1
   fi
 
   if (( state_version > 5 )); then
@@ -2917,9 +3079,16 @@ check_thresholds() {
   # old observed deadline is the only trustworthy reset identity, while the
   # current sample is merely when the crossing was observed.  An existing arm
   # remains authoritative and is deliberately left untouched.
+  if (( last_sampled_at_epoch > 0 )) \
+    && ! is_reset_observation_gap_acceptable \
+      "$last_sampled_at_epoch" "$scraped_at_epoch" \
+      "$last_sample_interval_seconds" "$sample_interval_seconds"; then
+    weekly_gap_within_archive_bound=0
+  fi
   if (( weekly_armed_reset_at == 0 )) \
     && [[ "$observed_weekly_limit_id" == "$limit_id" ]] \
     && (( observed_weekly_reset_recovery == 0 )) \
+    && (( weekly_gap_within_archive_bound == 1 )) \
     && [[ "$observed_weekly_pct" =~ ^100([.]0+)?$ ]] \
     && [[ "$weekly_pct" =~ ^100([.]0+)?$ ]] \
     && [[ "$weekly_reset_at" =~ ^[0-9]+$ ]] \
@@ -4076,6 +4245,12 @@ PYEOF
     # entries.  Subsequent cycles return to normal expire-before-deliver order.
     alerts_disabled_since=0
   fi
+  # Keep the previous observation timestamp and cadence beside detector state.
+  # This is the live equivalent of archive.py's adjacent-snapshot gap check;
+  # a failed final write leaves the older timestamp on disk and therefore
+  # fails closed on the next poll.
+  last_sampled_at_epoch="$scraped_at_epoch"
+  last_sample_interval_seconds="$sample_interval_seconds"
   if ! persist_alert_state; then
     echo "[ERROR] Could not persist alert state." >&2
     status=1
@@ -4083,6 +4258,10 @@ PYEOF
   elif ! python3 "$ALERTS_PY" prune "$ALERT_DELIVERIES_FILE" --now "$scraped_at_epoch"; then
     status=1
     ALERT_PROCESSING_ERROR="alert journal pruning failed"
+  elif (( interrupted_script_failsafe_loaded == 1 )) \
+    && ! clear_interrupted_script_failsafe; then
+    status=1
+    ALERT_PROCESSING_ERROR="interrupted alert script fail-safe cleanup failed"
   fi
   return "$status"
 }
@@ -4248,6 +4427,7 @@ run_cycle() {
     fi
     check_thresholds "$five_h" "$weekly" "$five_h_reset" "$weekly_reset" \
       "$five_h_reset_at" "$weekly_reset_at" "$scraped_at_epoch" "$limit_id" \
+      "$interval_seconds" \
       || { status=1; append_cycle_error "${ALERT_PROCESSING_ERROR:-alert processing failed}"; }
   else
     status=1

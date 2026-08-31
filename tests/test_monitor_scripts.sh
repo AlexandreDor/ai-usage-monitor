@@ -62,7 +62,8 @@ count_file_lines() {
 }
 
 reset_case() {
-  rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$HOOK_LOG" "$NOTIFICATION_LOG"
+  rm -f "$STATE_FILE" "$STATE_FILE.interrupted" "$ALERT_DELIVERIES_FILE" \
+    "$HOOK_LOG" "$NOTIFICATION_LOG"
   monitor_defaults
   ALERT_THRESHOLDS=0
 }
@@ -460,6 +461,49 @@ assert_eq "$owner_switch_action_id" "$(state_value suppressed_script_5h_actions)
   "interrupted owner hook was not durably suppressed"
 assert_eq 0 "$(count_file_lines "$NOTIFICATION_LOG")" \
   "owner switch recovery emitted an unexpected notification"
+
+# If the initial interrupted-hook marker write fails, the old pending state is
+# still durable. A separate fail-safe tombstone must make the return to A
+# acknowledge the old action without replaying it.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:50'
+validate_config
+initial_marker_failure_deadline=$((now + 300))
+check_thresholds 80 100 later unknown "$initial_marker_failure_deadline" '' \
+  "$now" group-a
+(
+  # shellcheck disable=SC2317,SC2329
+  run_alert_script() {
+    local crash_exit=99
+    exit "$crash_exit"
+  }
+  check_thresholds 40 100 later unknown "$initial_marker_failure_deadline" '' \
+    "$((now + 1))" group-a
+) >/dev/null 2>&1 || true
+initial_marker_failure_action_id="${ALERT_SCRIPT_RULE_IDS[0]}"
+initial_marker_failure_marker="${TEST_ROOT}/initial-marker-failure.marker"
+eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_initial_marker_original /')"
+# shellcheck disable=SC2034
+persist_alert_state() {
+  if [[ -n "${interrupted_script_identities:-}" ]]; then
+    : > "$initial_marker_failure_marker"
+    return 1
+  fi
+  persist_alert_state_initial_marker_original
+}
+check_thresholds 80 100 later unknown "$initial_marker_failure_deadline" '' \
+  "$((now + 2))" group-b >/dev/null 2>&1 || true
+eval "$(declare -f persist_alert_state_initial_marker_original | sed '1s/^persist_alert_state_initial_marker_original /persist_alert_state /')"
+assert_eq "$initial_marker_failure_action_id" "$(state_value pending_script_5h_actions)" \
+  "initial marker failure did not preserve the old pending action"
+[[ -f "$STATE_FILE.interrupted" ]] || fail "initial marker failure did not create a fail-safe tombstone"
+check_thresholds 40 100 later unknown "$initial_marker_failure_deadline" '' \
+  "$((now + 3))" group-a
+[[ ! -e "$HOOK_LOG" ]] || fail "initial marker persistence failure replayed the old hook"
+assert_eq "$initial_marker_failure_action_id" "$(state_value suppressed_script_5h_actions)" \
+  "initial marker failure did not suppress the old hook"
+[[ ! -e "$STATE_FILE.interrupted" ]] || fail "fail-safe tombstone was not retired after durable acknowledgement"
 
 # A rich pending intent must retain its immutable identity even when a
 # restored arm has lost its owner. Change only the mutable invocation fields

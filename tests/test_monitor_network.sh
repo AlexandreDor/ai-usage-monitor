@@ -2198,4 +2198,32 @@ assert reset["created_at"] == int(sys.argv[2]), reset
 assert reset["event_data"]["reset_epoch"] != int(sys.argv[3]), reset
 PYEOF
 
+# A full-to-full weekly transition after a gap larger than the archive's
+# evidence window is not a scheduled crossing.  Live and archive must reject
+# the same insufficient pair rather than letting live anchor a reset at the
+# old deadline.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-weekly-full-long-gap"
+weekly_long_gap_before=2000020000
+weekly_long_gap_old_deadline=$((weekly_long_gap_before + 900))
+weekly_long_gap_after=$((weekly_long_gap_before + 100000))
+weekly_long_gap_new_deadline=$((weekly_long_gap_old_deadline + 7 * 24 * 60 * 60))
+check_thresholds 100 100 unknown later '' "$weekly_long_gap_old_deadline" \
+  "$weekly_long_gap_before" group-a >/dev/null
+check_thresholds 100 100 unknown later '' "$weekly_long_gap_new_deadline" \
+  "$weekly_long_gap_after" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "long-gap weekly full-to-full transition emitted a live reset"
+python3 - "$ALERT_DELIVERIES_FILE" "$weekly_long_gap_old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert not any(
+    item["kind"] == "reset"
+    and item["event_data"].get("reset_epoch") == int(sys.argv[2])
+    for item in items
+), items
+PYEOF
+
 printf 'PASS: monitor network tests\n'
