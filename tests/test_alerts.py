@@ -381,6 +381,56 @@ class AlertJournalTests(unittest.TestCase):
                                  for item in self.document["alerts"]))
         alerts.validate_document(self.document, allow_legacy=False)
 
+    def test_observed_weekly_recovery_keeps_pending_after_legacy_terminal_failure(self):
+        weekly_id = alerts.canonicalize_limit_id("default")
+        legacy = reset_request(
+            window="weekly", cycle=f"legacy-v4|limit:default|reset:400",
+        )
+        legacy["expire_threshold_cycle"] = None
+        legacy_item = alerts.register(self.document, legacy)
+        modern = reset_request(
+            window="weekly", cycle=f"limit:{weekly_id}|reset:400",
+        )
+        modern["event_data"]["limit_id"] = weekly_id
+        modern["expire_threshold_cycle"] = None
+        modern_item = alerts.register(self.document, modern)
+
+        # The modern preserve cycle keeps the equivalent legacy row out of
+        # owner cleanup, so de-duplication creates the terminal superseded row.
+        changed = alerts.expire_observed_owner_cycle(
+            self.document, "weekly", weekly_id, 500,
+            preserve_cycle=modern["cycle_key"],
+            new_reset_request=modern,
+        )
+        self.assertEqual(1, changed)
+        self.assertEqual("failed", legacy_item["status"])
+        self.assertEqual("superseded", legacy_item["terminal_reason"])
+        self.assertEqual("pending", modern_item["status"])
+
+        changed = alerts.expire_observed_owner_cycle(
+            self.document, "weekly", weekly_id, 501,
+            preserve_cycle=modern["cycle_key"],
+            new_reset_request=modern,
+        )
+        self.assertEqual(0, changed)
+        self.assertEqual("failed", legacy_item["status"])
+        self.assertEqual("superseded", legacy_item["terminal_reason"])
+        self.assertEqual("pending", modern_item["status"])
+        self.assertEqual("pending", modern_item["channels"]["discord"]["status"])
+
+        alerts.atomic_write(self.path, self.document)
+        due = subprocess.run(
+            [sys.executable, str(ROOT / "local" / "alerts.py"), "due",
+             str(self.path), "--now", "501"],
+            input=json.dumps({"configured_channels": ["discord"]}) + "\n",
+            check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(0, due.returncode, due.stderr)
+        self.assertEqual(
+            modern_item["alert_id"], json.loads(due.stdout)["alert_id"],
+        )
+        alerts.validate_document(self.document, allow_legacy=False)
+
     def test_observed_weekly_terminal_cycle_prevents_pending_legacy_resurrection(self):
         weekly_id = alerts.canonicalize_limit_id("default")
         modern = reset_request(

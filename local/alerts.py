@@ -555,25 +555,28 @@ def _register_or_reuse_observed_reset(document: dict[str, Any],
             and equivalent_cycle(existing["cycle_key"], normalized_cycle))
     ]
     if matches:
-        # A terminal row is authoritative: in particular, a delivered or
-        # local-observed row must never be resurrected by a later recovery
-        # request.  If every matching row is pending, prefer the canonical
+        # A delivered row is authoritative and must never be resurrected by a
+        # later recovery request.  If no delivery succeeded, keep a pending
+        # row authoritative so a retry is not lost; prefer the canonical
         # modern cycle so a legacy duplicate is retired deterministically.
         terminal = [item for item in matches if item["status"] != "pending"]
-        if terminal:
+        delivered = [item for item in terminal if item["terminal_reason"] == "delivered"]
+        pending = [item for item in matches if item["status"] == "pending"]
+        if delivered:
             authority = next(
-                (item for item in terminal if item["terminal_reason"] == "delivered"),
-                terminal[0],
+                item for item in matches if item["terminal_reason"] == "delivered"
             )
-        else:
+        elif pending:
             authority = min(
-                matches,
+                pending,
                 key=lambda item: (
                     item["cycle_key"] != normalized_cycle,
                     item["created_at"],
                     item["alert_id"],
                 ),
             )
+        else:
+            authority = terminal[0]
         completed_at = request.get("created_at")
         if not _is_int(completed_at):
             completed_at = max(item["created_at"] for item in matches)
