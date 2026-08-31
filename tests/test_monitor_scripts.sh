@@ -505,6 +505,109 @@ assert_eq "$initial_marker_failure_action_id" "$(state_value suppressed_script_5
   "initial marker failure did not suppress the old hook"
 [[ ! -e "$STATE_FILE.interrupted" ]] || fail "fail-safe tombstone was not retired after durable acknowledgement"
 
+# A second interruption of the same stable action ID must replace the older
+# interrupted context in the fail-safe journal.  Otherwise restart merges the
+# stale state marker, misses the newer owner/cycle identity, and replays the
+# pending hook.  After that acknowledgement, a different owner/cycle remains
+# a legitimate execution of the same configured rule.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:50'
+validate_config
+same_action_old_deadline=$((now + 2400))
+same_action_new_deadline=$((same_action_old_deadline + 900))
+check_thresholds 80 100 later unknown "$same_action_old_deadline" '' "$now" group-a
+(
+  # shellcheck disable=SC2317,SC2329
+  run_alert_script() {
+    local crash_exit=99
+    exit "$crash_exit"
+  }
+  check_thresholds 40 100 later unknown "$same_action_old_deadline" '' \
+    "$((now + 1))" group-a
+) >/dev/null 2>&1 || true
+same_action_id="${ALERT_SCRIPT_RULE_IDS[0]}"
+check_thresholds 80 100 unknown unknown '' '' "$((now + 2))" group-b
+same_action_first_contexts="$(state_value interrupted_script_contexts)"
+same_action_first_identities="$(state_value interrupted_script_identities)"
+assert_contains "$same_action_first_contexts" "$same_action_id:" \
+  "first same-action interruption context was not retained"
+assert_contains "$same_action_first_identities" "$same_action_id:" \
+  "first same-action interruption identity was not retained"
+check_thresholds 40 100 later unknown "$same_action_old_deadline" '' \
+  "$((now + 3))" group-a
+[[ ! -e "$HOOK_LOG" ]] || fail "first same-action interruption was replayed"
+
+# Establish a distinct A cycle and leave the same action pending again.
+check_thresholds 80 100 later unknown "$same_action_new_deadline" '' \
+  "$((now + 4))" group-a
+(
+  # shellcheck disable=SC2317,SC2329
+  run_alert_script() {
+    local crash_exit=99
+    exit "$crash_exit"
+  }
+  check_thresholds 40 100 later unknown "$same_action_new_deadline" '' \
+    "$((now + 5))" group-a
+) >/dev/null 2>&1 || true
+same_action_second_contexts="$(state_value pending_script_contexts)"
+same_action_second_context_entry="${same_action_second_contexts%%,*}"
+same_action_second_context_encoded="${same_action_second_context_entry#*:}"
+same_action_second_identity_encoded="$(alert_script_identity_from_context \
+  "$same_action_second_context_encoded")"
+same_action_second_identities="${same_action_id}:${same_action_second_identity_encoded}"
+assert_contains "$same_action_second_contexts" "$same_action_id:" \
+  "second same-action interruption setup lost its pending context"
+
+same_action_marker="${TEST_ROOT}/same-action-marker.marker"
+eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_same_action_original /')"
+# shellcheck disable=SC2034
+persist_alert_state() {
+  # Allow writes before the new marker is installed, then force the marker and
+  # subsequent state writes to use the separate fail-safe journal.
+  if [[ -n "${interrupted_script_contexts:-}" \
+    && "$interrupted_script_contexts" != "$same_action_first_contexts" ]]; then
+    : > "$same_action_marker"
+    return 1
+  fi
+  if [[ -e "$same_action_marker" ]]; then
+    return 1
+  fi
+  persist_alert_state_same_action_original
+}
+check_thresholds 80 100 unknown unknown '' '' "$((now + 6))" group-b \
+  >/dev/null 2>&1 || true
+eval "$(declare -f persist_alert_state_same_action_original | sed '1s/^persist_alert_state_same_action_original /persist_alert_state /')"
+same_action_failsafe_contexts="$(awk -F= '$1 == "interrupted_script_contexts" {print substr($0, index($0, "=") + 1)}' "$STATE_FILE.interrupted")"
+same_action_failsafe_identities="$(awk -F= '$1 == "interrupted_script_identities" {print substr($0, index($0, "=") + 1)}' "$STATE_FILE.interrupted")"
+assert_eq "$same_action_second_contexts" "$same_action_failsafe_contexts" \
+  "second same-action interruption did not replace the fail-safe context"
+assert_eq "$same_action_second_identities" "$same_action_failsafe_identities" \
+  "second same-action interruption did not replace the fail-safe identity"
+assert_eq "$same_action_first_contexts" "$(state_value interrupted_script_contexts)" \
+  "state marker changed despite the forced second interruption write failure"
+
+# Restart must acknowledge the newer pending context without running it.
+check_thresholds 40 100 later unknown "$same_action_new_deadline" '' \
+  "$((now + 7))" group-a
+[[ ! -e "$HOOK_LOG" ]] || fail "newer same-action interruption was replayed after restart"
+assert_eq "" "$(state_value pending_script_5h_actions)" \
+  "newer same-action interruption remained pending after acknowledgement"
+assert_eq "$same_action_id" "$(state_value suppressed_script_5h_actions)" \
+  "newer same-action interruption was not suppressed after acknowledgement"
+[[ ! -e "$STATE_FILE.interrupted" ]] || fail "same-action fail-safe marker was not retired"
+
+# Clearing the old owner ledger on a real owner switch releases the stable rule
+# ID for its distinct cycle; this invocation is legitimate and must execute.
+check_thresholds 80 100 later unknown "$same_action_new_deadline" '' \
+  "$((now + 8))" group-c
+check_thresholds 40 100 later unknown "$same_action_new_deadline" '' \
+  "$((now + 9))" group-c
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" \
+  "legitimate distinct same-action cycle did not execute exactly once"
+assert_contains "$(tail -n 1 "$HOOK_LOG")" "|$same_action_id" \
+  "legitimate distinct cycle changed the stable action ID"
+
 # A rich pending intent must retain its immutable identity even when a
 # restored arm has lost its owner. Change only the mutable invocation fields
 # at the crash boundary; returning to A must still suppress the old action.

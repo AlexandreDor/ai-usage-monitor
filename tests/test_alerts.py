@@ -827,6 +827,29 @@ class AlertJournalTests(unittest.TestCase):
                              for item in self.document["alerts"]))
         alerts.validate_document(self.document, allow_legacy=False)
 
+    def test_register_same_id_metadata_change_keeps_owner_tombstone(self):
+        original = reset_request(created=200, cycle="limit:default|reset:200")
+        tombstone = alerts.register(self.document, original)
+        self.assertEqual(1, alerts.interrupt_reset_cycle(
+            self.document, "5h", "default", 200, 201,
+        ))
+
+        changed = reset_request(created=202, cycle="limit:default|reset:200")
+        changed.update({
+            "message": "recovery observed later",
+            "expires_at": 900,
+            "channels": ["telegram"],
+        })
+
+        result = alerts.register(self.document, changed)
+
+        self.assertIs(tombstone, result)
+        self.assertEqual(1, len(self.document["alerts"]))
+        self.assertEqual("failed", tombstone["status"])
+        self.assertEqual("owner_interrupted", tombstone["terminal_reason"])
+        self.assertEqual({"discord"}, set(tombstone["channels"]))
+        alerts.validate_document(self.document, allow_legacy=False)
+
     def test_interrupt_pending_owner_terminalizes_both_windows_idempotently(self):
         five_threshold_request = request(
             "50", channels=["discord"], cycle="limit:default|reset:100",

@@ -1917,10 +1917,12 @@ load_interrupted_script_failsafe() {
       item="${entry%%:*}"
       encoded="${entry#*:}"
       [[ "$entry" == *:* && -n "$encoded" ]] || return 1
-      if ! pending_script_context_entry "$interrupted_script_contexts" "$item" >/dev/null; then
-        interrupted_script_contexts="$(pending_script_context_set \
-          "$interrupted_script_contexts" "$item" "$encoded")"
-      fi
+      # The fail-safe file is the newest durable proof at this crash boundary.
+      # Replace an older marker from the main state file even when the action
+      # ID is the same; keeping the old context can make a later pending cycle
+      # look unrelated and replay its hook.
+      interrupted_script_contexts="$(pending_script_context_set \
+        "$interrupted_script_contexts" "$item" "$encoded")"
     done
   fi
   if [[ -n "$failsafe_identities" ]]; then
@@ -1929,10 +1931,8 @@ load_interrupted_script_failsafe() {
       item="${entry%%:*}"
       encoded="${entry#*:}"
       [[ "$entry" == *:* && -n "$encoded" ]] || return 1
-      if ! pending_script_context_entry "$interrupted_script_identities" "$item" >/dev/null; then
-        interrupted_script_identities="$(pending_script_context_set \
-          "$interrupted_script_identities" "$item" "$encoded")"
-      fi
+      interrupted_script_identities="$(pending_script_context_set \
+        "$interrupted_script_identities" "$item" "$encoded")"
     done
   fi
   if [[ -n "$failsafe_actions" ]]; then
@@ -2872,7 +2872,8 @@ check_thresholds() {
   pace="$(weekly_pace_vs_ideal "$weekly_pct" "$weekly_reset_at" "$scraped_at_epoch")"
   pace_suffix=""
   [[ -n "$pace" ]] && pace_suffix=$'\n'"*Pace vs ideal:* ${pace}"
-  if [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ && "$weekly_reset_at" =~ ^[0-9]+$ ]]; then
+  if [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ && "$weekly_reset_at" =~ ^[0-9]+$ ]] \
+    && (( weekly_reset_at > 0 )); then
     weekly_observation_valid=1
   fi
   if [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ && "$five_h_reset_at" =~ ^[0-9]+$ ]] \
@@ -4245,12 +4246,14 @@ PYEOF
     # entries.  Subsequent cycles return to normal expire-before-deliver order.
     alerts_disabled_since=0
   fi
-  # Keep the previous observation timestamp and cadence beside detector state.
-  # This is the live equivalent of archive.py's adjacent-snapshot gap check;
-  # a failed final write leaves the older timestamp on disk and therefore
-  # fails closed on the next poll.
-  last_sampled_at_epoch="$scraped_at_epoch"
-  last_sample_interval_seconds="$sample_interval_seconds"
+  # Keep the previous complete weekly observation timestamp and cadence beside
+  # detector state. This is the live equivalent of archive.py's adjacent
+  # complete-snapshot gap check: a partial observation must not hide an old
+  # complete baseline and make a sparse full-to-full pair look recent.
+  if (( weekly_observation_valid == 1 )); then
+    last_sampled_at_epoch="$scraped_at_epoch"
+    last_sample_interval_seconds="$sample_interval_seconds"
+  fi
   if ! persist_alert_state; then
     echo "[ERROR] Could not persist alert state." >&2
     status=1

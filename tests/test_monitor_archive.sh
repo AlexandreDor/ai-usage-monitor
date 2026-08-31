@@ -669,6 +669,36 @@ with sqlite3.connect(sys.argv[1]) as connection:
 PYEOF
 )" "long-gap weekly full-to-full pair diverged from live"
 
+# A same-owner partial row must not become the adjacent weekly baseline.  The
+# archive therefore rejects the same full -> partial -> full sparse pair as
+# live, even though the final full row is only one second after the partial.
+rm -f "$ARCHIVE_FILE"
+printf '[]\n' > "$HISTORY_FILE"
+partial_full_before=$((BASE + 10000))
+partial_full_old_deadline=$((partial_full_before + 900))
+partial_full_partial=$((partial_full_before + 100000))
+partial_full_after=$((partial_full_partial + 1))
+partial_full_new_deadline=$((partial_full_old_deadline + 7 * 24 * 60 * 60))
+printf '{"five_h_pct":100,"weekly_pct":100,"five_h_reset_at":%s,"weekly_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$partial_full_old_deadline" "$partial_full_old_deadline" "$(iso_at "$partial_full_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$partial_full_old_deadline" "$(iso_at "$partial_full_partial")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":100,"weekly_pct":100,"five_h_reset_at":%s,"weekly_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$partial_full_old_deadline" "$partial_full_new_deadline" "$(iso_at "$partial_full_after")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute(
+        "SELECT COUNT(*) FROM reset_events WHERE window = 'weekly'"
+    ).fetchone()[0])
+PYEOF
+)" "full-partial-full weekly gap fabricated an archive reset"
+
 # Scheduled reconstruction never combines observations from different groups.
 rm -f "$ARCHIVE_FILE"
 printf '{"weekly_pct":40,"weekly_reset_at":%s,"limit_id":"group-a","scraped_at":"%s"}\n' \

@@ -2226,4 +2226,41 @@ assert not any(
 ), items
 PYEOF
 
+# A partial same-owner observation must not reset live's weekly gap baseline.
+# Archive keeps the two complete weekly samples adjacent, so the full ->
+# partial -> full sequence must be rejected by both paths when those full
+# samples are farther apart than the shared evidence bound.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-weekly-full-partial-full"
+weekly_partial_full_before=2000025000
+weekly_partial_full_old_deadline=$((weekly_partial_full_before + 900))
+weekly_partial_full_partial=$((weekly_partial_full_before + 100000))
+weekly_partial_full_after=$((weekly_partial_full_partial + 1))
+weekly_partial_full_new_deadline=$((weekly_partial_full_old_deadline + 7 * 24 * 60 * 60))
+check_thresholds 100 100 later later "$weekly_partial_full_old_deadline" \
+  "$weekly_partial_full_old_deadline" "$weekly_partial_full_before" group-a >/dev/null
+check_thresholds 100 80 later unknown "$weekly_partial_full_old_deadline" '' \
+  "$weekly_partial_full_partial" group-a >/dev/null
+assert_eq "$weekly_partial_full_before" \
+  "$(awk -F= '$1 == "last_sampled_at_epoch" {print $2}' "$STATE_FILE")" \
+  "partial weekly observation masked the complete live baseline"
+check_thresholds 100 100 later later "$weekly_partial_full_old_deadline" \
+  "$weekly_partial_full_new_deadline" "$weekly_partial_full_after" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "full-partial-full weekly gap emitted a live reset"
+python3 - "${ALERT_DELIVERIES_FILE}" "${STATE_FILE}" <<'PYEOF'
+import json
+import pathlib
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert not any(item["kind"] == "reset" and item["window"] == "weekly" for item in items), items
+state = dict(
+    line.split("=", 1)
+    for line in pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").splitlines()
+    if "=" in line
+)
+assert state["last_sampled_at_epoch"] == str(2000125001), state
+PYEOF
+
 printf 'PASS: monitor network tests\n'
