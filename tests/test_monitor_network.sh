@@ -656,88 +656,81 @@ assert_eq local_observed "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.termina
 assert_eq "$((reconcile_fail_old + 1))" "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.detector_acknowledged_at)" \
   "reconcile retry did not acknowledge the local-only tombstone"
 
-# The final detector-state write can fail after the write-ahead row,
-# reconciliation, and delivery-stage state write have succeeded. Detect the
-# durable marker itself instead of relying on a persistence-call count, whose
-# number varies with runtime/CLI paths. The durable tombstone must suppress
-# the observed reset on recovery and leave its hook retryable.
+# A process can stop after the write-ahead row, reconciliation, and the
+# detector-state write have succeeded, but before the reset hook runs. This
+# exercises the same stale-arm recovery path with a different prior journal
+# history. The durable marker must suppress the observed reset on recovery and
+# leave its hook retryable.
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
-export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-final-persist-failure"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-stale-arm-crash"
 export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
-final_fail_now=2000011000
-final_fail_old=$((final_fail_now + 1800))
-final_fail_new=$((final_fail_old + 900))
-final_fail_id="$(canonicalize_alert_limit_id group-a)"
+stale_arm_crash_now=2000011000
+stale_arm_crash_old=$((stale_arm_crash_now + 1800))
+stale_arm_crash_new=$((stale_arm_crash_old + 900))
+stale_arm_crash_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
   'prev_5h_pct=100' 'prev_weekly_pct=100' \
-  'observed_5h_pct=100' "observed_5h_reset_at=${final_fail_old}" \
-  "observed_5h_limit_id=${final_fail_id}" \
+  'observed_5h_pct=100' "observed_5h_reset_at=${stale_arm_crash_old}" \
+  "observed_5h_limit_id=${stale_arm_crash_id}" \
   'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
-  "five_h_armed_reset_at=${final_fail_old}" \
-  "five_h_armed_limit_id=${final_fail_id}" \
+  "five_h_armed_reset_at=${stale_arm_crash_old}" \
+  "five_h_armed_limit_id=${stale_arm_crash_id}" \
   'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
   'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
   'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
   'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
-printf '{"completed_at":%s,"alerts":[]}\n' "$final_fail_now" \
+printf '{"completed_at":%s,"alerts":[]}\n' "$stale_arm_crash_now" \
   | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
-final_hook="${TEST_ROOT}/observed-final-persist-hook.sh"
-final_hook_log="${TEST_ROOT}/observed-final-persist-hook.log"
+stale_arm_crash_hook="${TEST_ROOT}/observed-stale-arm-crash-hook.sh"
+stale_arm_crash_hook_log="${TEST_ROOT}/observed-stale-arm-crash-hook.log"
 # shellcheck disable=SC2016
-printf '%s\n' '#!/usr/bin/env bash' 'printf "hook|%s|%s\n" "$CODEX_ALERT_EVENT" "$CODEX_ALERT_WINDOW" >> "$FINAL_HOOK_LOG"' > "$final_hook"
-chmod 700 "$final_hook"
-export FINAL_HOOK_LOG="$final_hook_log"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "hook|%s|%s\n" "$CODEX_ALERT_EVENT" "$CODEX_ALERT_WINDOW" >> "$STALE_ARM_CRASH_HOOK_LOG"' > "$stale_arm_crash_hook"
+chmod 700 "$stale_arm_crash_hook"
+export STALE_ARM_CRASH_HOOK_LOG="$stale_arm_crash_hook_log"
 # shellcheck disable=SC2034
-ALERT_SCRIPT_1="$final_hook"
+ALERT_SCRIPT_1="$stale_arm_crash_hook"
 # shellcheck disable=SC2034
 ALERT_SCRIPT_1_EVENTS='5h:reset'
 validate_config
-# shellcheck disable=SC2317,SC2329,SC2001
-eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_final_original /')"
 (
-  final_marker_persisted=0
-  persist_alert_state() {
-    if (( final_marker_persisted == 1 )); then
-      return 1
-    fi
-    persist_alert_state_final_original || return 1
-    if [[ "$last_notified_5h_reset_at" == "$final_fail_now" ]]; then
-      final_marker_persisted=1
-    fi
+  # The write-ahead marker and pending context have already been persisted;
+  # terminate from the hook invocation before the hook can run.
+  # shellcheck disable=SC2329
+  run_alert_script() {
+    exit 99
   }
-  check_thresholds 100 100 later unknown "$final_fail_new" '' "$final_fail_now" group-a >/dev/null
+  check_thresholds 100 100 later unknown "$stale_arm_crash_new" '' "$stale_arm_crash_now" group-a >/dev/null
 ) >/dev/null 2>&1 || true
 assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
-  "final state persistence failure emitted an HTTP request"
-assert_eq "$final_fail_now" "$(awk -F= '$1 == "last_notified_5h_reset_at" {print $2}' "$STATE_FILE")" \
-  "final state persistence failure lost the durable observed marker"
+  "stale-arm crash emitted an HTTP request"
+assert_eq "$stale_arm_crash_now" "$(awk -F= '$1 == "last_notified_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "stale-arm crash lost the durable observed marker"
 assert_eq local_observed "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.terminal_reason)" \
-  "final state persistence failure lost the write-ahead tombstone"
-eval "$(declare -f persist_alert_state_final_original | sed '1s/^persist_alert_state_final_original /persist_alert_state /')"
+  "stale-arm crash lost the write-ahead tombstone"
 # The hook variables are intentionally scoped to this recovery subshell.
 # shellcheck disable=SC2030
 (
   # shellcheck disable=SC2034
-  ALERT_SCRIPT_1="$final_hook"
+  ALERT_SCRIPT_1="$stale_arm_crash_hook"
   # shellcheck disable=SC2034
   ALERT_SCRIPT_1_EVENTS='5h:reset'
   validate_config
   # The restart sample has consumed quota and is no longer an observed-reset
   # proof; the durable tombstone must still prevent the stale scheduled path.
-  check_thresholds 80 100 later unknown "$final_fail_new" '' "$((final_fail_old + 1))" group-a >/dev/null
+  check_thresholds 80 100 later unknown "$stale_arm_crash_new" '' "$((stale_arm_crash_old + 1))" group-a >/dev/null
 ) >/dev/null
 assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
-  "final state recovery emitted an HTTP request"
-assert_eq 1 "$(wc -l < "$final_hook_log")" \
-  "final state recovery did not run the local hook once"
-check_thresholds 100 100 later unknown "$final_fail_new" '' "$((final_fail_old + 2))" group-a >/dev/null
+  "stale-arm recovery emitted an HTTP request"
+assert_eq 1 "$(wc -l < "$stale_arm_crash_hook_log")" \
+  "stale-arm recovery did not run the local hook once"
+check_thresholds 100 100 later unknown "$stale_arm_crash_new" '' "$((stale_arm_crash_old + 2))" group-a >/dev/null
 assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
-  "final state recovery replayed the reset"
-assert_eq 1 "$(wc -l < "$final_hook_log")" \
-  "final state recovery replayed the local hook"
-assert_eq "$final_fail_now" "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.detector_acknowledged_at)" \
-  "final state recovery did not acknowledge the tombstone"
+  "stale-arm recovery replayed the reset"
+assert_eq 1 "$(wc -l < "$stale_arm_crash_hook_log")" \
+  "stale-arm recovery replayed the local hook"
+assert_eq "$stale_arm_crash_now" "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.detector_acknowledged_at)" \
+  "stale-arm recovery did not acknowledge the tombstone"
 
 # A restored arm is not trustworthy when its owner is absent or belongs to a
 # different group. The journal, rather than that arm, is authoritative: a
