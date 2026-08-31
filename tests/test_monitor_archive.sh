@@ -546,13 +546,27 @@ printf '{"five_h_pct":50,"limit_id":"test","scraped_at":"%s"}\n' "$(iso_at "$((B
 printf '{"weekly_pct":100,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$partial_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
-assert_eq '1' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+assert_eq "${partial_deadline}:${BASE}:40.0:100.0:scheduled_crossing:0" "$(python3 - "$ARCHIVE_FILE" "$partial_deadline" <<'PYEOF'
 import sqlite3
 import sys
 with sqlite3.connect(sys.argv[1]) as connection:
-    print(connection.execute("SELECT COUNT(*) FROM reset_events").fetchone()[0])
+    row = connection.execute(
+        "SELECT reset_at_epoch, observed_at_epoch, before_pct, after_pct, detection_method "
+        "FROM reset_events WHERE window = 'weekly'"
+    ).fetchone()
+    random_count = connection.execute(
+        "SELECT COUNT(*) FROM reset_events "
+        "WHERE window = 'weekly' AND detection_method = 'random_observed'"
+    ).fetchone()[0]
+    total_count = connection.execute(
+        "SELECT COUNT(*) FROM reset_events WHERE window = 'weekly'"
+    ).fetchone()[0]
+assert row == (int(sys.argv[2]), 2000000000, 40.0, 100.0, "scheduled_crossing"), row
+assert random_count == 0, random_count
+assert total_count == 1, total_count
+print(":".join(map(str, (*row, random_count))))
 PYEOF
-)" "partial sample before deadline suppressed strong reset evidence"
+)" "partial sample before deadline produced the wrong scheduled crossing"
 
 rm -f "$ARCHIVE_FILE"
 printf '{"weekly_pct":40,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
@@ -563,13 +577,27 @@ printf '{"five_h_pct":50,"limit_id":"test","scraped_at":"%s"}\n' "$(iso_at "$((B
 printf '{"weekly_pct":100,"weekly_reset_at":%s,"limit_id":"test","scraped_at":"%s"}\n' \
   "$partial_current_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
   --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
-assert_eq '1' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+assert_eq "${partial_deadline}:${BASE}:40.0:100.0:scheduled_crossing:0" "$(python3 - "$ARCHIVE_FILE" "$partial_deadline" <<'PYEOF'
 import sqlite3
 import sys
 with sqlite3.connect(sys.argv[1]) as connection:
-    print(connection.execute("SELECT COUNT(*) FROM reset_events").fetchone()[0])
+    row = connection.execute(
+        "SELECT reset_at_epoch, observed_at_epoch, before_pct, after_pct, detection_method "
+        "FROM reset_events WHERE window = 'weekly'"
+    ).fetchone()
+    random_count = connection.execute(
+        "SELECT COUNT(*) FROM reset_events "
+        "WHERE window = 'weekly' AND detection_method = 'random_observed'"
+    ).fetchone()[0]
+    total_count = connection.execute(
+        "SELECT COUNT(*) FROM reset_events WHERE window = 'weekly'"
+    ).fetchone()[0]
+assert row == (int(sys.argv[2]), 2000000000, 40.0, 100.0, "scheduled_crossing"), row
+assert random_count == 0, random_count
+assert total_count == 1, total_count
+print(":".join(map(str, (*row, random_count))))
 PYEOF
-)" "partial sample after deadline duplicated the reset event"
+)" "partial sample after deadline produced a duplicate or wrong scheduled crossing"
 
 # Scheduled reconstruction never combines observations from different groups.
 rm -f "$ARCHIVE_FILE"

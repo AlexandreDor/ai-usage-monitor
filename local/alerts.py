@@ -1098,6 +1098,28 @@ def register(document: dict[str, Any], request: dict[str, Any]) -> dict[str, Any
             if not _same_registration(existing, incoming):
                 raise JournalError("alert_id collision with different content")
             return existing
+    # Reset identity is durable in the owner/window/event payload and cycle,
+    # not in the namespace-specific alert ID.  A legacy-vN row can therefore
+    # be equivalent to a modern request even though their IDs differ.  Only a
+    # durable owner-interrupted row gets this registration-time veto: pending
+    # and delivered legacy/modern duplicates retain the historical behavior
+    # and are merged by the observed-reset recovery path.  Exact-ID collisions
+    # were checked above and still retain strict immutable-content validation.
+    if (incoming["kind"] == "reset" and incoming["selector"] == "reset"
+            and set(incoming["event_data"]) == {"limit_id", "reset_epoch"}
+            and any(
+                existing["kind"] == "reset"
+                and existing["window"] == incoming["window"]
+                and existing["selector"] == "reset"
+                and existing["event_data"] == incoming["event_data"]
+                and (_same_cycle(existing["cycle_key"], incoming["cycle_key"])
+                     or _same_cycle(incoming["cycle_key"], existing["cycle_key"]))
+                and existing["status"] != "pending"
+                and existing["terminal_reason"] == "owner_interrupted"
+                for existing in document["alerts"]
+            )):
+        authority, _ = _register_or_reuse_observed_reset(document, request)
+        return authority
     now = incoming["created_at"]
     if request.get("replace_pending_thresholds"):
         for existing in document["alerts"]:

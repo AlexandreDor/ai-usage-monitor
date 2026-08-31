@@ -461,6 +461,211 @@ assert_eq "$owner_switch_action_id" "$(state_value suppressed_script_5h_actions)
 assert_eq 0 "$(count_file_lines "$NOTIFICATION_LOG")" \
   "owner switch recovery emitted an unexpected notification"
 
+# A rich pending intent must retain its immutable identity even when a
+# restored arm has lost its owner. Change only the mutable invocation fields
+# at the crash boundary; returning to A must still suppress the old action.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:50'
+validate_config
+ownerless_context_old_deadline=$((now + 900))
+check_thresholds 80 100 later unknown "$ownerless_context_old_deadline" '' "$now" group-a
+(
+  # shellcheck disable=SC2317,SC2329
+  run_alert_script() {
+    local crash_exit=99
+    exit "$crash_exit"
+  }
+  check_thresholds 40 100 later unknown "$ownerless_context_old_deadline" '' \
+    "$((now + 1))" group-a
+) >/dev/null 2>&1 || true
+ownerless_context_action_id="${ALERT_SCRIPT_RULE_IDS[0]}"
+python3 - "$STATE_FILE" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+values = {}
+for line in path.read_text(encoding="utf-8").splitlines():
+    key, separator, value = line.partition("=")
+    if separator:
+        values[key] = value
+values["five_h_armed_limit_id"] = ""
+path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+PYEOF
+ownerless_context_tombstone_marker="${TEST_ROOT}/ownerless-context-tombstone.marker"
+ownerless_context_failure_marker="${TEST_ROOT}/ownerless-context-failure.marker"
+eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_ownerless_context_original /')"
+# shellcheck disable=SC2034
+persist_alert_state() {
+  if [[ -n "${interrupted_script_identities:-}" \
+    && ! -e "$ownerless_context_tombstone_marker" ]]; then
+    persist_alert_state_ownerless_context_original
+    : > "$ownerless_context_tombstone_marker"
+    return 0
+  fi
+  if [[ -e "$ownerless_context_tombstone_marker" ]]; then
+    : > "$ownerless_context_failure_marker"
+    return 1
+  fi
+  persist_alert_state_ownerless_context_original
+}
+check_thresholds 80 100 later unknown "$ownerless_context_old_deadline" '' \
+  "$((now + 2))" group-b >/dev/null 2>&1 || true
+eval "$(declare -f persist_alert_state_ownerless_context_original | sed '1s/^persist_alert_state_ownerless_context_original /persist_alert_state /')"
+assert_contains "$(state_value interrupted_script_identities)" \
+  "$ownerless_context_action_id:" \
+  "ownerless rich context did not persist its stable identity"
+assert_eq "$ownerless_context_action_id" "$(state_value pending_script_5h_actions)" \
+  "ownerless rich context did not preserve the crash-boundary intent"
+
+python3 - "$STATE_FILE" "$ownerless_context_action_id" \
+  "$(canonicalize_alert_limit_id group-a)" \
+  "limit:$(canonicalize_alert_limit_id group-a)|reset:${ownerless_context_old_deadline}" <<'PYEOF'
+import base64
+import json
+import pathlib
+import sys
+
+path, action_id, limit_id, cycle_key = sys.argv[1:]
+values = {}
+for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+    key, separator, value = line.partition("=")
+    if separator:
+        values[key] = value
+
+result = []
+for entry in values.get("pending_script_contexts", "").split(","):
+    if not entry:
+        continue
+    item, encoded = entry.split(":", 1)
+    padding = "=" * ((-len(encoded)) % 4)
+    context = json.loads(base64.b64decode(encoded + padding).decode("utf-8"))
+    if item == action_id:
+        context.update(
+            scraped_at=int(context["scraped_at"]) + 1000,
+            remaining_pct="41",
+            reset_label="changed after recovery",
+            message="changed after recovery",
+        )
+        encoded = base64.b64encode(
+            json.dumps(context, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+    result.append(f"{item}:{encoded}")
+values["pending_script_contexts"] = ",".join(result)
+
+identity_entries = values.get("interrupted_script_identities", "").split(",")
+identity = next(
+    entry.split(":", 1)[1] for entry in identity_entries
+    if entry.startswith(action_id + ":")
+)
+padding = "=" * ((-len(identity)) % 4)
+decoded_identity = json.loads(base64.b64decode(identity + padding).decode("utf-8"))
+assert decoded_identity == {"limit_id": limit_id, "cycle_key": cycle_key}, decoded_identity
+# Avoid re-entering the ownerless-arm clearing branch on return; the durable
+# identity is the recovery authority for the still-pending action.
+values["five_h_armed_reset_at"] = "0"
+values["five_h_armed_limit_id"] = ""
+pathlib.Path(path).write_text(
+    "".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8",
+)
+PYEOF
+check_thresholds 40 100 later unknown "$ownerless_context_old_deadline" '' \
+  "$((now + 3))" group-a
+[[ ! -e "$HOOK_LOG" ]] || fail "ownerless rich interrupted hook was replayed after mutable context changes"
+assert_eq "" "$(state_value pending_script_5h_actions)" \
+  "ownerless rich interrupted hook remained pending after acknowledgement"
+assert_eq "$ownerless_context_action_id" "$(state_value suppressed_script_5h_actions)" \
+  "ownerless rich interrupted hook was not suppressed"
+
+# A legacy ID-only interruption is fail-closed only until its old pending list
+# is acknowledged/retired. Its marker is consumed at that boundary, so the
+# same action ID can execute in a new reset cycle.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:50'
+validate_config
+legacy_id_only_old_deadline=$((now + 1200))
+check_thresholds 80 100 later unknown "$legacy_id_only_old_deadline" '' "$now" group-a
+(
+  # shellcheck disable=SC2317,SC2329
+  run_alert_script() {
+    local crash_exit=99
+    exit "$crash_exit"
+  }
+  check_thresholds 40 100 later unknown "$legacy_id_only_old_deadline" '' \
+    "$((now + 1))" group-a
+) >/dev/null 2>&1 || true
+legacy_id_only_action_id="${ALERT_SCRIPT_RULE_IDS[0]}"
+python3 - "$STATE_FILE" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+values = {}
+for line in path.read_text(encoding="utf-8").splitlines():
+    key, separator, value = line.partition("=")
+    if separator:
+        values[key] = value
+values["pending_script_contexts"] = ""
+values["five_h_armed_limit_id"] = ""
+path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+PYEOF
+legacy_id_only_tombstone_marker="${TEST_ROOT}/legacy-id-only-tombstone.marker"
+legacy_id_only_failure_marker="${TEST_ROOT}/legacy-id-only-failure.marker"
+eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_legacy_id_only_original /')"
+# shellcheck disable=SC2034
+persist_alert_state() {
+  if [[ -n "${interrupted_script_actions:-}" \
+    && ! -e "$legacy_id_only_tombstone_marker" ]]; then
+    persist_alert_state_legacy_id_only_original
+    : > "$legacy_id_only_tombstone_marker"
+    return 0
+  fi
+  if [[ -e "$legacy_id_only_tombstone_marker" ]]; then
+    : > "$legacy_id_only_failure_marker"
+    return 1
+  fi
+  persist_alert_state_legacy_id_only_original
+}
+check_thresholds 80 100 later unknown "$legacy_id_only_old_deadline" '' \
+  "$((now + 2))" group-b >/dev/null 2>&1 || true
+eval "$(declare -f persist_alert_state_legacy_id_only_original | sed '1s/^persist_alert_state_legacy_id_only_original /persist_alert_state /')"
+assert_eq "$legacy_id_only_action_id" "$(state_value interrupted_script_actions)" \
+  "legacy ID-only interruption did not persist its temporary quarantine"
+assert_eq "$legacy_id_only_action_id" "$(state_value pending_script_5h_actions)" \
+  "legacy ID-only crash boundary lost the pending intent"
+python3 - "$STATE_FILE" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+values = {}
+for line in path.read_text(encoding="utf-8").splitlines():
+    key, separator, value = line.partition("=")
+    if separator:
+        values[key] = value
+values["five_h_armed_reset_at"] = "0"
+values["five_h_armed_limit_id"] = ""
+path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+PYEOF
+check_thresholds 40 100 later unknown '' '' \
+  "$((now + 3))" group-a
+[[ ! -e "$HOOK_LOG" ]] || fail "legacy ID-only interrupted hook was replayed"
+assert_eq "" "$(state_value interrupted_script_actions)" \
+  "legacy ID-only quarantine was not consumed at the old-intent boundary"
+assert_eq "$legacy_id_only_action_id" "$(state_value suppressed_script_5h_actions)" \
+  "legacy ID-only interrupted hook was not suppressed"
+legacy_id_only_new_deadline=$((now + 600))
+check_thresholds 80 100 later unknown "$legacy_id_only_new_deadline" '' \
+  "$((now + 4))" group-a
+check_thresholds 100 100 unknown unknown '' '' \
+  "$((legacy_id_only_new_deadline + 1))" group-a
+check_thresholds 40 100 later unknown "$((legacy_id_only_new_deadline + 900))" '' \
+  "$((legacy_id_only_new_deadline + 2))" group-a
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" \
+  "legacy ID-only quarantine blocked a legitimate new cycle"
+
 # An unarmed threshold uses the owner/unarmed identity rather than a reset
 # deadline. The old intent is suppressed after the switch, while a later reset
 # cycle with a new deadline remains a legitimate, executable action.

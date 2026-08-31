@@ -425,6 +425,13 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             reset_at = previous[reset_index]
             if not isinstance(reset_at, int) or reset_at <= 0:
                 continue
+            # A partial snapshot cannot be the observed side of a reset
+            # occurrence.  Same-owner partial rows are handled by the
+            # window-specific baseline pass below, which can anchor the event
+            # to the later complete sample and preserve both percentages.
+            if not isinstance(previous[pct_index], (int, float)) \
+                    or not isinstance(current[pct_index], (int, float)):
+                continue
             if previous[0] < reset_at <= current[0]:
                 connection.execute(
                     """

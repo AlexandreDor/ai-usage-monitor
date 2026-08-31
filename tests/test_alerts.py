@@ -792,6 +792,41 @@ class AlertJournalTests(unittest.TestCase):
         self.assertEqual(1, len(self.document["alerts"]))
         alerts.validate_document(self.document, allow_legacy=False)
 
+    def test_register_modern_reset_cannot_bypass_legacy_owner_tombstone(self):
+        weekly_id = alerts.canonicalize_limit_id("default")
+        legacy = reset_request(
+            window="weekly", created=400,
+            cycle="legacy-v5|limit:default|reset:400",
+        )
+        legacy["channels"] = ["discord"]
+        legacy["expire_threshold_cycle"] = None
+        tombstone = alerts.register(self.document, legacy)
+        self.assertEqual(1, alerts.interrupt_reset_cycle(
+            self.document, "weekly", "default", 400, 401,
+        ))
+
+        modern = reset_request(
+            window="weekly", created=500,
+            cycle=f"limit:{weekly_id}|reset:400",
+        )
+        modern["event_data"]["limit_id"] = weekly_id
+        modern["event_data"]["reset_epoch"] = 400
+        modern["channels"] = ["discord", "telegram"]
+        modern["message"] = "recovery with a different observation"
+        modern["expires_at"] = 1000
+        modern["expire_threshold_cycle"] = None
+
+        result = alerts.register(self.document, modern)
+
+        self.assertIs(tombstone, result)
+        self.assertEqual(1, len(self.document["alerts"]))
+        self.assertEqual("failed", tombstone["status"])
+        self.assertEqual("owner_interrupted", tombstone["terminal_reason"])
+        self.assertEqual({"discord"}, set(tombstone["channels"]))
+        self.assertFalse(any(item["status"] == "pending"
+                             for item in self.document["alerts"]))
+        alerts.validate_document(self.document, allow_legacy=False)
+
     def test_interrupt_pending_owner_terminalizes_both_windows_idempotently(self):
         five_threshold_request = request(
             "50", channels=["discord"], cycle="limit:default|reset:100",

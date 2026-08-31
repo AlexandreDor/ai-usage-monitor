@@ -1475,6 +1475,40 @@ print(base64.b64encode(payload).decode("ascii"), end="")
 PYEOF
 }
 
+alert_script_identity_from_context() {
+  local encoded="$1"
+  python3 - "$encoded" <<'PYEOF'
+import base64
+import binascii
+import json
+import sys
+
+try:
+    encoded = sys.argv[1]
+    if len(encoded) % 4 == 1:
+        raise ValueError("invalid base64 length")
+    padded = encoded + "=" * ((-len(encoded)) % 4)
+    context = json.loads(base64.b64decode(padded, validate=True).decode("utf-8"))
+except (binascii.Error, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+if not isinstance(context, dict):
+    raise SystemExit(1)
+limit_id = context.get("limit_id")
+cycle_key = context.get("cycle_key")
+if (not isinstance(limit_id, str) or not limit_id
+        or not isinstance(cycle_key, str) or not cycle_key
+        or any(ord(character) < 32 for character in limit_id + cycle_key)):
+    raise SystemExit(1)
+identity = json.dumps(
+    {"limit_id": limit_id, "cycle_key": cycle_key},
+    separators=(",", ":"),
+    ensure_ascii=False,
+).encode("utf-8")
+print(base64.b64encode(identity).decode("ascii"), end="")
+PYEOF
+}
+
 interrupted_script_identity_has() {
   local identities="$1" wanted="$2" limit_id="$3" cycle_key="$4"
   local encoded
@@ -1498,13 +1532,16 @@ mark_interrupted_script_list() {
       encoded="${entry#*:}"
       interrupted_script_contexts="$(pending_script_context_set \
         "$interrupted_script_contexts" "$item" "$encoded")"
-      if [[ -n "$owner_id" ]]; then
-        if ! identity_encoded="$(encode_alert_script_identity "$owner_id" "$cycle_key")"; then
-          return 1
-        fi
-        interrupted_script_identities="$(pending_script_context_set \
-          "$interrupted_script_identities" "$item" "$identity_encoded")"
+      # The context is the only durable source of the original invocation
+      # when the restored arm has no owner (or an incoherent owner).  Its
+      # scraped time, remaining percentage, message and reset label are
+      # mutable recovery details; derive a second marker from the immutable
+      # limit/cycle identity so a changed context cannot replay the action.
+      if ! identity_encoded="$(alert_script_identity_from_context "$encoded")"; then
+        return 1
       fi
+      interrupted_script_identities="$(pending_script_context_set \
+        "$interrupted_script_identities" "$item" "$identity_encoded")"
     elif [[ -n "$owner_id" ]]; then
       if ! identity_encoded="$(encode_alert_script_identity "$owner_id" "$cycle_key")"; then
         return 1
@@ -1513,9 +1550,13 @@ mark_interrupted_script_list() {
         "$interrupted_script_identities" "$item" "$identity_encoded")"
     else
       # A pre-v5 ID-only intent has no recoverable owner/cycle identity.  Do
-      # not risk replaying it after an interruption; a future, context-rich
-      # cycle can still use its distinct context once this tombstone is kept.
-      interrupted_script_actions="${interrupted_script_actions:+${interrupted_script_actions},}${item}"
+      # not risk replaying it after an interruption.  This is a bounded,
+      # one-shot quarantine: clear_* consumes it when the old list is retired,
+      # while attempt_alert_script consumes it when the old pending intent can
+      # be acknowledged.  It is never a permanent action-ID veto.
+      if ! csv_contains "$interrupted_script_actions" "$item"; then
+        interrupted_script_actions="${interrupted_script_actions:+${interrupted_script_actions},}${item}"
+      fi
     fi
   done
 }
@@ -1573,6 +1614,11 @@ remove_pending_script_contexts_for_list() {
   IFS=',' read -r -a items <<< "$list"
   for item in "${items[@]}"; do
     [[ -n "$item" ]] || continue
+    # A legacy ID-only quarantine has no owner/cycle data to match.  Once the
+    # interrupted pending list is discarded at this lifecycle boundary, the
+    # old invocation is no longer present and the marker must be released so
+    # the same action ID can run in a later, newly identified cycle.
+    interrupted_script_actions="$(csv_without "$interrupted_script_actions" "$item")"
     pending_script_contexts="$(pending_script_context_remove "$pending_script_contexts" "$item")"
   done
 }
@@ -1903,6 +1949,7 @@ attempt_alert_script() {
   local previous_pending="${!pending_list_name}"
   local previous_suppressed="${!suppressed_list_name}"
   local previous_contexts="$pending_script_contexts"
+  local previous_interrupted_actions="$interrupted_script_actions"
   local updated_list cycle_key context_encoded
 
   cycle_key="limit:${limit_id}|unarmed"
@@ -1931,20 +1978,37 @@ attempt_alert_script() {
       "$context_encoded" \
     || interrupted_script_identity_has "$interrupted_script_identities" \
       "$action_id" "$limit_id" "$cycle_key" \
-    || csv_contains "$interrupted_script_actions" "$action_id"; then
+    || { csv_contains "$interrupted_script_actions" "$action_id" \
+         && csv_contains "$previous_pending" "$action_id"; }; then
     updated_list="$(csv_without "$previous_pending" "$action_id")"
     printf -v "$pending_list_name" '%s' "$updated_list"
     printf -v "$suppressed_list_name" '%s' "${previous_suppressed:+${previous_suppressed},}${action_id}"
+    interrupted_script_actions="$(csv_without "$interrupted_script_actions" "$action_id")"
     pending_script_contexts="$(pending_script_context_remove "$pending_script_contexts" "$action_id")"
     if ! persist_alert_state; then
       printf -v "$pending_list_name" '%s' "$previous_pending"
       printf -v "$suppressed_list_name" '%s' "$previous_suppressed"
       pending_script_contexts="$previous_contexts"
+      interrupted_script_actions="$previous_interrupted_actions"
       ALERT_PROCESSING_ERROR="interrupted alert script tombstone acknowledgement failed"
       echo "[ERROR] Could not acknowledge interrupted alert script action." >&2
       return 1
     fi
     return 0
+  fi
+
+  if csv_contains "$interrupted_script_actions" "$action_id"; then
+    # An ID-only marker whose old pending list has already been retired is a
+    # stale compatibility quarantine, not proof against a new cycle. Release
+    # it durably before starting the newly identified invocation. Failure to
+    # persist the release remains fail-closed and prevents the hook launch.
+    interrupted_script_actions="$(csv_without "$interrupted_script_actions" "$action_id")"
+    if ! persist_alert_state; then
+      interrupted_script_actions="$previous_interrupted_actions"
+      ALERT_PROCESSING_ERROR="legacy interrupted alert marker release failed"
+      echo "[ERROR] Could not release legacy interrupted alert marker." >&2
+      return 1
+    fi
   fi
 
   if [[ "${ALERTS_ENABLED:-1}" != 1 ]]; then
@@ -2014,6 +2078,7 @@ attempt_alert_script() {
     printf -v "$pending_list_name" '%s' "${previous_pending:-${action_id}}"
     printf -v "$completed_list_name" '%s' "$previous_completed"
     pending_script_contexts="$previous_contexts"
+    interrupted_script_actions="$previous_interrupted_actions"
     ALERT_PROCESSING_ERROR="alert script completion persistence failed; pending retry"
     echo "[ERROR] Could not journal completed alert script action; action remains pending." >&2
     return 1
@@ -2846,6 +2911,25 @@ check_thresholds() {
         && { weekly_armed_reset_at=0; weekly_armed_limit_id=""; }
       local_observed_weekly_reset_at=0
     fi
+  fi
+  # A full weekly observation can straddle a planned deadline without an
+  # intermediate poll.  Decide this before the random-refill detector: the
+  # old observed deadline is the only trustworthy reset identity, while the
+  # current sample is merely when the crossing was observed.  An existing arm
+  # remains authoritative and is deliberately left untouched.
+  if (( weekly_armed_reset_at == 0 )) \
+    && [[ "$observed_weekly_limit_id" == "$limit_id" ]] \
+    && (( observed_weekly_reset_recovery == 0 )) \
+    && [[ "$observed_weekly_pct" =~ ^100([.]0+)?$ ]] \
+    && [[ "$weekly_pct" =~ ^100([.]0+)?$ ]] \
+    && [[ "$weekly_reset_at" =~ ^[0-9]+$ ]] \
+    && (( observed_weekly_reset_at > 0 \
+          && observed_weekly_reset_at <= scraped_at_epoch \
+          && observed_weekly_reset_at <= weekly_reset_at \
+          && weekly_reset_at > observed_weekly_reset_at )); then
+    weekly_armed_reset_at="$observed_weekly_reset_at"
+    weekly_armed_limit_id="$limit_id"
+    observed_weekly_scheduled_due=1
   fi
   # As with 5h, a due same-owner weekly arm must expire stale thresholds on
   # every poll before the scheduled reset can be delivered.  This is kept
