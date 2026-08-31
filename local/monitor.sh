@@ -1624,6 +1624,29 @@ except OSError as exc:
 PYEOF
 }
 
+persist_alert_state_file() {
+  local state_tmp="$1"
+  if ! python3 - "$state_tmp" "$STATE_FILE" <<'PYEOF'
+import os
+import pathlib
+import sys
+
+temporary, destination = map(pathlib.Path, sys.argv[1:])
+with temporary.open("rb") as handle:
+    os.fsync(handle.fileno())
+os.replace(temporary, destination)
+directory_fd = os.open(destination.parent, os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PYEOF
+  then
+    rm -f "$state_tmp"
+    return 1
+  fi
+}
+
 persist_alert_state() {
   local state_tmp
   state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || return 1
@@ -1674,25 +1697,7 @@ persist_alert_state() {
     rm -f "$state_tmp"
     return 1
   fi
-  if ! python3 - "$state_tmp" "$STATE_FILE" <<'PYEOF'
-import os
-import pathlib
-import sys
-
-temporary, destination = map(pathlib.Path, sys.argv[1:])
-with temporary.open("rb") as handle:
-    os.fsync(handle.fileno())
-os.replace(temporary, destination)
-directory_fd = os.open(destination.parent, os.O_RDONLY)
-try:
-    os.fsync(directory_fd)
-finally:
-    os.close(directory_fd)
-PYEOF
-  then
-    rm -f "$state_tmp"
-    return 1
-  fi
+  persist_alert_state_file "$state_tmp"
 }
 
 persist_observed_5h_intent() {
