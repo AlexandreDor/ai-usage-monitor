@@ -67,8 +67,14 @@ path.unlink()
 PYEOF
 check_thresholds 100 100 later unknown "$new_five_deadline" '' 2000001000 group-a >/dev/null
 [[ ! -e "$FAKE_CURL_LOG" ]] || fail "observed 5h reset emitted an HTTP request"
-assert_eq 0 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["alerts"]))' "$ALERT_DELIVERIES_FILE")" \
-  "observed 5h reset was queued in the network journal"
+assert_eq 0 "$(python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+print(sum(item["kind"] == "reset" and item["status"] == "pending" for item in items))
+PYEOF
+)" "observed 5h reset was queued in the network journal"
 ALERT_THRESHOLDS=75
 TELEGRAM_BOT_TOKEN='123:token'
 TELEGRAM_CHAT_ID=-456
@@ -113,16 +119,877 @@ import json
 import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
-assert len(items) == 1, items
-threshold = items[0]
+assert len(items) == 2, items
+threshold = next(item for item in items if item["kind"] == "threshold")
+tombstone = next(item for item in items if item["kind"] == "reset")
 assert threshold["kind"] == "threshold", threshold
 assert threshold["status"] == "failed", threshold
 assert threshold["terminal_reason"] == "expired_after_reset", threshold
 assert threshold["channels"]["discord"]["error_class"] == "expired_after_reset", threshold
 assert threshold["detector_acknowledged_at"] is not None, threshold
-assert not any(item["kind"] == "reset" for item in items), items
+assert tombstone["status"] == "failed", tombstone
+assert tombstone["terminal_reason"] == "local_observed", tombstone
+assert tombstone["detector_acknowledged_at"] is not None, tombstone
 PYEOF
 ALERTS_ENABLED=1
+
+# A partially restored detector can retain the observed pre-reset baseline
+# while losing its explicit arm.  The observed refill must expire that OLD
+# cycle, not the NEW deadline from the sample, before due delivery runs.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-restored"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+restored_now=2000002050
+restored_old_deadline=$((restored_now + 3600))
+restored_new_deadline=$((restored_old_deadline + 900))
+restored_limit_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${restored_old_deadline}" \
+  "observed_5h_limit_id=${restored_limit_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=50' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$restored_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+register_network_alert threshold 5h 50 \
+  "limit:${restored_limit_id}|reset:${restored_old_deadline}" \
+  "restored stale threshold" \
+  "{\"limit_id\":\"${restored_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${restored_old_deadline},\"covered_thresholds\":[50]}" \
+  "$((restored_now + 1))" "$((restored_old_deadline + 5 * 60 * 60))" false >/dev/null
+check_thresholds 100 100 later unknown "$restored_new_deadline" '' \
+  "$((restored_now + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "restored observed 5h refill delivered the stale threshold"
+python3 - "$ALERT_DELIVERIES_FILE" "$restored_limit_id" "$restored_old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 2, items
+threshold = items[0]
+assert threshold["kind"] == "threshold", threshold
+assert threshold["event_data"]["limit_id"] == sys.argv[2], threshold
+assert threshold["event_data"]["reset_epoch"] == int(sys.argv[3]), threshold
+assert threshold["status"] == "failed", threshold
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["channels"]["discord"]["error_class"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+tombstone = next(item for item in items if item["kind"] == "reset")
+assert tombstone["terminal_reason"] == "local_observed", tombstone
+assert tombstone["status"] == "failed", tombstone
+PYEOF
+check_thresholds 100 100 later unknown "$restored_new_deadline" '' \
+  "$((restored_now + 2))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "restored stale threshold replayed on the next poll"
+
+# A due, explicitly same-owner arm owns a simultaneous 100% -> 100% deadline
+# advance.  With no journal on disk, initialization must reconstruct the
+# scheduled reset rather than skipping it as a local observed reset.  The
+# stale threshold is still expired before that reset is delivered.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-due-observed-missing-journal"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+due_missing_hook="${TEST_ROOT}/due-observed-missing-hook.sh"
+due_missing_hook_log="${TEST_ROOT}/due-observed-missing-hook.log"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' \
+  'printf "hook|%s|%s\n" "$CODEX_ALERT_EVENT" "$CODEX_ALERT_WINDOW" >> "$DUE_MISSING_HOOK_LOG"' \
+  > "$due_missing_hook"
+chmod 700 "$due_missing_hook"
+export DUE_MISSING_HOOK_LOG="$due_missing_hook_log"
+due_missing_now=2000015000
+due_missing_old=$((due_missing_now - 60))
+due_missing_new=$((due_missing_old + 900))
+due_missing_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${due_missing_old}" \
+  "observed_5h_limit_id=${due_missing_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  "five_h_armed_reset_at=${due_missing_old}" "five_h_armed_limit_id=${due_missing_id}" \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'local_observed_5h_reset_at=0' 'local_observed_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=50' 'pending_weekly_threshold=' > "$STATE_FILE"
+export ALERT_SCRIPT_1="$due_missing_hook" ALERT_SCRIPT_1_EVENTS='5h:reset'
+validate_config
+check_thresholds 100 100 later unknown "$due_missing_new" '' \
+  "$due_missing_now" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "due observed reset was suppressed after missing-journal reconstruction"
+assert_eq 1 "$(wc -l < "$due_missing_hook_log")" \
+  "due scheduled reset hook did not execute exactly once"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 2, items
+threshold = next(item for item in items if item["kind"] == "threshold")
+reset = next(item for item in items if item["kind"] == "reset")
+assert threshold["status"] == "failed", threshold
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+assert reset["status"] == "delivered", reset
+assert reset["terminal_reason"] == "delivered", reset
+assert reset["event_data"]["limit_id"].startswith("limit-"), reset
+PYEOF
+
+# The same ownership rule applies when both pending rows already exist: do not
+# create a local tombstone or duplicate the scheduled reset, but atomically
+# expire the threshold before the existing reset is delivered.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-due-observed-existing-journal"
+due_existing_now=2000016000
+due_existing_old=$((due_existing_now - 60))
+due_existing_new=$((due_existing_old + 900))
+due_existing_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${due_existing_old}" \
+  "observed_5h_limit_id=${due_existing_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  "five_h_armed_reset_at=${due_existing_old}" "five_h_armed_limit_id=${due_existing_id}" \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'local_observed_5h_reset_at=0' 'local_observed_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$due_existing_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+register_network_alert threshold 5h 50 \
+  "limit:${due_existing_id}|reset:${due_existing_old}" \
+  "existing stale threshold" \
+  "{\"limit_id\":\"${due_existing_id}\",\"remaining_pct\":40,\"reset_epoch\":${due_existing_old},\"covered_thresholds\":[50]}" \
+  "$((due_existing_now - 1))" "$((due_existing_old + 5 * 60 * 60))" false >/dev/null
+register_network_alert reset 5h reset \
+  "limit:${due_existing_id}|reset:${due_existing_old}" \
+  "existing scheduled reset" \
+  "{\"limit_id\":\"${due_existing_id}\",\"reset_epoch\":${due_existing_old}}" \
+  "$((due_existing_now - 1))" "$((due_existing_old + 5 * 60 * 60))" false >/dev/null
+due_existing_hook="${TEST_ROOT}/due-observed-existing-hook.sh"
+due_existing_hook_log="${TEST_ROOT}/due-observed-existing-hook.log"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' \
+  'printf "hook|%s|%s\n" "$CODEX_ALERT_EVENT" "$CODEX_ALERT_WINDOW" >> "$DUE_EXISTING_HOOK_LOG"' \
+  > "$due_existing_hook"
+chmod 700 "$due_existing_hook"
+export DUE_EXISTING_HOOK_LOG="$due_existing_hook_log"
+export ALERT_SCRIPT_1="$due_existing_hook" ALERT_SCRIPT_1_EVENTS='5h:reset'
+validate_config
+check_thresholds 100 100 later unknown "$due_existing_new" '' \
+  "$due_existing_now" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "existing due scheduled reset was not delivered exactly once"
+assert_eq 1 "$(wc -l < "$due_existing_hook_log")" \
+  "existing due scheduled reset hook did not execute exactly once"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 2, items
+threshold = next(item for item in items if item["kind"] == "threshold")
+reset = next(item for item in items if item["kind"] == "reset")
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+assert reset["status"] == "delivered", reset
+assert reset["terminal_reason"] == "delivered", reset
+PYEOF
+
+# Expiration-only work is fail-closed and retryable for this scheduled path.
+# A failed transaction must leave both pending rows and the old detector arm
+# untouched; the retry then delivers only the legitimate scheduled reset.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-due-observed-expiry-retry"
+retry_now=2000017000
+retry_old=$((retry_now - 60))
+retry_new=$((retry_old + 900))
+retry_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${retry_old}" \
+  "observed_5h_limit_id=${retry_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  "five_h_armed_reset_at=${retry_old}" "five_h_armed_limit_id=${retry_id}" \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'local_observed_5h_reset_at=0' 'local_observed_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$retry_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+register_network_alert threshold 5h 50 \
+  "limit:${retry_id}|reset:${retry_old}" "retry stale threshold" \
+  "{\"limit_id\":\"${retry_id}\",\"remaining_pct\":40,\"reset_epoch\":${retry_old},\"covered_thresholds\":[50]}" \
+  "$((retry_now - 1))" "$((retry_old + 5 * 60 * 60))" false >/dev/null
+register_network_alert reset 5h reset \
+  "limit:${retry_id}|reset:${retry_old}" "retry scheduled reset" \
+  "{\"limit_id\":\"${retry_id}\",\"reset_epoch\":${retry_old}}" \
+  "$((retry_now - 1))" "$((retry_old + 5 * 60 * 60))" false >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_owner_thresholds_and_suppress_reset | sed '1s/^expire_owner_thresholds_and_suppress_reset /expire_owner_thresholds_and_suppress_reset_due_original /')"
+(
+  expire_owner_thresholds_and_suppress_reset() { return 1; }
+  check_thresholds 100 100 later unknown "$retry_new" '' "$retry_now" group-a
+) >/dev/null 2>&1 || true
+eval "$(declare -f expire_owner_thresholds_and_suppress_reset_due_original | sed '1s/^expire_owner_thresholds_and_suppress_reset_due_original /expire_owner_thresholds_and_suppress_reset /')"
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "failed due-threshold expiry emitted a reset request"
+assert_eq "$retry_old" "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "failed due-threshold expiry advanced the detector arm"
+assert_eq pending "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.status)" \
+  "failed due-threshold expiry changed the journal"
+check_thresholds 80 100 unknown unknown '' '' "$((retry_now + 1))" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "retry after due-threshold expiry did not deliver the scheduled reset"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+threshold = next(item for item in items if item["kind"] == "threshold")
+reset = next(item for item in items if item["kind"] == "reset")
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert reset["terminal_reason"] == "delivered", reset
+PYEOF
+
+# Weekly scheduled resets use the same expiry-only guard.  A failed guard must
+# be retryable on a changed/partial sample, without delivering the stale
+# threshold first or creating a local tombstone.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-due-weekly-expiry-retry"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+weekly_retry_now=2000018000
+weekly_retry_old=$((weekly_retry_now - 60))
+weekly_retry_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=' 'observed_5h_reset_at=0' 'observed_5h_limit_id=' \
+  'observed_weekly_pct=100' "observed_weekly_reset_at=${weekly_retry_old}" \
+  "observed_weekly_limit_id=${weekly_retry_id}" \
+  'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
+  "weekly_armed_reset_at=${weekly_retry_old}" "weekly_armed_limit_id=${weekly_retry_id}" \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'local_observed_5h_reset_at=0' 'local_observed_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$weekly_retry_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+register_network_alert threshold weekly 50 \
+  "limit:${weekly_retry_id}|reset:${weekly_retry_old}" \
+  "weekly retry stale threshold" \
+  "{\"limit_id\":\"${weekly_retry_id}\",\"remaining_pct\":40,\"reset_epoch\":${weekly_retry_old},\"covered_thresholds\":[50]}" \
+  "$((weekly_retry_now - 1))" "$((weekly_retry_old + 7 * 24 * 60 * 60))" false >/dev/null
+register_network_alert reset weekly reset \
+  "limit:${weekly_retry_id}|reset:${weekly_retry_old}" \
+  "weekly retry scheduled reset" \
+  "{\"limit_id\":\"${weekly_retry_id}\",\"reset_epoch\":${weekly_retry_old}}" \
+  "$((weekly_retry_now - 1))" "$((weekly_retry_old + 7 * 24 * 60 * 60))" false >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_owner_thresholds_and_suppress_reset | sed '1s/^expire_owner_thresholds_and_suppress_reset /expire_owner_thresholds_and_suppress_reset_weekly_original /')"
+(
+  expire_owner_thresholds_and_suppress_reset() { return 1; }
+  check_thresholds 100 80 unknown unknown '' '' "$weekly_retry_now" group-a
+) >/dev/null 2>&1 || true
+eval "$(declare -f expire_owner_thresholds_and_suppress_reset_weekly_original | sed '1s/^expire_owner_thresholds_and_suppress_reset_weekly_original /expire_owner_thresholds_and_suppress_reset /')"
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "failed weekly due-threshold expiry emitted a reset request"
+assert_eq pending "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.discord.status)" \
+  "failed weekly due-threshold expiry changed the journal"
+check_thresholds 100 80 unknown unknown '' '' "$((weekly_retry_now + 1))" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "weekly due-threshold expiry retry did not deliver the scheduled reset"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 2, items
+threshold = next(item for item in items if item["kind"] == "threshold")
+reset = next(item for item in items if item["kind"] == "reset")
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert reset["terminal_reason"] == "delivered", reset
+PYEOF
+
+# If the process stops after reconciliation has persisted detector state but
+# before the final state write, the observed reset must remain local-only on
+# restart. The durable marker prevents a scheduled reset POST, while the
+# local hook remains eligible exactly once on the retry.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-restart"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+restart_hook="${TEST_ROOT}/observed-restart-hook.sh"
+restart_hook_log="${TEST_ROOT}/observed-restart-hook.log"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' 'printf "hook|%s|%s\n" "$CODEX_ALERT_EVENT" "$CODEX_ALERT_WINDOW" >> "$RESTART_HOOK_LOG"' > "$restart_hook"
+chmod 700 "$restart_hook"
+export RESTART_HOOK_LOG="$restart_hook_log"
+restart_now=2000002500
+restart_old_deadline=$((restart_now + 1800))
+restart_new_deadline=$((restart_old_deadline + 900))
+restart_limit_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${restart_old_deadline}" \
+  "observed_5h_limit_id=${restart_limit_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=50' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$restart_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+register_network_alert threshold 5h 50 \
+  "limit:${restart_limit_id}|reset:${restart_old_deadline}" \
+  "restart stale threshold" \
+  "{\"limit_id\":\"${restart_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${restart_old_deadline},\"covered_thresholds\":[50]}" \
+  "$((restart_now + 1))" "$((restart_old_deadline + 5 * 60 * 60))" false >/dev/null
+# Stop from the hook invocation itself: the write-ahead marker and pending
+# context have already been persisted, while the hook has not run yet. This
+# crash point is independent of unrelated persistence calls in the monitor.
+(
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1="$restart_hook"
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1_EVENTS='5h:reset'
+  validate_config
+  # shellcheck disable=SC2317,SC2329
+  run_alert_script() {
+    exit 99
+  }
+  check_thresholds 100 100 later unknown "$restart_new_deadline" '' \
+    "$((restart_now + 1))" group-a >/dev/null
+) >/dev/null 2>&1 || true
+assert_eq "$((restart_now + 1))" "$(awk -F= '$1 == "last_notified_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "restart lost the durable observed-reset marker"
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "crashed observed reset emitted an HTTP request"
+(
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1="$restart_hook"
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1_EVENTS='5h:reset'
+  validate_config
+  check_thresholds 100 100 later unknown "$restart_new_deadline" '' \
+    "$((restart_now + 2))" group-a >/dev/null
+) >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "restarted observed reset emitted an HTTP request"
+assert_eq 1 "$(wc -l < "$restart_hook_log")" \
+  "restarted observed reset did not execute its local hook exactly once"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 2, items
+threshold = next(item for item in items if item["kind"] == "threshold")
+assert threshold["status"] == "failed", threshold
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+tombstone = next(item for item in items if item["kind"] == "reset")
+assert tombstone["status"] == "failed", tombstone
+assert tombstone["terminal_reason"] == "local_observed", tombstone
+assert tombstone["detector_acknowledged_at"] is not None, tombstone
+PYEOF
+
+# The reset arm itself can survive on disk when a process stops immediately
+# after the write-ahead suppression. Recovery after the old deadline must use
+# that journal tombstone as local-only reset evidence and still run the hook.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-write-ahead"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+wal_hook="${TEST_ROOT}/observed-write-ahead-hook.sh"
+wal_hook_log="${TEST_ROOT}/observed-write-ahead-hook.log"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' 'printf "hook|%s|%s\n" "$CODEX_ALERT_EVENT" "$CODEX_ALERT_WINDOW" >> "$WAL_HOOK_LOG"' > "$wal_hook"
+chmod 700 "$wal_hook"
+export WAL_HOOK_LOG="$wal_hook_log"
+wal_now=2000007000
+wal_old_deadline=$((wal_now + 1800))
+wal_new_deadline=$((wal_old_deadline + 900))
+wal_limit_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${wal_old_deadline}" \
+  "observed_5h_limit_id=${wal_limit_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  "five_h_armed_reset_at=${wal_old_deadline}" \
+  "five_h_armed_limit_id=${wal_limit_id}" \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=50' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$wal_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+register_network_alert threshold 5h 50 \
+  "limit:${wal_limit_id}|reset:${wal_old_deadline}" \
+  "write-ahead stale threshold" \
+  "{\"limit_id\":\"${wal_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${wal_old_deadline},\"covered_thresholds\":[50]}" \
+  "$((wal_now + 1))" "$((wal_old_deadline + 5 * 60 * 60))" false >/dev/null
+# Preserve the real implementation and stop after the atomic threshold expiry
+# plus durable tombstone write.
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_original /')"
+(
+  expire_observed_owner_cycle() {
+    expire_observed_owner_cycle_original "$@"
+    exit 99
+  }
+  check_thresholds 100 100 later unknown "$wal_new_deadline" '' "$wal_now" group-a >/dev/null
+) >/dev/null 2>&1 || true
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "write-ahead crash emitted an HTTP request"
+python3 - "$ALERT_DELIVERIES_FILE" "$wal_limit_id" "$wal_old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+tombstones = [item for item in items if item["kind"] == "reset"]
+assert len(tombstones) == 1, items
+tombstone = tombstones[0]
+assert tombstone["event_data"]["limit_id"] == sys.argv[2], tombstone
+assert tombstone["event_data"]["reset_epoch"] == int(sys.argv[3]), tombstone
+assert tombstone["terminal_reason"] == "local_observed", tombstone
+assert tombstone["status"] == "failed", tombstone
+PYEOF
+# Restore the real wrapper for the retry and let recovery run after OLD.  The
+# first retry deliberately omits the 5-hour deadline: the durable local intent
+# must close the stale threshold before a complete reset proof is reacquired.
+eval "$(declare -f expire_observed_owner_cycle_original | sed '1s/^expire_observed_owner_cycle_original /expire_observed_owner_cycle /')"
+(
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1="$wal_hook"
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1_EVENTS='5h:reset'
+  validate_config
+  check_thresholds 100 100 later unknown '' '' "$((wal_old_deadline + 1))" group-a >/dev/null
+) >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "write-ahead recovery emitted an HTTP request"
+assert_eq 1 "$(wc -l < "$wal_hook_log")" \
+  "write-ahead recovery did not run the local hook exactly once"
+check_thresholds 100 100 later unknown "$wal_new_deadline" '' "$((wal_old_deadline + 2))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "write-ahead recovery replayed a reset on the next poll"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+thresholds = [item for item in items if item["kind"] == "threshold"]
+tombstones = [item for item in items if item["kind"] == "reset"]
+assert len(thresholds) == 1, items
+assert thresholds[0]["terminal_reason"] == "expired_after_reset", thresholds
+assert thresholds[0]["detector_acknowledged_at"] is not None, thresholds
+assert len(tombstones) == 1, items
+assert tombstones[0]["terminal_reason"] == "local_observed", tombstones
+assert tombstones[0]["detector_acknowledged_at"] is not None, tombstones
+PYEOF
+# Reconciliation itself can fail after the write-ahead marker. The detector
+# state must remain on the old arm and retry the same proof on the next poll.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-reconcile-failure"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+reconcile_fail_now=2000009000
+reconcile_fail_old=$((reconcile_fail_now + 1800))
+reconcile_fail_new=$((reconcile_fail_old + 900))
+reconcile_fail_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${reconcile_fail_old}" \
+  "observed_5h_limit_id=${reconcile_fail_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  "five_h_armed_reset_at=${reconcile_fail_old}" \
+  "five_h_armed_limit_id=${reconcile_fail_id}" \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$reconcile_fail_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f reconcile_alert_deliveries | sed '1s/^reconcile_alert_deliveries /reconcile_alert_deliveries_original /')"
+(
+  reconcile_alert_deliveries() { return 1; }
+  check_thresholds 100 100 later unknown "$reconcile_fail_new" '' "$reconcile_fail_now" group-a >/dev/null
+) >/dev/null 2>&1 || true
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "reconcile failure emitted an HTTP request"
+assert_eq "$reconcile_fail_old" "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "reconcile failure advanced the old reset arm"
+assert_eq "$reconcile_fail_old" "$(awk -F= '$1 == "last_notified_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "reconcile failure advanced local-only marker"
+eval "$(declare -f reconcile_alert_deliveries_original | sed '1s/^reconcile_alert_deliveries_original /reconcile_alert_deliveries /')"
+check_thresholds 100 100 later unknown "$reconcile_fail_new" '' \
+  "$((reconcile_fail_old + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "reconcile retry emitted an HTTP request"
+assert_eq local_observed "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.terminal_reason)" \
+  "reconcile retry did not retain the local-only tombstone"
+assert_eq "$((reconcile_fail_old + 1))" "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.detector_acknowledged_at)" \
+  "reconcile retry did not acknowledge the local-only tombstone"
+
+# A process can stop after the write-ahead row, reconciliation, and the
+# detector-state write have succeeded, but before the reset hook runs. This
+# exercises the same stale-arm recovery path with a different prior journal
+# history. The durable marker must suppress the observed reset on recovery and
+# leave its hook retryable.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-stale-arm-crash"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+stale_arm_crash_now=2000011000
+stale_arm_crash_old=$((stale_arm_crash_now + 1800))
+stale_arm_crash_new=$((stale_arm_crash_old + 900))
+stale_arm_crash_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${stale_arm_crash_old}" \
+  "observed_5h_limit_id=${stale_arm_crash_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  "five_h_armed_reset_at=${stale_arm_crash_old}" \
+  "five_h_armed_limit_id=${stale_arm_crash_id}" \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$stale_arm_crash_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+stale_arm_crash_hook="${TEST_ROOT}/observed-stale-arm-crash-hook.sh"
+stale_arm_crash_hook_log="${TEST_ROOT}/observed-stale-arm-crash-hook.log"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' 'printf "hook|%s|%s\n" "$CODEX_ALERT_EVENT" "$CODEX_ALERT_WINDOW" >> "$STALE_ARM_CRASH_HOOK_LOG"' > "$stale_arm_crash_hook"
+chmod 700 "$stale_arm_crash_hook"
+export STALE_ARM_CRASH_HOOK_LOG="$stale_arm_crash_hook_log"
+# shellcheck disable=SC2034
+ALERT_SCRIPT_1="$stale_arm_crash_hook"
+# shellcheck disable=SC2034
+ALERT_SCRIPT_1_EVENTS='5h:reset'
+validate_config
+(
+  # The write-ahead marker and pending context have already been persisted;
+  # terminate from the hook invocation before the hook can run.
+  # shellcheck disable=SC2317,SC2329
+  run_alert_script() {
+    exit 99
+  }
+  check_thresholds 100 100 later unknown "$stale_arm_crash_new" '' "$stale_arm_crash_now" group-a >/dev/null
+) >/dev/null 2>&1 || true
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "stale-arm crash emitted an HTTP request"
+assert_eq "$stale_arm_crash_now" "$(awk -F= '$1 == "last_notified_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "stale-arm crash lost the durable observed marker"
+assert_eq local_observed "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.terminal_reason)" \
+  "stale-arm crash lost the write-ahead tombstone"
+# The hook variables are intentionally scoped to this recovery subshell.
+# shellcheck disable=SC2030
+(
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1="$stale_arm_crash_hook"
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1_EVENTS='5h:reset'
+  validate_config
+  # The restart sample has consumed quota and is no longer an observed-reset
+  # proof; the durable tombstone must still prevent the stale scheduled path.
+  check_thresholds 80 100 later unknown "$stale_arm_crash_new" '' "$((stale_arm_crash_old + 1))" group-a >/dev/null
+) >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "stale-arm recovery emitted an HTTP request"
+assert_eq 1 "$(wc -l < "$stale_arm_crash_hook_log")" \
+  "stale-arm recovery did not run the local hook once"
+check_thresholds 100 100 later unknown "$stale_arm_crash_new" '' "$((stale_arm_crash_old + 2))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "stale-arm recovery replayed the reset"
+assert_eq 1 "$(wc -l < "$stale_arm_crash_hook_log")" \
+  "stale-arm recovery replayed the local hook"
+assert_eq "$stale_arm_crash_now" "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.detector_acknowledged_at)" \
+  "stale-arm recovery did not acknowledge the tombstone"
+
+# A restored arm is not trustworthy when its owner is absent or belongs to a
+# different group. The journal, rather than that arm, is authoritative: a
+# pending threshold for the current owner must still be expired on the local
+# observed refill, regardless of which reset cycle key it carries.
+run_restored_incoherent_arm_case() {
+  local case_name="$1" arm_owner="$2"
+  local case_now=2000005000
+  local case_old_deadline=$((case_now + 1800))
+  local case_arm_deadline=$((case_now + 3600))
+  local case_new_deadline=$((case_old_deadline + 900))
+  local case_limit_id case_cycle
+  rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+  export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-${case_name}"
+  export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+  case_limit_id="$(canonicalize_alert_limit_id group-a)"
+  case_cycle="limit:${case_limit_id}|reset:${case_arm_deadline}"
+  printf '%s\n' \
+    'state_version=5' 'limit_id_contract_version=1' \
+    'prev_5h_pct=100' 'prev_weekly_pct=100' \
+    'observed_5h_pct=100' "observed_5h_reset_at=${case_old_deadline}" \
+    "observed_5h_limit_id=${case_limit_id}" \
+    'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+    "five_h_armed_reset_at=${case_arm_deadline}" \
+    "five_h_armed_limit_id=${arm_owner}" \
+    'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+    'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+    'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+    'pending_5h_threshold=50' 'pending_weekly_threshold=' > "$STATE_FILE"
+  printf '{"completed_at":%s,"alerts":[]}\n' "$case_now" \
+    | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+  register_network_alert threshold 5h 50 "$case_cycle" \
+    "incoherent ${case_name} stale threshold" \
+    "{\"limit_id\":\"${case_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${case_arm_deadline},\"covered_thresholds\":[50]}" \
+    "$((case_now + 1))" "$((case_arm_deadline + 5 * 60 * 60))" false >/dev/null
+  check_thresholds 100 100 later unknown "$case_new_deadline" '' \
+    "$((case_now + 1))" group-a >/dev/null
+  assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+    "${case_name} arm left a stale threshold deliverable"
+python3 - "$ALERT_DELIVERIES_FILE" "$case_limit_id" "$case_arm_deadline" "$arm_owner" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+expected_count = 3 if sys.argv[4] else 2
+assert len(items) == expected_count, items
+threshold = next(item for item in items if item["kind"] == "threshold")
+assert threshold["kind"] == "threshold", threshold
+assert threshold["event_data"]["limit_id"] == sys.argv[2], threshold
+assert threshold["event_data"]["reset_epoch"] == int(sys.argv[3]), threshold
+assert threshold["status"] == "failed", threshold
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["channels"]["discord"]["error_class"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+if sys.argv[4]:
+    tombstone = next(item for item in items
+                     if item["kind"] == "reset"
+                     and item["event_data"]["limit_id"] == sys.argv[4])
+    assert tombstone["event_data"]["limit_id"] == sys.argv[4], tombstone
+    assert tombstone["event_data"]["reset_epoch"] == int(sys.argv[3]), tombstone
+    assert tombstone["terminal_reason"] == "owner_interrupted", tombstone
+else:
+    tombstone = next(item for item in items if item["kind"] == "reset")
+    assert tombstone["event_data"]["limit_id"] == sys.argv[2], tombstone
+    assert tombstone["terminal_reason"] == "local_observed", tombstone
+assert tombstone["status"] == "failed", tombstone
+assert tombstone["detector_acknowledged_at"] is not None, tombstone
+if sys.argv[4]:
+    local_tombstone = next(item for item in items
+                           if item["kind"] == "reset"
+                           and item["event_data"]["limit_id"] == sys.argv[2])
+    assert local_tombstone["terminal_reason"] == "local_observed", local_tombstone
+    assert local_tombstone["status"] == "failed", local_tombstone
+PYEOF
+  check_thresholds 100 100 later unknown "$case_new_deadline" '' \
+    "$((case_now + 2))" group-a >/dev/null
+  assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+    "${case_name} stale threshold replayed on the next poll"
+}
+
+run_restored_incoherent_arm_case ownerless ""
+run_restored_incoherent_arm_case foreign "$(canonicalize_alert_limit_id group-b)"
+
+# A low sample must not borrow a restored arm whose owner is absent or foreign.
+# Otherwise the threshold occurrence for A is incorrectly assigned B's reset
+# cycle (or an ownerless arm is silently attached to A).
+run_low_incoherent_arm_case() {
+  local case_name="$1" arm_owner="$2"
+  local case_now=2000005500
+  local case_old_deadline=$((case_now + 1800))
+  local case_arm_deadline=$((case_now + 3600))
+  local case_sample_deadline=$((case_now + 5400))
+  local case_limit_id case_cycle
+  rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+  export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-low-5h-${case_name}"
+  export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+  case_limit_id="$(canonicalize_alert_limit_id group-a)"
+  case_cycle="limit:${case_limit_id}|reset:${case_sample_deadline}"
+  printf '%s\n' \
+    'state_version=5' 'limit_id_contract_version=1' \
+    'prev_5h_pct=100' 'prev_weekly_pct=100' \
+    'observed_5h_pct=100' "observed_5h_reset_at=${case_old_deadline}" \
+    "observed_5h_limit_id=${case_limit_id}" \
+    'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+    "five_h_armed_reset_at=${case_arm_deadline}" \
+    "five_h_armed_limit_id=${arm_owner}" \
+    'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+    'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+    'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+    'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+  printf '{"completed_at":%s,"alerts":[]}\n' "$case_now" \
+    | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+  check_thresholds 40 100 later unknown "$case_sample_deadline" '' \
+    "$((case_now + 1))" group-a >/dev/null
+  assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+    "${case_name} low sample did not deliver its own threshold"
+  python3 - "$ALERT_DELIVERIES_FILE" "$case_limit_id" "$case_cycle" "$case_sample_deadline" "$arm_owner" "$case_arm_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+foreign_arm = bool(sys.argv[5]) and sys.argv[5] != sys.argv[2]
+expected_count = 2 if foreign_arm else 1
+assert len(items) == expected_count, items
+threshold = next(item for item in items if item["kind"] == "threshold")
+assert threshold["kind"] == "threshold", threshold
+assert threshold["event_data"]["limit_id"] == sys.argv[2], threshold
+assert threshold["cycle_key"] == sys.argv[3], threshold
+assert threshold["event_data"]["reset_epoch"] == int(sys.argv[4]), threshold
+if foreign_arm:
+    tombstone = next(item for item in items if item["kind"] == "reset")
+    assert tombstone["event_data"]["limit_id"] == sys.argv[5], tombstone
+    assert tombstone["event_data"]["reset_epoch"] == int(sys.argv[6]), tombstone
+    assert tombstone["terminal_reason"] == "owner_interrupted", tombstone
+    assert tombstone["status"] == "failed", tombstone
+PYEOF
+}
+
+run_low_incoherent_arm_case ownerless ""
+run_low_incoherent_arm_case foreign "$(canonicalize_alert_limit_id group-b)"
+
+# Weekly threshold cycles follow the same owner contract. Ownerless arms are
+# discarded conservatively; a foreign arm cannot supply B's deadline to A;
+# an explicit same-owner arm remains the normal cycle anchor.
+run_low_incoherent_weekly_arm_case() {
+  local case_name="$1" arm_owner="$2"
+  local case_now=2000006500
+  local case_old_deadline=$((case_now + 1800))
+  local case_arm_deadline=$((case_now + 3600))
+  local case_sample_deadline=$((case_now + 5400))
+  local case_limit_id case_cycle expected_deadline
+  rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+  export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-low-weekly-${case_name}"
+  export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+  DISCORD_WEBHOOK='https://discord.com/api/webhooks/123/token'
+  TELEGRAM_BOT_TOKEN='' TELEGRAM_CHAT_ID=''
+  case_limit_id="$(canonicalize_alert_limit_id group-a)"
+  expected_deadline="$case_sample_deadline"
+  [[ "$arm_owner" == "$case_limit_id" ]] && expected_deadline="$case_arm_deadline"
+  case_cycle="limit:${case_limit_id}|reset:${expected_deadline}"
+  printf '%s\n' \
+    'state_version=5' 'limit_id_contract_version=1' \
+    'prev_5h_pct=100' 'prev_weekly_pct=100' \
+    'observed_5h_pct=' 'observed_5h_reset_at=0' 'observed_5h_limit_id=' \
+    'observed_weekly_pct=100' "observed_weekly_reset_at=${case_old_deadline}" \
+    "observed_weekly_limit_id=${case_limit_id}" \
+    'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
+    "weekly_armed_reset_at=${case_arm_deadline}" \
+    "weekly_armed_limit_id=${arm_owner}" \
+    'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+    'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+    'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+  printf '{"completed_at":%s,"alerts":[]}\n' "$case_now" \
+    | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+  check_thresholds 100 40 unknown later '' "$case_sample_deadline" \
+    "$((case_now + 1))" group-a >/dev/null
+  assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+    "${case_name} weekly sample did not deliver its own threshold"
+  python3 - "$ALERT_DELIVERIES_FILE" "$case_limit_id" "$case_cycle" "$expected_deadline" "$arm_owner" "$case_arm_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+foreign_arm = bool(sys.argv[5]) and sys.argv[5] != sys.argv[2]
+expected_count = 2 if foreign_arm else 1
+assert len(items) == expected_count, items
+threshold = next(item for item in items if item["kind"] == "threshold")
+assert threshold["kind"] == "threshold", threshold
+assert threshold["event_data"]["limit_id"] == sys.argv[2], threshold
+assert threshold["cycle_key"] == sys.argv[3], threshold
+assert threshold["event_data"]["reset_epoch"] == int(sys.argv[4]), threshold
+if foreign_arm:
+    tombstone = next(item for item in items if item["kind"] == "reset")
+    assert tombstone["event_data"]["limit_id"] == sys.argv[5], tombstone
+    assert tombstone["event_data"]["reset_epoch"] == int(sys.argv[6]), tombstone
+    assert tombstone["terminal_reason"] == "owner_interrupted", tombstone
+    assert tombstone["status"] == "failed", tombstone
+PYEOF
+}
+
+run_low_incoherent_weekly_arm_case ownerless ""
+run_low_incoherent_weekly_arm_case foreign "$(canonicalize_alert_limit_id group-b)"
+run_low_incoherent_weekly_arm_case same-owner "$(canonicalize_alert_limit_id group-a)"
+
+# The same journal-authoritative expiration applies to a random weekly refill.
+# Weekly reset notification remains network-visible, but a pending threshold
+# from the consumed weekly cycle must not be delivered alongside it.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-weekly-stale-threshold"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+weekly_observation_now=2000006000
+weekly_old_deadline=$((weekly_observation_now + 4 * 24 * 60 * 60))
+weekly_arm_deadline=$((weekly_observation_now + 6 * 24 * 60 * 60))
+weekly_new_deadline=$((weekly_old_deadline + 3 * 24 * 60 * 60))
+weekly_limit_id="$(canonicalize_alert_limit_id group-a)"
+weekly_cycle="limit:${weekly_limit_id}|reset:${weekly_arm_deadline}"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=28' \
+  'observed_5h_pct=' 'observed_5h_reset_at=0' 'observed_5h_limit_id=' \
+  'observed_weekly_pct=28' "observed_weekly_reset_at=${weekly_old_deadline}" \
+  "observed_weekly_limit_id=${weekly_limit_id}" \
+  'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
+  "weekly_armed_reset_at=${weekly_arm_deadline}" \
+  "weekly_armed_limit_id=${weekly_limit_id}" \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=' 'pending_weekly_threshold=50' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$weekly_observation_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+register_network_alert threshold weekly 50 "$weekly_cycle" \
+  "stale weekly threshold" \
+  "{\"limit_id\":\"${weekly_limit_id}\",\"remaining_pct\":28,\"reset_epoch\":${weekly_arm_deadline},\"covered_thresholds\":[50]}" \
+  "$((weekly_observation_now + 1))" "$((weekly_arm_deadline + 7 * 24 * 60 * 60))" false >/dev/null
+check_thresholds 100 100 unknown later '' "$weekly_new_deadline" \
+  "$((weekly_observation_now + 1))" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "weekly refill delivered a stale threshold along with its reset"
+python3 - "$ALERT_DELIVERIES_FILE" "$weekly_limit_id" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+thresholds = [item for item in items if item["kind"] == "threshold"]
+resets = [item for item in items if item["kind"] == "reset"]
+assert len(thresholds) == 1, items
+assert thresholds[0]["event_data"]["limit_id"] == sys.argv[2], thresholds
+assert thresholds[0]["status"] == "failed", thresholds
+assert thresholds[0]["terminal_reason"] == "expired_after_reset", thresholds
+assert thresholds[0]["detector_acknowledged_at"] is not None, thresholds
+assert len(resets) == 1, items
+assert resets[0]["status"] == "delivered", resets
+PYEOF
+check_thresholds 100 100 unknown later '' "$weekly_new_deadline" \
+  "$((weekly_observation_now + 2))" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "weekly refill replayed a stale threshold or reset"
 
 # Expiry of stale thresholds is fail-closed.  If the atomic invalidation path
 # fails, the observed proof and arm remain durable so the next identical sample
@@ -156,8 +1023,9 @@ register_network_alert threshold 5h 50 "limit:${retry_limit_id}|reset:${retry_ol
   "stale retry threshold" \
   "{\"limit_id\":\"${retry_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${retry_old_deadline},\"covered_thresholds\":[50]}" \
   "$((retry_observation_at + 1))" "$retry_old_deadline" false >/dev/null
-# shellcheck disable=SC2317,SC2329
-invalidate_pending_thresholds() { return 1; }
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_original /')"
+expire_observed_owner_cycle() { return 1; }
 if check_thresholds 100 100 later unknown "$retry_new_deadline" '' "$((retry_observation_at + 900))" group-a >/dev/null 2>&1; then
   fail "observed reset invalidation failure was accepted"
 fi
@@ -166,11 +1034,7 @@ assert_eq "$retry_old_deadline" "$(awk -F= '$1 == "observed_5h_reset_at" {print 
   "failed invalidation advanced the observed baseline"
 assert_eq "$retry_old_deadline" "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
   "failed invalidation advanced the reset arm"
-invalidate_pending_thresholds() {
-  local window="$1" cycle_key="$2" limit_id="$3" now="$4"
-  python3 "$ALERTS_PY" expire-thresholds "$ALERT_DELIVERIES_FILE" \
-    "$window" "$cycle_key" "$limit_id" --now "$now"
-}
+eval "$(declare -f expire_observed_owner_cycle_original | sed '1s/^expire_observed_owner_cycle_original /expire_observed_owner_cycle /')"
 check_thresholds 100 100 later unknown "$retry_new_deadline" '' "$((retry_observation_at + 901))" group-a >/dev/null
 [[ ! -e "$FAKE_CURL_LOG" ]] || fail "successful observed reset emitted an HTTP request"
 python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
@@ -178,11 +1042,114 @@ import json
 import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
-assert len(items) == 1, items
-assert items[0]["kind"] == "threshold", items
-assert items[0]["terminal_reason"] == "expired_after_reset", items
-assert items[0]["channels"]["discord"]["error_class"] == "expired_after_reset", items
-assert not any(item["kind"] == "reset" for item in items), items
+assert len(items) == 2, items
+threshold = next(item for item in items if item["kind"] == "threshold")
+tombstone = next(item for item in items if item["kind"] == "reset")
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["channels"]["discord"]["error_class"] == "expired_after_reset", threshold
+assert tombstone["terminal_reason"] == "local_observed", tombstone
+assert tombstone["detector_acknowledged_at"] is not None, tombstone
+PYEOF
+
+# A journal transaction failure must leave a durable recovery intent even when
+# the restored detector has no armed reset.  A later changed sample must retry
+# the old cycle before it can deliver anything, and the successful retry must
+# retire the baseline-only marker rather than reprocessing it forever.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-no-arm-journal-failure"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+no_arm_retry_now=2000002700
+no_arm_retry_old=$((no_arm_retry_now + 1800))
+no_arm_retry_new=$((no_arm_retry_old + 900))
+no_arm_retry_id="$(canonicalize_alert_limit_id group-a)"
+check_thresholds 100 100 later unknown "$no_arm_retry_old" '' \
+  "$no_arm_retry_now" group-a >/dev/null
+register_network_alert threshold 5h 50 \
+  "limit:${no_arm_retry_id}|reset:${no_arm_retry_old}" \
+  "no-arm journal failure threshold" \
+  "{\"limit_id\":\"${no_arm_retry_id}\",\"remaining_pct\":40,\"reset_epoch\":${no_arm_retry_old},\"covered_thresholds\":[50]}" \
+  "$((no_arm_retry_now + 1))" "$((no_arm_retry_old + 5 * 60 * 60))" false >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_original /')"
+expire_observed_owner_cycle() { return 1; }
+if check_thresholds 100 100 later unknown "$no_arm_retry_new" '' \
+  "$((no_arm_retry_now + 2))" group-a >/dev/null 2>&1; then
+  fail "no-arm observed journal failure was accepted"
+fi
+[[ ! -e "$FAKE_CURL_LOG" ]] || fail "no-arm journal failure emitted HTTP"
+eval "$(declare -f expire_observed_owner_cycle_original | sed '1s/^expire_observed_owner_cycle_original /expire_observed_owner_cycle /')"
+check_thresholds 80 100 later unknown "$no_arm_retry_new" '' \
+  "$((no_arm_retry_now + 3))" group-a >/dev/null
+[[ ! -e "$FAKE_CURL_LOG" ]] || fail "no-arm recovery emitted HTTP"
+assert_eq 0 "$(awk -F= '$1 == "local_observed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "no-arm recovery marker was reintroduced"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+threshold = next(item for item in items if item["kind"] == "threshold")
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+tombstone = next(item for item in items if item["kind"] == "reset")
+assert tombstone["terminal_reason"] == "local_observed", tombstone
+PYEOF
+
+# Weekly observed-reset expiry has the complementary durable marker.  If the
+# journal transaction fails, a later changed sample retries expiry and may
+# deliver only the legitimate weekly reset, never the stale threshold.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-weekly-journal-failure"
+weekly_retry_now=2000002900
+weekly_retry_old=$((weekly_retry_now + 3600))
+weekly_retry_new=$((weekly_retry_old + 3600))
+weekly_retry_id="$(canonicalize_alert_limit_id group-a)"
+check_thresholds 100 80 unknown later '' "$weekly_retry_old" \
+  "$weekly_retry_now" group-a >/dev/null
+python3 - "$STATE_FILE" "$weekly_retry_id" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+values = {}
+for line in path.read_text(encoding="utf-8").splitlines():
+    key, separator, value = line.partition("=")
+    if separator:
+        values[key] = value
+values["weekly_armed_reset_at"] = "0"
+values["weekly_armed_limit_id"] = ""
+path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+PYEOF
+register_network_alert threshold weekly 50 \
+  "limit:${weekly_retry_id}|reset:${weekly_retry_old}" \
+  "weekly journal failure threshold" \
+  "{\"limit_id\":\"${weekly_retry_id}\",\"remaining_pct\":40,\"reset_epoch\":${weekly_retry_old},\"covered_thresholds\":[50]}" \
+  "$((weekly_retry_now + 1))" "$((weekly_retry_old + 7 * 24 * 60 * 60))" false >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_original /')"
+expire_observed_owner_cycle() { return 1; }
+if check_thresholds 100 100 unknown later '' "$weekly_retry_new" \
+  "$((weekly_retry_now + 2))" group-a >/dev/null 2>&1; then
+  fail "weekly journal failure was accepted"
+fi
+[[ ! -e "$FAKE_CURL_LOG" ]] || fail "weekly journal failure emitted HTTP"
+eval "$(declare -f expire_observed_owner_cycle_original | sed '1s/^expire_observed_owner_cycle_original /expire_observed_owner_cycle /')"
+check_thresholds 100 80 unknown later '' "$weekly_retry_new" \
+  "$((weekly_retry_now + 3))" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "weekly recovery did not deliver exactly its reset"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+threshold = next(item for item in items if item["kind"] == "threshold")
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+reset = next(item for item in items if item["kind"] == "reset")
+assert reset["status"] == "delivered", reset
 PYEOF
 
 # Reconstructing a missing journal must keep legacy occurrences bound to the
@@ -218,9 +1185,78 @@ import json
 import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
-assert not items, items
+assert len(items) == 2, items
+assert {item["kind"] for item in items} == {"reset"}, items
+assert {item["window"] for item in items} == {"5h", "weekly"}, items
+for item in items:
+    assert item["event_data"]["limit_id"] == sys.argv[2], item
+    assert item["terminal_reason"] == "owner_interrupted", item
+    assert item["status"] == "failed", item
+    assert item["detector_acknowledged_at"] is not None, item
 PYEOF
 ALERT_THRESHOLDS=75
+
+# Missing-journal reconstruction must run after restored arms are checked. A
+# foreign or ownerless arm may not supply a deadline to either current-owner
+# threshold; an explicit same-owner arm remains the scheduled cycle anchor.
+run_missing_journal_incoherent_arm_case() {
+  local case_name="$1" arm_owner="$2"
+  local case_now=2000008000
+  local case_arm_deadline=$((case_now + 3600))
+  local case_sample_deadline=$((case_now + 5400))
+  local case_limit_id case_other_id
+  rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+  export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-missing-${case_name}"
+  export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+  case_limit_id="$(canonicalize_alert_limit_id group-a)"
+  case_other_id="$(canonicalize_alert_limit_id group-b)"
+  printf '%s\n' \
+    'state_version=5' 'limit_id_contract_version=1' \
+    'prev_5h_pct=80' 'prev_weekly_pct=80' \
+    'observed_5h_pct=80' "observed_5h_reset_at=${case_now}" \
+    "observed_5h_limit_id=${case_limit_id}" \
+    'observed_weekly_pct=80' "observed_weekly_reset_at=${case_now}" \
+    "observed_weekly_limit_id=${case_limit_id}" \
+    "five_h_armed_reset_at=${case_arm_deadline}" \
+    "five_h_armed_limit_id=${arm_owner}" \
+    "weekly_armed_reset_at=${case_arm_deadline}" \
+    "weekly_armed_limit_id=${arm_owner}" \
+    'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+    'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+    'pending_5h_threshold=50' 'pending_weekly_threshold=50' > "$STATE_FILE"
+  [[ "$arm_owner" == "$case_limit_id" || "$arm_owner" == "" || "$arm_owner" == "$case_other_id" ]]
+  [[ ! -e "$ALERT_DELIVERIES_FILE" ]] || fail "${case_name} journal was not absent before reconstruction"
+  check_thresholds 40 40 later later "$case_sample_deadline" "$case_sample_deadline" \
+    "$case_now" group-a >/dev/null
+  assert_eq 2 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+    "${case_name} missing-journal threshold reconstruction count"
+  python3 - "$ALERT_DELIVERIES_FILE" "$case_limit_id" "$case_arm_deadline" "$case_name" "$arm_owner" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+thresholds = [item for item in items if item["kind"] == "threshold"]
+resets = [item for item in items if item["kind"] == "reset"]
+assert len(thresholds) == 2, items
+expected_resets = 2 if sys.argv[4] == "foreign" else 0
+assert len(resets) == expected_resets, items
+for item in thresholds:
+    assert item["event_data"]["limit_id"] == sys.argv[2], item
+    expected = int(sys.argv[3]) if sys.argv[4] == "same-owner" else 0
+    assert item["event_data"]["reset_epoch"] == expected, item
+    expected_cycle = f"limit:{sys.argv[2]}|reset:{expected}" if expected else f"limit:{sys.argv[2]}|unarmed"
+    assert item["cycle_key"].endswith(expected_cycle), item
+if expected_resets:
+    for item in resets:
+        assert item["event_data"]["limit_id"] == sys.argv[5], item
+        assert item["terminal_reason"] == "owner_interrupted", item
+        assert item["status"] == "failed", item
+PYEOF
+}
+
+run_missing_journal_incoherent_arm_case ownerless ""
+run_missing_journal_incoherent_arm_case foreign "$(canonicalize_alert_limit_id group-b)"
+run_missing_journal_incoherent_arm_case same-owner "$(canonicalize_alert_limit_id group-a)"
 
 # A legacy v4 detector state can have no owner fields even though the existing
 # journal still carries pending events for A.  Both a complete and a partial B
@@ -327,6 +1363,159 @@ assert state["last_notified_5h_reset_at"] == "0", state
 assert state["last_notified_weekly_reset_at"] == "0", state
 PYEOF
 
+# If a process dies after writing a local-observed tombstone but before
+# persisting the detector cleanup, a later owner interruption must promote the
+# same reset row to owner_interrupted.  Otherwise a return to A can mistake the
+# old local tombstone for permission to run the 5h hook.  This models both
+# crash windows: the first write-ahead local tombstone, then B's interruption
+# immediately after its promotion and before the arm is persisted.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-local-tombstone-interruption-5h"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+collision_hook="${TEST_ROOT}/local-tombstone-interruption-5h-hook.sh"
+collision_hook_log="${TEST_ROOT}/local-tombstone-interruption-5h-hook.log"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' \
+  'printf "hook|%s|%s\n" "$CODEX_ALERT_EVENT" "$CODEX_ALERT_WINDOW" >> "$COLLISION_HOOK_LOG"' \
+  > "$collision_hook"
+chmod 700 "$collision_hook"
+export COLLISION_HOOK_LOG="$collision_hook_log"
+collision_now=2000004100
+collision_old=$((collision_now + 1800))
+collision_a_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${collision_old}" \
+  "observed_5h_limit_id=${collision_a_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  "five_h_armed_reset_at=${collision_old}" "five_h_armed_limit_id=${collision_a_id}" \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'local_observed_5h_reset_at=0' 'local_observed_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$collision_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+python3 "$ALERTS_PY" suppress-local-reset "$ALERT_DELIVERIES_FILE" 5h \
+  "$collision_a_id" "$collision_old" --now "$collision_now" >/dev/null
+assert_eq local_observed "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.terminal_reason)" \
+  "first crash window did not leave a local-observed tombstone"
+# shellcheck disable=SC2031
+export ALERT_SCRIPT_1="$collision_hook" ALERT_SCRIPT_1_EVENTS='5h:reset'
+validate_config
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f interrupt_reset_cycle | sed '1s/^interrupt_reset_cycle /interrupt_reset_cycle_collision_original /')"
+(
+  interrupt_reset_cycle() {
+    interrupt_reset_cycle_collision_original "$@"
+    exit 99
+  }
+  check_thresholds 80 100 unknown unknown '' '' "$((collision_now + 1))" group-b
+) >/dev/null 2>&1 || true
+eval "$(declare -f interrupt_reset_cycle_collision_original | sed '1s/^interrupt_reset_cycle_collision_original /interrupt_reset_cycle /')"
+python3 - "$ALERT_DELIVERIES_FILE" "$collision_a_id" "$collision_old" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 1, items
+tombstone = items[0]
+assert tombstone["event_data"]["limit_id"] == sys.argv[2], tombstone
+assert tombstone["event_data"]["reset_epoch"] == int(sys.argv[3]), tombstone
+assert tombstone["terminal_reason"] == "owner_interrupted", tombstone
+assert tombstone["status"] == "failed", tombstone
+PYEOF
+# A partial A row after the old deadline must clear the interrupted arm before
+# due processing; it must neither POST the reset nor execute its local hook.
+check_thresholds 80 100 unknown unknown '' '' "$((collision_old + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "promoted 5h local tombstone emitted an HTTP request on owner return"
+[[ ! -e "$collision_hook_log" ]] || fail \
+  "promoted 5h local tombstone executed a reset hook on owner return"
+assert_eq 0 "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "owner-interrupted 5h arm was not cleared after return"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+item = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"][0]
+assert item["terminal_reason"] == "owner_interrupted", item
+assert item["detector_acknowledged_at"] is not None, item
+PYEOF
+
+# The generic journal promotion also protects weekly reset hooks.  Keep the
+# weekly arm and local tombstone on disk, crash during B's partial interruption,
+# then return to A after the deadline and assert the same no-delivery/no-hook
+# invariant.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-local-tombstone-interruption-weekly"
+weekly_collision_hook="${TEST_ROOT}/local-tombstone-interruption-weekly-hook.sh"
+weekly_collision_hook_log="${TEST_ROOT}/local-tombstone-interruption-weekly-hook.log"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' \
+  'printf "hook|%s|%s\n" "$CODEX_ALERT_EVENT" "$CODEX_ALERT_WINDOW" >> "$WEEKLY_COLLISION_HOOK_LOG"' \
+  > "$weekly_collision_hook"
+chmod 700 "$weekly_collision_hook"
+export WEEKLY_COLLISION_HOOK_LOG="$weekly_collision_hook_log"
+weekly_collision_now=2000005100
+weekly_collision_old=$((weekly_collision_now + 3 * 24 * 60 * 60))
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=' 'observed_5h_reset_at=0' 'observed_5h_limit_id=' \
+  'observed_weekly_pct=100' "observed_weekly_reset_at=${weekly_collision_old}" \
+  "observed_weekly_limit_id=${collision_a_id}" \
+  'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
+  "weekly_armed_reset_at=${weekly_collision_old}" "weekly_armed_limit_id=${collision_a_id}" \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'local_observed_5h_reset_at=0' 'local_observed_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$weekly_collision_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+python3 "$ALERTS_PY" suppress-local-reset "$ALERT_DELIVERIES_FILE" weekly \
+  "$collision_a_id" "$weekly_collision_old" --now "$weekly_collision_now" >/dev/null
+assert_eq local_observed "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.terminal_reason)" \
+  "weekly first crash window did not leave a local-observed tombstone"
+export ALERT_SCRIPT_1="$weekly_collision_hook" ALERT_SCRIPT_1_EVENTS='weekly:reset'
+validate_config
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f interrupt_reset_cycle | sed '1s/^interrupt_reset_cycle /interrupt_reset_cycle_weekly_collision_original /')"
+(
+  interrupt_reset_cycle() {
+    interrupt_reset_cycle_weekly_collision_original "$@"
+    exit 99
+  }
+  check_thresholds 100 80 unknown unknown '' '' "$((weekly_collision_now + 1))" group-b
+) >/dev/null 2>&1 || true
+eval "$(declare -f interrupt_reset_cycle_weekly_collision_original | sed '1s/^interrupt_reset_cycle_weekly_collision_original /interrupt_reset_cycle /')"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+item = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"][0]
+assert item["window"] == "weekly", item
+assert item["terminal_reason"] == "owner_interrupted", item
+PYEOF
+check_thresholds 100 80 unknown unknown '' '' "$((weekly_collision_old + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "promoted weekly local tombstone emitted an HTTP request on owner return"
+[[ ! -e "$weekly_collision_hook_log" ]] || fail \
+  "promoted weekly local tombstone executed a reset hook on owner return"
+assert_eq 0 "$(awk -F= '$1 == "weekly_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "owner-interrupted weekly arm was not cleared after return"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+item = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"][0]
+assert item["terminal_reason"] == "owner_interrupted", item
+assert item["detector_acknowledged_at"] is not None, item
+PYEOF
+
 # A terminal delivery from group-a must not rewrite group-b's fresh baseline.
 # The next B threshold must still be detected from B's own complete sample.
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
@@ -359,14 +1548,22 @@ import json
 import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
-assert len(items) == 2, items
-by_owner = {item["event_data"]["limit_id"]: item for item in items}
-assert set(by_owner) == {sys.argv[2], sys.argv[3]}, items
-assert by_owner[sys.argv[2]]["status"] == "failed", items
-assert by_owner[sys.argv[2]]["terminal_reason"] == "owner_interrupted", items
-assert by_owner[sys.argv[2]]["detector_acknowledged_at"] is not None, items
-assert by_owner[sys.argv[3]]["status"] == "delivered", items
-assert by_owner[sys.argv[3]]["selector"] == "50", items
+assert len(items) == 3, items
+a_threshold = next(item for item in items
+                   if item["event_data"]["limit_id"] == sys.argv[2]
+                   and item["kind"] == "threshold")
+a_reset = next(item for item in items
+               if item["event_data"]["limit_id"] == sys.argv[2]
+               and item["kind"] == "reset")
+b_threshold = next(item for item in items
+                   if item["event_data"]["limit_id"] == sys.argv[3]
+                   and item["kind"] == "threshold")
+for item in (a_threshold, a_reset):
+    assert item["status"] == "failed", items
+    assert item["terminal_reason"] == "owner_interrupted", items
+    assert item["detector_acknowledged_at"] is not None, items
+assert b_threshold["status"] == "delivered", items
+assert b_threshold["selector"] == "50", items
 PYEOF
 
 # A partial observation from another owner breaks live continuity durably.  All
@@ -647,6 +1844,62 @@ PYEOF
 assert_eq 0 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["alerts"]))' "$ALERT_DELIVERIES_FILE")" \
   "disabled anomaly was queued"
 
+# A weekly refill observed while alerting is disabled is local-only.  Recreate
+# the durable pre-cleanup state to model a crash after its local marker write;
+# re-enabling alerts must not turn that marker into a network reset.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-disabled-observed-weekly"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERT_THRESHOLDS=0
+ALERTS_ENABLED=0
+weekly_disabled_now=2000001000
+weekly_disabled_old=$((weekly_disabled_now + 4 * 24 * 60 * 60))
+weekly_disabled_new=$((weekly_disabled_old + 3 * 24 * 60 * 60))
+weekly_disabled_id="$(canonicalize_alert_limit_id group-a)"
+check_thresholds 100 40 unknown later '' "$weekly_disabled_old" \
+  "$weekly_disabled_now" group-a >/dev/null
+check_thresholds 100 100 unknown later '' "$weekly_disabled_new" \
+  "$((weekly_disabled_now + 1))" group-a >/dev/null
+python3 - "$STATE_FILE" "$((weekly_disabled_now + 1))" "$weekly_disabled_id" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+values = {}
+for line in path.read_text(encoding="utf-8").splitlines():
+    key, separator, value = line.partition("=")
+    if separator:
+        values[key] = value
+values["weekly_armed_reset_at"] = sys.argv[2]
+values["weekly_armed_limit_id"] = sys.argv[3]
+values["last_notified_weekly_reset_at"] = "0"
+values["local_observed_weekly_reset_at"] = sys.argv[2]
+values["pending_observed_weekly_reset_at"] = "0"
+values["pending_observed_weekly_reset_limit_id"] = ""
+path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+PYEOF
+assert_eq 0 "$(python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+print(len(json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]))
+PYEOF
+)" "disabled weekly observation was queued before re-enable"
+ALERTS_ENABLED=1
+check_thresholds 100 100 unknown later '' "$weekly_disabled_new" \
+  "$((weekly_disabled_now + 2))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "disabled weekly observation was delivered after re-enable"
+assert_eq 0 "$(python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+print(len(json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]))
+PYEOF
+)" "disabled weekly observation rebuilt a reset occurrence"
+assert_eq 0 "$(awk -F= '$1 == "weekly_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "disabled weekly marker retained a reset arm"
+assert_eq 0 "$(awk -F= '$1 == "local_observed_weekly_reset_at" {print $2}' "$STATE_FILE")" \
+  "disabled weekly marker was not consumed locally"
+
 # A delivery that was already pending before the pause remains pending and
 # resumes after re-enabling without being treated as an unconfigured channel.
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
@@ -717,5 +1970,160 @@ assert_eq pending "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.channels.disco
   "legacy pending alert was cleared instead of migrated while disabled"
 assert_eq threshold "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.kind)" \
   "legacy migration did not preserve the pending threshold"
+
+# Weekly observed-reset recovery must preserve the pending occurrence created
+# before a transient 503.  Rebuilding it at the next poll has a different
+# observation time, but the same immutable cycle and event data.
+rm -f "${STATE_FILE}" "${ALERT_DELIVERIES_FILE}" "${FAKE_CURL_LOG}"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-weekly-retry-reuse"
+export FAKE_CURL_DISCORD_STATUS_SEQUENCE=503,204
+unset FAKE_CURL_DISCORD_STATUS
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=5
+weekly_reuse_now=2000002250
+weekly_reuse_old=$((weekly_reuse_now + 3600))
+weekly_reuse_new=$((weekly_reuse_old + 3600))
+weekly_reuse_id="$(canonicalize_alert_limit_id group-a)"
+ALERTS_ENABLED=0 check_thresholds 100 40 unknown later '' "${weekly_reuse_old}" \
+  "${weekly_reuse_now}" group-a >/dev/null
+ALERT_THRESHOLDS=50
+register_network_alert threshold weekly 50 \
+  "limit:${weekly_reuse_id}|reset:${weekly_reuse_old}" \
+  "weekly retry stale threshold" \
+  "{\"limit_id\":\"${weekly_reuse_id}\",\"remaining_pct\":40,\"reset_epoch\":${weekly_reuse_old},\"covered_thresholds\":[50]}" \
+  "$((weekly_reuse_now + 1))" "$((weekly_reuse_old + 7 * 24 * 60 * 60))" false >/dev/null
+check_thresholds 100 100 unknown later '' "${weekly_reuse_new}" \
+  "$((weekly_reuse_now + 1))" group-a >/dev/null 2>&1 || true
+assert_eq pending "$(json_field "${ALERT_DELIVERIES_FILE}" alerts.1.channels.discord.status)" \
+  "weekly 503 reset occurrence was not left pending"
+assert_eq 1 "$(json_field "${ALERT_DELIVERIES_FILE}" alerts.1.channels.discord.attempt_count)" \
+  "weekly 503 reset attempt was not recorded"
+check_thresholds 100 100 unknown later '' "${weekly_reuse_new}" \
+  "$((weekly_reuse_now + 2))" group-a >/dev/null
+assert_eq 2 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "weekly reset recovery did not retry exactly once"
+assert_eq 1 "$(python3 - "${ALERT_DELIVERIES_FILE}" <<'PYEOF'
+import json
+import sys
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+print(sum(item["kind"] == "reset" for item in items))
+PYEOF
+)" "weekly recovery rebuilt a duplicate reset occurrence"
+assert_eq delivered "$(json_field "${ALERT_DELIVERIES_FILE}" alerts.1.status)" \
+  "weekly reset recovery did not deliver the original occurrence"
+
+# A reset observed from a restored baseline can have no durable arm yet.  The
+# first observed poll must persist a local-only arm before the hook runs; if the
+# process stops at that boundary, a changed restart sample still runs the hook
+# once and never creates a scheduled network reset.
+rm -f "${STATE_FILE}" "${ALERT_DELIVERIES_FILE}" "${FAKE_CURL_LOG}"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-no-arm-hook-recovery"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+no_arm_hook="${TEST_ROOT}/observed-no-arm-hook.sh"
+no_arm_hook_log="${TEST_ROOT}/observed-no-arm-hook.log"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' 'printf "hook|%s|%s\n" "${CODEX_ALERT_EVENT}" "${CODEX_ALERT_WINDOW}" >> "${NO_ARM_HOOK_LOG}"' > "${no_arm_hook}"
+chmod 700 "${no_arm_hook}"
+export NO_ARM_HOOK_LOG="${no_arm_hook_log}"
+no_arm_hook_now=2000002300
+no_arm_hook_old=$((no_arm_hook_now + 1800))
+no_arm_hook_new=$((no_arm_hook_old + 900))
+check_thresholds 100 100 later unknown "${no_arm_hook_old}" '' \
+  "${no_arm_hook_now}" group-a >/dev/null
+printf '{"schema_version":2,"limit_id_contract_version":1,"legacy_migration":{"source_state_version":5,"completed_at":%s},"alerts":[]}\n' \
+  "${no_arm_hook_now}" > "${ALERT_DELIVERIES_FILE}"
+(
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1="${no_arm_hook}"
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1_EVENTS='5h:reset'
+  validate_config
+  # The local arm and hook intent are durable before the hook invocation;
+  # terminate there to model a process crash without a persistence-call count.
+  # shellcheck disable=SC2317,SC2329
+  run_alert_script() {
+    exit 99
+  }
+  check_thresholds 100 100 later unknown "${no_arm_hook_new}" '' \
+    "$((no_arm_hook_now + 1))" group-a >/dev/null
+) >/dev/null 2>&1 || true
+assert_eq "$((no_arm_hook_now + 1))" "$(awk -F= '$1 == "local_observed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "no-arm observed reset marker was not written before final persistence"
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "no-arm observed reset emitted HTTP before restart"
+(
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1="${no_arm_hook}"
+  # shellcheck disable=SC2034
+  ALERT_SCRIPT_1_EVENTS='5h:reset'
+  validate_config
+  check_thresholds 80 100 later unknown "${no_arm_hook_new}" '' \
+    "$((no_arm_hook_old + 1))" group-a >/dev/null
+) >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "no-arm observed recovery emitted HTTP"
+assert_eq 1 "$(wc -l < "${no_arm_hook_log}")" \
+  "no-arm observed recovery did not execute one local hook"
+check_thresholds 80 100 later unknown "${no_arm_hook_new}" '' \
+  "$((no_arm_hook_old + 2))" group-a >/dev/null
+assert_eq 1 "$(wc -l < "${no_arm_hook_log}")" \
+  "no-arm observed recovery replayed its local hook"
+
+# A weekly recovery marker with no journal occurrence must not be rebuilt after
+# its delivery window has expired. In particular, the reconstructed request
+# would have expires_at before created_at and could otherwise block every
+# subsequent poll.
+rm -f "${STATE_FILE}" "${ALERT_DELIVERIES_FILE}" "${FAKE_CURL_LOG}"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-weekly-expired-marker"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=50
+weekly_expired_now=2000003600
+weekly_expired_epoch=$((weekly_expired_now - 8 * 24 * 60 * 60))
+weekly_expired_id="$(canonicalize_alert_limit_id group-a)"
+python3 - "${STATE_FILE}" "${weekly_expired_epoch}" "${weekly_expired_id}" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+epoch = sys.argv[2]
+limit_id = sys.argv[3]
+values = {
+    "state_version": "5", "limit_id_contract_version": "1",
+    "prev_5h_pct": "100", "prev_weekly_pct": "100",
+    "observed_5h_pct": "", "observed_5h_reset_at": "0", "observed_5h_limit_id": "",
+    "observed_weekly_pct": "100", "observed_weekly_reset_at": epoch,
+    "observed_weekly_limit_id": limit_id,
+    "five_h_armed_reset_at": "0", "five_h_armed_limit_id": "",
+    "weekly_armed_reset_at": epoch, "weekly_armed_limit_id": limit_id,
+    "last_notified_5h_reset_at": "0", "last_notified_weekly_reset_at": "0",
+    "local_observed_5h_reset_at": "0", "local_observed_weekly_reset_at": epoch,
+    "notified_5h_thresholds": "", "notified_weekly_thresholds": "",
+    "pending_5h_threshold": "", "pending_weekly_threshold": "",
+}
+path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+PYEOF
+printf '{"schema_version":2,"limit_id_contract_version":1,"legacy_migration":{"source_state_version":5,"completed_at":%s},"alerts":[]}\n' \
+  "${weekly_expired_now}" > "${ALERT_DELIVERIES_FILE}"
+check_thresholds 80 80 unknown later '' "$((weekly_expired_epoch + 1))" \
+  "${weekly_expired_now}" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "expired weekly recovery marker emitted HTTP"
+assert_eq 0 "$(awk -F= '$1 == "weekly_armed_reset_at" {print $2}' "${STATE_FILE}")" \
+  "expired weekly recovery arm was not cleared"
+assert_eq 0 "$(awk -F= '$1 == "local_observed_weekly_reset_at" {print $2}' "${STATE_FILE}")" \
+  "expired weekly recovery marker was not cleared"
+assert_eq 0 "$(python3 - "${ALERT_DELIVERIES_FILE}" <<'PYEOF'
+import json
+import sys
+print(len(json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]))
+PYEOF
+)" "expired weekly recovery rebuilt an occurrence"
+check_thresholds 80 80 unknown later '' "$((weekly_expired_epoch + 1))" \
+  "$((weekly_expired_now + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "expired weekly recovery blocked the following poll"
 
 printf 'PASS: monitor network tests\n'

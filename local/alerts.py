@@ -39,11 +39,12 @@ ALERT_STATUSES = CHANNEL_STATUSES
 ERROR_CLASSES = {
     "client_error", "rate_limited", "server_error", "timeout",
     "transport_error", "invalid_response", "channel_unconfigured",
-    "superseded", "expired_after_reset", "owner_interrupted",
+    "superseded", "expired_after_reset", "owner_interrupted", "local_observed",
 }
 TERMINAL_REASONS = {
     "delivered", "permanent_failure", "superseded",
     "expired_after_reset", "channel_unconfigured", "owner_interrupted",
+    "local_observed",
 }
 OPAQUE_LIMIT_ID_RE = re.compile(r"limit-[0-9a-f]{64}\Z")
 LEGACY_NAMESPACE_RE = re.compile(r"legacy-v[0-9]+\Z")
@@ -114,6 +115,21 @@ def _replace_limit_segment(cycle_key: str, old_limit_id: str,
     return "|".join(segments)
 
 
+def _cycle_reset_epoch(cycle_key: str) -> int | None:
+    """Return the reset epoch encoded by a cycle key, when it has one."""
+
+    reset_segments = [segment for segment in cycle_key.split("|")
+                      if segment.startswith("reset:")]
+    if len(reset_segments) > 1:
+        raise JournalError("cycle key contains multiple reset epochs")
+    if not reset_segments:
+        return None
+    raw_epoch = reset_segments[0].split(":", 1)[1]
+    if not raw_epoch.isdigit():
+        raise JournalError("cycle key contains an invalid reset epoch")
+    return int(raw_epoch)
+
+
 def empty_journal(source_version: int, completed_at: int) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -151,7 +167,8 @@ def _validate_channel(name: str, channel: Any) -> None:
         raise JournalError("delivered channel has an error")
 
 
-def _validate_alert(item: Any, *, require_opaque_limit_id: bool = False) -> None:
+def _validate_alert(item: Any, *, require_opaque_limit_id: bool = False,
+                    enforce_cycle_identity: bool = True) -> None:
     if not isinstance(item, dict):
         raise JournalError("alert must be an object")
     required = {
@@ -193,6 +210,17 @@ def _validate_alert(item: Any, *, require_opaque_limit_id: bool = False) -> None
         raise JournalError("event limit_id is not an opaque identifier")
     if not _is_int(event.get("reset_epoch")):
         raise JournalError("invalid event reset_epoch")
+    if enforce_cycle_identity:
+        cycle_reset_epoch = _cycle_reset_epoch(item["cycle_key"])
+        has_unarmed_segment = "unarmed" in item["cycle_key"].split("|")
+        if cycle_reset_epoch is not None and event["reset_epoch"] != cycle_reset_epoch:
+            raise JournalError("event reset_epoch is inconsistent with cycle key")
+        if has_unarmed_segment and cycle_reset_epoch is not None:
+            raise JournalError("cycle key cannot be both reset and unarmed")
+        if has_unarmed_segment and event["reset_epoch"] != 0:
+            raise JournalError("unarmed cycle has a reset epoch")
+        if item["kind"] == "reset" and cycle_reset_epoch is None:
+            raise JournalError("reset cycle key lacks a reset epoch")
     if item["kind"] == "threshold":
         if set(event) != {"limit_id", "remaining_pct", "reset_epoch", "covered_thresholds"}:
             raise JournalError("invalid threshold event_data")
@@ -288,7 +316,11 @@ def validate_document(document: Any, *, allow_legacy: bool = True) -> dict[str, 
         raise JournalError("alerts must be an array")
     seen: set[str] = set()
     for item in document["alerts"]:
-        _validate_alert(item, require_opaque_limit_id=version == SCHEMA_VERSION)
+        _validate_alert(
+            item,
+            require_opaque_limit_id=version == SCHEMA_VERSION,
+            enforce_cycle_identity=version == SCHEMA_VERSION,
+        )
         if item["alert_id"] in seen:
             raise JournalError("duplicate alert_id")
         seen.add(item["alert_id"])
@@ -337,6 +369,14 @@ def migrate_document(document: dict[str, Any], completed_at: int) -> dict[str, A
         item["cycle_key"] = _migrate_cycle_key(
             item["cycle_key"], old_limit_id, new_limit_id
         )
+        # Legacy journals did not require the cycle key and event payload to
+        # agree.  Preserve the durable cycle identity while normalizing the
+        # redundant reset field before validating the modern document.
+        cycle_reset_epoch = _cycle_reset_epoch(item["cycle_key"])
+        if cycle_reset_epoch is not None:
+            item["event_data"]["reset_epoch"] = cycle_reset_epoch
+        elif "unarmed" in item["cycle_key"].split("|"):
+            item["event_data"]["reset_epoch"] = 0
         item["alert_id"] = alert_id(
             item["kind"], item["window"], item["selector"], item["cycle_key"], namespace
         )
@@ -391,14 +431,11 @@ def atomic_write(path: pathlib.Path, document: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        except OSError:
-            pass
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         try:
             os.close(fd)
@@ -427,7 +464,9 @@ def _request_alert(request: dict[str, Any]) -> dict[str, Any]:
     channels = request.get("channels")
     if kind not in KINDS or window not in WINDOWS or not isinstance(cycle_key, str):
         raise JournalError("invalid registration request")
-    if not isinstance(channels, list) or not channels or any(channel not in CHANNELS for channel in channels):
+    if (not isinstance(channels, list) or not channels
+            or any(not isinstance(channel, str) or channel not in CHANNELS
+                   for channel in channels)):
         raise JournalError("registration requires configured channels")
     if len(set(channels)) != len(channels):
         raise JournalError("duplicate registration channel")
@@ -466,6 +505,207 @@ def _request_alert(request: dict[str, Any]) -> dict[str, Any]:
 def _same_registration(existing: dict[str, Any], incoming: dict[str, Any]) -> bool:
     immutable = ("alert_id", "kind", "window", "selector", "cycle_key", "message", "event_data", "created_at", "expires_at")
     return all(existing[key] == incoming[key] for key in immutable) and set(existing["channels"]) == set(incoming["channels"])
+
+
+def _merge_observed_reset_channels(authority: dict[str, Any],
+                                   matches: list[dict[str, Any]],
+                                   requested_channels: Iterable[str] = ()) -> bool:
+    """Merge durable channel outcomes into a pending observed-reset authority.
+
+    Equivalent legacy and modern rows can have reached different channel
+    outcomes before de-duplication.  A successful delivery is a per-channel
+    fact, so it must win over both pending and failed state in the row that is
+    retained.  Pending state wins over terminal failure only when the retained
+    row's channel is itself terminal; otherwise the retained pending state is
+    kept so that its retry schedule remains authoritative.  Failed metadata is
+    deliberately not copied over a pending channel: the failed row remains in
+    the journal, while the pending authority keeps that channel retryable.
+    Channels present only on another pending equivalent row are added to the
+    authority, so selecting one occurrence cannot discard configured channels.
+    Channels newly requested by the current recovery are added as fresh
+    pending state when no equivalent delivery covers them, including when
+    the retained authority currently records a terminal failure.
+    """
+
+    def candidates(name: str, status: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        return [
+            (item, item["channels"][name])
+            for item in matches
+            if name in item["channels"] and item["channels"][name]["status"] == status
+        ]
+
+    def newest_attempt(pair: tuple[dict[str, Any], dict[str, Any]]) -> tuple[int, int, int, str]:
+        item, channel = pair
+        return (
+            channel["last_attempt_at"], channel["attempt_count"],
+            item["created_at"], item["alert_id"],
+        )
+
+    requested = set(requested_channels)
+    changed = False
+    channel_names = sorted(
+        requested
+        | {name for item in matches for name in item["channels"]}
+    )
+    for name in channel_names:
+        current = authority["channels"].get(name)
+        delivered = candidates(name, "delivered")
+        replacement: dict[str, Any] | None = None
+        if delivered:
+            # Keep the complete successful attempt record, not just its
+            # status, so counters and response metadata remain coherent.
+            replacement = max(delivered, key=newest_attempt)[1]
+        elif current is None or current["status"] != "pending":
+            pending = candidates(name, "pending")
+            if pending:
+                replacement = max(pending, key=newest_attempt)[1]
+            elif name in requested:
+                # A prior terminal failure must not block a recovery retry.
+                # Start a fresh state so stale terminal metadata cannot make
+                # the reconstructed occurrence terminal again.  Equivalent
+                # deliveries were handled above and remain immutable.
+                replacement = _channel_state()
+        if replacement is not None and current != replacement:
+            _validate_channel(name, replacement)
+            authority["channels"][name] = copy.deepcopy(replacement)
+            changed = True
+    return changed
+
+
+def _register_or_reuse_observed_reset(document: dict[str, Any],
+                                      request: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    """Register a weekly observed-reset request without rebuilding retries.
+
+    The detector can reconstruct an observed weekly reset after the first
+    delivery attempt has failed.  Its current poll time and configured
+    channels are not immutable event data, so feeding a freshly-built request
+    to ``register`` would look like an alert-id collision.  Reuse an existing
+    reset occurrence only when its owner, window, cycle, selector and reset
+    epoch are identical; all other identity collisions remain errors.
+    """
+
+    if not isinstance(request, dict):
+        raise JournalError("observed reset request must be an object")
+    raw_event = request.get("event_data")
+    raw_limit_id = raw_event.get("limit_id") if isinstance(raw_event, dict) else None
+    canonical_limit_id = canonicalize_limit_id(raw_limit_id)
+    cycle_key = request.get("cycle_key")
+    if (request.get("kind") != "reset" or request.get("selector") != "reset"
+            or request.get("window") not in WINDOWS
+            or not isinstance(cycle_key, str) or canonical_limit_id is None
+            or not isinstance(raw_event, dict)
+            or set(raw_event) != {"limit_id", "reset_epoch"}
+            or not _is_int(raw_event.get("reset_epoch"))):
+        raise JournalError("invalid observed reset request identity")
+    normalized_cycle = _replace_limit_segment(
+        cycle_key, raw_limit_id, canonical_limit_id,
+    )
+    if (not isinstance(request.get("channels"), list)
+            or not request["channels"]
+            or any(not isinstance(channel, str) or channel not in CHANNELS
+                   for channel in request["channels"])
+            or len(set(request["channels"])) != len(request["channels"])):
+        raise JournalError("registration requires configured channels")
+    expected_event = {
+        "limit_id": canonical_limit_id,
+        "reset_epoch": raw_event["reset_epoch"],
+    }
+
+    def equivalent_cycle(left: str, right: str) -> bool:
+        return _same_cycle(left, right) or _same_cycle(right, left)
+
+    matches = [
+        existing for existing in document["alerts"]
+        if (existing["kind"] == "reset"
+            and existing["window"] == request["window"]
+            and existing["selector"] == "reset"
+            and existing["event_data"] == expected_event
+            and equivalent_cycle(existing["cycle_key"], normalized_cycle))
+    ]
+    if matches:
+        # Keep a pending row authoritative when it carries a channel not
+        # covered by an equivalent delivery.  Otherwise a delivered row is
+        # authoritative and must never be resurrected; when no delivery
+        # succeeded, prefer the canonical modern cycle so a legacy duplicate
+        # is retired deterministically.
+        terminal = [item for item in matches if item["status"] != "pending"]
+        delivered = [item for item in terminal if item["terminal_reason"] == "delivered"]
+        pending = [item for item in matches if item["status"] == "pending"]
+        delivered_channels = {
+            name
+            for item in matches
+            for name, channel in item["channels"].items()
+            if channel["status"] == "delivered"
+        }
+        pending_with_uncovered_channels = [
+            item for item in pending
+            if set(item["channels"]) - delivered_channels
+        ]
+        if pending_with_uncovered_channels:
+            authority = min(
+                pending_with_uncovered_channels,
+                key=lambda item: (
+                    item["cycle_key"] != normalized_cycle,
+                    item["created_at"],
+                    item["alert_id"],
+                ),
+            )
+        elif delivered:
+            authority = next(
+                item for item in matches if item["terminal_reason"] == "delivered"
+            )
+        elif pending:
+            authority = min(
+                pending,
+                key=lambda item: (
+                    item["cycle_key"] != normalized_cycle,
+                    item["created_at"],
+                    item["alert_id"],
+                ),
+            )
+        else:
+            authority = terminal[0]
+        completed_at = request.get("created_at")
+        if not _is_int(completed_at):
+            completed_at = max(item["created_at"] for item in matches)
+        changed = 0
+        if _merge_observed_reset_channels(
+                authority, matches, request["channels"]):
+            attempt_times = [
+                channel["last_attempt_at"]
+                for channel in authority["channels"].values()
+                if channel["last_attempt_at"]
+            ]
+            completion_time = (
+                max(attempt_times)
+                if attempt_times
+                else max(authority["created_at"], completed_at)
+            )
+            _recompute(authority, completion_time)
+            changed += 1
+        for duplicate in matches:
+            if duplicate is authority or duplicate["status"] != "pending":
+                continue
+            _terminate(
+                duplicate, "superseded", completed_at, "superseded",
+                authority["alert_id"],
+            )
+            changed += 1
+        return authority, changed
+
+    # Search by durable event identity before validating created/expires.  A
+    # recovery poll can legitimately be later than the original reset's
+    # expiry; rebuilding that request would fail validation and is unnecessary
+    # because the existing occurrence owns all retry/terminal state.
+    incoming = _request_alert(request)
+    for existing in document["alerts"]:
+        if existing["alert_id"] != incoming["alert_id"]:
+            continue
+        if _same_registration(existing, incoming):
+            return existing, 0
+        raise JournalError("alert_id collision with different content")
+    document["alerts"].append(incoming)
+    return incoming, 1
 
 
 def _terminate(item: dict[str, Any], reason: str, now: int,
@@ -547,6 +787,35 @@ def expire_pending_thresholds(document: dict[str, Any], window: str,
     return expired
 
 
+def expire_pending_thresholds_for_owner(document: dict[str, Any], window: str,
+                                        limit_id: str, now: int) -> int:
+    """Terminalize every pending threshold for one owner and window.
+
+    An observed refill is evidence that the detector's pre-reset cycle has
+    ended, but a restored arm/deadline may no longer identify that cycle.  In
+    that case the journal's durable event owner is the authority, so expire
+    all pending thresholds for the current owner in the affected window.  Do
+    not broaden this to resets, anomalies, or another owner.
+    """
+
+    if (window not in WINDOWS or not isinstance(limit_id, str)
+            or not limit_id or not _is_int(now)):
+        raise JournalError("invalid owner threshold expiration request")
+    canonical_limit_id = canonicalize_limit_id(limit_id)
+    if canonical_limit_id is None:
+        raise JournalError("owner threshold expiration limit ID is invalid")
+
+    expired = 0
+    for existing in document["alerts"]:
+        if (existing["kind"] == "threshold"
+                and existing["window"] == window
+                and existing["status"] == "pending"
+                and existing["event_data"].get("limit_id") == canonical_limit_id):
+            _terminate(existing, "expired_after_reset", now, "expired_after_reset")
+            expired += 1
+    return expired
+
+
 def interrupt_pending_owner(document: dict[str, Any], limit_id: str, now: int) -> int:
     """Terminalize pending threshold/reset occurrences for an interrupted owner.
 
@@ -602,6 +871,180 @@ def interrupt_pending_other_owners(document: dict[str, Any], current_limit_id: s
     return interrupted
 
 
+def suppress_local_reset_cycle(document: dict[str, Any], window: str,
+                               limit_id: str, reset_epoch: int, now: int,
+                               reason: str = "local_observed") -> int:
+    """Durably suppress one scheduled reset superseded by observed evidence.
+
+    The terminal journal row is a write-ahead tombstone for a local-only
+    observed 5-hour refill.  It is intentionally terminal from creation, so
+    ``due`` can never select it, even when alerts are disabled or no channel is
+    configured.  If a pending occurrence for the same owner/cycle already
+    exists, terminalize it in place; otherwise append an idempotent marker.
+    """
+
+    if (window not in WINDOWS or reason not in {"local_observed", "owner_interrupted"}
+            or not isinstance(limit_id, str) or not limit_id
+            or not _is_int(reset_epoch) or not _is_int(now)):
+        raise JournalError("invalid reset cycle suppression request")
+    canonical_limit_id = canonicalize_limit_id(limit_id)
+    if canonical_limit_id is None:
+        raise JournalError("reset cycle suppression limit ID is invalid")
+    cycle_key = f"limit:{canonical_limit_id}|reset:{reset_epoch}"
+    validity = 5 * 60 * 60 if window == "5h" else 7 * 24 * 60 * 60
+    message = (
+        "Observed local reset; scheduled notification suppressed."
+        if reason == "local_observed"
+        else "Limit owner interrupted; scheduled notification suppressed."
+    )
+    changed = 0
+    matched = False
+    for existing in document["alerts"]:
+        if (existing["kind"] != "reset" or existing["window"] != window
+                or existing["selector"] != "reset"
+                or existing["event_data"].get("limit_id") != canonical_limit_id
+                or not _same_cycle(existing["cycle_key"], cycle_key)):
+            continue
+        matched = True
+        if existing["status"] == "pending":
+            _terminate(existing, reason, now, reason)
+            changed += 1
+        elif reason == "owner_interrupted" and existing["terminal_reason"] == "local_observed":
+            # An owner interruption is stronger than an earlier local-only
+            # classification for the same cycle.  A crash can leave the local
+            # tombstone behind while the detector arm is restored under the
+            # interrupted owner; promote only this specific collision so the
+            # return path cannot execute a local hook.  Delivered/permanent
+            # terminal events are intentionally immutable.
+            for channel in existing["channels"].values():
+                if (channel["status"] == "failed"
+                        and channel["error_class"] == "local_observed"):
+                    channel["error_class"] = "owner_interrupted"
+            existing["message"] = message
+            existing["terminal_reason"] = "owner_interrupted"
+            existing["completed_at"] = now
+            existing["replacement_alert_id"] = None
+            changed += 1
+    if matched:
+        return changed
+
+    tombstone = _request_alert({
+        "kind": "reset",
+        "window": window,
+        "selector": "reset",
+        "cycle_key": cycle_key,
+        "message": message,
+        "event_data": {
+            "limit_id": canonical_limit_id,
+            "reset_epoch": reset_epoch,
+        },
+        "created_at": now,
+        "expires_at": max(now, reset_epoch + validity),
+        # Terminal markers use the complete known channel set and are never
+        # passed to due; this keeps the schema independent of configuration.
+        "channels": sorted(CHANNELS),
+    })
+    _terminate(tombstone, reason, now, reason)
+    document["alerts"].append(tombstone)
+    return 1
+
+
+def expire_owner_thresholds_and_suppress_reset(document: dict[str, Any],
+                                               window: str, limit_id: str,
+                                               reset_epoch: int, now: int) -> int:
+    """Atomically expire an owner's thresholds and suppress its reset cycle.
+
+    The caller writes the resulting document once.  A zero ``reset_epoch``
+    means that no reset tombstone is needed (for example an observed reset
+    with no durable arm), while threshold invalidation remains part of the
+    same journal transaction.
+    """
+
+    if not _is_int(reset_epoch):
+        raise JournalError("invalid atomic reset epoch")
+    changed = expire_pending_thresholds_for_owner(document, window, limit_id, now)
+    if reset_epoch:
+        changed += suppress_local_reset_cycle(
+            document, window, limit_id, reset_epoch, now,
+        )
+    return changed
+
+
+def expire_observed_owner_cycle(document: dict[str, Any], window: str,
+                                limit_id: str, now: int,
+                                superseded_reset_epoch: int = 0,
+                                preserve_cycle: str | None = None,
+                                new_reset_request: dict[str, Any] | None = None) -> int:
+    """Close stale owner events and optionally publish a new reset atomically.
+
+    Observed evidence consumes the detector's prior cycle.  Thresholds and
+    pending reset rows for that owner/window must therefore be terminalized in
+    the same journal transaction.  ``preserve_cycle`` is used by weekly
+    observed refills: the new reset occurrence is created in this transaction
+    and is the only pending reset row retained for the owner.  A 5h observed
+    refill passes the superseded arm epoch instead and gets a local-only
+    tombstone when no matching reset row already exists.
+    """
+
+    if (window not in WINDOWS or not isinstance(limit_id, str)
+            or not limit_id or not _is_int(now)
+            or not _is_int(superseded_reset_epoch)):
+        raise JournalError("invalid observed owner cycle request")
+    canonical_limit_id = canonicalize_limit_id(limit_id)
+    if canonical_limit_id is None:
+        raise JournalError("observed owner cycle limit ID is invalid")
+    if preserve_cycle is not None:
+        if not isinstance(preserve_cycle, str) or not preserve_cycle:
+            raise JournalError("observed owner preserve cycle is invalid")
+        try:
+            _limit_segment_index(preserve_cycle, canonical_limit_id)
+        except JournalError:
+            raise JournalError("observed owner preserve cycle has wrong owner") from None
+    if new_reset_request is not None:
+        if (new_reset_request.get("kind") != "reset"
+                or new_reset_request.get("window") != window
+                or new_reset_request.get("event_data", {}).get("limit_id")
+                != canonical_limit_id):
+            raise JournalError("observed owner reset request has wrong owner")
+        if preserve_cycle is None or not _same_cycle(
+                new_reset_request.get("cycle_key", ""), preserve_cycle):
+            raise JournalError("observed owner reset request is not preserved")
+
+    changed = expire_pending_thresholds_for_owner(
+        document, window, canonical_limit_id, now,
+    )
+    for existing in document["alerts"]:
+        if (existing["kind"] != "reset" or existing["window"] != window
+                or existing["status"] != "pending"
+                or existing["event_data"].get("limit_id") != canonical_limit_id):
+            continue
+        if preserve_cycle is not None and _same_cycle(
+                existing["cycle_key"], preserve_cycle):
+            continue
+        _terminate(existing, "local_observed", now, "local_observed")
+        changed += 1
+
+    if superseded_reset_epoch:
+        changed += suppress_local_reset_cycle(
+            document, window, canonical_limit_id, superseded_reset_epoch, now,
+        )
+    if new_reset_request is not None:
+        _, registration_changed = _register_or_reuse_observed_reset(
+            document, new_reset_request,
+        )
+        changed += registration_changed
+    return int(changed)
+
+
+def interrupt_reset_cycle(document: dict[str, Any], window: str,
+                          limit_id: str, reset_epoch: int, now: int) -> int:
+    """Durably suppress a reset cycle interrupted by another owner."""
+
+    return suppress_local_reset_cycle(
+        document, window, limit_id, reset_epoch, now, "owner_interrupted",
+    )
+
+
 def register(document: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
     incoming = _request_alert(request)
     expire_cycle = request.get("expire_threshold_cycle")
@@ -652,7 +1095,9 @@ def _configured_channels(payload: Any) -> set[str]:
         values = payload.get("configured_channels", payload.get("channels", []))
     else:
         raise JournalError("invalid configured channels")
-    if not isinstance(values, list) or any(value not in CHANNELS for value in values):
+    if (not isinstance(values, list)
+            or any(not isinstance(value, str) or value not in CHANNELS
+                   for value in values)):
         raise JournalError("invalid configured channels")
     return set(values)
 
@@ -767,11 +1212,40 @@ def command(args: argparse.Namespace) -> None:
         atomic_write(path, document)
         print(json.dumps(item, separators=(",", ":"), ensure_ascii=False))
     elif args.action in {"expire-thresholds", "expire-threshold"}:
+        migrated = migrate_document(document, args.now)
         expired = expire_pending_thresholds(
-            document, args.window, args.cycle_key, args.limit_id, args.now,
+            migrated, args.window, args.cycle_key, args.limit_id, args.now,
         )
-        if expired:
-            atomic_write(path, document)
+        if migrated is not document or expired:
+            atomic_write(path, migrated)
+    elif args.action in {"expire-owner-thresholds", "expire-thresholds-owner"}:
+        migrated = migrate_document(document, args.now)
+        expired = expire_pending_thresholds_for_owner(
+            migrated, args.window, args.limit_id, args.now,
+        )
+        if migrated is not document or expired:
+            atomic_write(path, migrated)
+    elif args.action in {
+        "expire-owner-thresholds-and-reset",
+        "expire-thresholds-and-local-reset",
+    }:
+        migrated = migrate_document(document, args.now)
+        changed = expire_owner_thresholds_and_suppress_reset(
+            migrated, args.window, args.limit_id, args.reset_epoch, args.now,
+        )
+        if migrated is not document or changed:
+            atomic_write(path, migrated)
+    elif args.action in {"expire-observed-owner", "expire-owner-observed-cycle"}:
+        migrated = migrate_document(document, args.now)
+        request = _read_stdin({})
+        if request is not None and not isinstance(request, dict):
+            raise JournalError("observed owner reset request must be an object")
+        changed = expire_observed_owner_cycle(
+            migrated, args.window, args.limit_id, args.now,
+            args.superseded_reset_epoch, args.preserve_cycle, request or None,
+        )
+        if migrated is not document or changed:
+            atomic_write(path, migrated)
     elif args.action in {"interrupt-owner", "interrupt-pending-owner"}:
         migrated = migrate_document(document, args.now)
         interrupted = interrupt_pending_owner(migrated, args.limit_id, args.now)
@@ -783,6 +1257,20 @@ def command(args: argparse.Namespace) -> None:
             migrated, args.current_limit_id, args.now,
         )
         if migrated is not document or interrupted:
+            atomic_write(path, migrated)
+    elif args.action in {"suppress-local-reset", "tombstone-local-reset"}:
+        migrated = migrate_document(document, args.now)
+        changed = suppress_local_reset_cycle(
+            migrated, args.window, args.limit_id, args.reset_epoch, args.now,
+        )
+        if migrated is not document or changed:
+            atomic_write(path, migrated)
+    elif args.action in {"interrupt-reset-cycle", "tombstone-owner-reset"}:
+        migrated = migrate_document(document, args.now)
+        changed = interrupt_reset_cycle(
+            migrated, args.window, args.limit_id, args.reset_epoch, args.now,
+        )
+        if migrated is not document or changed:
             atomic_write(path, migrated)
     elif args.action == "due":
         configured = _configured_channels(_read_stdin(None))
@@ -881,6 +1369,31 @@ def parser() -> argparse.ArgumentParser:
     expire_thresholds_parser.add_argument("cycle_key")
     expire_thresholds_parser.add_argument("limit_id")
     expire_thresholds_parser.add_argument("--now", type=int, required=True)
+    expire_owner_thresholds_parser = sub.add_parser(
+        "expire-owner-thresholds", aliases=["expire-thresholds-owner"],
+    )
+    expire_owner_thresholds_parser.add_argument("journal")
+    expire_owner_thresholds_parser.add_argument("window", choices=sorted(WINDOWS))
+    expire_owner_thresholds_parser.add_argument("limit_id")
+    expire_owner_thresholds_parser.add_argument("--now", type=int, required=True)
+    expire_owner_atomic_parser = sub.add_parser(
+        "expire-owner-thresholds-and-reset",
+        aliases=["expire-thresholds-and-local-reset"],
+    )
+    expire_owner_atomic_parser.add_argument("journal")
+    expire_owner_atomic_parser.add_argument("window", choices=sorted(WINDOWS))
+    expire_owner_atomic_parser.add_argument("limit_id")
+    expire_owner_atomic_parser.add_argument("reset_epoch", type=int)
+    expire_owner_atomic_parser.add_argument("--now", type=int, required=True)
+    expire_observed_parser = sub.add_parser(
+        "expire-observed-owner", aliases=["expire-owner-observed-cycle"],
+    )
+    expire_observed_parser.add_argument("journal")
+    expire_observed_parser.add_argument("window", choices=sorted(WINDOWS))
+    expire_observed_parser.add_argument("limit_id")
+    expire_observed_parser.add_argument("--superseded-reset-epoch", type=int, default=0)
+    expire_observed_parser.add_argument("--preserve-cycle")
+    expire_observed_parser.add_argument("--now", type=int, required=True)
     interrupt_owner_parser = sub.add_parser(
         "interrupt-owner", aliases=["interrupt-pending-owner"],
     )
@@ -893,6 +1406,22 @@ def parser() -> argparse.ArgumentParser:
     interrupt_other_parser.add_argument("journal")
     interrupt_other_parser.add_argument("current_limit_id")
     interrupt_other_parser.add_argument("--now", type=int, required=True)
+    local_reset_parser = sub.add_parser(
+        "suppress-local-reset", aliases=["tombstone-local-reset"],
+    )
+    local_reset_parser.add_argument("journal")
+    local_reset_parser.add_argument("window", choices=sorted(WINDOWS))
+    local_reset_parser.add_argument("limit_id")
+    local_reset_parser.add_argument("reset_epoch", type=int)
+    local_reset_parser.add_argument("--now", type=int, required=True)
+    interrupt_reset_parser = sub.add_parser(
+        "interrupt-reset-cycle", aliases=["tombstone-owner-reset"],
+    )
+    interrupt_reset_parser.add_argument("journal")
+    interrupt_reset_parser.add_argument("window", choices=sorted(WINDOWS))
+    interrupt_reset_parser.add_argument("limit_id")
+    interrupt_reset_parser.add_argument("reset_epoch", type=int)
+    interrupt_reset_parser.add_argument("--now", type=int, required=True)
     migrate_parser = sub.add_parser("migrate")
     migrate_parser.add_argument("journal")
     migrate_parser.add_argument("--at", type=int, required=True)
