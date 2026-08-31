@@ -431,6 +431,78 @@ class AlertJournalTests(unittest.TestCase):
         )
         alerts.validate_document(self.document, allow_legacy=False)
 
+    def test_observed_weekly_recovery_merges_delivered_channel_from_legacy_failure(self):
+        weekly_id = alerts.canonicalize_limit_id("default")
+        legacy = reset_request(
+            window="weekly", cycle=f"legacy-v4|limit:default|reset:400",
+        )
+        legacy["channels"] = ["discord", "telegram"]
+        legacy["expire_threshold_cycle"] = None
+        legacy_item = alerts.register(self.document, legacy)
+        legacy_item["channels"]["discord"].update(
+            status="delivered", attempt_count=2, last_attempt_at=450,
+            next_attempt_at=0, last_http_status=204, last_curl_code=0,
+            error_class=None,
+        )
+        legacy_item["channels"]["telegram"].update(
+            status="failed", attempt_count=1, last_attempt_at=451,
+            next_attempt_at=0, last_http_status=400, last_curl_code=0,
+            error_class="client_error",
+        )
+        alerts._recompute(legacy_item, 451)
+        self.assertEqual("failed", legacy_item["status"])
+        self.assertEqual("permanent_failure", legacy_item["terminal_reason"])
+
+        modern = reset_request(
+            window="weekly", cycle=f"limit:{weekly_id}|reset:400",
+        )
+        modern["channels"] = ["discord", "telegram"]
+        modern["event_data"]["limit_id"] = weekly_id
+        modern["expire_threshold_cycle"] = None
+        modern_item = alerts.register(self.document, modern)
+
+        changed = alerts.expire_observed_owner_cycle(
+            self.document, "weekly", weekly_id, 500,
+            preserve_cycle=modern["cycle_key"],
+            new_reset_request=modern,
+        )
+
+        self.assertEqual(1, changed)
+        self.assertEqual("pending", modern_item["status"])
+        self.assertEqual("delivered", modern_item["channels"]["discord"]["status"])
+        self.assertEqual(2, modern_item["channels"]["discord"]["attempt_count"])
+        self.assertEqual(450, modern_item["channels"]["discord"]["last_attempt_at"])
+        self.assertEqual(0, modern_item["channels"]["discord"]["next_attempt_at"])
+        self.assertEqual(204, modern_item["channels"]["discord"]["last_http_status"])
+        self.assertEqual(0, modern_item["channels"]["discord"]["last_curl_code"])
+        self.assertIsNone(modern_item["channels"]["discord"]["error_class"])
+        self.assertEqual("pending", modern_item["channels"]["telegram"]["status"])
+        self.assertEqual(0, modern_item["channels"]["telegram"]["attempt_count"])
+        alerts.validate_document(self.document, allow_legacy=False)
+
+        snapshot = json.dumps(self.document, sort_keys=True)
+        self.assertEqual(0, alerts.expire_observed_owner_cycle(
+            self.document, "weekly", weekly_id, 501,
+            preserve_cycle=modern["cycle_key"],
+            new_reset_request=modern,
+        ))
+        self.assertEqual(snapshot, json.dumps(self.document, sort_keys=True))
+        alerts.validate_document(self.document, allow_legacy=False)
+
+        alerts.atomic_write(self.path, self.document)
+        due = subprocess.run(
+            [sys.executable, str(ROOT / "local" / "alerts.py"), "due",
+             str(self.path), "--now", "501"],
+            input=json.dumps({"configured_channels": ["discord", "telegram"]}) + "\n",
+            check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(0, due.returncode, due.stderr)
+        due_rows = [json.loads(line) for line in due.stdout.splitlines()]
+        self.assertEqual(1, len(due_rows))
+        self.assertEqual(modern_item["alert_id"], due_rows[0]["alert_id"])
+        self.assertEqual("telegram", due_rows[0]["channel"])
+        alerts.validate_document(alerts.load(self.path, allow_legacy=False), allow_legacy=False)
+
     def test_observed_weekly_terminal_cycle_prevents_pending_legacy_resurrection(self):
         weekly_id = alerts.canonicalize_limit_id("default")
         modern = reset_request(

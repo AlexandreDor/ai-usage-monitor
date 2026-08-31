@@ -505,6 +505,52 @@ def _same_registration(existing: dict[str, Any], incoming: dict[str, Any]) -> bo
     return all(existing[key] == incoming[key] for key in immutable) and set(existing["channels"]) == set(incoming["channels"])
 
 
+def _merge_observed_reset_channels(authority: dict[str, Any],
+                                   matches: list[dict[str, Any]]) -> bool:
+    """Merge durable channel outcomes into a pending observed-reset authority.
+
+    Equivalent legacy and modern rows can have reached different channel
+    outcomes before de-duplication.  A successful delivery is a per-channel
+    fact, so it must win over both pending and failed state in the row that is
+    retained.  Pending state wins over terminal failure only when the retained
+    row's channel is itself terminal; otherwise the retained pending state is
+    kept so that its retry schedule remains authoritative.  Failed metadata is
+    deliberately not copied over a pending channel: the failed row remains in
+    the journal, while the pending authority keeps that channel retryable.
+    """
+
+    def candidates(name: str, status: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        return [
+            (item, item["channels"][name])
+            for item in matches
+            if name in item["channels"] and item["channels"][name]["status"] == status
+        ]
+
+    def newest_attempt(pair: tuple[dict[str, Any], dict[str, Any]]) -> tuple[int, int, int, str]:
+        item, channel = pair
+        return (
+            channel["last_attempt_at"], channel["attempt_count"],
+            item["created_at"], item["alert_id"],
+        )
+
+    changed = False
+    for name, current in authority["channels"].items():
+        delivered = candidates(name, "delivered")
+        replacement: dict[str, Any] | None = None
+        if delivered:
+            # Keep the complete successful attempt record, not just its
+            # status, so counters and response metadata remain coherent.
+            replacement = max(delivered, key=newest_attempt)[1]
+        elif current["status"] != "pending":
+            pending = candidates(name, "pending")
+            if pending:
+                replacement = max(pending, key=newest_attempt)[1]
+        if replacement is not None and current != replacement:
+            authority["channels"][name] = copy.deepcopy(replacement)
+            changed = True
+    return changed
+
+
 def _register_or_reuse_observed_reset(document: dict[str, Any],
                                       request: dict[str, Any]) -> tuple[dict[str, Any], int]:
     """Register a weekly observed-reset request without rebuilding retries.
@@ -581,6 +627,20 @@ def _register_or_reuse_observed_reset(document: dict[str, Any],
         if not _is_int(completed_at):
             completed_at = max(item["created_at"] for item in matches)
         changed = 0
+        if pending and authority["status"] == "pending":
+            if _merge_observed_reset_channels(authority, matches):
+                attempt_times = [
+                    channel["last_attempt_at"]
+                    for channel in authority["channels"].values()
+                    if channel["last_attempt_at"]
+                ]
+                completion_time = (
+                    max(attempt_times)
+                    if attempt_times
+                    else max(authority["created_at"], completed_at)
+                )
+                _recompute(authority, completion_time)
+                changed += 1
         for duplicate in matches:
             if duplicate is authority or duplicate["status"] != "pending":
                 continue
