@@ -144,7 +144,7 @@ crash_old_five_deadline=$((now + 300))
 crash_new_five_deadline=$((crash_old_five_deadline + 900))
 check_thresholds 100 100 later later "$crash_old_five_deadline" '' "$now" group-a
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   run_alert_script() {
     local crash_exit=99
     exit "$crash_exit"
@@ -183,7 +183,7 @@ crash_old_weekly_deadline=$((now + 4 * 24 * 60 * 60))
 crash_new_weekly_deadline=$((crash_old_weekly_deadline + 3 * 24 * 60 * 60))
 check_thresholds 100 28 unknown later '' "$crash_old_weekly_deadline" "$now" group-a
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   run_alert_script() {
     local crash_exit=99
     exit "$crash_exit"
@@ -378,7 +378,7 @@ persist_alert_state() {
   fi
   persist_alert_state_completion_original
 }
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 run_alert_script() {
   run_alert_script_completion_original "$@"
   : > "$completion_failure_marker"

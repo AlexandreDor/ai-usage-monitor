@@ -475,7 +475,7 @@ register_network_alert threshold 5h 50 \
   # shellcheck disable=SC2034
   ALERT_SCRIPT_1_EVENTS='5h:reset'
   validate_config
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   run_alert_script() {
     exit 99
   }
@@ -696,7 +696,7 @@ validate_config
 (
   # The write-ahead marker and pending context have already been persisted;
   # terminate from the hook invocation before the hook can run.
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   run_alert_script() {
     exit 99
   }
@@ -2042,7 +2042,7 @@ printf '{"schema_version":2,"limit_id_contract_version":1,"legacy_migration":{"s
   validate_config
   # The local arm and hook intent are durable before the hook invocation;
   # terminate there to model a process crash without a persistence-call count.
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   run_alert_script() {
     exit 99
   }
