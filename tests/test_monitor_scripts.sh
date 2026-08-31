@@ -400,6 +400,127 @@ assert_eq "${ALERT_SCRIPT_RULE_IDS[0]}" "$(state_value attempted_script_5h_actio
 check_thresholds 40 100 later unknown "$((now + 300))" '' "$((now + 3))"
 assert_eq 2 "$(wc -l < "$HOOK_LOG")" "completed threshold hook was replayed"
 
+# An owner switch must tombstone a pending local hook before clearing the
+# in-memory action. Simulate the critical state write after that tombstone:
+# the old owner intent remains on disk, but its return must acknowledge it as
+# interrupted without invoking the hook or a notification transport.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:50'
+validate_config
+check_thresholds 80 100 later unknown "$((now + 300))" '' "$now" group-a
+(
+  # shellcheck disable=SC2317,SC2329
+  run_alert_script() {
+    local crash_exit=99
+    exit "$crash_exit"
+  }
+  check_thresholds 40 100 later unknown "$((now + 300))" '' "$((now + 1))" group-a
+) >/dev/null 2>&1 || true
+owner_switch_action_id="${ALERT_SCRIPT_RULE_IDS[0]}"
+assert_eq "$owner_switch_action_id" "$(state_value pending_script_5h_actions)" \
+  "owner switch setup did not leave a pending hook"
+owner_switch_tombstone_marker="${TEST_ROOT}/owner-switch-tombstone.marker"
+owner_switch_failure_marker="${TEST_ROOT}/owner-switch-failure.marker"
+eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_owner_switch_original /')"
+# shellcheck disable=SC2034
+persist_alert_state() {
+  # The first write with an interruption tombstone is allowed through and
+  # records that the next critical write must fail. This leaves the durable
+  # tombstone alongside the old pending intent at the crash boundary.
+  if [[ -n "${interrupted_script_contexts:-}" \
+    && ! -e "$owner_switch_tombstone_marker" ]]; then
+    persist_alert_state_owner_switch_original
+    : > "$owner_switch_tombstone_marker"
+    return 0
+  fi
+  if [[ -e "$owner_switch_tombstone_marker" ]]; then
+    : > "$owner_switch_failure_marker"
+    return 1
+  fi
+  if [[ -e "$owner_switch_failure_marker" ]]; then
+    return 1
+  fi
+  persist_alert_state_owner_switch_original
+}
+check_thresholds 80 100 later unknown "$((now + 300))" '' "$((now + 2))" group-b \
+  >/dev/null 2>&1 || true
+eval "$(declare -f persist_alert_state_owner_switch_original | sed '1s/^persist_alert_state_owner_switch_original /persist_alert_state /')"
+assert_contains "$(state_value interrupted_script_contexts)" "$owner_switch_action_id:" \
+  "owner switch tombstone was not durable after the critical write failure"
+assert_contains "$(state_value interrupted_script_identities)" "$owner_switch_action_id:" \
+  "owner switch stable identity was not durable after the critical write failure"
+assert_eq "$owner_switch_action_id" "$(state_value pending_script_5h_actions)" \
+  "failure boundary did not preserve the old pending hook intent"
+check_thresholds 40 100 later unknown "$((now + 300))" '' "$((now + 3))" group-a
+[[ ! -e "$HOOK_LOG" ]] || fail "interrupted owner hook was replayed after owner return"
+assert_eq "" "$(state_value pending_script_5h_actions)" \
+  "interrupted owner hook remained pending after acknowledgement"
+assert_eq "$owner_switch_action_id" "$(state_value suppressed_script_5h_actions)" \
+  "interrupted owner hook was not durably suppressed"
+assert_eq 0 "$(count_file_lines "$NOTIFICATION_LOG")" \
+  "owner switch recovery emitted an unexpected notification"
+
+# An unarmed threshold uses the owner/unarmed identity rather than a reset
+# deadline. The old intent is suppressed after the switch, while a later reset
+# cycle with a new deadline remains a legitimate, executable action.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:50'
+validate_config
+check_thresholds 80 100 later unknown '' '' "$now" group-a
+(
+  # shellcheck disable=SC2317,SC2329
+  run_alert_script() {
+    local crash_exit=99
+    exit "$crash_exit"
+  }
+  check_thresholds 40 100 later unknown '' '' "$((now + 1))" group-a
+) >/dev/null 2>&1 || true
+unarmed_switch_action_id="${ALERT_SCRIPT_RULE_IDS[0]}"
+assert_eq "$unarmed_switch_action_id" "$(state_value pending_script_5h_actions)" \
+  "unarmed owner switch setup did not leave a pending hook"
+unarmed_switch_tombstone_marker="${TEST_ROOT}/unarmed-switch-tombstone.marker"
+unarmed_switch_failure_marker="${TEST_ROOT}/unarmed-switch-failure.marker"
+eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_unarmed_switch_original /')"
+# shellcheck disable=SC2034
+persist_alert_state() {
+  if [[ -n "${interrupted_script_identities:-}" \
+    && ! -e "$unarmed_switch_tombstone_marker" ]]; then
+    persist_alert_state_unarmed_switch_original
+    : > "$unarmed_switch_tombstone_marker"
+    return 0
+  fi
+  if [[ -e "$unarmed_switch_tombstone_marker" ]]; then
+    : > "$unarmed_switch_failure_marker"
+    return 1
+  fi
+  if [[ -e "$unarmed_switch_failure_marker" ]]; then
+    return 1
+  fi
+  persist_alert_state_unarmed_switch_original
+}
+check_thresholds 80 100 later unknown '' '' "$((now + 2))" group-b \
+  >/dev/null 2>&1 || true
+eval "$(declare -f persist_alert_state_unarmed_switch_original | sed '1s/^persist_alert_state_unarmed_switch_original /persist_alert_state /')"
+assert_contains "$(state_value interrupted_script_identities)" "$unarmed_switch_action_id:" \
+  "unarmed owner switch identity was not durable"
+check_thresholds 40 100 later unknown '' '' "$((now + 3))" group-a
+[[ ! -e "$HOOK_LOG" ]] || fail "unarmed interrupted owner hook was replayed"
+assert_eq "$unarmed_switch_action_id" "$(state_value suppressed_script_5h_actions)" \
+  "unarmed interrupted owner hook was not suppressed"
+
+unarmed_new_cycle_deadline=$((now + 600))
+check_thresholds 80 100 later unknown "$unarmed_new_cycle_deadline" '' "$((now + 4))" group-a
+check_thresholds 100 100 unknown unknown '' '' "$((unarmed_new_cycle_deadline + 1))" group-a
+check_thresholds 40 100 later unknown "$((unarmed_new_cycle_deadline + 900))" '' \
+  "$((unarmed_new_cycle_deadline + 2))" group-a
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" \
+  "new reset cycle was blocked by the old unarmed tombstone"
+assert_contains "$(tail -n 1 "$HOOK_LOG")" \
+  "|$((unarmed_new_cycle_deadline + 900))|" \
+  "new reset cycle did not carry its own reset identity"
+
 # Version 2 state migrates without replaying a threshold already below baseline.
 reset_case
 # shellcheck disable=SC2034

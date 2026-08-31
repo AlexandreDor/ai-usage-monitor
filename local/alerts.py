@@ -623,6 +623,39 @@ def _register_or_reuse_observed_reset(document: dict[str, Any],
             and equivalent_cycle(existing["cycle_key"], normalized_cycle))
     ]
     if matches:
+        interrupted = [
+            item for item in matches
+            if item["status"] != "pending"
+            and item["terminal_reason"] == "owner_interrupted"
+        ]
+        if interrupted:
+            # An owner interruption is a durable terminal decision for this
+            # event identity.  Recovery may retry a genuinely pending
+            # occurrence, but it must never rebuild an occurrence that the
+            # interruption path already tombstoned.  Collapse any duplicate
+            # pending legacy row into the same terminal outcome before
+            # returning the authoritative tombstone.
+            authority = min(
+                interrupted,
+                key=lambda item: (
+                    item["cycle_key"] != normalized_cycle,
+                    item["completed_at"],
+                    item["alert_id"],
+                ),
+            )
+            completed_at = request.get("created_at")
+            if not _is_int(completed_at):
+                completed_at = max(item["created_at"] for item in matches)
+            changed = 0
+            for duplicate in matches:
+                if duplicate is authority or duplicate["status"] != "pending":
+                    continue
+                _terminate(
+                    duplicate, "owner_interrupted", completed_at,
+                    "owner_interrupted",
+                )
+                changed += 1
+            return authority, changed
         # Keep a pending row authoritative when it carries a channel not
         # covered by an equivalent delivery.  Otherwise a delivered row is
         # authoritative and must never be resurrected; when no delivery

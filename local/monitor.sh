@@ -1400,13 +1400,31 @@ PYEOF
 }
 
 pending_script_context_has() {
-  local contexts="$1" wanted="$2" entry
+  local contexts="$1" wanted="$2" expected="${3:-}" entry encoded
   local -a entries=()
   [[ -n "$contexts" ]] || return 1
   IFS=',' read -r -a entries <<< "$contexts"
   for entry in "${entries[@]}"; do
-    [[ "$entry" == *:* && -n "${entry#*:}" \
-      && "${entry%%:*}" == "$wanted" ]] && return 0
+    encoded="${entry#*:}"
+    [[ "$entry" == *:* && -n "$encoded" \
+      && "${entry%%:*}" == "$wanted" \
+      && ( -z "$expected" || "$encoded" == "$expected" ) ]] && return 0
+  done
+  return 1
+}
+
+pending_script_context_entry() {
+  local contexts="$1" wanted="$2" entry encoded
+  local -a entries=()
+  [[ -n "$contexts" ]] || return 1
+  IFS=',' read -r -a entries <<< "$contexts"
+  for entry in "${entries[@]}"; do
+    encoded="${entry#*:}"
+    if [[ "$entry" == *:* && -n "$encoded" \
+      && "${entry%%:*}" == "$wanted" ]]; then
+      printf '%s' "$entry"
+      return 0
+    fi
   done
   return 1
 }
@@ -1439,6 +1457,113 @@ pending_script_context_remove() {
     result="${result:+${result},}${entry}"
   done
   printf '%s' "$result"
+}
+
+encode_alert_script_identity() {
+  local limit_id="$1" cycle_key="$2"
+  python3 - "$limit_id" "$cycle_key" <<'PYEOF'
+import base64
+import json
+import sys
+
+payload = json.dumps(
+    {"limit_id": sys.argv[1], "cycle_key": sys.argv[2]},
+    separators=(",", ":"),
+    ensure_ascii=False,
+).encode("utf-8")
+print(base64.b64encode(payload).decode("ascii"), end="")
+PYEOF
+}
+
+interrupted_script_identity_has() {
+  local identities="$1" wanted="$2" limit_id="$3" cycle_key="$4"
+  local encoded
+  encoded="$(encode_alert_script_identity "$limit_id" "$cycle_key")" || return 1
+  pending_script_context_has "$identities" "$wanted" "$encoded"
+}
+
+mark_interrupted_script_list() {
+  local list="$1" owner_id="$2" reset_epoch="$3"
+  local item entry encoded identity_encoded cycle_key
+  local -a items=()
+  [[ -n "$list" ]] || return 0
+  cycle_key="limit:${owner_id}|unarmed"
+  if [[ "$reset_epoch" =~ ^[0-9]+$ ]] && (( reset_epoch > 0 )); then
+    cycle_key="limit:${owner_id}|reset:${reset_epoch}"
+  fi
+  IFS=',' read -r -a items <<< "$list"
+  for item in "${items[@]}"; do
+    [[ -n "$item" ]] || continue
+    if entry="$(pending_script_context_entry "$pending_script_contexts" "$item")"; then
+      encoded="${entry#*:}"
+      interrupted_script_contexts="$(pending_script_context_set \
+        "$interrupted_script_contexts" "$item" "$encoded")"
+      if [[ -n "$owner_id" ]]; then
+        if ! identity_encoded="$(encode_alert_script_identity "$owner_id" "$cycle_key")"; then
+          return 1
+        fi
+        interrupted_script_identities="$(pending_script_context_set \
+          "$interrupted_script_identities" "$item" "$identity_encoded")"
+      fi
+    elif [[ -n "$owner_id" ]]; then
+      if ! identity_encoded="$(encode_alert_script_identity "$owner_id" "$cycle_key")"; then
+        return 1
+      fi
+      interrupted_script_identities="$(pending_script_context_set \
+        "$interrupted_script_identities" "$item" "$identity_encoded")"
+    else
+      # A pre-v5 ID-only intent has no recoverable owner/cycle identity.  Do
+      # not risk replaying it after an interruption; a future, context-rich
+      # cycle can still use its distinct context once this tombstone is kept.
+      interrupted_script_actions="${interrupted_script_actions:+${interrupted_script_actions},}${item}"
+    fi
+  done
+}
+
+mark_interrupted_script_window() {
+  local window="$1" owner_id="$2" reset_epoch="$3"
+  local previous_contexts="$interrupted_script_contexts"
+  local previous_identities="$interrupted_script_identities"
+  local previous_actions="$interrupted_script_actions"
+  case "$window" in
+    5h)
+      if ! mark_interrupted_script_list "$pending_script_5h_actions" "$owner_id" "$reset_epoch" \
+        || ! mark_interrupted_script_list "$pending_script_5h_reset_actions" "$owner_id" "$reset_epoch"; then
+        interrupted_script_contexts="$previous_contexts"
+        interrupted_script_identities="$previous_identities"
+        interrupted_script_actions="$previous_actions"
+        return 1
+      fi
+      ;;
+    weekly)
+      if ! mark_interrupted_script_list "$pending_script_weekly_actions" "$owner_id" "$reset_epoch" \
+        || ! mark_interrupted_script_list "$pending_script_weekly_reset_actions" "$owner_id" "$reset_epoch"; then
+        interrupted_script_contexts="$previous_contexts"
+        interrupted_script_identities="$previous_identities"
+        interrupted_script_actions="$previous_actions"
+        return 1
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  # The per-list helper intentionally only mutates memory.  Persist once for
+  # the selected window, and roll back all of its marker changes if that write
+  # fails so callers can fail closed before clearing the pending intent.
+  if [[ "$interrupted_script_contexts" == "$previous_contexts" \
+    && "$interrupted_script_identities" == "$previous_identities" \
+    && "$interrupted_script_actions" == "$previous_actions" ]]; then
+    return 0
+  fi
+  if ! persist_alert_state; then
+    interrupted_script_contexts="$previous_contexts"
+    interrupted_script_identities="$previous_identities"
+    interrupted_script_actions="$previous_actions"
+    ALERT_PROCESSING_ERROR="interrupted alert script tombstone persistence failed"
+    echo "[ERROR] Could not journal interrupted alert script actions." >&2
+    return 1
+  fi
 }
 
 remove_pending_script_contexts_for_list() {
@@ -1684,6 +1809,9 @@ persist_alert_state() {
     "pending_script_5h_actions=${pending_script_5h_actions}" \
     "pending_script_weekly_actions=${pending_script_weekly_actions}" \
     "pending_script_contexts=${pending_script_contexts}" \
+    "interrupted_script_contexts=${interrupted_script_contexts}" \
+    "interrupted_script_identities=${interrupted_script_identities}" \
+    "interrupted_script_actions=${interrupted_script_actions}" \
     "suppressed_script_5h_actions=${suppressed_script_5h_actions}" \
     "suppressed_script_weekly_actions=${suppressed_script_weekly_actions}" \
     "script_5h_reset_attempted_at=${script_5h_reset_attempted_at}" \
@@ -1777,12 +1905,47 @@ attempt_alert_script() {
   local previous_contexts="$pending_script_contexts"
   local updated_list cycle_key context_encoded
 
+  cycle_key="limit:${limit_id}|unarmed"
+  if [[ "$reset_at" =~ ^[0-9]+$ ]] && (( reset_at > 0 )); then
+    cycle_key="limit:${limit_id}|reset:${reset_at}"
+  fi
+  if ! context_encoded="$(encode_alert_script_context "$event_kind" "$window" \
+      "$threshold" "$remaining_pct" "$reset_at" "$reset_label" "$scraped_at" \
+      "$message" "$limit_id" "$cycle_key")"; then
+    ALERT_PROCESSING_ERROR="alert script context encoding failed"
+    return 1
+  fi
+
   # Existing attempted_script_* values are the backward-compatible completed
   # ledger. Pending intent is separate: a crash after its write must not be
   # mistaken for a completed hook.
   csv_contains "$previous_completed" "$action_id" && return 0
   csv_contains "$previous_suppressed" "$action_id" && return 0
   csv_contains "$script_actions_started" "$action_id" && return 0
+
+  # An interrupted intent is a durable tombstone, not a retryable pending
+  # action.  Match the immutable context first; the identity fallback is only
+  # for pre-context ID-only state.  New cycles retain their action IDs but use
+  # a different owner/cycle identity and therefore remain executable.
+  if pending_script_context_has "$interrupted_script_contexts" "$action_id" \
+      "$context_encoded" \
+    || interrupted_script_identity_has "$interrupted_script_identities" \
+      "$action_id" "$limit_id" "$cycle_key" \
+    || csv_contains "$interrupted_script_actions" "$action_id"; then
+    updated_list="$(csv_without "$previous_pending" "$action_id")"
+    printf -v "$pending_list_name" '%s' "$updated_list"
+    printf -v "$suppressed_list_name" '%s' "${previous_suppressed:+${previous_suppressed},}${action_id}"
+    pending_script_contexts="$(pending_script_context_remove "$pending_script_contexts" "$action_id")"
+    if ! persist_alert_state; then
+      printf -v "$pending_list_name" '%s' "$previous_pending"
+      printf -v "$suppressed_list_name" '%s' "$previous_suppressed"
+      pending_script_contexts="$previous_contexts"
+      ALERT_PROCESSING_ERROR="interrupted alert script tombstone acknowledgement failed"
+      echo "[ERROR] Could not acknowledge interrupted alert script action." >&2
+      return 1
+    fi
+    return 0
+  fi
 
   if [[ "${ALERTS_ENABLED:-1}" != 1 ]]; then
     # Suppression is an explicit operator decision, not a successful hook.
@@ -1805,17 +1968,6 @@ attempt_alert_script() {
 
   if ! csv_contains "$previous_pending" "$action_id"; then
     printf -v "$pending_list_name" '%s' "${previous_pending:+${previous_pending},}${action_id}"
-    cycle_key="limit:${limit_id}|unarmed"
-    if [[ "$reset_at" =~ ^[0-9]+$ ]] && (( reset_at > 0 )); then
-      cycle_key="limit:${limit_id}|reset:${reset_at}"
-    fi
-    if ! context_encoded="$(encode_alert_script_context "$event_kind" "$window" \
-        "$threshold" "$remaining_pct" "$reset_at" "$reset_label" "$scraped_at" \
-        "$message" "$limit_id" "$cycle_key")"; then
-      printf -v "$pending_list_name" '%s' "$previous_pending"
-      ALERT_PROCESSING_ERROR="alert script context encoding failed"
-      return 1
-    fi
     pending_script_contexts="$(pending_script_context_set "$pending_script_contexts" \
       "$action_id" "$context_encoded")"
     if ! persist_alert_state; then
@@ -1828,16 +1980,6 @@ attempt_alert_script() {
   elif ! pending_script_context_has "$pending_script_contexts" "$action_id"; then
     # Upgrade a legacy ID-only pending marker before running it.  The context
     # then remains autonomous even if this poll clears its detector arm.
-    cycle_key="limit:${limit_id}|unarmed"
-    if [[ "$reset_at" =~ ^[0-9]+$ ]] && (( reset_at > 0 )); then
-      cycle_key="limit:${limit_id}|reset:${reset_at}"
-    fi
-    if ! context_encoded="$(encode_alert_script_context "$event_kind" "$window" \
-        "$threshold" "$remaining_pct" "$reset_at" "$reset_label" "$scraped_at" \
-        "$message" "$limit_id" "$cycle_key")"; then
-      ALERT_PROCESSING_ERROR="alert script context encoding failed"
-      return 1
-    fi
     pending_script_contexts="$(pending_script_context_set "$pending_script_contexts" \
       "$action_id" "$context_encoded")"
     if ! persist_alert_state; then
@@ -2394,6 +2536,9 @@ check_thresholds() {
   local suppressed_script_5h_reset_actions=""
   local suppressed_script_weekly_reset_actions=""
   local pending_script_contexts=""
+  local interrupted_script_contexts=""
+  local interrupted_script_identities=""
+  local interrupted_script_actions=""
   local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold
   local original_pending cycle_key covered_json registration_status disabled_notified transaction_epoch
   local weekly_cycle_key weekly_request_json
@@ -2465,8 +2610,12 @@ check_thresholds() {
         pending_script_5h_actions|pending_script_weekly_actions|pending_script_5h_reset_actions|pending_script_weekly_reset_actions|suppressed_script_5h_actions|suppressed_script_weekly_actions|suppressed_script_5h_reset_actions|suppressed_script_weekly_reset_actions)
           [[ "$state_value" =~ ^([a-f0-9]{24},)*[a-f0-9]{0,24}$ ]] && printf -v "$state_key" '%s' "$state_value"
           ;;
-        pending_script_contexts)
+        pending_script_contexts|interrupted_script_contexts|interrupted_script_identities)
           [[ -z "$state_value" || "$state_value" =~ ^([a-f0-9]{24}:[A-Za-z0-9+/=]+,)*[a-f0-9]{24}:[A-Za-z0-9+/=]+$ ]] \
+            && printf -v "$state_key" '%s' "$state_value"
+          ;;
+        interrupted_script_actions)
+          [[ "$state_value" =~ ^([a-f0-9]{24},)*[a-f0-9]{0,24}$ ]] \
             && printf -v "$state_key" '%s' "$state_value"
           ;;
         script_5h_reset_attempted_at|script_weekly_reset_attempted_at)
@@ -2511,6 +2660,9 @@ check_thresholds() {
   # later cycle cannot replay actions from an interrupted group.
   if (( five_h_armed_reset_at > 0 )) \
     && [[ -z "$five_h_armed_limit_id" ]]; then
+    if ! mark_interrupted_script_window 5h "" "$five_h_armed_reset_at"; then
+      return 1
+    fi
     [[ "$local_observed_5h_reset_at" == "$five_h_armed_reset_at" ]] \
       && local_observed_5h_reset_at=0
     five_h_armed_reset_at=0
@@ -2521,6 +2673,9 @@ check_thresholds() {
     && [[ "$five_h_armed_limit_id" != "$limit_id" ]]; then
     interrupted_5h_owner="$five_h_armed_limit_id"
     interrupted_5h_reset_at="$five_h_armed_reset_at"
+    if ! mark_interrupted_script_window 5h "$five_h_armed_limit_id" "$five_h_armed_reset_at"; then
+      return 1
+    fi
     [[ "$local_observed_5h_reset_at" == "$five_h_armed_reset_at" ]] \
       && local_observed_5h_reset_at=0
     five_h_armed_reset_at=0
@@ -2531,6 +2686,9 @@ check_thresholds() {
   fi
   if (( weekly_armed_reset_at > 0 )) \
     && [[ -z "$weekly_armed_limit_id" ]]; then
+    if ! mark_interrupted_script_window weekly "" "$weekly_armed_reset_at"; then
+      return 1
+    fi
     [[ "$local_observed_weekly_reset_at" == "$weekly_armed_reset_at" ]] \
       && local_observed_weekly_reset_at=0
     weekly_armed_reset_at=0
@@ -2541,6 +2699,9 @@ check_thresholds() {
     && [[ "$weekly_armed_limit_id" != "$limit_id" ]]; then
     interrupted_weekly_owner="$weekly_armed_limit_id"
     interrupted_weekly_reset_at="$weekly_armed_reset_at"
+    if ! mark_interrupted_script_window weekly "$weekly_armed_limit_id" "$weekly_armed_reset_at"; then
+      return 1
+    fi
     [[ "$local_observed_weekly_reset_at" == "$weekly_armed_reset_at" ]] \
       && local_observed_weekly_reset_at=0
     weekly_armed_reset_at=0
@@ -2940,6 +3101,9 @@ check_thresholds() {
   # another group starts a fresh baseline instead of crossing group boundaries.
   if (( state_loaded == 1 )) && [[ -z "$observed_weekly_limit_id" ]]; then
     if (( weekly_observation_valid == 1 )); then
+      if ! mark_interrupted_script_window weekly "$weekly_armed_limit_id" "$weekly_armed_reset_at"; then
+        return 1
+      fi
       prev_weekly_pct="$weekly_pct"
       notified_weekly_thresholds=""
       pending_weekly_threshold=""
@@ -2955,6 +3119,9 @@ check_thresholds() {
     fi
   elif (( weekly_observation_valid == 1 )) \
     && [[ -n "$observed_weekly_limit_id" && "$limit_id" != "$observed_weekly_limit_id" ]]; then
+    if ! mark_interrupted_script_window weekly "$observed_weekly_limit_id" "$weekly_armed_reset_at"; then
+      return 1
+    fi
     prev_weekly_pct="$weekly_pct"
     notified_weekly_thresholds=""
     pending_weekly_threshold=""
@@ -2974,6 +3141,9 @@ check_thresholds() {
     # A partial row from another owner breaks continuity just as a complete
     # group switch does.  Keeping the old baseline would let a later return
     # to that owner look like a reset and cross its scheduled detector state.
+    if ! mark_interrupted_script_window weekly "$observed_weekly_limit_id" "$weekly_armed_reset_at"; then
+      return 1
+    fi
     process_weekly_sample=0
     observed_weekly_pct=""
     observed_weekly_reset_at=0
@@ -3009,10 +3179,16 @@ check_thresholds() {
         notified_5h_thresholds=""
         pending_5h_threshold=""
         script_prev_5h_pct="$five_h_pct"
+        if ! mark_interrupted_script_window 5h "$five_h_armed_limit_id" "$five_h_armed_reset_at"; then
+          return 1
+        fi
         clear_5h_script_actions
         clear_5h_reset_script_actions
       fi
     elif [[ "$observed_5h_limit_id" != "$limit_id" ]]; then
+      if ! mark_interrupted_script_window 5h "$observed_5h_limit_id" "$five_h_armed_reset_at"; then
+        return 1
+      fi
       observed_5h_pct="$five_h_pct"
       observed_5h_reset_at="$five_h_reset_at"
       observed_5h_limit_id="$limit_id"
@@ -3042,6 +3218,9 @@ check_thresholds() {
     # owner starts fresh rather than looking like a reset.  Clear all detector
     # state that could otherwise cross the interruption, while preserving the
     # same-owner partial-sample behavior above.
+    if ! mark_interrupted_script_window 5h "$observed_5h_limit_id" "$five_h_armed_reset_at"; then
+      return 1
+    fi
     process_5h_sample=0
     observed_5h_pct=""
     observed_5h_reset_at=0
@@ -3119,6 +3298,7 @@ check_thresholds() {
   if (( observed_weekly_reset_at > 0 )) \
     && [[ "$limit_id" == "$observed_weekly_limit_id" ]] \
     && (( observed_weekly_reset_recovery == 0 )) \
+    && (( observed_weekly_scheduled_due == 0 )) \
     && is_random_weekly_reset "$observed_weekly_pct" "$weekly_pct" \
       "$observed_weekly_reset_at" "$weekly_reset_at"; then
     weekly_armed_reset_at="$scraped_at_epoch"
