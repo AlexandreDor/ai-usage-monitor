@@ -523,7 +523,8 @@ def _merge_observed_reset_channels(authority: dict[str, Any],
     Channels present only on another pending equivalent row are added to the
     authority, so selecting one occurrence cannot discard configured channels.
     Channels newly requested by the current recovery are added as fresh
-    pending state when no equivalent delivery covers them.
+    pending state when no equivalent delivery covers them, including when
+    the retained authority currently records a terminal failure.
     """
 
     def candidates(name: str, status: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -558,7 +559,11 @@ def _merge_observed_reset_channels(authority: dict[str, Any],
             pending = candidates(name, "pending")
             if pending:
                 replacement = max(pending, key=newest_attempt)[1]
-            elif current is None and name in requested:
+            elif name in requested:
+                # A prior terminal failure must not block a recovery retry.
+                # Start a fresh state so stale terminal metadata cannot make
+                # the reconstructed occurrence terminal again.  Equivalent
+                # deliveries were handled above and remain immutable.
                 replacement = _channel_state()
         if replacement is not None and current != replacement:
             _validate_channel(name, replacement)

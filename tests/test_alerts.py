@@ -503,6 +503,80 @@ class AlertJournalTests(unittest.TestCase):
         self.assertEqual("telegram", due_rows[0]["channel"])
         alerts.validate_document(alerts.load(self.path, allow_legacy=False), allow_legacy=False)
 
+    def test_observed_weekly_recovery_retries_failed_channel_without_pending_occurrence(self):
+        weekly_id = alerts.canonicalize_limit_id("default")
+        existing_request = reset_request(
+            window="weekly", cycle="legacy-v4|limit:default|reset:400",
+            created=400,
+        )
+        existing_request["channels"] = ["discord", "telegram"]
+        existing_request["expire_threshold_cycle"] = None
+        existing = alerts.register(self.document, existing_request)
+        existing["channels"]["discord"].update(
+            status="delivered", attempt_count=2, last_attempt_at=450,
+            next_attempt_at=0, last_http_status=204, last_curl_code=0,
+            error_class=None,
+        )
+        existing["channels"]["telegram"].update(
+            status="failed", attempt_count=1, last_attempt_at=451,
+            next_attempt_at=0, last_http_status=None, last_curl_code=None,
+            error_class="channel_unconfigured",
+        )
+        alerts._recompute(existing, 451)
+        self.assertEqual("failed", existing["status"])
+        self.assertEqual("channel_unconfigured", existing["terminal_reason"])
+
+        recovery = reset_request(
+            window="weekly", created=500,
+            cycle=f"limit:{weekly_id}|reset:400",
+        )
+        recovery["channels"] = ["discord", "telegram"]
+        recovery["event_data"]["limit_id"] = weekly_id
+        recovery["expire_threshold_cycle"] = None
+
+        changed = alerts.expire_observed_owner_cycle(
+            self.document, "weekly", weekly_id, 500,
+            preserve_cycle=recovery["cycle_key"],
+            new_reset_request=recovery,
+        )
+
+        self.assertEqual(1, changed)
+        self.assertEqual(1, len(self.document["alerts"]))
+        self.assertIs(existing, self.document["alerts"][0])
+        self.assertEqual("pending", existing["status"])
+        self.assertIsNone(existing["terminal_reason"])
+        self.assertEqual("delivered", existing["channels"]["discord"]["status"])
+        self.assertEqual(2, existing["channels"]["discord"]["attempt_count"])
+        self.assertEqual(450, existing["channels"]["discord"]["last_attempt_at"])
+        self.assertEqual("pending", existing["channels"]["telegram"]["status"])
+        self.assertEqual(0, existing["channels"]["telegram"]["attempt_count"])
+        self.assertEqual(0, existing["channels"]["telegram"]["next_attempt_at"])
+        self.assertIsNone(existing["channels"]["telegram"]["error_class"])
+        alerts.validate_document(self.document, allow_legacy=False)
+
+        snapshot = json.dumps(self.document, sort_keys=True)
+        self.assertEqual(0, alerts.expire_observed_owner_cycle(
+            self.document, "weekly", weekly_id, 501,
+            preserve_cycle=recovery["cycle_key"],
+            new_reset_request=recovery,
+        ))
+        self.assertEqual(snapshot, json.dumps(self.document, sort_keys=True))
+        alerts.validate_document(self.document, allow_legacy=False)
+
+        alerts.atomic_write(self.path, self.document)
+        due = subprocess.run(
+            [sys.executable, str(ROOT / "local" / "alerts.py"), "due",
+             str(self.path), "--now", "501"],
+            input=json.dumps({"configured_channels": ["discord", "telegram"]}) + "\n",
+            check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(0, due.returncode, due.stderr)
+        due_rows = [json.loads(line) for line in due.stdout.splitlines()]
+        self.assertEqual(1, len(due_rows))
+        self.assertEqual(existing["alert_id"], due_rows[0]["alert_id"])
+        self.assertEqual("telegram", due_rows[0]["channel"])
+        alerts.validate_document(alerts.load(self.path, allow_legacy=False), allow_legacy=False)
+
     def test_observed_weekly_recovery_preserves_pending_extra_channel(self):
         weekly_id = alerts.canonicalize_limit_id("default")
         legacy = reset_request(
