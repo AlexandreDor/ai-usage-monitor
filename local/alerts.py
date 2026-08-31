@@ -508,7 +508,8 @@ def _same_registration(existing: dict[str, Any], incoming: dict[str, Any]) -> bo
 
 
 def _merge_observed_reset_channels(authority: dict[str, Any],
-                                   matches: list[dict[str, Any]]) -> bool:
+                                   matches: list[dict[str, Any]],
+                                   requested_channels: Iterable[str] = ()) -> bool:
     """Merge durable channel outcomes into a pending observed-reset authority.
 
     Equivalent legacy and modern rows can have reached different channel
@@ -521,6 +522,8 @@ def _merge_observed_reset_channels(authority: dict[str, Any],
     the journal, while the pending authority keeps that channel retryable.
     Channels present only on another pending equivalent row are added to the
     authority, so selecting one occurrence cannot discard configured channels.
+    Channels newly requested by the current recovery are added as fresh
+    pending state when no equivalent delivery covers them.
     """
 
     def candidates(name: str, status: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -537,10 +540,12 @@ def _merge_observed_reset_channels(authority: dict[str, Any],
             item["created_at"], item["alert_id"],
         )
 
+    requested = set(requested_channels)
     changed = False
-    channel_names = sorted({
-        name for item in matches for name in item["channels"]
-    })
+    channel_names = sorted(
+        requested
+        | {name for item in matches for name in item["channels"]}
+    )
     for name in channel_names:
         current = authority["channels"].get(name)
         delivered = candidates(name, "delivered")
@@ -553,6 +558,8 @@ def _merge_observed_reset_channels(authority: dict[str, Any],
             pending = candidates(name, "pending")
             if pending:
                 replacement = max(pending, key=newest_attempt)[1]
+            elif current is None and name in requested:
+                replacement = _channel_state()
         if replacement is not None and current != replacement:
             _validate_channel(name, replacement)
             authority["channels"][name] = copy.deepcopy(replacement)
@@ -657,20 +664,20 @@ def _register_or_reuse_observed_reset(document: dict[str, Any],
         if not _is_int(completed_at):
             completed_at = max(item["created_at"] for item in matches)
         changed = 0
-        if pending and authority["status"] == "pending":
-            if _merge_observed_reset_channels(authority, matches):
-                attempt_times = [
-                    channel["last_attempt_at"]
-                    for channel in authority["channels"].values()
-                    if channel["last_attempt_at"]
-                ]
-                completion_time = (
-                    max(attempt_times)
-                    if attempt_times
-                    else max(authority["created_at"], completed_at)
-                )
-                _recompute(authority, completion_time)
-                changed += 1
+        if _merge_observed_reset_channels(
+                authority, matches, request["channels"]):
+            attempt_times = [
+                channel["last_attempt_at"]
+                for channel in authority["channels"].values()
+                if channel["last_attempt_at"]
+            ]
+            completion_time = (
+                max(attempt_times)
+                if attempt_times
+                else max(authority["created_at"], completed_at)
+            )
+            _recompute(authority, completion_time)
+            changed += 1
         for duplicate in matches:
             if duplicate is authority or duplicate["status"] != "pending":
                 continue
