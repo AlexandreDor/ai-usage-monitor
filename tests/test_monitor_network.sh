@@ -2013,9 +2013,9 @@ assert_eq delivered "$(json_field "${ALERT_DELIVERIES_FILE}" alerts.1.status)" \
   "weekly reset recovery did not deliver the original occurrence"
 
 # A reset observed from a restored baseline can have no durable arm yet.  The
-# first observed poll must persist a local-only arm before the final detector
-# write; if the process stops at that boundary, a changed restart sample still
-# runs the hook once and never creates a scheduled network reset.
+# first observed poll must persist a local-only arm before the hook runs; if the
+# process stops at that boundary, a changed restart sample still runs the hook
+# once and never creates a scheduled network reset.
 rm -f "${STATE_FILE}" "${ALERT_DELIVERIES_FILE}" "${FAKE_CURL_LOG}"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-no-arm-hook-recovery"
 export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
@@ -2034,21 +2034,17 @@ check_thresholds 100 100 later unknown "${no_arm_hook_old}" '' \
   "${no_arm_hook_now}" group-a >/dev/null
 printf '{"schema_version":2,"limit_id_contract_version":1,"legacy_migration":{"source_state_version":5,"completed_at":%s},"alerts":[]}\n' \
   "${no_arm_hook_now}" > "${ALERT_DELIVERIES_FILE}"
-# shellcheck disable=SC2317,SC2329,SC2001
-eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_no_arm_original /')"
 (
   # shellcheck disable=SC2034
   ALERT_SCRIPT_1="${no_arm_hook}"
   # shellcheck disable=SC2034
   ALERT_SCRIPT_1_EVENTS='5h:reset'
   validate_config
-  no_arm_persist_calls=0
-  persist_alert_state() {
-    no_arm_persist_calls=$((no_arm_persist_calls + 1))
-    if (( no_arm_persist_calls == 2 )); then
-      exit 99
-    fi
-    persist_alert_state_no_arm_original
+  # The local arm and hook intent are durable before the hook invocation;
+  # terminate there to model a process crash without a persistence-call count.
+  # shellcheck disable=SC2329
+  run_alert_script() {
+    exit 99
   }
   check_thresholds 100 100 later unknown "${no_arm_hook_new}" '' \
     "$((no_arm_hook_now + 1))" group-a >/dev/null
@@ -2057,7 +2053,6 @@ assert_eq "$((no_arm_hook_now + 1))" "$(awk -F= '$1 == "local_observed_5h_reset_
   "no-arm observed reset marker was not written before final persistence"
 assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
   "no-arm observed reset emitted HTTP before restart"
-eval "$(declare -f persist_alert_state_no_arm_original | sed '1s/^persist_alert_state_no_arm_original /persist_alert_state /')"
 (
   # shellcheck disable=SC2034
   ALERT_SCRIPT_1="${no_arm_hook}"
