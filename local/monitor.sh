@@ -3039,6 +3039,8 @@ check_thresholds() {
       five_h_baseline_trusted=1
       five_h_baseline_migration_pending=0
     elif (( five_h_armed_reset_at == 0 )) \
+      && (( observed_5h_reset_at > 0 )) \
+      && (( scraped_at_epoch >= observed_5h_reset_at )) \
       && { (( five_h_observation_valid == 0 )) || ! percentage_below_full "$five_h_pct"; }; then
       five_h_legacy_baseline_cleanup=1
     fi
@@ -3276,7 +3278,13 @@ check_thresholds() {
       return 1
     fi
     observed_5h_atomic_done=1
-    five_h_baseline_migration_pending=0
+    # Keep the migration intent while the current observation is partial.  A
+    # complete sample is still required to establish the trusted baseline; if
+    # the process stops after this journal write, the marker makes the next
+    # partial poll repeat the cleanup before any detector work.
+    if (( five_h_observation_valid == 1 )); then
+      five_h_baseline_migration_pending=0
+    fi
   fi
 
   # Close an observed 5-hour cycle immediately after the journal is known to
@@ -3623,10 +3631,13 @@ check_thresholds() {
       five_h_baseline_migration_pending=0
       five_h_last_sampled_at_epoch=0
       five_h_last_sample_interval_seconds=900
-      if ! percentage_below_full "$five_h_pct"; then
+      if (( five_h_legacy_baseline_cleanup == 1 )) \
+        || ! percentage_below_full "$five_h_pct"; then
         # A complete full sample establishes the first trusted baseline after
         # migration (or after an initial partial observation), but must not
-        # replay the untrusted historical percentage/deadline.
+        # replay the untrusted historical percentage/deadline.  The same rule
+        # applies to a low sample after the retained deadline: the old cycle
+        # has just been closed, so this sample is baseline-only as well.
         initialize_5h_baseline=1
         process_5h_sample=0
         prev_5h_pct="$five_h_pct"
@@ -3673,10 +3684,15 @@ check_thresholds() {
     # that threshold baseline to the sample's owner immediately so later
     # partial samples can be compared safely without looking like legacy state.
     observed_5h_limit_id="$limit_id"
-  elif (( state_loaded == 1 && journal_source_state_version < ALERT_STATE_VERSION \
-          && five_h_baseline_trusted == 0 )); then
+  elif (( state_loaded == 1 && five_h_baseline_trusted == 0 \
+          && (five_h_baseline_migration_pending == 1 \
+              || journal_source_state_version < ALERT_STATE_VERSION) )); then
     # Until a complete sample establishes the migrated baseline, a partial
     # sample must not run threshold or hook detectors against legacy state.
+    # The migration may already have rewritten the source file to v6 before a
+    # crash, so the durable migration marker is checked alongside the raw
+    # source version. A fresh v6 detector with no migration marker retains its
+    # normal partial-sample continuity.
     process_5h_sample=0
   fi
 
