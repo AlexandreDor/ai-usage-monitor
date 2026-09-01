@@ -56,7 +56,9 @@ export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-silent"
 export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
 DISCORD_WEBHOOK='https://discord.com/api/webhooks/123/token'
 TELEGRAM_BOT_TOKEN='' TELEGRAM_CHAT_ID=''
-old_five_deadline=$((2000000100 + 300))
+# Keep the planned deadline after both samples so this remains the legitimate
+# observed-refill case; a crossed deadline is covered by the scheduled tests.
+old_five_deadline=$((2000000100 + 1800))
 new_five_deadline=$((old_five_deadline + 900))
 check_thresholds 100 100 later unknown "$old_five_deadline" '' 2000000100 group-a >/dev/null
 python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
@@ -78,6 +80,68 @@ PYEOF
 ALERT_THRESHOLDS=75
 TELEGRAM_BOT_TOKEN='123:token'
 TELEGRAM_CHAT_ID=-456
+
+# A complete 5h sample can cross its planned deadline through a same-owner
+# partial sample.  The live event must use the old deadline as both its cycle
+# identity and creation anchor, with no local observed-refill duplicate.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-5h-full-partial-full"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+unset FAKE_CURL_DISCORD_STATUS_SEQUENCE
+DISCORD_WEBHOOK='https://discord.com/api/webhooks/123/token'
+TELEGRAM_BOT_TOKEN='' TELEGRAM_CHAT_ID=''
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=0
+five_h_partial_full_before=2000003000
+five_h_partial_full_old_deadline=$((five_h_partial_full_before + 900))
+five_h_partial_full_partial=$((five_h_partial_full_old_deadline + 900))
+five_h_partial_full_after=$((five_h_partial_full_partial + 900))
+five_h_partial_full_new_deadline=$((five_h_partial_full_old_deadline + 5 * 60 * 60))
+five_h_partial_full_id="$(canonicalize_alert_limit_id group-a)"
+check_thresholds 100 100 unknown unknown "$five_h_partial_full_old_deadline" '' \
+  "$five_h_partial_full_before" group-a >/dev/null
+check_thresholds 80 100 unknown unknown '' '' \
+  "$five_h_partial_full_partial" group-a >/dev/null
+assert_eq "$five_h_partial_full_before" \
+  "$(awk -F= '$1 == "five_h_last_sampled_at_epoch" {print $2}' "$STATE_FILE")" \
+  "same-owner partial masked the complete 5h live baseline"
+check_thresholds 100 100 unknown unknown "$five_h_partial_full_new_deadline" '' \
+  "$five_h_partial_full_after" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "5h full-partial-full crossing did not send one live reset"
+python3 - "$ALERT_DELIVERIES_FILE" "$five_h_partial_full_id" \
+  "$five_h_partial_full_old_deadline" "$five_h_partial_full_after" \
+  "$STATE_FILE" <<'PYEOF'
+import json
+import pathlib
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"]
+assert len(resets) == 1, items
+reset = resets[0]
+assert reset["event_data"] == {
+    "limit_id": sys.argv[2], "reset_epoch": int(sys.argv[3]),
+}, reset
+assert reset["cycle_key"] == f"limit:{sys.argv[2]}|reset:{sys.argv[3]}", reset
+assert reset["status"] == "delivered", reset
+assert reset["created_at"] == int(sys.argv[3]), reset
+assert not any(
+    item["kind"] == "reset"
+    and item["event_data"].get("reset_epoch") == int(sys.argv[4])
+    for item in items
+), items
+assert not any(
+    item["kind"] == "reset" and item.get("terminal_reason") == "local_observed"
+    for item in items
+), items
+state = dict(
+    line.split("=", 1)
+    for line in pathlib.Path(sys.argv[5]).read_text(encoding="utf-8").splitlines()
+    if "=" in line
+)
+assert state["five_h_last_sampled_at_epoch"] == sys.argv[4], state
+PYEOF
 
 # An observed refill also invalidates a pending threshold attached to the
 # already-armed cycle (not only an unarmed threshold).  It must remain local:

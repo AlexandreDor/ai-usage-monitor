@@ -1967,6 +1967,8 @@ persist_alert_state() {
     "observed_weekly_pct=${observed_weekly_pct}" \
     "observed_weekly_reset_at=${observed_weekly_reset_at}" \
     "observed_weekly_limit_id=${observed_weekly_limit_id}" \
+    "five_h_last_sampled_at_epoch=${five_h_last_sampled_at_epoch}" \
+    "five_h_last_sample_interval_seconds=${five_h_last_sample_interval_seconds}" \
     "last_sampled_at_epoch=${last_sampled_at_epoch}" \
     "last_sample_interval_seconds=${last_sample_interval_seconds}" \
     "five_h_armed_reset_at=${five_h_armed_reset_at}" \
@@ -2710,6 +2712,8 @@ check_thresholds() {
   local observed_weekly_pct=""
   local observed_weekly_reset_at=0
   local observed_weekly_limit_id=""
+  local five_h_last_sampled_at_epoch=0
+  local five_h_last_sample_interval_seconds=900
   local last_sampled_at_epoch=0
   local last_sample_interval_seconds=900
   local five_h_armed_reset_at=0
@@ -2763,6 +2767,7 @@ check_thresholds() {
   local observed_5h_initial_no_arm=0
   local observed_weekly_reset_recovery=0 weekly_intent_succeeded=1
   local observed_weekly_scheduled_due=0 weekly_atomic_done=0
+  local five_h_gap_within_archive_bound=1
   local weekly_gap_within_archive_bound=1
   local interrupted_5h_owner="" interrupted_5h_reset_at=0
   local interrupted_weekly_owner="" interrupted_weekly_reset_at=0
@@ -2800,12 +2805,12 @@ check_thresholds() {
             printf -v "$state_key" '%s' "$state_value"
           fi
           ;;
-        last_sampled_at_epoch)
+        five_h_last_sampled_at_epoch|last_sampled_at_epoch)
           if [[ "$state_value" =~ ^(0|[1-9][0-9]{0,11})$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
           fi
           ;;
-        last_sample_interval_seconds)
+        five_h_last_sample_interval_seconds|last_sample_interval_seconds)
           if [[ "$state_value" =~ ^[1-9][0-9]{0,4}$ ]] \
             && (( state_value <= 86400 )); then
             printf -v "$state_key" '%s' "$state_value"
@@ -2937,6 +2942,33 @@ check_thresholds() {
     script_weekly_reset_attempted_at=0
     clear_weekly_reset_script_actions
     clear_weekly_script_actions
+  fi
+
+  # A complete 5h observation can straddle a planned deadline without an
+  # intermediate complete poll.  Same-owner partial samples are intentionally
+  # skipped, so the stored complete-sample timestamp supplies the strict
+  # previous-sample and shared archive/live gap checks.  Keep a durable local
+  # marker authoritative; it represents a previously consumed local cycle.
+  if (( five_h_last_sampled_at_epoch > 0 )) \
+    && ! is_reset_observation_gap_acceptable \
+      "$five_h_last_sampled_at_epoch" "$scraped_at_epoch" \
+      "$five_h_last_sample_interval_seconds" "$sample_interval_seconds"; then
+    five_h_gap_within_archive_bound=0
+  fi
+  if (( five_h_armed_reset_at == 0 )) \
+    && [[ "$observed_5h_limit_id" == "$limit_id" ]] \
+    && (( five_h_gap_within_archive_bound == 1 )) \
+    && (( local_observed_5h_reset_at == 0 )) \
+    && [[ "$observed_5h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] \
+    && (( five_h_observation_valid == 1 )) \
+    && [[ "$five_h_reset_at" =~ ^[0-9]+$ ]] \
+    && (( five_h_last_sampled_at_epoch > 0 \
+          && five_h_last_sampled_at_epoch < observed_5h_reset_at \
+          && observed_5h_reset_at <= scraped_at_epoch \
+          && five_h_reset_at > observed_5h_reset_at )); then
+    five_h_armed_reset_at="$observed_5h_reset_at"
+    five_h_armed_limit_id="$limit_id"
+    observed_5h_scheduled_due=1
   fi
 
   # Detect this candidate before a missing delivery journal is reconstructed.
@@ -4246,10 +4278,14 @@ PYEOF
     # entries.  Subsequent cycles return to normal expire-before-deliver order.
     alerts_disabled_since=0
   fi
-  # Keep the previous complete weekly observation timestamp and cadence beside
+  # Keep the previous complete observation timestamp and cadence beside
   # detector state. This is the live equivalent of archive.py's adjacent
   # complete-snapshot gap check: a partial observation must not hide an old
-  # complete baseline and make a sparse full-to-full pair look recent.
+  # complete baseline and make a sparse pair look recent.
+  if (( five_h_observation_valid == 1 )); then
+    five_h_last_sampled_at_epoch="$scraped_at_epoch"
+    five_h_last_sample_interval_seconds="$sample_interval_seconds"
+  fi
   if (( weekly_observation_valid == 1 )); then
     last_sampled_at_epoch="$scraped_at_epoch"
     last_sample_interval_seconds="$sample_interval_seconds"
