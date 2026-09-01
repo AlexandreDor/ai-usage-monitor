@@ -428,6 +428,78 @@ check_thresholds 40 100 later unknown "$partial_recovery_new_deadline" '' \
 assert_eq 0 "$(awk -F= '$1 == "five_h_baseline_migration_pending" {print $2}' "$STATE_FILE")" \
   "complete migration recovery did not clear the cleanup marker"
 
+# A complete, already-consumed sample must also close the migrated old cycle,
+# and the marker must survive a crash at the later reconciliation write.  This
+# catches both the low-percentage cleanup path and the intermediate state image
+# in which the complete baseline has not yet been persisted.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-migrated-reconcile-crash"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+post_reconcile_now=2000005050
+post_reconcile_old_deadline=$((post_reconcile_now - 60))
+post_reconcile_new_deadline=$((post_reconcile_old_deadline + 900))
+post_reconcile_limit_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${post_reconcile_old_deadline}" \
+  "observed_5h_limit_id=${post_reconcile_limit_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=50' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$post_reconcile_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+register_network_alert threshold 5h 50 \
+  "limit:${post_reconcile_limit_id}|reset:${post_reconcile_old_deadline}" \
+  "post-reconciliation migration threshold" \
+  "{\"limit_id\":\"${post_reconcile_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${post_reconcile_old_deadline},\"covered_thresholds\":[50]}" \
+  "$((post_reconcile_now - 1))" "$((post_reconcile_old_deadline + 5 * 60 * 60))" false >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_reconcile_original /')"
+(
+  persist_alert_state() {
+    persist_alert_state_reconcile_original "$@"
+    exit 99
+  }
+  check_thresholds 40 100 later unknown "$post_reconcile_new_deadline" '' \
+    "$post_reconcile_now" group-a >/dev/null
+) >/dev/null 2>&1 || true
+eval "$(declare -f persist_alert_state_reconcile_original | sed '1s/^persist_alert_state_reconcile_original /persist_alert_state /')"
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "post-reconciliation migration crash delivered the old threshold"
+assert_eq 6 "$(awk -F= '$1 == "state_version" {print $2}' "$STATE_FILE")" \
+  "post-reconciliation migration crash did not durably migrate state"
+assert_eq 1 "$(awk -F= '$1 == "five_h_baseline_migration_pending" {print $2}' "$STATE_FILE")" \
+  "post-reconciliation migration crash lost the cleanup marker"
+check_thresholds 40 100 unknown unknown '' '' \
+  "$((post_reconcile_now + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "post-reconciliation partial recovery delivered an unarmed threshold"
+python3 - "$ALERT_DELIVERIES_FILE" "$post_reconcile_limit_id" "$post_reconcile_old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 1, items
+threshold = items[0]
+assert threshold["kind"] == "threshold", threshold
+assert threshold["event_data"]["limit_id"] == sys.argv[2], threshold
+assert threshold["event_data"]["reset_epoch"] == int(sys.argv[3]), threshold
+assert threshold["status"] == "failed", threshold
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+PYEOF
+check_thresholds 40 100 later unknown "$post_reconcile_new_deadline" '' \
+  "$((post_reconcile_now + 2))" group-a >/dev/null
+assert_eq 0 "$(awk -F= '$1 == "five_h_baseline_migration_pending" {print $2}' "$STATE_FILE")" \
+  "post-reconciliation complete baseline did not clear the cleanup marker"
+assert_eq "$((post_reconcile_now + 2))" \
+  "$(awk -F= '$1 == "five_h_last_sampled_at_epoch" {print $2}' "$STATE_FILE")" \
+  "post-reconciliation complete baseline did not persist its timestamp"
+
 # A due, explicitly same-owner arm owns a simultaneous 100% -> 100% deadline
 # advance.  With no journal on disk, initialization must reconstruct the
 # scheduled reset rather than skipping it as a local observed reset.  The

@@ -2841,6 +2841,7 @@ check_thresholds() {
   local discard_other_group_terminal=0
   local resumed_after_disabled=0 resume_delivery_attempted=0
   local journal_source_state_version=1 raw_source_state_version
+  local alert_delivery_journal_preexisting=0
   local -a script_thresholds=()
   ALERT_PROCESSING_ERROR=""
   SCRIPT_HOOK_FAILED=0
@@ -2946,6 +2947,7 @@ check_thresholds() {
   elif (( alerts_disabled_since > 0 )); then
     resumed_after_disabled=1
   fi
+  [[ -e "$ALERT_DELIVERIES_FILE" ]] && alert_delivery_journal_preexisting=1
 
   mapfile -t thresholds < <(load_thresholds)
   pace="$(weekly_pace_vs_ideal "$weekly_pct" "$weekly_reset_at" "$scraped_at_epoch")"
@@ -3037,11 +3039,12 @@ check_thresholds() {
       && (( five_h_reset_at > observed_5h_reset_at )) \
       && (( scraped_at_epoch < observed_5h_reset_at )); then
       five_h_baseline_trusted=1
-      five_h_baseline_migration_pending=0
+      five_h_last_sampled_at_epoch="$scraped_at_epoch"
+      five_h_last_sample_interval_seconds="$sample_interval_seconds"
     elif (( five_h_armed_reset_at == 0 )) \
       && (( observed_5h_reset_at > 0 )) \
       && (( scraped_at_epoch >= observed_5h_reset_at )) \
-      && { (( five_h_observation_valid == 0 )) || ! percentage_below_full "$five_h_pct"; }; then
+      && (( alert_delivery_journal_preexisting == 1 )); then
       five_h_legacy_baseline_cleanup=1
     fi
   fi
@@ -3278,13 +3281,10 @@ check_thresholds() {
       return 1
     fi
     observed_5h_atomic_done=1
-    # Keep the migration intent while the current observation is partial.  A
-    # complete sample is still required to establish the trusted baseline; if
-    # the process stops after this journal write, the marker makes the next
-    # partial poll repeat the cleanup before any detector work.
-    if (( five_h_observation_valid == 1 )); then
-      five_h_baseline_migration_pending=0
-    fi
+    # Keep the migration intent until the complete baseline and its timestamp
+    # are persisted together at the end of this cycle. If the process stops
+    # after this journal write, the marker makes the next poll repeat cleanup
+    # before any detector work.
   fi
 
   # Close an observed 5-hour cycle immediately after the journal is known to
@@ -3578,7 +3578,8 @@ check_thresholds() {
       observed_5h_limit_id="$limit_id"
       local_observed_5h_reset_at=0
       five_h_baseline_trusted=1
-      five_h_baseline_migration_pending=0
+      five_h_last_sampled_at_epoch="$scraped_at_epoch"
+      five_h_last_sample_interval_seconds="$sample_interval_seconds"
       initialize_5h_baseline=1
       if (( state_loaded == 1 )); then
         # State from before the owner-aware format has no trustworthy 5h
@@ -3604,7 +3605,8 @@ check_thresholds() {
       observed_5h_limit_id="$limit_id"
       local_observed_5h_reset_at=0
       five_h_baseline_trusted=1
-      five_h_baseline_migration_pending=0
+      five_h_last_sampled_at_epoch="$scraped_at_epoch"
+      five_h_last_sample_interval_seconds="$sample_interval_seconds"
       initialize_5h_baseline=1
       process_5h_sample=0
       # A complete sample from a new limit group is a fresh baseline.  Clear
@@ -3628,9 +3630,8 @@ check_thresholds() {
       observed_5h_reset_at="$five_h_reset_at"
       observed_5h_limit_id="$limit_id"
       five_h_baseline_trusted=1
-      five_h_baseline_migration_pending=0
-      five_h_last_sampled_at_epoch=0
-      five_h_last_sample_interval_seconds=900
+      five_h_last_sampled_at_epoch="$scraped_at_epoch"
+      five_h_last_sample_interval_seconds="$sample_interval_seconds"
       if (( five_h_legacy_baseline_cleanup == 1 )) \
         || ! percentage_below_full "$five_h_pct"; then
         # A complete full sample establishes the first trusted baseline after
@@ -4449,6 +4450,11 @@ PYEOF
     five_h_last_sampled_at_epoch="$scraped_at_epoch"
     five_h_last_sample_interval_seconds="$sample_interval_seconds"
     five_h_baseline_trusted=1
+    # Retire migration cleanup only after the complete owner-aware baseline,
+    # trust bit, timestamp and cadence are all in the final state image. Any
+    # earlier state write keeps this marker and therefore remains fail-closed
+    # on a subsequent partial sample.
+    five_h_baseline_migration_pending=0
   fi
   if (( weekly_observation_valid == 1 )); then
     last_sampled_at_epoch="$scraped_at_epoch"
