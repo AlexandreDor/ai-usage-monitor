@@ -413,6 +413,114 @@ with sqlite3.connect(sys.argv[1]) as connection:
 PYEOF
 )" "observed 5h reset reconstruction created duplicates"
 
+# A same-owner partial 5h sample can span a scheduled reset.  The complete
+# baseline must retain its percentage and deadline, then anchor the event to
+# the crossed deadline rather than the final observation.
+rm -f "$ARCHIVE_FILE"
+five_scheduled_partial_before=$((BASE - 1800))
+five_scheduled_partial_deadline=$((BASE - 900))
+five_scheduled_partial_sample=$BASE
+five_scheduled_partial_after=$((BASE + 900))
+five_scheduled_partial_new_deadline=$((five_scheduled_partial_deadline + 5 * 3600))
+printf '{"five_h_pct":40,"five_h_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$five_scheduled_partial_deadline" "$(iso_at "$five_scheduled_partial_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":30,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$(iso_at "$five_scheduled_partial_sample")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$five_scheduled_partial_new_deadline" "$(iso_at "$five_scheduled_partial_after")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq "${five_scheduled_partial_deadline}:${five_scheduled_partial_after}:40.0:100.0:scheduled_crossing:0:1" "$(python3 - "$ARCHIVE_FILE" "$five_scheduled_partial_deadline" "$five_scheduled_partial_after" <<'PYEOF'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    row = connection.execute(
+        "SELECT reset_at_epoch, observed_at_epoch, before_pct, after_pct, detection_method "
+        "FROM reset_events WHERE window = '5h'"
+    ).fetchone()
+    observed_count = connection.execute(
+        "SELECT COUNT(*) FROM reset_events "
+        "WHERE window = '5h' AND detection_method = 'observed_refill'"
+    ).fetchone()[0]
+    total_count = connection.execute(
+        "SELECT COUNT(*) FROM reset_events WHERE window = '5h'"
+    ).fetchone()[0]
+assert row == (
+    int(sys.argv[2]), int(sys.argv[3]), 40.0, 100.0, "scheduled_crossing"
+), row
+assert observed_count == 0, observed_count
+assert total_count == 1, total_count
+print(":".join(map(str, (*row, observed_count, total_count))))
+PYEOF
+)" "partial 5h sample diverged from scheduled crossing"
+
+# The same scheduled classification applies when the complete baseline was
+# already at 100%; it must not fall back to observed_refill after the partial.
+rm -f "$ARCHIVE_FILE"
+five_full_scheduled_before=$((BASE - 1800))
+five_full_scheduled_deadline=$((BASE - 900))
+five_full_scheduled_sample=$BASE
+five_full_scheduled_after=$((BASE + 900))
+five_full_scheduled_new_deadline=$((five_full_scheduled_deadline + 5 * 3600))
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$five_full_scheduled_deadline" "$(iso_at "$five_full_scheduled_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":35,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$(iso_at "$five_full_scheduled_sample")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$five_full_scheduled_new_deadline" "$(iso_at "$five_full_scheduled_after")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq "${five_full_scheduled_deadline}:${five_full_scheduled_after}:100.0:100.0:scheduled_crossing:0:1" "$(python3 - "$ARCHIVE_FILE" "$five_full_scheduled_deadline" "$five_full_scheduled_after" <<'PYEOF'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    row = connection.execute(
+        "SELECT reset_at_epoch, observed_at_epoch, before_pct, after_pct, detection_method "
+        "FROM reset_events WHERE window = '5h'"
+    ).fetchone()
+    observed_count = connection.execute(
+        "SELECT COUNT(*) FROM reset_events "
+        "WHERE window = '5h' AND detection_method = 'observed_refill'"
+    ).fetchone()[0]
+    total_count = connection.execute(
+        "SELECT COUNT(*) FROM reset_events WHERE window = '5h'"
+    ).fetchone()[0]
+assert row == (
+    int(sys.argv[2]), int(sys.argv[3]), 100.0, 100.0, "scheduled_crossing"
+), row
+assert observed_count == 0, observed_count
+assert total_count == 1, total_count
+print(":".join(map(str, (*row, observed_count, total_count))))
+PYEOF
+)" "full 5h partial sample was classified as observed refill"
+
+# A same-owner 5h baseline separated by a long gap is not enough evidence for
+# a scheduled crossing, even when the old deadline was crossed.
+rm -f "$ARCHIVE_FILE"
+five_long_gap_before=$((BASE - 100000))
+five_long_gap_deadline=$((BASE - 50000))
+five_long_gap_new_deadline=$((five_long_gap_deadline + 5 * 3600))
+printf '{"five_h_pct":40,"five_h_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$five_long_gap_deadline" "$(iso_at "$five_long_gap_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$five_long_gap_new_deadline" "$(iso_at "$BASE")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute(
+        "SELECT COUNT(*) FROM reset_events WHERE window = '5h'"
+    ).fetchone()[0])
+PYEOF
+)" "long-gap 5h baseline fabricated a scheduled crossing"
+
 # A partial 5h row from another group breaks the complete baseline.  The
 # return to A must establish a fresh baseline rather than compare A across B.
 rm -f "$ARCHIVE_FILE"
