@@ -326,6 +326,13 @@ function evaluate(expression) {
   }
   if (evaluate('chart.config.options.interaction.mode') !== 'timeSlice') fail('dashboard does not use the shared time-slice interaction');
   if (evaluate('chart.data.datasets.every(dataset => dataset.valueKind === "percent")') !== true) fail('dashboard datasets do not declare percent units');
+  if (evaluate('chart.data.datasets.find(dataset => dataset.datasetKey === "five-hour").hidden') !== true) fail('dashboard 5-hour dataset was visible by default');
+  evaluate('chart.data.datasets.find(dataset => dataset.datasetKey === "five-hour").hidden = false');
+  evaluate(`renderHistory([
+    {scraped_at:'2026-08-01T00:00:00Z', five_h_pct:80, weekly_pct:90},
+    {scraped_at:'2026-08-02T00:00:00Z', five_h_pct:70, weekly_pct:70},
+  ])`);
+  if (evaluate('chart.data.datasets.find(dataset => dataset.datasetKey === "five-hour").hidden') !== false) fail('dashboard 5-hour selection was lost on refresh');
 
   const forecastPoints = evaluate(`normalizeHistory([
     {scraped_at:'2026-08-01T00:00:00Z', five_h_pct:80, codex_forecast:{chance_24h_pct:55,chance_6h_pct:20,generated_at:'2026-08-01T00:00:00Z'}},
