@@ -255,6 +255,72 @@ check_thresholds 100 100 later unknown "$restored_new_deadline" '' \
 assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
   "restored unknown baseline replayed on the next poll"
 
+# The migration itself can succeed before the owner-cycle cleanup runs.  If
+# the process stops at that boundary, the durable migration marker must make
+# the restart repeat cleanup before delivering the old threshold.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-migrated-cleanup-crash"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+cleanup_crash_now=2000003050
+cleanup_crash_old_deadline=$((cleanup_crash_now - 60))
+cleanup_crash_new_deadline=$((cleanup_crash_old_deadline + 900))
+cleanup_crash_limit_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${cleanup_crash_old_deadline}" \
+  "observed_5h_limit_id=${cleanup_crash_limit_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=50' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$cleanup_crash_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+register_network_alert threshold 5h 50 \
+  "limit:${cleanup_crash_limit_id}|reset:${cleanup_crash_old_deadline}" \
+  "migrated stale threshold" \
+  "{\"limit_id\":\"${cleanup_crash_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${cleanup_crash_old_deadline},\"covered_thresholds\":[50]}" \
+  "$((cleanup_crash_now - 1))" "$((cleanup_crash_old_deadline + 5 * 60 * 60))" false >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_migrated_original /')"
+(
+  expire_observed_owner_cycle() {
+    expire_observed_owner_cycle_migrated_original "$@"
+    exit 99
+  }
+  check_thresholds 100 100 later unknown "$cleanup_crash_new_deadline" '' \
+    "$cleanup_crash_now" group-a >/dev/null
+) >/dev/null 2>&1 || true
+eval "$(declare -f expire_observed_owner_cycle_migrated_original | sed '1s/^expire_observed_owner_cycle_migrated_original /expire_observed_owner_cycle /')"
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "migration-boundary crash delivered a stale threshold"
+assert_eq 6 "$(awk -F= '$1 == "state_version" {print $2}' "$STATE_FILE")" \
+  "migration-boundary crash did not durably migrate state"
+assert_eq 1 "$(awk -F= '$1 == "five_h_baseline_migration_pending" {print $2}' "$STATE_FILE")" \
+  "migration-boundary crash lost the cleanup marker"
+check_thresholds 100 100 later unknown "$cleanup_crash_new_deadline" '' \
+  "$((cleanup_crash_now + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "migration-boundary recovery delivered a stale threshold"
+python3 - "$ALERT_DELIVERIES_FILE" "$cleanup_crash_limit_id" "$cleanup_crash_old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 1, items
+threshold = items[0]
+assert threshold["kind"] == "threshold", threshold
+assert threshold["event_data"]["limit_id"] == sys.argv[2], threshold
+assert threshold["event_data"]["reset_epoch"] == int(sys.argv[3]), threshold
+assert threshold["status"] == "failed", threshold
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+PYEOF
+assert_eq 0 "$(awk -F= '$1 == "five_h_baseline_migration_pending" {print $2}' "$STATE_FILE")" \
+  "migration-boundary recovery did not clear the cleanup marker"
+
 # A due, explicitly same-owner arm owns a simultaneous 100% -> 100% deadline
 # advance.  With no journal on disk, initialization must reconstruct the
 # scheduled reset rather than skipping it as a local observed reset.  The

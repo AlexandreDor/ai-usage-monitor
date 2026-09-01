@@ -1820,10 +1820,22 @@ elif version == CURRENT_STATE_VERSION \
 else:
     five_h_trusted = "0"
 
+raw_five_h_migration_pending = values.get("five_h_baseline_migration_pending")
+if (version == 5 and five_h_trusted == "0"
+        and values.get("observed_5h_limit_id")):
+    # Keep this intent durable across a crash after this migration replaces
+    # the v5 file but before the delivery journal has been cleaned up.
+    five_h_migration_pending = "1"
+elif version == CURRENT_STATE_VERSION and raw_five_h_migration_pending in ("0", "1"):
+    five_h_migration_pending = raw_five_h_migration_pending
+else:
+    five_h_migration_pending = "0"
+
 if (version == CURRENT_STATE_VERSION and marker == "1"
         and values.get("five_h_last_sampled_at_epoch") == five_h_epoch
         and values.get("five_h_last_sample_interval_seconds") == five_h_interval
-        and values.get("five_h_baseline_trusted") == five_h_trusted):
+        and values.get("five_h_baseline_trusted") == five_h_trusted
+        and values.get("five_h_baseline_migration_pending") == five_h_migration_pending):
     raise SystemExit(0)
 
 output = [f"state_version={CURRENT_STATE_VERSION}", "limit_id_contract_version=1"]
@@ -1834,7 +1846,8 @@ for line in lines:
     if key in {"state_version", "limit_id_contract_version",
                "five_h_last_sampled_at_epoch",
                "five_h_last_sample_interval_seconds",
-               "five_h_baseline_trusted"}:
+               "five_h_baseline_trusted",
+               "five_h_baseline_migration_pending"}:
         continue
     if key in {"observed_5h_limit_id", "observed_weekly_limit_id",
                "five_h_armed_limit_id", "weekly_armed_limit_id",
@@ -1845,6 +1858,7 @@ output.extend([
     f"five_h_last_sampled_at_epoch={five_h_epoch}",
     f"five_h_last_sample_interval_seconds={five_h_interval}",
     f"five_h_baseline_trusted={five_h_trusted}",
+    f"five_h_baseline_migration_pending={five_h_migration_pending}",
 ])
 encoded = ("\n".join(output) + "\n").encode("utf-8")
 
@@ -2017,6 +2031,7 @@ persist_alert_state() {
     "five_h_last_sampled_at_epoch=${five_h_last_sampled_at_epoch}" \
     "five_h_last_sample_interval_seconds=${five_h_last_sample_interval_seconds}" \
     "five_h_baseline_trusted=${five_h_baseline_trusted}" \
+    "five_h_baseline_migration_pending=${five_h_baseline_migration_pending}" \
     "last_sampled_at_epoch=${last_sampled_at_epoch}" \
     "last_sample_interval_seconds=${last_sample_interval_seconds}" \
     "five_h_armed_reset_at=${five_h_armed_reset_at}" \
@@ -2763,6 +2778,7 @@ check_thresholds() {
   local five_h_last_sampled_at_epoch=0
   local five_h_last_sample_interval_seconds=900
   local five_h_baseline_trusted=0
+  local five_h_baseline_migration_pending=0
   local last_sampled_at_epoch=0
   local last_sample_interval_seconds=900
   local five_h_armed_reset_at=0
@@ -2869,6 +2885,10 @@ check_thresholds() {
         five_h_baseline_trusted)
           [[ "$state_value" == 0 || "$state_value" == 1 ]] \
             && five_h_baseline_trusted="$state_value"
+          ;;
+        five_h_baseline_migration_pending)
+          [[ "$state_value" == 0 || "$state_value" == 1 ]] \
+            && five_h_baseline_migration_pending="$state_value"
           ;;
         notified_5h_thresholds|notified_weekly_thresholds)
           [[ "$state_value" =~ ^([0-9]+,)*[0-9]*$ ]] && printf -v "$state_key" '%s' "$state_value"
@@ -2998,12 +3018,14 @@ check_thresholds() {
     clear_weekly_script_actions
   fi
 
-  # A v5 state written before the complete-sample timestamp contract cannot
-  # prove whether its retained 5h baseline crossed a deadline. Do not replay
-  # its threshold/reset rows on a sample from the same owner; an explicitly
-  # owned arm remains authoritative and follows the normal retry path.
-  if (( state_loaded == 1 && journal_source_state_version < ALERT_STATE_VERSION \
-        && five_h_baseline_trusted == 0 \
+  # A migrated state written before the complete-sample timestamp contract
+  # cannot prove whether its retained 5h baseline crossed a deadline. The
+  # durable migration marker is required here because migration itself may
+  # have replaced the v5 file before a crash, making the raw version 6 on the
+  # next process.
+  if (( state_loaded == 1 && five_h_baseline_trusted == 0 \
+        && (five_h_baseline_migration_pending == 1 \
+            || journal_source_state_version < ALERT_STATE_VERSION) \
         )) \
     && [[ -n "$observed_5h_limit_id" && "$observed_5h_limit_id" == "$limit_id" ]]; then
     # Before the retained deadline there is no crossing ambiguity: a later
@@ -3015,6 +3037,7 @@ check_thresholds() {
       && (( five_h_reset_at > observed_5h_reset_at )) \
       && (( scraped_at_epoch < observed_5h_reset_at )); then
       five_h_baseline_trusted=1
+      five_h_baseline_migration_pending=0
     elif (( five_h_armed_reset_at == 0 )) \
       && { (( five_h_observation_valid == 0 )) || ! percentage_below_full "$five_h_pct"; }; then
       five_h_legacy_baseline_cleanup=1
@@ -3253,6 +3276,7 @@ check_thresholds() {
       return 1
     fi
     observed_5h_atomic_done=1
+    five_h_baseline_migration_pending=0
   fi
 
   # Close an observed 5-hour cycle immediately after the journal is known to
@@ -3546,6 +3570,7 @@ check_thresholds() {
       observed_5h_limit_id="$limit_id"
       local_observed_5h_reset_at=0
       five_h_baseline_trusted=1
+      five_h_baseline_migration_pending=0
       initialize_5h_baseline=1
       if (( state_loaded == 1 )); then
         # State from before the owner-aware format has no trustworthy 5h
@@ -3571,6 +3596,7 @@ check_thresholds() {
       observed_5h_limit_id="$limit_id"
       local_observed_5h_reset_at=0
       five_h_baseline_trusted=1
+      five_h_baseline_migration_pending=0
       initialize_5h_baseline=1
       process_5h_sample=0
       # A complete sample from a new limit group is a fresh baseline.  Clear
@@ -3594,6 +3620,7 @@ check_thresholds() {
       observed_5h_reset_at="$five_h_reset_at"
       observed_5h_limit_id="$limit_id"
       five_h_baseline_trusted=1
+      five_h_baseline_migration_pending=0
       five_h_last_sampled_at_epoch=0
       five_h_last_sample_interval_seconds=900
       if ! percentage_below_full "$five_h_pct"; then
