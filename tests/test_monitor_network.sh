@@ -2126,4 +2126,222 @@ check_thresholds 80 80 unknown later '' "$((weekly_expired_epoch + 1))" \
 assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
   "expired weekly recovery blocked the following poll"
 
+# A full weekly sample before the announced deadline followed by a full
+# sample after it is a scheduled crossing, even when the deadline advances.
+# The live journal must use the old deadline as the immutable reset identity.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-weekly-full-crossing"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+unset FAKE_CURL_DISCORD_STATUS_SEQUENCE
+DISCORD_WEBHOOK='https://discord.com/api/webhooks/123/token'
+TELEGRAM_BOT_TOKEN='' TELEGRAM_CHAT_ID=''
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=0
+weekly_full_before=2000007000
+weekly_full_old_deadline=$((weekly_full_before + 900))
+weekly_full_after=$((weekly_full_old_deadline + 900))
+weekly_full_new_deadline=$((weekly_full_old_deadline + 7 * 24 * 60 * 60))
+weekly_full_id="$(canonicalize_alert_limit_id group-a)"
+check_thresholds 100 100 unknown later '' "$weekly_full_old_deadline" \
+  "$weekly_full_before" group-a >/dev/null
+check_thresholds 100 100 unknown later '' "$weekly_full_new_deadline" \
+  "$weekly_full_after" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "weekly full-to-full crossing did not send one live reset"
+python3 - "$ALERT_DELIVERIES_FILE" "$weekly_full_id" "$weekly_full_old_deadline" \
+  "$weekly_full_after" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"]
+assert len(resets) == 1, items
+reset = resets[0]
+assert reset["event_data"] == {
+    "limit_id": sys.argv[2], "reset_epoch": int(sys.argv[3]),
+}, reset
+assert reset["cycle_key"] == f"limit:{sys.argv[2]}|reset:{sys.argv[3]}", reset
+assert reset["status"] == "delivered", reset
+assert reset["created_at"] == int(sys.argv[3]), reset
+assert not any(
+    item["kind"] == "reset" and item["event_data"]["reset_epoch"] == int(sys.argv[4])
+    for item in items
+), items
+PYEOF
+
+# A deadline that was already crossed by the previous complete observation is
+# not scheduled-crossing evidence.  Equality at the previous timestamp is
+# rejected as well, matching archive.py's strict lower bound.
+weekly_deadline_elapsed_case() {
+  local case_name="$1" before="$2" old_deadline="$3"
+  local after=$((before + 900))
+  local new_deadline=$((old_deadline + 7 * 24 * 60 * 60))
+  rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+  export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/${case_name}"
+  check_thresholds 100 100 unknown later '' "$old_deadline" \
+    "$before" group-a >/dev/null
+  check_thresholds 100 100 unknown later '' "$new_deadline" \
+    "$after" group-a >/dev/null
+  assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+    "${case_name} weekly deadline emitted a false live reset"
+  python3 - "$ALERT_DELIVERIES_FILE" "$old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert not any(
+    item["kind"] == "reset"
+    and item["event_data"].get("reset_epoch") == int(sys.argv[2])
+    for item in items
+), items
+PYEOF
+}
+
+weekly_deadline_elapsed_case weekly-deadline-past 2000010000 2000009999
+weekly_deadline_elapsed_case weekly-deadline-equal 2000011000 2000011000
+
+# A complete 100% -> 80% weekly observation pair that crosses the old
+# deadline is scheduled evidence too.  Keep a stale threshold in the old
+# cycle, fail the first reset delivery, then retry the same observation: the
+# threshold must be expired once and the reset must retain the old identity.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-weekly-full-consumption-crossing"
+export FAKE_CURL_DISCORD_STATUS=500 FAKE_CURL_DISCORD_EXIT=0
+export FAKE_CURL_DISCORD_STATUS_SEQUENCE=500,204
+weekly_consumption_before=2000012000
+weekly_consumption_old_deadline=$((weekly_consumption_before + 900))
+weekly_consumption_after=$((weekly_consumption_old_deadline + 900))
+weekly_consumption_new_deadline=$((weekly_consumption_old_deadline + 7 * 24 * 60 * 60))
+weekly_consumption_id="$(canonicalize_alert_limit_id group-a)"
+ALERT_THRESHOLDS=50
+check_thresholds 100 100 unknown later '' "$weekly_consumption_old_deadline" \
+  "$weekly_consumption_before" group-a >/dev/null
+register_network_alert threshold weekly 50 \
+  "limit:${weekly_consumption_id}|reset:${weekly_consumption_old_deadline}" \
+  "stale weekly threshold" \
+  "{\"limit_id\":\"${weekly_consumption_id}\",\"remaining_pct\":40,\"reset_epoch\":${weekly_consumption_old_deadline},\"covered_thresholds\":[50]}" \
+  "$((weekly_consumption_before + 1))" "$weekly_consumption_new_deadline" false >/dev/null
+if check_thresholds 100 80 unknown later '' "$weekly_consumption_new_deadline" \
+  "$weekly_consumption_after" group-a >/dev/null 2>&1; then
+  fail "failed full-to-consumption scheduled reset delivery was accepted"
+fi
+check_thresholds 100 80 unknown later '' "$weekly_consumption_new_deadline" \
+  "$((weekly_consumption_after + 1))" group-a >/dev/null
+assert_eq 2 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "full-to-consumption scheduled reset did not retry exactly once"
+python3 - "$ALERT_DELIVERIES_FILE" "$weekly_consumption_id" \
+  "$weekly_consumption_old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 2, items
+threshold = next(item for item in items if item["kind"] == "threshold")
+reset = next(item for item in items if item["kind"] == "reset")
+assert threshold["status"] == "failed", threshold
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+assert reset["event_data"] == {
+    "limit_id": sys.argv[2], "reset_epoch": int(sys.argv[3]),
+}, reset
+assert reset["status"] == "delivered", reset
+assert reset["created_at"] == int(sys.argv[3]), reset
+PYEOF
+unset FAKE_CURL_DISCORD_STATUS_SEQUENCE
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+
+# A refill observed before the planned deadline remains the historical random
+# case; the scheduled-crossing priority applies only after the old deadline
+# has actually been crossed.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-weekly-full-random-before-deadline"
+weekly_random_before=2000009000
+weekly_random_old_deadline=$((weekly_random_before + 1800))
+weekly_random_observed=$((weekly_random_before + 900))
+weekly_random_new_deadline=$((weekly_random_old_deadline + 3 * 24 * 60 * 60))
+check_thresholds 100 97 unknown later '' "$weekly_random_old_deadline" \
+  "$weekly_random_before" group-a >/dev/null
+check_thresholds 100 100 unknown later '' "$weekly_random_new_deadline" \
+  "$weekly_random_observed" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "weekly full-to-full refill before its deadline was not random"
+python3 - "$ALERT_DELIVERIES_FILE" "$weekly_random_observed" \
+  "$weekly_random_old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"]
+assert len(resets) == 1, items
+reset = resets[0]
+assert reset["event_data"]["reset_epoch"] == int(sys.argv[2]), reset
+assert reset["created_at"] == int(sys.argv[2]), reset
+assert reset["event_data"]["reset_epoch"] != int(sys.argv[3]), reset
+PYEOF
+
+# A full-to-full weekly transition after a gap larger than the archive's
+# evidence window is not a scheduled crossing.  Live and archive must reject
+# the same insufficient pair rather than letting live anchor a reset at the
+# old deadline.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-weekly-full-long-gap"
+weekly_long_gap_before=2000020000
+weekly_long_gap_old_deadline=$((weekly_long_gap_before + 900))
+weekly_long_gap_after=$((weekly_long_gap_before + 100000))
+weekly_long_gap_new_deadline=$((weekly_long_gap_old_deadline + 7 * 24 * 60 * 60))
+check_thresholds 100 100 unknown later '' "$weekly_long_gap_old_deadline" \
+  "$weekly_long_gap_before" group-a >/dev/null
+check_thresholds 100 100 unknown later '' "$weekly_long_gap_new_deadline" \
+  "$weekly_long_gap_after" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "long-gap weekly full-to-full transition emitted a live reset"
+python3 - "$ALERT_DELIVERIES_FILE" "$weekly_long_gap_old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert not any(
+    item["kind"] == "reset"
+    and item["event_data"].get("reset_epoch") == int(sys.argv[2])
+    for item in items
+), items
+PYEOF
+
+# A partial same-owner observation must not reset live's weekly gap baseline.
+# Archive keeps the two complete weekly samples adjacent, so the full ->
+# partial -> full sequence must be rejected by both paths when those full
+# samples are farther apart than the shared evidence bound.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-weekly-full-partial-full"
+weekly_partial_full_before=2000025000
+weekly_partial_full_old_deadline=$((weekly_partial_full_before + 900))
+weekly_partial_full_partial=$((weekly_partial_full_before + 100000))
+weekly_partial_full_after=$((weekly_partial_full_partial + 1))
+weekly_partial_full_new_deadline=$((weekly_partial_full_old_deadline + 7 * 24 * 60 * 60))
+check_thresholds 100 100 later later "$weekly_partial_full_old_deadline" \
+  "$weekly_partial_full_old_deadline" "$weekly_partial_full_before" group-a >/dev/null
+check_thresholds 100 80 later unknown "$weekly_partial_full_old_deadline" '' \
+  "$weekly_partial_full_partial" group-a >/dev/null
+assert_eq "$weekly_partial_full_before" \
+  "$(awk -F= '$1 == "last_sampled_at_epoch" {print $2}' "$STATE_FILE")" \
+  "partial weekly observation masked the complete live baseline"
+check_thresholds 100 100 later later "$weekly_partial_full_old_deadline" \
+  "$weekly_partial_full_new_deadline" "$weekly_partial_full_after" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "full-partial-full weekly gap emitted a live reset"
+python3 - "${ALERT_DELIVERIES_FILE}" "${STATE_FILE}" <<'PYEOF'
+import json
+import pathlib
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert not any(item["kind"] == "reset" and item["window"] == "weekly" for item in items), items
+state = dict(
+    line.split("=", 1)
+    for line in pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").splitlines()
+    if "=" in line
+)
+assert state["last_sampled_at_epoch"] == str(2000125001), state
+PYEOF
+
 printf 'PASS: monitor network tests\n'

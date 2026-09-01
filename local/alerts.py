@@ -623,6 +623,39 @@ def _register_or_reuse_observed_reset(document: dict[str, Any],
             and equivalent_cycle(existing["cycle_key"], normalized_cycle))
     ]
     if matches:
+        interrupted = [
+            item for item in matches
+            if item["status"] != "pending"
+            and item["terminal_reason"] == "owner_interrupted"
+        ]
+        if interrupted:
+            # An owner interruption is a durable terminal decision for this
+            # event identity.  Recovery may retry a genuinely pending
+            # occurrence, but it must never rebuild an occurrence that the
+            # interruption path already tombstoned.  Collapse any duplicate
+            # pending legacy row into the same terminal outcome before
+            # returning the authoritative tombstone.
+            authority = min(
+                interrupted,
+                key=lambda item: (
+                    item["cycle_key"] != normalized_cycle,
+                    item["completed_at"],
+                    item["alert_id"],
+                ),
+            )
+            completed_at = request.get("created_at")
+            if not _is_int(completed_at):
+                completed_at = max(item["created_at"] for item in matches)
+            changed = 0
+            for duplicate in matches:
+                if duplicate is authority or duplicate["status"] != "pending":
+                    continue
+                _terminate(
+                    duplicate, "owner_interrupted", completed_at,
+                    "owner_interrupted",
+                )
+                changed += 1
+            return authority, changed
         # Keep a pending row authoritative when it carries a channel not
         # covered by an equivalent delivery.  Otherwise a delivered row is
         # authoritative and must never be resurrected; when no delivery
@@ -1060,6 +1093,28 @@ def register(document: dict[str, Any], request: dict[str, Any]) -> dict[str, Any
             document, incoming["window"], expire_cycle, canonical_limit_id,
             incoming["created_at"], raw_limit_id=raw_limit_id,
         )
+    # Reset identity is durable in the owner/window/event payload and cycle,
+    # not in the namespace-specific alert ID.  A legacy-vN row can therefore
+    # be equivalent to a modern request even though their IDs differ.  Only a
+    # durable owner-interrupted row gets this registration-time veto: pending
+    # and delivered legacy/modern duplicates retain the historical behavior
+    # and are merged by the observed-reset recovery path.  Exact-ID collisions
+    # below still retain strict immutable-content validation.
+    if (incoming["kind"] == "reset" and incoming["selector"] == "reset"
+            and set(incoming["event_data"]) == {"limit_id", "reset_epoch"}
+            and any(
+                existing["kind"] == "reset"
+                and existing["window"] == incoming["window"]
+                and existing["selector"] == "reset"
+                and existing["event_data"] == incoming["event_data"]
+                and (_same_cycle(existing["cycle_key"], incoming["cycle_key"])
+                     or _same_cycle(incoming["cycle_key"], existing["cycle_key"]))
+                and existing["status"] != "pending"
+                and existing["terminal_reason"] == "owner_interrupted"
+                for existing in document["alerts"]
+            )):
+        authority, _ = _register_or_reuse_observed_reset(document, request)
+        return authority
     for existing in document["alerts"]:
         if existing["alert_id"] == incoming["alert_id"]:
             if not _same_registration(existing, incoming):
