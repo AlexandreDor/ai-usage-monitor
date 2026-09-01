@@ -3090,12 +3090,12 @@ check_thresholds() {
     && [[ "$observed_weekly_limit_id" == "$limit_id" ]] \
     && (( observed_weekly_reset_recovery == 0 )) \
     && (( weekly_gap_within_archive_bound == 1 )) \
-    && [[ "$observed_weekly_pct" =~ ^100([.]0+)?$ ]] \
-    && [[ "$weekly_pct" =~ ^100([.]0+)?$ ]] \
+    && [[ "$observed_weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] \
+    && (( weekly_observation_valid == 1 )) \
     && [[ "$weekly_reset_at" =~ ^[0-9]+$ ]] \
-    && (( observed_weekly_reset_at > 0 \
+    && (( last_sampled_at_epoch > 0 \
+          && last_sampled_at_epoch < observed_weekly_reset_at \
           && observed_weekly_reset_at <= scraped_at_epoch \
-          && observed_weekly_reset_at <= weekly_reset_at \
           && weekly_reset_at > observed_weekly_reset_at )); then
     weekly_armed_reset_at="$observed_weekly_reset_at"
     weekly_armed_limit_id="$limit_id"

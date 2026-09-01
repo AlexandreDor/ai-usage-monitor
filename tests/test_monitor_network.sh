@@ -2169,6 +2169,87 @@ assert not any(
 ), items
 PYEOF
 
+# A deadline that was already crossed by the previous complete observation is
+# not scheduled-crossing evidence.  Equality at the previous timestamp is
+# rejected as well, matching archive.py's strict lower bound.
+weekly_deadline_elapsed_case() {
+  local case_name="$1" before="$2" old_deadline="$3"
+  local after=$((before + 900))
+  local new_deadline=$((old_deadline + 7 * 24 * 60 * 60))
+  rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+  export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/${case_name}"
+  check_thresholds 100 100 unknown later '' "$old_deadline" \
+    "$before" group-a >/dev/null
+  check_thresholds 100 100 unknown later '' "$new_deadline" \
+    "$after" group-a >/dev/null
+  assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+    "${case_name} weekly deadline emitted a false live reset"
+  python3 - "$ALERT_DELIVERIES_FILE" "$old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert not any(
+    item["kind"] == "reset"
+    and item["event_data"].get("reset_epoch") == int(sys.argv[2])
+    for item in items
+), items
+PYEOF
+}
+
+weekly_deadline_elapsed_case weekly-deadline-past 2000010000 2000009999
+weekly_deadline_elapsed_case weekly-deadline-equal 2000011000 2000011000
+
+# A complete 100% -> 80% weekly observation pair that crosses the old
+# deadline is scheduled evidence too.  Keep a stale threshold in the old
+# cycle, fail the first reset delivery, then retry the same observation: the
+# threshold must be expired once and the reset must retain the old identity.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-weekly-full-consumption-crossing"
+export FAKE_CURL_DISCORD_STATUS=500 FAKE_CURL_DISCORD_EXIT=0
+export FAKE_CURL_DISCORD_STATUS_SEQUENCE=500,204
+weekly_consumption_before=2000012000
+weekly_consumption_old_deadline=$((weekly_consumption_before + 900))
+weekly_consumption_after=$((weekly_consumption_old_deadline + 900))
+weekly_consumption_new_deadline=$((weekly_consumption_old_deadline + 7 * 24 * 60 * 60))
+weekly_consumption_id="$(canonicalize_alert_limit_id group-a)"
+ALERT_THRESHOLDS=50
+check_thresholds 100 100 unknown later '' "$weekly_consumption_old_deadline" \
+  "$weekly_consumption_before" group-a >/dev/null
+register_network_alert threshold weekly 50 \
+  "limit:${weekly_consumption_id}|reset:${weekly_consumption_old_deadline}" \
+  "stale weekly threshold" \
+  "{\"limit_id\":\"${weekly_consumption_id}\",\"remaining_pct\":40,\"reset_epoch\":${weekly_consumption_old_deadline},\"covered_thresholds\":[50]}" \
+  "$((weekly_consumption_before + 1))" "$weekly_consumption_new_deadline" false >/dev/null
+if check_thresholds 100 80 unknown later '' "$weekly_consumption_new_deadline" \
+  "$weekly_consumption_after" group-a >/dev/null 2>&1; then
+  fail "failed full-to-consumption scheduled reset delivery was accepted"
+fi
+check_thresholds 100 80 unknown later '' "$weekly_consumption_new_deadline" \
+  "$((weekly_consumption_after + 1))" group-a >/dev/null
+assert_eq 2 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "full-to-consumption scheduled reset did not retry exactly once"
+python3 - "$ALERT_DELIVERIES_FILE" "$weekly_consumption_id" \
+  "$weekly_consumption_old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 2, items
+threshold = next(item for item in items if item["kind"] == "threshold")
+reset = next(item for item in items if item["kind"] == "reset")
+assert threshold["status"] == "failed", threshold
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+assert reset["event_data"] == {
+    "limit_id": sys.argv[2], "reset_epoch": int(sys.argv[3]),
+}, reset
+assert reset["status"] == "delivered", reset
+assert reset["created_at"] == int(sys.argv[3]), reset
+PYEOF
+unset FAKE_CURL_DISCORD_STATUS_SEQUENCE
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+
 # A refill observed before the planned deadline remains the historical random
 # case; the scheduled-crossing priority applies only after the old deadline
 # has actually been crossed.

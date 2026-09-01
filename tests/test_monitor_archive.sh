@@ -436,6 +436,92 @@ with sqlite3.connect(sys.argv[1]) as connection:
 PYEOF
 )" "cross-group partial 5h sample fabricated a reset"
 
+# A weekly deadline that was already crossed by the previous complete sample
+# is not a scheduled crossing. Test both the elapsed and equality boundaries
+# of archive.py's strict previous timestamp check.
+rm -f "$ARCHIVE_FILE"
+weekly_deadline_past_before=$((BASE + 10000))
+weekly_deadline_past_old=$((weekly_deadline_past_before - 1))
+weekly_deadline_past_after=$((weekly_deadline_past_before + 900))
+weekly_deadline_past_new=$((weekly_deadline_past_old + 7 * 86400))
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$weekly_deadline_past_old" "$(iso_at "$weekly_deadline_past_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$weekly_deadline_past_new" "$(iso_at "$weekly_deadline_past_after")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute(
+        "SELECT COUNT(*) FROM reset_events WHERE window = 'weekly'"
+    ).fetchone()[0])
+PYEOF
+)" "past weekly deadline fabricated an archive reset"
+
+rm -f "$ARCHIVE_FILE"
+weekly_deadline_equal_before=$((BASE + 11000))
+weekly_deadline_equal_old="$weekly_deadline_equal_before"
+weekly_deadline_equal_after=$((weekly_deadline_equal_before + 900))
+weekly_deadline_equal_new=$((weekly_deadline_equal_old + 7 * 86400))
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$weekly_deadline_equal_old" "$(iso_at "$weekly_deadline_equal_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$weekly_deadline_equal_new" "$(iso_at "$weekly_deadline_equal_after")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute(
+        "SELECT COUNT(*) FROM reset_events WHERE window = 'weekly'"
+    ).fetchone()[0])
+PYEOF
+)" "equal weekly deadline fabricated an archive reset"
+
+# A complete 100% -> 80% weekly pair that crosses the old deadline is a
+# scheduled crossing, not an observed refill. Its event identity and exact
+# before/after percentages must match live's reset transaction.
+rm -f "$ARCHIVE_FILE"
+weekly_consumption_before=$((BASE + 12000))
+weekly_consumption_old=$((weekly_consumption_before + 900))
+weekly_consumption_after=$((weekly_consumption_old + 900))
+weekly_consumption_new=$((weekly_consumption_old + 7 * 86400))
+printf '{"weekly_pct":100,"weekly_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$weekly_consumption_old" "$(iso_at "$weekly_consumption_before")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"weekly_pct":80,"weekly_reset_at":%s,"sample_interval_seconds":900,"limit_id":"test","scraped_at":"%s"}\n' \
+  "$weekly_consumption_new" "$(iso_at "$weekly_consumption_after")" | python3 "$ARCHIVE_SCRIPT" \
+  --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq "${weekly_consumption_old}:${weekly_consumption_after}:100.0:80.0:scheduled_crossing:0" "$(python3 - "$ARCHIVE_FILE" "$weekly_consumption_old" "$weekly_consumption_after" <<'PYEOF'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    row = connection.execute(
+        "SELECT reset_at_epoch, observed_at_epoch, before_pct, after_pct, detection_method "
+        "FROM reset_events WHERE window = 'weekly'"
+    ).fetchone()
+    random_count = connection.execute(
+        "SELECT COUNT(*) FROM reset_events "
+        "WHERE window = 'weekly' AND detection_method = 'random_observed'"
+    ).fetchone()[0]
+    total_count = connection.execute(
+        "SELECT COUNT(*) FROM reset_events WHERE window = 'weekly'"
+    ).fetchone()[0]
+assert row == (
+    int(sys.argv[2]), int(sys.argv[3]), 100.0, 80.0, "scheduled_crossing"
+), row
+assert random_count == 0, random_count
+assert total_count == 1, total_count
+print(":".join(map(str, (*row, random_count))))
+PYEOF
+)" "full-to-consumption weekly archive parity diverged"
+
 # An early weekly refill with a materially advanced deadline is classified as
 # a random reset rather than a scheduled end-of-week reset.
 rm -f "$ARCHIVE_FILE"
