@@ -69,13 +69,15 @@ reset_case
 printf 'prev_5h_pct=80\nprev_weekly_pct=70\n' > "$STATE_FILE"
 check_thresholds 80 70 "later" "later" "$((now + 300))" "$((now + 3600))" "$now"
 assert_alert_count 0
-[[ "$(state_value state_version)" == "5" ]] || fail "state was not migrated"
+[[ "$(state_value state_version)" == "6" ]] || fail "state was not migrated"
 
 # A full 5-hour cycle is observable from a deadline advance even when the
 # quota stays at 100%. It is anchored to the first observation carrying the
 # new deadline and is acknowledged locally without a deliverable network occurrence.
 reset_case
-old_five_deadline=$((now + 300))
+# Keep this observed-refill fixture before the planned deadline; crossed
+# deadlines are scheduled crossings and are covered by the focused cases.
+old_five_deadline=$((now + 1800))
 new_five_deadline=$((old_five_deadline + 15 * 60))
 check_thresholds 100 100 later later "$old_five_deadline" '' "$now" group-a
 check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 900))" group-a

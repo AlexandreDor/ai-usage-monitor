@@ -74,6 +74,22 @@ class AnomalyDetectorTests(unittest.TestCase):
         self.observe(snapshot(200, five=100, five_reset=previous_deadline + 900))
         self.assertEqual([], self.rows("5h"))
 
+    def test_five_hour_partial_keeps_complete_baseline_for_planned_crossing(self):
+        previous_deadline = 1_000
+        next_deadline = 2_000
+        self.observe(snapshot(100, five=100, five_reset=previous_deadline))
+        # The percentage is still usable for reset-missing detection, but the
+        # absent deadline must not replace the complete 5h reset baseline.
+        self.observe(snapshot(1_100, five=80, five_reset=None))
+        self.observe(snapshot(1_200, five=100, five_reset=next_deadline))
+        self.assertEqual([], self.rows("5h"))
+        state = json.loads(self.connection.execute(
+            "SELECT state_json FROM anomaly_detector_state WHERE window = '5h'"
+        ).fetchone()[0])
+        self.assertEqual(1_200, state["last_complete_epoch"])
+        self.assertEqual(100.0, state["last_complete_pct"])
+        self.assertEqual(next_deadline, state["last_complete_reset_at"])
+
     def test_weekly_quota_increase_is_reported_independently(self):
         self.observe(snapshot(100, five=50, weekly=40, weekly_reset=10_000))
         self.observe(snapshot(200, five=50, weekly=50, weekly_reset=10_000))

@@ -56,7 +56,9 @@ export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-silent"
 export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
 DISCORD_WEBHOOK='https://discord.com/api/webhooks/123/token'
 TELEGRAM_BOT_TOKEN='' TELEGRAM_CHAT_ID=''
-old_five_deadline=$((2000000100 + 300))
+# Keep the planned deadline after both samples so this remains the legitimate
+# observed-refill case; a crossed deadline is covered by the scheduled tests.
+old_five_deadline=$((2000000100 + 1800))
 new_five_deadline=$((old_five_deadline + 900))
 check_thresholds 100 100 later unknown "$old_five_deadline" '' 2000000100 group-a >/dev/null
 python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
@@ -78,6 +80,68 @@ PYEOF
 ALERT_THRESHOLDS=75
 TELEGRAM_BOT_TOKEN='123:token'
 TELEGRAM_CHAT_ID=-456
+
+# A complete 5h sample can cross its planned deadline through a same-owner
+# partial sample.  The live event must use the old deadline as both its cycle
+# identity and creation anchor, with no local observed-refill duplicate.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-5h-full-partial-full"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+unset FAKE_CURL_DISCORD_STATUS_SEQUENCE
+DISCORD_WEBHOOK='https://discord.com/api/webhooks/123/token'
+TELEGRAM_BOT_TOKEN='' TELEGRAM_CHAT_ID=''
+ALERTS_ENABLED=1
+ALERT_THRESHOLDS=0
+five_h_partial_full_before=2000003000
+five_h_partial_full_old_deadline=$((five_h_partial_full_before + 900))
+five_h_partial_full_partial=$((five_h_partial_full_old_deadline + 900))
+five_h_partial_full_after=$((five_h_partial_full_partial + 900))
+five_h_partial_full_new_deadline=$((five_h_partial_full_old_deadline + 5 * 60 * 60))
+five_h_partial_full_id="$(canonicalize_alert_limit_id group-a)"
+check_thresholds 100 100 unknown unknown "$five_h_partial_full_old_deadline" '' \
+  "$five_h_partial_full_before" group-a >/dev/null
+check_thresholds 80 100 unknown unknown '' '' \
+  "$five_h_partial_full_partial" group-a >/dev/null
+assert_eq "$five_h_partial_full_before" \
+  "$(awk -F= '$1 == "five_h_last_sampled_at_epoch" {print $2}' "$STATE_FILE")" \
+  "same-owner partial masked the complete 5h live baseline"
+check_thresholds 100 100 unknown unknown "$five_h_partial_full_new_deadline" '' \
+  "$five_h_partial_full_after" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "5h full-partial-full crossing did not send one live reset"
+python3 - "$ALERT_DELIVERIES_FILE" "$five_h_partial_full_id" \
+  "$five_h_partial_full_old_deadline" "$five_h_partial_full_after" \
+  "$STATE_FILE" <<'PYEOF'
+import json
+import pathlib
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"]
+assert len(resets) == 1, items
+reset = resets[0]
+assert reset["event_data"] == {
+    "limit_id": sys.argv[2], "reset_epoch": int(sys.argv[3]),
+}, reset
+assert reset["cycle_key"] == f"limit:{sys.argv[2]}|reset:{sys.argv[3]}", reset
+assert reset["status"] == "delivered", reset
+assert reset["created_at"] == int(sys.argv[3]), reset
+assert not any(
+    item["kind"] == "reset"
+    and item["event_data"].get("reset_epoch") == int(sys.argv[4])
+    for item in items
+), items
+assert not any(
+    item["kind"] == "reset" and item.get("terminal_reason") == "local_observed"
+    for item in items
+), items
+state = dict(
+    line.split("=", 1)
+    for line in pathlib.Path(sys.argv[5]).read_text(encoding="utf-8").splitlines()
+    if "=" in line
+)
+assert state["five_h_last_sampled_at_epoch"] == sys.argv[4], state
+PYEOF
 
 # An observed refill also invalidates a pending threshold attached to the
 # already-armed cycle (not only an unarmed threshold).  It must remain local:
@@ -134,8 +198,10 @@ PYEOF
 ALERTS_ENABLED=1
 
 # A partially restored detector can retain the observed pre-reset baseline
-# while losing its explicit arm.  The observed refill must expire that OLD
-# cycle, not the NEW deadline from the sample, before due delivery runs.
+# while losing its explicit arm. Because v5 has no complete-sample timestamp,
+# migration treats that baseline as unknown once the retained deadline has been
+# crossed and closes old pending rows before due delivery; it must not invent a
+# new network reset.
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-restored"
 export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
@@ -144,6 +210,7 @@ ALERT_THRESHOLDS=50
 restored_now=2000002050
 restored_old_deadline=$((restored_now + 3600))
 restored_new_deadline=$((restored_old_deadline + 900))
+restored_sample_at=$((restored_old_deadline + 1))
 restored_limit_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -164,15 +231,15 @@ register_network_alert threshold 5h 50 \
   "{\"limit_id\":\"${restored_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${restored_old_deadline},\"covered_thresholds\":[50]}" \
   "$((restored_now + 1))" "$((restored_old_deadline + 5 * 60 * 60))" false >/dev/null
 check_thresholds 100 100 later unknown "$restored_new_deadline" '' \
-  "$((restored_now + 1))" group-a >/dev/null
+  "$restored_sample_at" group-a >/dev/null
 assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
-  "restored observed 5h refill delivered the stale threshold"
+  "restored unknown 5h baseline delivered the stale threshold"
 python3 - "$ALERT_DELIVERIES_FILE" "$restored_limit_id" "$restored_old_deadline" <<'PYEOF'
 import json
 import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
-assert len(items) == 2, items
+assert len(items) == 1, items
 threshold = items[0]
 assert threshold["kind"] == "threshold", threshold
 assert threshold["event_data"]["limit_id"] == sys.argv[2], threshold
@@ -181,14 +248,257 @@ assert threshold["status"] == "failed", threshold
 assert threshold["terminal_reason"] == "expired_after_reset", threshold
 assert threshold["channels"]["discord"]["error_class"] == "expired_after_reset", threshold
 assert threshold["detector_acknowledged_at"] is not None, threshold
-tombstone = next(item for item in items if item["kind"] == "reset")
-assert tombstone["terminal_reason"] == "local_observed", tombstone
-assert tombstone["status"] == "failed", tombstone
+assert threshold["kind"] == "threshold", threshold
 PYEOF
 check_thresholds 100 100 later unknown "$restored_new_deadline" '' \
-  "$((restored_now + 2))" group-a >/dev/null
+  "$((restored_sample_at + 1))" group-a >/dev/null
 assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
-  "restored stale threshold replayed on the next poll"
+  "restored unknown baseline replayed on the next poll"
+
+# A migrated baseline must not expire a still-valid threshold when a partial
+# sample arrives before its retained deadline.  The threshold remains part of
+# the current cycle and may be delivered; it must not be rewritten as an
+# expired-after-reset occurrence merely because the sample has no reset time.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-migrated-partial-before-deadline"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+future_partial_now=2000002550
+future_partial_old_deadline=$((future_partial_now + 3600))
+future_partial_limit_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${future_partial_old_deadline}" \
+  "observed_5h_limit_id=${future_partial_limit_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=50' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$future_partial_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+register_network_alert threshold 5h 50 \
+  "limit:${future_partial_limit_id}|reset:${future_partial_old_deadline}" \
+  "valid pre-deadline threshold" \
+  "{\"limit_id\":\"${future_partial_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${future_partial_old_deadline},\"covered_thresholds\":[50]}" \
+  "$((future_partial_now - 1))" "$((future_partial_old_deadline + 5 * 60 * 60))" false >/dev/null
+check_thresholds 40 100 unknown unknown '' '' "$future_partial_now" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "pre-deadline partial migration discarded a valid threshold"
+assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.status)" \
+  "pre-deadline partial migration did not preserve the valid threshold"
+assert_eq delivered "$(json_field "$ALERT_DELIVERIES_FILE" alerts.0.terminal_reason)" \
+  "pre-deadline partial migration expired the valid threshold"
+
+# The migration itself can succeed before the owner-cycle cleanup runs.  If
+# the process stops at that boundary, the durable migration marker must make
+# the restart repeat cleanup before delivering the old threshold.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-migrated-cleanup-crash"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+cleanup_crash_now=2000003050
+cleanup_crash_old_deadline=$((cleanup_crash_now - 60))
+cleanup_crash_new_deadline=$((cleanup_crash_old_deadline + 900))
+cleanup_crash_limit_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${cleanup_crash_old_deadline}" \
+  "observed_5h_limit_id=${cleanup_crash_limit_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=50' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$cleanup_crash_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+register_network_alert threshold 5h 50 \
+  "limit:${cleanup_crash_limit_id}|reset:${cleanup_crash_old_deadline}" \
+  "migrated stale threshold" \
+  "{\"limit_id\":\"${cleanup_crash_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${cleanup_crash_old_deadline},\"covered_thresholds\":[50]}" \
+  "$((cleanup_crash_now - 1))" "$((cleanup_crash_old_deadline + 5 * 60 * 60))" false >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_migrated_original /')"
+(
+  expire_observed_owner_cycle() {
+    expire_observed_owner_cycle_migrated_original "$@"
+    exit 99
+  }
+  check_thresholds 100 100 later unknown "$cleanup_crash_new_deadline" '' \
+    "$cleanup_crash_now" group-a >/dev/null
+) >/dev/null 2>&1 || true
+eval "$(declare -f expire_observed_owner_cycle_migrated_original | sed '1s/^expire_observed_owner_cycle_migrated_original /expire_observed_owner_cycle /')"
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "migration-boundary crash delivered a stale threshold"
+assert_eq 6 "$(awk -F= '$1 == "state_version" {print $2}' "$STATE_FILE")" \
+  "migration-boundary crash did not durably migrate state"
+assert_eq 1 "$(awk -F= '$1 == "five_h_baseline_migration_pending" {print $2}' "$STATE_FILE")" \
+  "migration-boundary crash lost the cleanup marker"
+check_thresholds 100 100 later unknown "$cleanup_crash_new_deadline" '' \
+  "$((cleanup_crash_now + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "migration-boundary recovery delivered a stale threshold"
+python3 - "$ALERT_DELIVERIES_FILE" "$cleanup_crash_limit_id" "$cleanup_crash_old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 1, items
+threshold = items[0]
+assert threshold["kind"] == "threshold", threshold
+assert threshold["event_data"]["limit_id"] == sys.argv[2], threshold
+assert threshold["event_data"]["reset_epoch"] == int(sys.argv[3]), threshold
+assert threshold["status"] == "failed", threshold
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+PYEOF
+assert_eq 0 "$(awk -F= '$1 == "five_h_baseline_migration_pending" {print $2}' "$STATE_FILE")" \
+  "migration-boundary recovery did not clear the cleanup marker"
+
+# If migration crashes before cleanup and the first resumed sample is partial,
+# the durable marker must prevent the untrusted historical percentage from
+# creating and delivering a new unarmed threshold.  Cleanup is retried before
+# the partial sample is allowed to reach any detector.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-migrated-partial-recovery"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+partial_recovery_now=2000004050
+partial_recovery_old_deadline=$((partial_recovery_now - 60))
+partial_recovery_new_deadline=$((partial_recovery_old_deadline + 900))
+partial_recovery_limit_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${partial_recovery_old_deadline}" \
+  "observed_5h_limit_id=${partial_recovery_limit_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=50' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$partial_recovery_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+register_network_alert threshold 5h 50 \
+  "limit:${partial_recovery_limit_id}|reset:${partial_recovery_old_deadline}" \
+  "partial migration recovery threshold" \
+  "{\"limit_id\":\"${partial_recovery_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${partial_recovery_old_deadline},\"covered_thresholds\":[50]}" \
+  "$((partial_recovery_now - 1))" "$((partial_recovery_old_deadline + 5 * 60 * 60))" false >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_partial_original /')"
+(
+  expire_observed_owner_cycle() {
+    expire_observed_owner_cycle_partial_original "$@"
+    exit 99
+  }
+  check_thresholds 40 100 unknown unknown '' '' \
+    "$partial_recovery_now" group-a >/dev/null
+) >/dev/null 2>&1 || true
+eval "$(declare -f expire_observed_owner_cycle_partial_original | sed '1s/^expire_observed_owner_cycle_partial_original /expire_observed_owner_cycle /')"
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "partial migration-boundary crash emitted HTTP"
+assert_eq 6 "$(awk -F= '$1 == "state_version" {print $2}' "$STATE_FILE")" \
+  "partial migration-boundary crash did not durably migrate state"
+assert_eq 1 "$(awk -F= '$1 == "five_h_baseline_migration_pending" {print $2}' "$STATE_FILE")" \
+  "partial migration-boundary crash lost the cleanup marker"
+check_thresholds 40 100 unknown unknown '' '' \
+  "$((partial_recovery_now + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "partial migration recovery delivered a new unarmed threshold"
+python3 - "$ALERT_DELIVERIES_FILE" "$partial_recovery_limit_id" "$partial_recovery_old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 1, items
+threshold = items[0]
+assert threshold["kind"] == "threshold", threshold
+assert threshold["event_data"]["limit_id"] == sys.argv[2], threshold
+assert threshold["event_data"]["reset_epoch"] == int(sys.argv[3]), threshold
+assert threshold["status"] == "failed", threshold
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+PYEOF
+assert_eq 1 "$(awk -F= '$1 == "five_h_baseline_migration_pending" {print $2}' "$STATE_FILE")" \
+  "partial migration recovery cleared the marker before a complete baseline"
+check_thresholds 40 100 later unknown "$partial_recovery_new_deadline" '' \
+  "$((partial_recovery_now + 2))" group-a >/dev/null
+assert_eq 0 "$(awk -F= '$1 == "five_h_baseline_migration_pending" {print $2}' "$STATE_FILE")" \
+  "complete migration recovery did not clear the cleanup marker"
+
+# A complete, already-consumed sample must also close the migrated old cycle,
+# and the marker must survive a crash at the later reconciliation write.  This
+# catches both the low-percentage cleanup path and the intermediate state image
+# in which the complete baseline has not yet been persisted.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-migrated-reconcile-crash"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+post_reconcile_now=2000005050
+post_reconcile_old_deadline=$((post_reconcile_now - 60))
+post_reconcile_new_deadline=$((post_reconcile_old_deadline + 900))
+post_reconcile_limit_id="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' \
+  'state_version=5' 'limit_id_contract_version=1' \
+  'prev_5h_pct=100' 'prev_weekly_pct=100' \
+  'observed_5h_pct=100' "observed_5h_reset_at=${post_reconcile_old_deadline}" \
+  "observed_5h_limit_id=${post_reconcile_limit_id}" \
+  'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
+  'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
+  'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
+  'last_notified_5h_reset_at=0' 'last_notified_weekly_reset_at=0' \
+  'notified_5h_thresholds=' 'notified_weekly_thresholds=' \
+  'pending_5h_threshold=50' 'pending_weekly_threshold=' > "$STATE_FILE"
+printf '{"completed_at":%s,"alerts":[]}\n' "$post_reconcile_now" \
+  | python3 "$ALERTS_PY" init "$ALERT_DELIVERIES_FILE" --source-state-version 5
+register_network_alert threshold 5h 50 \
+  "limit:${post_reconcile_limit_id}|reset:${post_reconcile_old_deadline}" \
+  "post-reconciliation migration threshold" \
+  "{\"limit_id\":\"${post_reconcile_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${post_reconcile_old_deadline},\"covered_thresholds\":[50]}" \
+  "$((post_reconcile_now - 1))" "$((post_reconcile_old_deadline + 5 * 60 * 60))" false >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f persist_alert_state | sed '1s/^persist_alert_state /persist_alert_state_reconcile_original /')"
+(
+  persist_alert_state() {
+    persist_alert_state_reconcile_original "$@"
+    exit 99
+  }
+  check_thresholds 40 100 later unknown "$post_reconcile_new_deadline" '' \
+    "$post_reconcile_now" group-a >/dev/null
+) >/dev/null 2>&1 || true
+eval "$(declare -f persist_alert_state_reconcile_original | sed '1s/^persist_alert_state_reconcile_original /persist_alert_state /')"
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "post-reconciliation migration crash delivered the old threshold"
+assert_eq 6 "$(awk -F= '$1 == "state_version" {print $2}' "$STATE_FILE")" \
+  "post-reconciliation migration crash did not durably migrate state"
+assert_eq 1 "$(awk -F= '$1 == "five_h_baseline_migration_pending" {print $2}' "$STATE_FILE")" \
+  "post-reconciliation migration crash lost the cleanup marker"
+check_thresholds 40 100 unknown unknown '' '' \
+  "$((post_reconcile_now + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "post-reconciliation partial recovery delivered an unarmed threshold"
+python3 - "$ALERT_DELIVERIES_FILE" "$post_reconcile_limit_id" "$post_reconcile_old_deadline" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+assert len(items) == 1, items
+threshold = items[0]
+assert threshold["kind"] == "threshold", threshold
+assert threshold["event_data"]["limit_id"] == sys.argv[2], threshold
+assert threshold["event_data"]["reset_epoch"] == int(sys.argv[3]), threshold
+assert threshold["status"] == "failed", threshold
+assert threshold["terminal_reason"] == "expired_after_reset", threshold
+assert threshold["detector_acknowledged_at"] is not None, threshold
+PYEOF
+check_thresholds 40 100 later unknown "$post_reconcile_new_deadline" '' \
+  "$((post_reconcile_now + 2))" group-a >/dev/null
+assert_eq 0 "$(awk -F= '$1 == "five_h_baseline_migration_pending" {print $2}' "$STATE_FILE")" \
+  "post-reconciliation complete baseline did not clear the cleanup marker"
+assert_eq "$((post_reconcile_now + 2))" \
+  "$(awk -F= '$1 == "five_h_last_sampled_at_epoch" {print $2}' "$STATE_FILE")" \
+  "post-reconciliation complete baseline did not persist its timestamp"
 
 # A due, explicitly same-owner arm owns a simultaneous 100% -> 100% deadline
 # advance.  With no journal on disk, initialization must reconstruct the
@@ -453,6 +763,8 @@ printf '%s\n' \
   'prev_5h_pct=100' 'prev_weekly_pct=100' \
   'observed_5h_pct=100' "observed_5h_reset_at=${restart_old_deadline}" \
   "observed_5h_limit_id=${restart_limit_id}" \
+  "five_h_last_sampled_at_epoch=${restart_now}" \
+  'five_h_last_sample_interval_seconds=900' \
   'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
   'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
   'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \

@@ -48,6 +48,7 @@ HEALTH_FILE="${RUNTIME_DIR}/health.json"
 HEARTBEAT_FILE="${RUNTIME_DIR}/dashboard-heartbeat"
 LOCK_FILE="${RUNTIME_DIR}/.monitor.lock"
 DEFAULT_INTERVAL_SECONDS=900
+ALERT_STATE_VERSION=6
 DASHBOARD_HEARTBEAT_MAX_AGE_SECONDS=90
 DASHBOARD_HEARTBEAT_POLL_SECONDS=5
 INVALID_ALERT_SCRIPT_CONFIG=0
@@ -1752,11 +1753,13 @@ for line_number, line in enumerate(lines, 1):
         raise SystemExit(f"invalid alert state line {line_number}")
     values[key] = value
 
+CURRENT_STATE_VERSION = 6
+
 version_text = values.get("state_version", "0")
 if not re.fullmatch(r"[0-9]+", version_text):
     raise SystemExit("invalid alert state version")
 version = int(version_text)
-if version > 5:
+if version > CURRENT_STATE_VERSION:
     raise SystemExit(f"unsupported future alert state version {version}")
 if version < 0:
     raise SystemExit("invalid alert state version")
@@ -1771,9 +1774,9 @@ if marker is not None:
         value = values.get(key, "")
         if value and not re.fullmatch(r"limit-[0-9a-f]{64}", value):
             raise SystemExit(f"marked alert state contains a raw {key}")
-    raise SystemExit(0)
-
-if version not in range(0, 5):
+    if version not in (5, CURRENT_STATE_VERSION):
+        raise SystemExit(f"unsupported alert state version {version}")
+elif version not in range(0, 5):
     raise SystemExit(f"unsupported alert state version {version}")
 
 def opaque(value):
@@ -1781,24 +1784,82 @@ def opaque(value):
         return value
     return "limit-" + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
 
-for key in ("observed_5h_limit_id", "observed_weekly_limit_id",
-            "five_h_armed_limit_id", "weekly_armed_limit_id",
-            "pending_observed_weekly_reset_limit_id"):
-    if key in values:
-        values[key] = opaque(values[key])
+if marker is None:
+    for key in ("observed_5h_limit_id", "observed_weekly_limit_id",
+                "five_h_armed_limit_id", "weekly_armed_limit_id",
+                "pending_observed_weekly_reset_limit_id"):
+        if key in values:
+            values[key] = opaque(values[key])
 
-output = ["state_version=5", "limit_id_contract_version=1"]
+def valid_epoch(value):
+    return value is not None and re.fullmatch(r"(0|[1-9][0-9]{0,11})", value)
+
+def valid_interval(value):
+    return (value is not None
+            and re.fullmatch(r"[1-9][0-9]{0,4}", value)
+            and int(value) <= 86400)
+
+raw_five_h_epoch = values.get("five_h_last_sampled_at_epoch")
+raw_five_h_interval = values.get("five_h_last_sample_interval_seconds")
+five_h_epoch = raw_five_h_epoch if valid_epoch(raw_five_h_epoch) else "0"
+five_h_interval = raw_five_h_interval if valid_interval(raw_five_h_interval) else "900"
+
+# v5 files written before the complete-sample timestamp contract are not
+# allowed to manufacture a crossing or an observed refill.  A v5 file that
+# already contains both fields was written by the intermediate owner-aware
+# implementation, so its complete baseline can be trusted.  v6 makes that
+# decision explicit and durable with the marker below.
+if version == 5 and valid_epoch(raw_five_h_epoch) and int(raw_five_h_epoch) > 0 \
+        and valid_interval(raw_five_h_interval):
+    five_h_trusted = "1"
+elif version == CURRENT_STATE_VERSION \
+        and values.get("five_h_baseline_trusted") == "1" \
+        and valid_epoch(raw_five_h_epoch) and int(raw_five_h_epoch) > 0 \
+        and valid_interval(raw_five_h_interval):
+    five_h_trusted = "1"
+else:
+    five_h_trusted = "0"
+
+raw_five_h_migration_pending = values.get("five_h_baseline_migration_pending")
+if (version == 5 and five_h_trusted == "0"
+        and values.get("observed_5h_limit_id")):
+    # Keep this intent durable across a crash after this migration replaces
+    # the v5 file but before the delivery journal has been cleaned up.
+    five_h_migration_pending = "1"
+elif version == CURRENT_STATE_VERSION and raw_five_h_migration_pending in ("0", "1"):
+    five_h_migration_pending = raw_five_h_migration_pending
+else:
+    five_h_migration_pending = "0"
+
+if (version == CURRENT_STATE_VERSION and marker == "1"
+        and values.get("five_h_last_sampled_at_epoch") == five_h_epoch
+        and values.get("five_h_last_sample_interval_seconds") == five_h_interval
+        and values.get("five_h_baseline_trusted") == five_h_trusted
+        and values.get("five_h_baseline_migration_pending") == five_h_migration_pending):
+    raise SystemExit(0)
+
+output = [f"state_version={CURRENT_STATE_VERSION}", "limit_id_contract_version=1"]
 for line in lines:
     if not line:
         continue
     key, _, value = line.partition("=")
-    if key in {"state_version", "limit_id_contract_version"}:
+    if key in {"state_version", "limit_id_contract_version",
+               "five_h_last_sampled_at_epoch",
+               "five_h_last_sample_interval_seconds",
+               "five_h_baseline_trusted",
+               "five_h_baseline_migration_pending"}:
         continue
     if key in {"observed_5h_limit_id", "observed_weekly_limit_id",
                "five_h_armed_limit_id", "weekly_armed_limit_id",
                "pending_observed_weekly_reset_limit_id"}:
         value = values[key]
     output.append(f"{key}={value}")
+output.extend([
+    f"five_h_last_sampled_at_epoch={five_h_epoch}",
+    f"five_h_last_sample_interval_seconds={five_h_interval}",
+    f"five_h_baseline_trusted={five_h_trusted}",
+    f"five_h_baseline_migration_pending={five_h_migration_pending}",
+])
 encoded = ("\n".join(output) + "\n").encode("utf-8")
 
 try:
@@ -1957,7 +2018,7 @@ persist_alert_state() {
   local state_tmp
   state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || return 1
   if ! printf '%s\n' \
-    'state_version=5' \
+    "state_version=${ALERT_STATE_VERSION}" \
     'limit_id_contract_version=1' \
     "prev_5h_pct=${prev_5h_pct}" \
     "prev_weekly_pct=${prev_weekly_pct}" \
@@ -1967,6 +2028,10 @@ persist_alert_state() {
     "observed_weekly_pct=${observed_weekly_pct}" \
     "observed_weekly_reset_at=${observed_weekly_reset_at}" \
     "observed_weekly_limit_id=${observed_weekly_limit_id}" \
+    "five_h_last_sampled_at_epoch=${five_h_last_sampled_at_epoch}" \
+    "five_h_last_sample_interval_seconds=${five_h_last_sample_interval_seconds}" \
+    "five_h_baseline_trusted=${five_h_baseline_trusted}" \
+    "five_h_baseline_migration_pending=${five_h_baseline_migration_pending}" \
     "last_sampled_at_epoch=${last_sampled_at_epoch}" \
     "last_sample_interval_seconds=${last_sample_interval_seconds}" \
     "five_h_armed_reset_at=${five_h_armed_reset_at}" \
@@ -2710,6 +2775,10 @@ check_thresholds() {
   local observed_weekly_pct=""
   local observed_weekly_reset_at=0
   local observed_weekly_limit_id=""
+  local five_h_last_sampled_at_epoch=0
+  local five_h_last_sample_interval_seconds=900
+  local five_h_baseline_trusted=0
+  local five_h_baseline_migration_pending=0
   local last_sampled_at_epoch=0
   local last_sample_interval_seconds=900
   local five_h_armed_reset_at=0
@@ -2763,6 +2832,8 @@ check_thresholds() {
   local observed_5h_initial_no_arm=0
   local observed_weekly_reset_recovery=0 weekly_intent_succeeded=1
   local observed_weekly_scheduled_due=0 weekly_atomic_done=0
+  local five_h_gap_within_archive_bound=1
+  local five_h_legacy_baseline_cleanup=0
   local weekly_gap_within_archive_bound=1
   local interrupted_5h_owner="" interrupted_5h_reset_at=0
   local interrupted_weekly_owner="" interrupted_weekly_reset_at=0
@@ -2770,6 +2841,7 @@ check_thresholds() {
   local discard_other_group_terminal=0
   local resumed_after_disabled=0 resume_delivery_attempted=0
   local journal_source_state_version=1 raw_source_state_version
+  local alert_delivery_journal_preexisting=0
   local -a script_thresholds=()
   ALERT_PROCESSING_ERROR=""
   SCRIPT_HOOK_FAILED=0
@@ -2800,16 +2872,24 @@ check_thresholds() {
             printf -v "$state_key" '%s' "$state_value"
           fi
           ;;
-        last_sampled_at_epoch)
+        five_h_last_sampled_at_epoch|last_sampled_at_epoch)
           if [[ "$state_value" =~ ^(0|[1-9][0-9]{0,11})$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
           fi
           ;;
-        last_sample_interval_seconds)
+        five_h_last_sample_interval_seconds|last_sample_interval_seconds)
           if [[ "$state_value" =~ ^[1-9][0-9]{0,4}$ ]] \
             && (( state_value <= 86400 )); then
             printf -v "$state_key" '%s' "$state_value"
           fi
+          ;;
+        five_h_baseline_trusted)
+          [[ "$state_value" == 0 || "$state_value" == 1 ]] \
+            && five_h_baseline_trusted="$state_value"
+          ;;
+        five_h_baseline_migration_pending)
+          [[ "$state_value" == 0 || "$state_value" == 1 ]] \
+            && five_h_baseline_migration_pending="$state_value"
           ;;
         notified_5h_thresholds|notified_weekly_thresholds)
           [[ "$state_value" =~ ^([0-9]+,)*[0-9]*$ ]] && printf -v "$state_key" '%s' "$state_value"
@@ -2852,12 +2932,12 @@ check_thresholds() {
     return 1
   fi
 
-  if (( state_version > 5 )); then
+  if (( state_version > ALERT_STATE_VERSION )); then
     echo "[ERROR] Unsupported future alert state version ${state_version}; alerts are disabled." >&2
     ALERT_PROCESSING_ERROR="unsupported future alert state version"
     return 1
   fi
-  if (( state_version < 1 || state_version > 5 )); then
+  if (( state_version < 1 || state_version > ALERT_STATE_VERSION )); then
     echo "[ERROR] Unsupported alert state version ${state_version}." >&2
     ALERT_PROCESSING_ERROR="invalid alert state version"
     return 1
@@ -2867,6 +2947,7 @@ check_thresholds() {
   elif (( alerts_disabled_since > 0 )); then
     resumed_after_disabled=1
   fi
+  [[ -e "$ALERT_DELIVERIES_FILE" ]] && alert_delivery_journal_preexisting=1
 
   mapfile -t thresholds < <(load_thresholds)
   pace="$(weekly_pace_vs_ideal "$weekly_pct" "$weekly_reset_at" "$scraped_at_epoch")"
@@ -2939,10 +3020,67 @@ check_thresholds() {
     clear_weekly_script_actions
   fi
 
+  # A migrated state written before the complete-sample timestamp contract
+  # cannot prove whether its retained 5h baseline crossed a deadline. The
+  # durable migration marker is required here because migration itself may
+  # have replaced the v5 file before a crash, making the raw version 6 on the
+  # next process.
+  if (( state_loaded == 1 && five_h_baseline_trusted == 0 \
+        && (five_h_baseline_migration_pending == 1 \
+            || journal_source_state_version < ALERT_STATE_VERSION) \
+        )) \
+    && [[ -n "$observed_5h_limit_id" && "$observed_5h_limit_id" == "$limit_id" ]]; then
+    # Before the retained deadline there is no crossing ambiguity: a later
+    # deadline in the current complete sample is necessarily an observed
+    # refill.  This preserves the safe pre-deadline behavior of v5 state while
+    # still refusing to guess when the sample is at/after that deadline.
+    if (( five_h_observation_valid == 1 )) \
+      && (( observed_5h_reset_at > 0 )) \
+      && (( five_h_reset_at > observed_5h_reset_at )) \
+      && (( scraped_at_epoch < observed_5h_reset_at )); then
+      five_h_baseline_trusted=1
+      five_h_last_sampled_at_epoch="$scraped_at_epoch"
+      five_h_last_sample_interval_seconds="$sample_interval_seconds"
+    elif (( five_h_armed_reset_at == 0 )) \
+      && (( observed_5h_reset_at > 0 )) \
+      && (( scraped_at_epoch >= observed_5h_reset_at )) \
+      && (( alert_delivery_journal_preexisting == 1 )); then
+      five_h_legacy_baseline_cleanup=1
+    fi
+  fi
+
+  # A complete 5h observation can straddle a planned deadline without an
+  # intermediate complete poll.  Same-owner partial samples are intentionally
+  # skipped, so the stored complete-sample timestamp supplies the strict
+  # previous-sample and shared archive/live gap checks.  Keep a durable local
+  # marker authoritative; it represents a previously consumed local cycle.
+  if (( five_h_last_sampled_at_epoch > 0 )) \
+    && ! is_reset_observation_gap_acceptable \
+      "$five_h_last_sampled_at_epoch" "$scraped_at_epoch" \
+      "$five_h_last_sample_interval_seconds" "$sample_interval_seconds"; then
+    five_h_gap_within_archive_bound=0
+  fi
+  if (( five_h_armed_reset_at == 0 )) \
+    && [[ "$observed_5h_limit_id" == "$limit_id" ]] \
+    && (( five_h_baseline_trusted == 1 )) \
+    && (( five_h_gap_within_archive_bound == 1 )) \
+    && (( local_observed_5h_reset_at == 0 )) \
+    && [[ "$observed_5h_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] \
+    && (( five_h_observation_valid == 1 )) \
+    && [[ "$five_h_reset_at" =~ ^[0-9]+$ ]] \
+    && (( five_h_last_sampled_at_epoch > 0 \
+          && five_h_last_sampled_at_epoch < observed_5h_reset_at \
+          && observed_5h_reset_at <= scraped_at_epoch \
+          && five_h_reset_at > observed_5h_reset_at )); then
+    five_h_armed_reset_at="$observed_5h_reset_at"
+    five_h_armed_limit_id="$limit_id"
+    observed_5h_scheduled_due=1
+  fi
+
   # Detect this candidate before a missing delivery journal is reconstructed.
   # Otherwise migration can turn the very sample that proves a local observed
   # reset into a stale network reset (and threshold) occurrence.
-  if (( five_h_observation_valid == 1 )) \
+  if (( five_h_baseline_trusted == 1 && five_h_observation_valid == 1 )) \
     && [[ -n "$observed_5h_limit_id" && "$limit_id" == "$observed_5h_limit_id" ]] \
     && is_observed_5h_reset "$observed_5h_pct" "$five_h_pct" \
       "$observed_5h_reset_at" "$five_h_reset_at"; then
@@ -3131,6 +3269,22 @@ check_thresholds() {
     echo "[ERROR] Alert delivery journal is invalid; no notification was sent." >&2
     ALERT_PROCESSING_ERROR="invalid alert delivery journal"
     return 1
+  fi
+
+  # A migrated v5 baseline has no trustworthy complete-sample timestamp. Close
+  # any owner-scoped legacy rows before reconciliation can deliver them, but do
+  # not create a synthetic reset occurrence: the current sample is only the
+  # point at which the fresh baseline becomes known.
+  if (( five_h_legacy_baseline_cleanup == 1 )); then
+    if ! expire_observed_owner_cycle 5h "$limit_id" "$scraped_at_epoch" 0; then
+      ALERT_PROCESSING_ERROR="legacy 5h baseline cleanup failed"
+      return 1
+    fi
+    observed_5h_atomic_done=1
+    # Keep the migration intent until the complete baseline and its timestamp
+    # are persisted together at the end of this cycle. If the process stops
+    # after this journal write, the marker makes the next poll repeat cleanup
+    # before any detector work.
   fi
 
   # Close an observed 5-hour cycle immediately after the journal is known to
@@ -3423,6 +3577,9 @@ check_thresholds() {
       observed_5h_reset_at="$five_h_reset_at"
       observed_5h_limit_id="$limit_id"
       local_observed_5h_reset_at=0
+      five_h_baseline_trusted=1
+      five_h_last_sampled_at_epoch="$scraped_at_epoch"
+      five_h_last_sample_interval_seconds="$sample_interval_seconds"
       initialize_5h_baseline=1
       if (( state_loaded == 1 )); then
         # State from before the owner-aware format has no trustworthy 5h
@@ -3447,6 +3604,9 @@ check_thresholds() {
       observed_5h_reset_at="$five_h_reset_at"
       observed_5h_limit_id="$limit_id"
       local_observed_5h_reset_at=0
+      five_h_baseline_trusted=1
+      five_h_last_sampled_at_epoch="$scraped_at_epoch"
+      five_h_last_sample_interval_seconds="$sample_interval_seconds"
       initialize_5h_baseline=1
       process_5h_sample=0
       # A complete sample from a new limit group is a fresh baseline.  Clear
@@ -3465,6 +3625,28 @@ check_thresholds() {
         script_5h_reset_attempted_at=0
         clear_5h_reset_script_actions
       fi
+    elif (( five_h_baseline_trusted == 0 )); then
+      observed_5h_pct="$five_h_pct"
+      observed_5h_reset_at="$five_h_reset_at"
+      observed_5h_limit_id="$limit_id"
+      five_h_baseline_trusted=1
+      five_h_last_sampled_at_epoch="$scraped_at_epoch"
+      five_h_last_sample_interval_seconds="$sample_interval_seconds"
+      if (( five_h_legacy_baseline_cleanup == 1 )) \
+        || ! percentage_below_full "$five_h_pct"; then
+        # A complete full sample establishes the first trusted baseline after
+        # migration (or after an initial partial observation), but must not
+        # replay the untrusted historical percentage/deadline.  The same rule
+        # applies to a low sample after the retained deadline: the old cycle
+        # has just been closed, so this sample is baseline-only as well.
+        initialize_5h_baseline=1
+        process_5h_sample=0
+        prev_5h_pct="$five_h_pct"
+        notified_5h_thresholds=""
+        pending_5h_threshold=""
+        script_prev_5h_pct="$five_h_pct"
+        clear_5h_script_actions
+      fi
     fi
   elif [[ -n "$observed_5h_limit_id" && "$limit_id" != "$observed_5h_limit_id" ]]; then
     # A partial row from another group has no reset deadline to establish a
@@ -3480,6 +3662,9 @@ check_thresholds() {
     observed_5h_reset_at=0
     observed_5h_limit_id=""
     local_observed_5h_reset_at=0
+    five_h_baseline_trusted=0
+    five_h_last_sampled_at_epoch=0
+    five_h_last_sample_interval_seconds=900
     five_h_armed_reset_at=0
     five_h_armed_limit_id=""
     prev_5h_pct=100
@@ -3500,6 +3685,16 @@ check_thresholds() {
     # that threshold baseline to the sample's owner immediately so later
     # partial samples can be compared safely without looking like legacy state.
     observed_5h_limit_id="$limit_id"
+  elif (( state_loaded == 1 && five_h_baseline_trusted == 0 \
+          && (five_h_baseline_migration_pending == 1 \
+              || journal_source_state_version < ALERT_STATE_VERSION) )); then
+    # Until a complete sample establishes the migrated baseline, a partial
+    # sample must not run threshold or hook detectors against legacy state.
+    # The migration may already have rewritten the source file to v6 before a
+    # crash, so the durable migration marker is checked alongside the raw
+    # source version. A fresh v6 detector with no migration marker retains its
+    # normal partial-sample continuity.
+    process_5h_sample=0
   fi
 
   # A recovery marker is useful only while its weekly reset occurrence could
@@ -3651,7 +3846,8 @@ check_thresholds() {
   # 5-hour reset. If an already armed scheduled cycle crossed in this sample,
   # let that normal path own the event so history and notifications cannot
   # double count the same reset.
-  if (( initialize_5h_baseline == 0 && five_h_observation_valid == 1 )) \
+  if (( initialize_5h_baseline == 0 && five_h_baseline_trusted == 1 \
+        && five_h_observation_valid == 1 )) \
     && [[ "$limit_id" == "$observed_5h_limit_id" ]] \
     && is_observed_5h_reset "$observed_5h_pct" "$five_h_pct" \
       "$observed_5h_reset_at" "$five_h_reset_at" \
@@ -4246,10 +4442,20 @@ PYEOF
     # entries.  Subsequent cycles return to normal expire-before-deliver order.
     alerts_disabled_since=0
   fi
-  # Keep the previous complete weekly observation timestamp and cadence beside
+  # Keep the previous complete observation timestamp and cadence beside
   # detector state. This is the live equivalent of archive.py's adjacent
   # complete-snapshot gap check: a partial observation must not hide an old
-  # complete baseline and make a sparse full-to-full pair look recent.
+  # complete baseline and make a sparse pair look recent.
+  if (( five_h_observation_valid == 1 )); then
+    five_h_last_sampled_at_epoch="$scraped_at_epoch"
+    five_h_last_sample_interval_seconds="$sample_interval_seconds"
+    five_h_baseline_trusted=1
+    # Retire migration cleanup only after the complete owner-aware baseline,
+    # trust bit, timestamp and cadence are all in the final state image. Any
+    # earlier state write keeps this marker and therefore remains fail-closed
+    # on a subsequent partial sample.
+    five_h_baseline_migration_pending=0
+  fi
   if (( weekly_observation_valid == 1 )); then
     last_sampled_at_epoch="$scraped_at_epoch"
     last_sample_interval_seconds="$sample_interval_seconds"

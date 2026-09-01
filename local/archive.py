@@ -435,13 +435,8 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             current_reset_at = current[reset_index]
             if (
                 previous[0] < reset_at <= current[0]
-                and (
-                    window != "weekly"
-                    or (
-                        isinstance(current_reset_at, int)
-                        and current_reset_at > reset_at
-                    )
-                )
+                and isinstance(current_reset_at, int)
+                and current_reset_at > reset_at
             ):
                 connection.execute(
                     """
@@ -493,6 +488,44 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
         previous = previous_five
         previous_pct, previous_deadline = previous[1], previous[2]
         scheduled_crossing = (previous_deadline, previous[6]) in scheduled_5h_cycles
+        if (
+            not scheduled_crossing
+            and previous[6] is not None
+            and current[6] is not None
+            and previous[6] == current[6]
+            and isinstance(previous_deadline, int)
+            and isinstance(current_deadline, int)
+            and current_deadline > previous_deadline
+            and previous[0] < previous_deadline <= current[0]
+        ):
+            # The complete baseline can span same-owner partial snapshots.
+            # Classify a crossed planned deadline from that baseline as a
+            # scheduled reset before considering refill evidence; otherwise a
+            # partial row can make live/archive paths disagree and anchor the
+            # event to the observation time.
+            gap = current[0] - previous[0]
+            intervals = [
+                value for value in (previous[5], current[5])
+                if isinstance(value, (int, float)) and value > 0
+            ]
+            expected_interval = int(max(intervals, default=900))
+            if gap > 0 and gap <= max(3_600, expected_interval * 2):
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO reset_events (
+                        window, reset_at_epoch, observed_at_epoch,
+                        before_pct, after_pct, detection_method
+                    ) VALUES ('5h', ?, ?, ?, ?, 'scheduled_crossing')
+                    """,
+                    (
+                        previous_deadline,
+                        current[0],
+                        previous_pct,
+                        current_pct,
+                    ),
+                )
+                scheduled_5h_cycles.add((previous_deadline, previous[6]))
+                scheduled_crossing = True
         if (
             previous[6] is not None
             and current[6] is not None

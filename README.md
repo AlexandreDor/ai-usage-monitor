@@ -418,12 +418,15 @@ Discord and Telegram maintain separate delivery progress. Temporary failures
 such as timeouts, HTTP 408, 429, or 5xx remain pending. Successful channels are
 not replayed because another channel failed.
 
-The durable detector state uses `state_version: 5` with an explicit opaque-ID
-contract marker, and `local/runtime/alert-deliveries.json` uses journal schema
-2 with the same marker. Existing unmarked state and schema-1 journals are
-migrated one file at a time with atomic replacement; pending and delivered
-channel state is retained, and a failed migration is retried on the next
-cycle. Future versions or inconsistent alert/cycle identities fail closed.
+The durable detector state uses `state_version: 6` with an explicit opaque-ID
+contract marker and a trusted complete-sample baseline for the 5-hour window,
+and `local/runtime/alert-deliveries.json` uses journal schema 2 with the same
+marker. Existing unmarked state and schema-1 journals are migrated one file at
+a time with atomic replacement; pending and delivered channel state is
+retained, and a failed migration is retried on the next cycle. Legacy 5-hour
+state without a complete-sample timestamp is treated conservatively after its
+retained deadline, so it cannot be replayed as a scheduled reset. Future
+versions or inconsistent alert/cycle identities fail closed.
 
 Set `ALERTS_ENABLED=0` to pause outbound alerting. New threshold, reset, and
 anomaly events observed while disabled are acknowledged locally: they advance

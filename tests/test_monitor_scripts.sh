@@ -122,7 +122,9 @@ reset_case
 ALERT_SCRIPT_1="$HOOK_ONE"
 ALERT_SCRIPT_1_EVENTS='5h:reset'
 validate_config
-old_five_deadline=$((now + 300))
+# Keep this observed-refill fixture before the planned deadline; crossed
+# deadlines are scheduled crossings and are covered by the focused cases.
+old_five_deadline=$((now + 1800))
 new_five_deadline=$((old_five_deadline + 15 * 60))
 check_thresholds 100 100 later later "$old_five_deadline" '' "$now" group-a
 check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 900))" group-a
@@ -141,7 +143,7 @@ reset_case
 ALERT_SCRIPT_1="$HOOK_ONE"
 ALERT_SCRIPT_1_EVENTS='5h:reset'
 validate_config
-crash_old_five_deadline=$((now + 300))
+crash_old_five_deadline=$((now + 1800))
 crash_new_five_deadline=$((crash_old_five_deadline + 900))
 check_thresholds 100 100 later later "$crash_old_five_deadline" '' "$now" group-a
 (
@@ -883,7 +885,7 @@ validate_config
 printf 'state_version=2\nprev_5h_pct=40\nprev_weekly_pct=100\n' > "$STATE_FILE"
 check_thresholds 40 100 later unknown '' '' "$now"
 [[ ! -e "$HOOK_LOG" ]] || fail "state migration replayed a historical threshold"
-assert_eq 5 "$(state_value state_version)" "alert state was not upgraded to version 5"
+assert_eq 6 "$(state_value state_version)" "alert state was not upgraded to version 6"
 assert_eq 1 "$(state_value script_tracking_initialized)" "script tracking was not initialized"
 
 # ALERTS_ENABLED=0 journals script actions and advances their baseline without
@@ -913,7 +915,7 @@ ALERT_SCRIPT_1="$HOOK_ONE"
 # shellcheck disable=SC2034
 ALERT_SCRIPT_1_EVENTS='5h:reset'
 validate_config
-old_five_deadline=$((now + 300))
+old_five_deadline=$((now + 1800))
 new_five_deadline=$((old_five_deadline + 900))
 check_thresholds 100 100 later unknown "$old_five_deadline" '' "$now" group-a
 check_thresholds 100 100 later unknown "$new_five_deadline" '' "$((now + 900))" group-a
