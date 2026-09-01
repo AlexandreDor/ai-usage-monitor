@@ -71,6 +71,13 @@ def _state_default() -> dict[str, Any]:
         "last_pct": None,
         "last_reset_at": None,
         "last_available_reset_at": None,
+        # The generic rolling baseline advances on a valid percentage even
+        # when the reset deadline is temporarily absent.  Keep a second,
+        # complete-only baseline for the 5h classifier so an A -> partial -> A
+        # sequence cannot turn a planned crossing into a quota increase.
+        "last_complete_epoch": 0,
+        "last_complete_pct": None,
+        "last_complete_reset_at": None,
         "missing_streak": 0,
         "missing_started_epoch": 0,
         "reset_history": [],
@@ -95,6 +102,23 @@ def _load_state(connection: sqlite3.Connection, limit_id: str, window: str,
             if isinstance(value, dict):
                 state = _state_default()
                 state.update(value)
+                if window == "5h":
+                    # States written before the complete-baseline fields can
+                    # still be upgraded safely when their last generic sample
+                    # was complete.  A missing reset deadline is deliberately
+                    # not enough evidence to infer the complete sample time.
+                    if not all(key in value for key in (
+                            "last_complete_epoch", "last_complete_pct",
+                            "last_complete_reset_at")):
+                        old_epoch = _epoch(value.get("last_epoch"))
+                        old_pct = _number(value.get("last_pct"))
+                        old_reset = _epoch(value.get("last_reset_at"))
+                        if old_epoch is not None and old_pct is not None and old_reset is not None:
+                            state.update({
+                                "last_complete_epoch": old_epoch,
+                                "last_complete_pct": old_pct,
+                                "last_complete_reset_at": old_reset,
+                            })
                 return state, True
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
@@ -118,6 +142,11 @@ def _load_state(connection: sqlite3.Connection, limit_id: str, window: str,
             "last_available_reset_at": _epoch(row[2]),
         })
         if state["last_reset_at"] is not None:
+            state.update({
+                "last_complete_epoch": int(row[0]),
+                "last_complete_pct": _number(row[1]),
+                "last_complete_reset_at": state["last_reset_at"],
+            })
             state["reset_history"] = [[int(row[0]), state["last_reset_at"]]]
     return state, False
 
@@ -162,11 +191,27 @@ def _observed_five_hour_reset(previous_pct: float, current_pct: float,
     )
 
 
-def _scheduled_crossing(state: dict[str, Any], current_epoch: int) -> bool:
-    previous_epoch = _epoch(state.get("last_epoch"))
-    previous_reset = _epoch(state.get("last_reset_at"))
-    if previous_reset is None:
-        previous_reset = _epoch(state.get("last_available_reset_at"))
+def _five_hour_complete_baseline(state: dict[str, Any]) -> tuple[int, float, int] | None:
+    previous_epoch = _epoch(state.get("last_complete_epoch"))
+    previous_pct = _number(state.get("last_complete_pct"))
+    previous_reset = _epoch(state.get("last_complete_reset_at"))
+    if previous_epoch is None or previous_pct is None or previous_reset is None:
+        return None
+    return previous_epoch, previous_pct, previous_reset
+
+
+def _scheduled_crossing(state: dict[str, Any], current_epoch: int,
+                        window: str) -> bool:
+    if window == "5h":
+        baseline = _five_hour_complete_baseline(state)
+        if baseline is None:
+            return False
+        previous_epoch, _, previous_reset = baseline
+    else:
+        previous_epoch = _epoch(state.get("last_epoch"))
+        previous_reset = _epoch(state.get("last_reset_at"))
+        if previous_reset is None:
+            previous_reset = _epoch(state.get("last_available_reset_at"))
     return bool(
         previous_epoch is not None and previous_reset is not None
         and previous_epoch < previous_reset <= current_epoch
@@ -237,6 +282,12 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
             "reset_shift_episode_started": 0,
             "quota_increase_active": False, "reset_shift_signature": None,
         })
+        if window == "5h":
+            state.update({
+                "last_complete_epoch": epoch if current_reset is not None else 0,
+                "last_complete_pct": current_pct if current_reset is not None else None,
+                "last_complete_reset_at": current_reset,
+            })
         _record_reset_history(state, epoch, current_reset)
         _save_state(connection, limit_id, window, state, epoch)
         return
@@ -244,15 +295,21 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     previous_epoch = _epoch(state.get("last_epoch"))
     if previous_epoch is None or epoch <= previous_epoch:
         return
-    previous_pct = float(state["last_pct"])
-    previous_reset = _epoch(state.get("last_reset_at"))
-    if previous_reset is None:
-        previous_reset = _epoch(state.get("last_available_reset_at"))
-    scheduled_crossing = _scheduled_crossing(state, epoch)
+    generic_previous_reset = _epoch(state.get("last_reset_at"))
+    if generic_previous_reset is None:
+        generic_previous_reset = _epoch(state.get("last_available_reset_at"))
+    complete_baseline = _five_hour_complete_baseline(state) if window == "5h" else None
+    comparison_available = window != "5h" or complete_baseline is not None
+    if complete_baseline is not None:
+        _, previous_pct, previous_reset = complete_baseline
+    else:
+        previous_pct = float(state["last_pct"])
+        previous_reset = generic_previous_reset
+    scheduled_crossing = _scheduled_crossing(state, epoch, window)
     recognized_weekly = window == "weekly" and _weekly_reset(
         previous_pct, current_pct, previous_reset, current_reset
     )
-    recognized_five_hour = window == "5h" and _observed_five_hour_reset(
+    recognized_five_hour = window == "5h" and comparison_available and _observed_five_hour_reset(
         previous_pct, current_pct, previous_reset, current_reset
     )
     reset_in_past = current_reset is not None and current_reset <= epoch
@@ -262,13 +319,14 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
         # A deadline that has just crossed the sampling instant is a planned
         # reset, not a malformed movement.  A deadline already in the past on
         # both sides is also not a new movement.
-        if reset_in_past and (previous_reset is None or current_reset < previous_reset):
+        if comparison_available and reset_in_past and (
+                previous_reset is None or current_reset < previous_reset):
             anomaly = (
                 "reset_in_past",
                 f"{window} reset date moved into the past ({current_reset}); "
                 "quota did not show a recognized reset.",
             )
-        elif previous_reset is not None and current_reset is not None:
+        elif comparison_available and previous_reset is not None and current_reset is not None:
             delta = current_reset - previous_reset
             if abs(delta) > RESET_SHIFT_TOLERANCE_SECONDS and not reset_in_past:
                 anomaly = (
@@ -313,14 +371,18 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
                     )
                     state["oscillation_signature"] = signature
                     state["oscillation_episode_started"] = epoch
-        if anomaly is None and current_pct > previous_pct + QUOTA_INCREASE_TOLERANCE_PCT:
+        if (anomaly is None and current_pct > previous_pct + QUOTA_INCREASE_TOLERANCE_PCT
+                and (window != "5h" or (comparison_available and current_reset is not None))):
             anomaly = (
                 "quota_increase",
                 f"{window} remaining quota rose from {previous_pct:g}% to "
                 f"{current_pct:g}% without a recognized reset.",
             )
 
-    quota_jump = current_pct > previous_pct + QUOTA_INCREASE_TOLERANCE_PCT
+    quota_jump = (
+        current_pct > previous_pct + QUOTA_INCREASE_TOLERANCE_PCT
+        and (window != "5h" or (comparison_available and current_reset is not None))
+    )
     if not quota_jump:
         state["quota_increase_active"] = False
     if anomaly is not None and anomaly[0] == "quota_increase":
@@ -374,6 +436,12 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     state["last_reset_at"] = current_reset
     if current_reset is not None:
         state["last_available_reset_at"] = current_reset
+        if window == "5h":
+            state.update({
+                "last_complete_epoch": epoch,
+                "last_complete_pct": current_pct,
+                "last_complete_reset_at": current_reset,
+            })
     _save_state(connection, limit_id, window, state, epoch)
 
 

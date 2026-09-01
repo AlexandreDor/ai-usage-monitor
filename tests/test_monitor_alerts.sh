@@ -69,7 +69,7 @@ reset_case
 printf 'prev_5h_pct=80\nprev_weekly_pct=70\n' > "$STATE_FILE"
 check_thresholds 80 70 "later" "later" "$((now + 300))" "$((now + 3600))" "$now"
 assert_alert_count 0
-[[ "$(state_value state_version)" == "5" ]] || fail "state was not migrated"
+[[ "$(state_value state_version)" == "6" ]] || fail "state was not migrated"
 
 # A full 5-hour cycle is observable from a deadline advance even when the
 # quota stays at 100%. It is anchored to the first observation carrying the

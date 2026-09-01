@@ -198,8 +198,10 @@ PYEOF
 ALERTS_ENABLED=1
 
 # A partially restored detector can retain the observed pre-reset baseline
-# while losing its explicit arm.  The observed refill must expire that OLD
-# cycle, not the NEW deadline from the sample, before due delivery runs.
+# while losing its explicit arm. Because v5 has no complete-sample timestamp,
+# migration treats that baseline as unknown once the retained deadline has been
+# crossed and closes old pending rows before due delivery; it must not invent a
+# new network reset.
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-restored"
 export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
@@ -208,6 +210,7 @@ ALERT_THRESHOLDS=50
 restored_now=2000002050
 restored_old_deadline=$((restored_now + 3600))
 restored_new_deadline=$((restored_old_deadline + 900))
+restored_sample_at=$((restored_old_deadline + 1))
 restored_limit_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -228,15 +231,15 @@ register_network_alert threshold 5h 50 \
   "{\"limit_id\":\"${restored_limit_id}\",\"remaining_pct\":40,\"reset_epoch\":${restored_old_deadline},\"covered_thresholds\":[50]}" \
   "$((restored_now + 1))" "$((restored_old_deadline + 5 * 60 * 60))" false >/dev/null
 check_thresholds 100 100 later unknown "$restored_new_deadline" '' \
-  "$((restored_now + 1))" group-a >/dev/null
+  "$restored_sample_at" group-a >/dev/null
 assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
-  "restored observed 5h refill delivered the stale threshold"
+  "restored unknown 5h baseline delivered the stale threshold"
 python3 - "$ALERT_DELIVERIES_FILE" "$restored_limit_id" "$restored_old_deadline" <<'PYEOF'
 import json
 import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
-assert len(items) == 2, items
+assert len(items) == 1, items
 threshold = items[0]
 assert threshold["kind"] == "threshold", threshold
 assert threshold["event_data"]["limit_id"] == sys.argv[2], threshold
@@ -245,14 +248,12 @@ assert threshold["status"] == "failed", threshold
 assert threshold["terminal_reason"] == "expired_after_reset", threshold
 assert threshold["channels"]["discord"]["error_class"] == "expired_after_reset", threshold
 assert threshold["detector_acknowledged_at"] is not None, threshold
-tombstone = next(item for item in items if item["kind"] == "reset")
-assert tombstone["terminal_reason"] == "local_observed", tombstone
-assert tombstone["status"] == "failed", tombstone
+assert threshold["kind"] == "threshold", threshold
 PYEOF
 check_thresholds 100 100 later unknown "$restored_new_deadline" '' \
-  "$((restored_now + 2))" group-a >/dev/null
+  "$((restored_sample_at + 1))" group-a >/dev/null
 assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
-  "restored stale threshold replayed on the next poll"
+  "restored unknown baseline replayed on the next poll"
 
 # A due, explicitly same-owner arm owns a simultaneous 100% -> 100% deadline
 # advance.  With no journal on disk, initialization must reconstruct the
@@ -517,6 +518,8 @@ printf '%s\n' \
   'prev_5h_pct=100' 'prev_weekly_pct=100' \
   'observed_5h_pct=100' "observed_5h_reset_at=${restart_old_deadline}" \
   "observed_5h_limit_id=${restart_limit_id}" \
+  "five_h_last_sampled_at_epoch=${restart_now}" \
+  'five_h_last_sample_interval_seconds=900' \
   'observed_weekly_pct=' 'observed_weekly_reset_at=0' 'observed_weekly_limit_id=' \
   'five_h_armed_reset_at=0' 'five_h_armed_limit_id=' \
   'weekly_armed_reset_at=0' 'weekly_armed_limit_id=' \
