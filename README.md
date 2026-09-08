@@ -14,8 +14,9 @@ reset probabilities from the independent Codex Forecast service.
 
 ### Live quota dashboard
 
-- Current remaining quota for the active weekly window by default; the 5-hour
-  series remains available from the chart legend when needed.
+- Current remaining quota for the active weekly window by default. The 5-hour
+  card is hidden initially and can be shown with the dashboard control when
+  needed; its chart series remains available from the legend selector.
 - Reset dates and weekly pace compared with ideal consumption.
 - Rolling history chart generated from local quota and Forecast snapshots.
 - The optional 5-hour series and selectors retain localized names and value
@@ -480,10 +481,13 @@ Personal scripts can be stored under `local/scripts/`, whose contents are
 ignored by Git except for `.gitkeep`.
 
 The `5h:reset` selector runs for scheduled resets and for the observed full
-5-hour reset described above. Each newly observed deadline is anchored to the
-first snapshot that reports it and is run once; repeated snapshots with that
-deadline are ignored. `ALERTS_ENABLED=0` acknowledges the event and records the
-script action without executing it.
+5-hour reset described above. Any same-owner pair of complete 100% observations
+with a strictly later deadline is local reset evidence, including when the old
+deadline has already passed; it runs the hook without creating a network reset
+occurrence. Each newly observed deadline is anchored to the first snapshot that
+reports it and is run once; repeated snapshots with that deadline are ignored.
+`ALERTS_ENABLED=0` acknowledges the event and records the script action without
+executing it.
 
 Scripts receive:
 

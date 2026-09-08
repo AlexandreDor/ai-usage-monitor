@@ -71,6 +71,14 @@ test('works offline and exposes no serious or critical accessibility violations'
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   await expect(page.locator('#weekly-pct')).toHaveText('36%');
   await expect(page.locator('#five-hour-card')).toBeHidden();
+  await expect(page.locator('#five-hour-toggle')).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.locator('#five-hour-toggle')).toHaveText('Show 5-hour limit');
+  await page.locator('#five-hour-toggle').click();
+  await expect(page.locator('#five-hour-card')).toBeVisible();
+  await expect(page.locator('#five-hour-toggle')).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.locator('#five-hour-toggle')).toHaveText('Hide 5-hour limit');
+  await page.locator('#five-hour-toggle').click();
+  await expect(page.locator('#five-hour-card')).toBeHidden();
   await expect(page.locator('#five-hour-title')).toHaveText('5-Hour Limit');
   await expect(page.locator('#weekly-title')).toHaveText('Weekly Limit');
   await expect(page.locator('.limit-card').first()).toHaveAttribute('aria-labelledby', 'five-hour-title');

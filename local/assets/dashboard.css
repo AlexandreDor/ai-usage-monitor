@@ -173,6 +173,16 @@ body[data-freshness="stale"] .limit-card {
   border-color: #fff;
 }
 
+.five-hour-toggle {
+  color: #bfdbfe;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid rgba(147, 197, 253, 0.42);
+  cursor: pointer;
+  font: inherit;
+  padding: 0 0 2px;
+}
+
 .dashboard-links {
   display: flex;
   align-items: center;

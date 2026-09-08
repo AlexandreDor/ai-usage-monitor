@@ -190,10 +190,9 @@ check_thresholds 100 100 later unknown "$restored_new_deadline" '' \
 assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
   "restored stale threshold replayed on the next poll"
 
-# A due, explicitly same-owner arm owns a simultaneous 100% -> 100% deadline
-# advance.  With no journal on disk, initialization must reconstruct the
-# scheduled reset rather than skipping it as a local observed reset.  The
-# stale threshold is still expired before that reset is delivered.
+# A due, explicitly same-owner arm still yields local evidence for a
+# simultaneous 100% -> 100% deadline advance.  With no journal on disk,
+# initialization must persist the local tombstone and keep the reset silent.
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-due-observed-missing-journal"
 export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
@@ -227,29 +226,32 @@ export ALERT_SCRIPT_1="$due_missing_hook" ALERT_SCRIPT_1_EVENTS='5h:reset'
 validate_config
 check_thresholds 100 100 later unknown "$due_missing_new" '' \
   "$due_missing_now" group-a >/dev/null
-assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
-  "due observed reset was suppressed after missing-journal reconstruction"
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "due observed reset emitted an HTTP request after missing-journal reconstruction"
 assert_eq 1 "$(wc -l < "$due_missing_hook_log")" \
-  "due scheduled reset hook did not execute exactly once"
+  "due local observed reset hook did not execute exactly once"
 python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
 import json
 import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
-assert len(items) == 2, items
-threshold = next(item for item in items if item["kind"] == "threshold")
-reset = next(item for item in items if item["kind"] == "reset")
-assert threshold["status"] == "failed", threshold
-assert threshold["terminal_reason"] == "expired_after_reset", threshold
-assert threshold["detector_acknowledged_at"] is not None, threshold
-assert reset["status"] == "delivered", reset
-assert reset["terminal_reason"] == "delivered", reset
+assert len(items) == 1, items
+reset = items[0]
+assert reset["kind"] == "reset", reset
+assert reset["status"] == "failed", reset
+assert reset["terminal_reason"] == "local_observed", reset
+assert reset["detector_acknowledged_at"] is not None, reset
 assert reset["event_data"]["limit_id"].startswith("limit-"), reset
 PYEOF
+check_thresholds 100 100 later unknown "$due_missing_new" '' \
+  "$((due_missing_now + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "repeated due observed reset emitted an HTTP request"
+assert_eq 1 "$(wc -l < "$due_missing_hook_log")" \
+  "repeated due local observed reset reran its hook"
 
-# The same ownership rule applies when both pending rows already exist: do not
-# create a local tombstone or duplicate the scheduled reset, but atomically
-# expire the threshold before the existing reset is delivered.
+# The same local classification applies when a stale scheduled row already
+# exists: atomically expire both old network rows and keep the reset silent.
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-due-observed-existing-journal"
 due_existing_now=2000016000
@@ -292,10 +294,10 @@ export ALERT_SCRIPT_1="$due_existing_hook" ALERT_SCRIPT_1_EVENTS='5h:reset'
 validate_config
 check_thresholds 100 100 later unknown "$due_existing_new" '' \
   "$due_existing_now" group-a >/dev/null
-assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
-  "existing due scheduled reset was not delivered exactly once"
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "existing due scheduled reset emitted an HTTP request"
 assert_eq 1 "$(wc -l < "$due_existing_hook_log")" \
-  "existing due scheduled reset hook did not execute exactly once"
+  "existing due local observed reset hook did not execute exactly once"
 python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
 import json
 import sys
@@ -306,13 +308,20 @@ threshold = next(item for item in items if item["kind"] == "threshold")
 reset = next(item for item in items if item["kind"] == "reset")
 assert threshold["terminal_reason"] == "expired_after_reset", threshold
 assert threshold["detector_acknowledged_at"] is not None, threshold
-assert reset["status"] == "delivered", reset
-assert reset["terminal_reason"] == "delivered", reset
+assert reset["status"] == "failed", reset
+assert reset["terminal_reason"] == "local_observed", reset
+assert reset["detector_acknowledged_at"] is not None, reset
 PYEOF
+check_thresholds 100 100 later unknown "$due_existing_new" '' \
+  "$((due_existing_now + 1))" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "repeated existing due observed reset emitted an HTTP request"
+assert_eq 1 "$(wc -l < "$due_existing_hook_log")" \
+  "repeated existing due local observed reset reran its hook"
 
-# Expiration-only work is fail-closed and retryable for this scheduled path.
-# A failed transaction must leave both pending rows and the old detector arm
-# untouched; the retry then delivers only the legitimate scheduled reset.
+# Expiration-only work is fail-closed and retryable for a consumed-quota
+# scheduled path.  A failed transaction must leave both pending rows and the
+# old detector arm untouched; the retry then delivers only that reset.
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-due-observed-expiry-retry"
 retry_now=2000017000
@@ -341,11 +350,11 @@ register_network_alert reset 5h reset \
   "limit:${retry_id}|reset:${retry_old}" "retry scheduled reset" \
   "{\"limit_id\":\"${retry_id}\",\"reset_epoch\":${retry_old}}" \
   "$((retry_now - 1))" "$((retry_old + 5 * 60 * 60))" false >/dev/null
-# shellcheck disable=SC2317,SC2329,SC2001
+# shellcheck disable=SC2120,SC2317,SC2329,SC2001
 eval "$(declare -f expire_owner_thresholds_and_suppress_reset | sed '1s/^expire_owner_thresholds_and_suppress_reset /expire_owner_thresholds_and_suppress_reset_due_original /')"
 (
   expire_owner_thresholds_and_suppress_reset() { return 1; }
-  check_thresholds 100 100 later unknown "$retry_new" '' "$retry_now" group-a
+  check_thresholds 80 100 later unknown "$retry_new" '' "$retry_now" group-a
 ) >/dev/null 2>&1 || true
 eval "$(declare -f expire_owner_thresholds_and_suppress_reset_due_original | sed '1s/^expire_owner_thresholds_and_suppress_reset_due_original /expire_owner_thresholds_and_suppress_reset /')"
 assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
