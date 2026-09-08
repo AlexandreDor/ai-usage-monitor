@@ -782,34 +782,6 @@ function renderData(data, { schedule = true, clearError = true } = {}) {
   if (schedule) scheduleRefresh(data);
 }
 
-function setFiveHourCardVisible(visible) {
-  const card = document.getElementById('five-hour-card');
-  const toggle = document.getElementById('five-hour-toggle');
-  if (!card || !toggle) return;
-  card.hidden = !visible;
-  setElementAttribute(toggle, 'aria-expanded', visible);
-  const key = visible ? 'hideFiveHourLimit' : 'showFiveHourLimit';
-  setElementAttribute(toggle, 'data-i18n', `dashboard.${key}`);
-  toggle.textContent = t(key);
-}
-
-function syncFiveHourCardToggle() {
-  const card = document.getElementById('five-hour-card');
-  if (card) setFiveHourCardVisible(!card.hidden);
-}
-
-function bindFiveHourCardToggle() {
-  const toggle = document.getElementById('five-hour-toggle');
-  if (!toggle) return;
-  syncFiveHourCardToggle();
-  if (typeof toggle.addEventListener === 'function') {
-    toggle.addEventListener('click', () => {
-      const card = document.getElementById('five-hour-card');
-      setFiveHourCardVisible(Boolean(card && card.hidden));
-    });
-  }
-}
-
 async function fetchJson(url, missingMessage) {
   const response = await fetch(`${url}?_=${Date.now()}`);
   if (!response.ok) {
@@ -914,7 +886,6 @@ function refresh() {
 }
 
 function refreshLocalizedDashboard() {
-  syncFiveHourCardToggle();
   if (dashboardSource) renderSource(dashboardSource);
   if (dashboardData) renderData(dashboardData, { schedule: false, clearError: false });
   else renderFreshness();
@@ -937,7 +908,6 @@ function refreshLocalizedDashboard() {
 }
 
 if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(refreshLocalizedDashboard);
-bindFiveHourCardToggle();
 document.addEventListener('visibilitychange', handleDashboardVisibility);
 window.addEventListener('pageshow', handleDashboardVisibility);
 window.addEventListener('pagehide', handleDashboardPageHide);

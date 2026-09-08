@@ -27,7 +27,6 @@
     <nav class="dashboard-links" data-i18n-aria-label="dashboard.navigationAria" aria-label="Dashboard navigation">
       <a class="nav-link external-link" href="https://github.com/AlexandreDor/ai-usage-monitor" target="_blank" rel="noopener noreferrer"><span data-i18n="dashboard.githubLink">GitHub repository</span> <span aria-hidden="true">↗</span></a>
       <a class="nav-link" href="analytics.html"><span data-i18n="dashboard.analyticsLink">Advanced analytics</span> <span aria-hidden="true">→</span></a>
-      <button class="nav-link five-hour-toggle" id="five-hour-toggle" type="button" data-i18n="dashboard.showFiveHourLimit" aria-controls="five-hour-card" aria-expanded="false">Show 5-hour limit</button>
     </nav>
     <div class="preference-controls" data-i18n-aria-label="preferences.ariaLabel" aria-label="Display preferences">
       <div class="preference-setting">
@@ -65,7 +64,7 @@
   </aside>
 
   <main class="grid">
-    <section class="card limit-card" id="five-hour-card" aria-labelledby="five-hour-title" hidden>
+    <section class="card limit-card" id="five-hour-card" aria-labelledby="five-hour-title">
       <h2 class="card-label" id="five-hour-title" data-i18n="dashboard.fiveHourLimit">5-Hour Limit</h2>
       <div class="pct-value unavailable" id="five-h-pct">--</div>
       <progress class="bar unavailable" id="five-h-bar" max="100" data-i18n-aria-label="dashboard.fiveHourQuotaLabel" data-i18n-aria-valuetext="dashboard.quotaUnavailable" aria-label="5-hour remaining quota" aria-valuetext="Unavailable"></progress>
