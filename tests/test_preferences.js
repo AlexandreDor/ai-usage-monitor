@@ -31,6 +31,8 @@ if (defaults.CodexPreferences.formatCurrency(11.25) !== '€9.68') fail('default
 if (defaults.CodexPreferences.formatRate() !== '0.86') fail('conversion rate formatting is incorrect');
 if (defaults.CodexPreferences.t('analytics.showCost') !== 'Show cost') fail('analytics cost toggle translation is missing');
 if (defaults.CodexPreferences.t('dashboard.globalResetForecast') !== 'Global reset forecast') fail('dashboard forecast translation is missing');
+if (defaults.CodexPreferences.t('dashboard.showFiveHourLimit') !== 'Show 5-hour limit') fail('5-hour show control translation is missing');
+if (defaults.CodexPreferences.t('dashboard.hideFiveHourLimit') !== 'Hide 5-hour limit') fail('5-hour hide control translation is missing');
 if (defaults.CodexPreferences.t('dashboard.stale') !== 'STALE') fail('dashboard freshness translation is missing');
 if (defaults.CodexPreferences.t('dashboard.dataAge', { age: '1 min' }) !== '1 min') fail('dashboard freshness duration contains an extra label');
 if (defaults.CodexPreferences.t('dashboard.staleDataAge', { age: '5 min', overdue: '1 min' }).includes('—')) fail('dashboard stale summary contains an em dash');
@@ -53,6 +55,8 @@ if (defaults.CodexPreferences.formatCurrency(11.25) !== '11,25 $') fail('French
 if (defaults.CodexPreferences.get().language !== 'fr') fail('language preference was not saved in memory');
 if (defaults.CodexPreferences.t('analytics.showCost') !== 'Afficher le coût') fail('French analytics cost toggle translation is missing');
 if (defaults.CodexPreferences.t('dashboard.forecastUnavailable') !== 'Prévision indisponible') fail('French dashboard forecast translation is missing');
+if (defaults.CodexPreferences.t('dashboard.showFiveHourLimit') !== 'Afficher la limite sur 5 heures') fail('French 5-hour show control translation is missing');
+if (defaults.CodexPreferences.t('dashboard.hideFiveHourLimit') !== 'Masquer la limite sur 5 heures') fail('French 5-hour hide control translation is missing');
 if (defaults.CodexPreferences.t('dashboard.stale') !== 'PÉRIMÉ') fail('French dashboard freshness translation is missing');
 if (defaults.CodexPreferences.t('dashboard.dataAge', { age: '1 min' }) !== '1 min') fail('French dashboard freshness duration contains an extra label');
 if (!defaults.CodexPreferences.t('dashboard.staleDataAge', { age: '5 min', overdue: '1 min' }).includes('retard')) fail('French dashboard stale summary translation is missing');

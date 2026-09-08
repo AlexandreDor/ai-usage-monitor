@@ -2949,15 +2949,15 @@ check_thresholds() {
     observed_5h_reset_candidate=1
     if (( five_h_armed_reset_at > 0 )) \
      && [[ "$five_h_armed_limit_id" == "$limit_id" ]]; then
-      # A due, explicitly-owned arm owns this reset.  Observed evidence must
-      # not silently convert it into a local-only event; expire only the stale
-      # threshold rows and let the normal scheduled reset delivery proceed.
+      # A full-to-full deadline advance is local evidence even when the
+      # previously armed deadline has just become due.  Both complete samples
+      # are full, so a network reset would contradict the 5h reset contract.
       if (( scraped_at_epoch >= five_h_armed_reset_at )) \
         && [[ "$local_observed_5h_reset_at" != "$five_h_armed_reset_at" ]]; then
-        observed_5h_scheduled_due=1
-        observed_5h_reset_candidate=0
+        observed_5h_reset=1
       else
-        # Only a not-yet-due arm is superseded by local observed evidence.
+        # A not-yet-due arm is superseded by local observed evidence and keeps
+        # its original cycle identity for stale-threshold cleanup.
         observed_5h_superseded_reset_at="$five_h_armed_reset_at"
       fi
     else
@@ -3014,7 +3014,8 @@ check_thresholds() {
   # exception and is resolved below from the local-observed journal row.
   if (( five_h_armed_reset_at > 0 && scraped_at_epoch >= five_h_armed_reset_at )) \
     && [[ "$five_h_armed_limit_id" == "$limit_id" \
-          && "$local_observed_5h_reset_at" != "$five_h_armed_reset_at" ]]; then
+          && "$local_observed_5h_reset_at" != "$five_h_armed_reset_at" \
+          && "$observed_5h_reset_candidate" == "0" ]]; then
     observed_5h_scheduled_due=1
     observed_5h_reset_candidate=0
     observed_5h_superseded_reset_at=0
@@ -3648,9 +3649,9 @@ check_thresholds() {
   fi
 
   # A complete 100% -> 100% observation with a later deadline is an observed
-  # 5-hour reset. If an already armed scheduled cycle crossed in this sample,
-  # let that normal path own the event so history and notifications cannot
-  # double count the same reset.
+  # 5-hour reset. The candidate was classified before journal reconstruction,
+  # including when an existing arm is already due, so all full-to-full resets
+  # stay local and silent on the network.
   if (( initialize_5h_baseline == 0 && five_h_observation_valid == 1 )) \
     && [[ "$limit_id" == "$observed_5h_limit_id" ]] \
     && is_observed_5h_reset "$observed_5h_pct" "$five_h_pct" \

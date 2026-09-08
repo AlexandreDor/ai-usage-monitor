@@ -435,6 +435,19 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             current_reset_at = current[reset_index]
             if (
                 previous[0] < reset_at <= current[0]
+                # A complete 100% -> 100% 5-hour pair with a strictly later
+                # deadline is the explicit no-consumption reset signal. Keep it
+                # in the observed pass below so archive consumers get the same
+                # local-only identity as the live detector, even when the old
+                # deadline was crossed between samples. Preserve scheduled
+                # crossing behavior when the deadline did not advance.
+                and not (
+                    window == "5h"
+                    and previous[pct_index] == 100
+                    and current[pct_index] == 100
+                    and isinstance(current_reset_at, int)
+                    and current_reset_at > reset_at
+                )
                 and (
                     window != "weekly"
                     or (

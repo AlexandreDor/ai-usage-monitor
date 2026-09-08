@@ -413,6 +413,56 @@ with sqlite3.connect(sys.argv[1]) as connection:
 PYEOF
 )" "observed 5h reset reconstruction created duplicates"
 
+# A complete 100% -> 100% pair remains an observed reset when the old
+# deadline crossed between samples.  Archive reconstruction must classify it
+# the same way as the live detector rather than creating a scheduled crossing.
+rm -f "$ARCHIVE_FILE"
+five_crossing_before=$((BASE - 1800))
+five_crossing_old_deadline=$((BASE - 900))
+five_crossing_new_deadline=$((five_crossing_old_deadline + 900))
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_crossing_old_deadline" "$(iso_at "$five_crossing_before")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_crossing_new_deadline" "$(iso_at "$BASE")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '1' "$(python3 - "$ARCHIVE_FILE" "$BASE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    rows = connection.execute(
+        "SELECT reset_at_epoch, observed_at_epoch, before_pct, after_pct, detection_method "
+        "FROM reset_events WHERE window = '5h'"
+    ).fetchall()
+assert rows == [(int(sys.argv[2]), int(sys.argv[2]), 100.0, 100.0, "observed_refill")], rows
+print(len(rows))
+PYEOF
+)" "crossed full 5h reset was not kept as one observed event"
+
+# A full pair without a deadline advance still represents an unobserved
+# crossing and retains the historical scheduled classification.
+rm -f "$ARCHIVE_FILE"
+five_same_before=$((BASE - 1800))
+five_same_deadline=$((BASE - 900))
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_same_deadline" "$(iso_at "$five_same_before")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_same_deadline" "$(iso_at "$BASE")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '1' "$(python3 - "$ARCHIVE_FILE" "$five_same_deadline" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    rows = connection.execute(
+        "SELECT reset_at_epoch, before_pct, after_pct, detection_method "
+        "FROM reset_events WHERE window = '5h'"
+    ).fetchall()
+assert rows == [(int(sys.argv[2]), 100.0, 100.0, "scheduled_crossing")], rows
+print(len(rows))
+PYEOF
+)" "same-deadline full crossing lost its scheduled event"
+
 # A partial 5h row from another group breaks the complete baseline.  The
 # return to A must establish a fresh baseline rather than compare A across B.
 rm -f "$ARCHIVE_FILE"
