@@ -441,7 +441,10 @@ const analyticsPayload = {
   schema_version: 1,
   period: { range: '30d', from: '2026-07-05T10:00:00Z', to: '2026-08-04T10:00:00Z', timezone: 'Europe/Paris', granularity_seconds: 86400 },
   filters: { sources: [], models: [], reset_type: 'all' },
-  available: { sources: ['codex', 'opencode'], models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'unknown-model'] },
+  available: {
+    sources: ['codex', 'opencode'],
+    models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra', 'gpt-5.5', 'gpt-5.4', 'unknown-model'],
+  },
   freshness: { limits_last_sample_at: '2026-08-04T09:45:00Z', collectors: { codex: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, opencode: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, hermes: { status: 'disabled', last_success_at: null } } },
   limits: { samples: 2, forecast_samples: 2, series: [{ at: '2026-08-03T00:00:00Z', five_h_pct: 80, weekly_pct: 60, ideal_weekly_pct: 65.5, forecast_chance_24h_pct: 60, forecast_chance_6h_pct: 20, forecast_generated_at: '2026-08-02T23:55:00Z', forecast_samples: 1 }, { at: '2026-08-04T00:00:00Z', five_h_pct: 55, weekly_pct: 52, ideal_weekly_pct: 51.2, forecast_chance_24h_pct: 70, forecast_chance_6h_pct: 30, forecast_generated_at: '2026-08-03T23:55:00Z', forecast_samples: 1 }] },
   weekly_limit_value: { currency: 'USD', window_seconds: 43200, point_interval_seconds: 21600, minimum_quota_delta_pct_points: 0.5, series: [{ at: '2026-08-04T00:00:00Z', window_start: '2026-08-03T12:00:00Z', window_seconds: 43200, limit_id: 'fixture', quota_consumed_pct_points: 2, consumed_fraction: 0.02, observed_cost_usd: 1.5, raw_value_usd: 75, value_usd: 75, quality: 'good', reason: null }], unavailable_reasons: {} },
@@ -539,7 +542,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#estimated-cost')).toHaveText('€9.68');
   await expect(page.locator('#allocation-total-cost')).toHaveText('€9.68');
   await expect(page.locator('#estimated-cost')).toHaveAttribute('title', 'Converted from USD using fixed rate: 1 USD = €0.86');
-  await expect.poll(() => analyticsQueries[0]?.get('models')).toBe('gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra');
+  await expect.poll(() => analyticsQueries[0]?.get('models')).toBe('gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-6-astra');
   await expect(page.locator('#weekly-reset-count')).toHaveText('2');
   await expect(page.locator('#weekly-reset-impact')).toHaveText('1 random · 1 end of week');
   await expect(page.locator('#random-reset-count')).toHaveText('1');
@@ -584,9 +587,12 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   });
   expect(warningPosition).toEqual({ afterDataHealth: true, beforeFooter: true, marginTop: '18px' });
   await expect(page.locator('#source-filter input, #model-filter input')).toHaveCount(0);
-  await expect(page.locator('#model-filter [data-filter-value]')).toHaveCount(4);
-  await page.getByRole('button', { name: 'GPT 5.6' }).click();
-  await expect.poll(() => analyticsQueries.at(-1)?.get('models')).toBe('gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna');
+  await expect(page.locator('#model-filter [data-filter-value]')).toHaveCount(7);
+  for (const model of ['gpt-5.5', 'gpt-5.4', 'unknown-model']) {
+    await expect(page.locator(`#model-filter [data-filter-value="${model}"]`)).toHaveAttribute('aria-pressed', 'false');
+  }
+  await page.getByRole('button', { name: 'GPT', exact: true }).click();
+  await expect.poll(() => analyticsQueries.at(-1)?.get('models')).toBe('gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-6-astra');
   await page.locator('#source-filter [data-filter-value="codex"]').click();
   await expect.poll(() => analyticsQueries.at(-1)?.get('sources')).toBe('opencode,hermes');
   await expect(page.locator('.page-nav')).toHaveCount(0);
@@ -647,7 +653,7 @@ test('hides analytics warning containers when the API returns no warnings', asyn
   await expect(page.locator('#analytics-price-warnings')).toBeHidden();
 });
 
-test('falls back once to all models when GPT 5.6 is unavailable', async ({ page }) => {
+test('falls back once to all models when GPT is unavailable', async ({ page }) => {
   const queries = [];
   const payload = {
     ...analyticsPayload,
@@ -660,14 +666,14 @@ test('falls back once to all models when GPT 5.6 is unavailable', async ({ page 
   await page.goto('/analytics.html');
 
   await expect.poll(() => queries.length).toBe(2);
-  expect(queries[0].get('models')).toBe('gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra');
+  expect(queries[0].get('models')).toBe('gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-6-astra');
   expect(queries[1].get('models')).toBe('legacy-model,unknown-model');
-  await expect(page.locator('#analytics-error')).toContainText('No GPT 5.6 Sol, Terra, or Luna model is available');
+  await expect(page.locator('#analytics-error')).toContainText('No supported GPT model is available');
   await page.waitForTimeout(100);
   expect(queries).toHaveLength(2);
 });
 
-test('selects GPT 5.6 when models appear after an initially empty archive', async ({ page }) => {
+test('selects GPT when models appear after an initially empty archive', async ({ page }) => {
   const queries = [];
   let availableModels = [];
   await page.route('**/api/analytics?*', route => {
@@ -683,11 +689,12 @@ test('selects GPT 5.6 when models appear after an initially empty archive', asyn
 
   await expect.poll(() => queries.length).toBe(1);
   await expect(page.locator('#analytics-error')).toBeHidden();
-  availableModels = ['gpt-5.6-sol', 'legacy-model'];
+  availableModels = ['gpt-6-astra', 'gpt-5.5', 'legacy-model'];
   await page.locator('[data-range="7d"]').click();
 
   await expect.poll(() => queries.length).toBe(2);
-  await expect(page.locator('#model-filter [data-filter-value="gpt-5.6-sol"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#model-filter [data-filter-value="gpt-6-astra"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#model-filter [data-filter-value="gpt-5.5"]')).toHaveAttribute('aria-pressed', 'false');
   await expect(page.locator('#model-filter [data-filter-value="legacy-model"]')).toHaveAttribute('aria-pressed', 'false');
   await expect(page.locator('#analytics-error')).toBeHidden();
 });

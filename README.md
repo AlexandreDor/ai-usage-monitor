@@ -48,8 +48,9 @@ The local Analytics page provides:
 - local token consumption from Codex, OpenCode, and Hermes;
 - uncached input, cache read, cache write, output, reasoning, and total token
   counters;
-- filtering by application and model, with GPT-5.6 models selected by default
-  when available;
+- filtering by application and model, with GPT-5.6 Sol, Terra, and Luna plus
+  GPT-6 Astra selected by default when available; older GPT models remain
+  outside this quick selection;
 - quota, token, and API-equivalent cost charts;
 - implicit weekly-limit value estimates from all locally collected
   API-equivalent token-event costs (Codex, OpenCode, and Hermes) in a rolling
@@ -574,7 +575,10 @@ those boundaries and then merges the public rows; aliases and identifiers use
 the same periods. Unknown models are kept in reports and assigned zero
 estimated cost. The default Standard short-context rates are sourced from the
 [OpenAI API pricing page](https://developers.openai.com/api/docs/pricing) and
-its [API changelog](https://developers.openai.com/api/docs/changelog).
+its [API changelog](https://developers.openai.com/api/docs/changelog). GPT-6
+Astra's current base rates are documented on its
+[model page](https://developers.openai.com/api/docs/models/gpt-6-astra); the
+catalog excludes its long-context and alternate billing tiers.
 
 Example with Codex and OpenCode only:
 

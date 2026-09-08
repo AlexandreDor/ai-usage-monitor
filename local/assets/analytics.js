@@ -6,11 +6,11 @@ const BREAKDOWN_PAGE_SIZE = 50;
 const PARIS_ZONE = 'Europe/Paris';
 const EMPTY_VALUE = '-';
 const PRICE_WARNING_PATTERN = /^No catalog price; assumed zero: (.+)$/u;
-const GPT_56_MODELS = Object.freeze(['gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra']);
+const GPT_MODELS = Object.freeze(['gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-6-astra']);
 const state = {
   range: '30d',
   sources: ['codex', 'opencode', 'hermes'],
-  models: [...GPT_56_MODELS],
+  models: [...GPT_MODELS],
   availableModels: [],
   modelAvailabilityResolved: false,
   modelFallbackNotice: false,
@@ -837,7 +837,7 @@ function updateModelOptions(models) {
   state.availableModels = normalized;
   let shouldRefresh = false;
   if (!state.modelAvailabilityResolved && normalized.length) {
-    const availableGpt = normalized.filter(model => GPT_56_MODELS.includes(model));
+    const availableGpt = normalized.filter(model => GPT_MODELS.includes(model));
     if (availableGpt.length) {
       state.models = availableGpt;
     } else {
@@ -995,10 +995,10 @@ byId('select-all-models').addEventListener('click', () => {
   state.breakdownOffset = 0;
   refresh();
 });
-byId('select-gpt-5-6').addEventListener('click', () => {
-  const gpt56 = state.availableModels.filter(model => GPT_56_MODELS.includes(model));
-  if (!gpt56.length) { setMessage('analytics-error', t('gptModelsUnavailable')); return; }
-  state.models = gpt56;
+byId('select-gpt').addEventListener('click', () => {
+  const gptModels = state.availableModels.filter(model => GPT_MODELS.includes(model));
+  if (!gptModels.length) { setMessage('analytics-error', t('gptModelsUnavailable')); return; }
+  state.models = gptModels;
   setPressedValues(byId('model-filter'), state.models);
   state.resetOffset = 0;
   state.breakdownOffset = 0;
