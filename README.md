@@ -14,13 +14,13 @@ reset probabilities from the independent Codex Forecast service.
 
 ### Live quota dashboard
 
-- Current remaining quota for the active weekly window by default. The 5-hour
-  card is hidden initially and can be shown with the dashboard control when
-  needed; its chart series remains available from the legend selector.
+- Current remaining quota for the active 5-hour and weekly windows, with both
+  dashboard cards visible by default.
 - Reset dates and weekly pace compared with ideal consumption.
 - Rolling history chart generated from local quota and Forecast snapshots.
-- The optional 5-hour series and selectors retain localized names and value
-  text when enabled.
+- The 5-hour series and reset markers are hidden by default in charts, and
+  5-hour reset statistics are hidden by default; they remain available from
+  the legend and filter selectors.
 - Mouse and touch exploration by nearest time slice, with a vertical cursor and
   one tooltip for every visible quota series at that time.
 - Automatic refresh based on the monitor collection interval.
