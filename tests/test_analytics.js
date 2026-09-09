@@ -146,3 +146,11 @@ evaluate(`renderLimits({
 if (evaluate('limitDatasets.find(dataset => dataset.datasetKey === "reset-5h").hidden') !== false) fail('5-hour marker visibility preference was lost after an absent-marker payload');
 
 console.log('PASS: analytics JavaScript tests');
+
+// Preserve selection across refreshes, but reset when the model leaves the range.
+evaluate(`renderWeeklyLimitValue({ by_model: [{ provider: 'openai', model: 'gpt-5.6-sol', series: [] }] });
+  weeklyValueModel = JSON.stringify(['openai', 'gpt-5.6-sol']);
+  renderWeeklyLimitValue(weeklyValueData);`);
+if (element('weekly-limit-value-model').value !== '["openai","gpt-5.6-sol"]') fail('weekly model selection lost on refresh');
+evaluate('renderWeeklyLimitValue({ series: [], by_model: [] })');
+if (element('weekly-limit-value-model').value !== '') fail('missing weekly model did not fall back to aggregate');

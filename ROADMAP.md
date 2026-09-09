@@ -31,7 +31,6 @@ jusqu'à la stabilisation du socle.
 Ces évolutions viendront après la stabilisation des fonctions existantes :
 
 - support de plusieurs comptes Codex ;
-- estimation de la « Weekly limit value » séparément pour chaque modèle GPT ;
 - notifications Slack, ntfy ou e-mail ;
 - exposition contrôlée des données déjà maintenues dans `runtime/health.json`,
   puis export Prometheus distinct ;

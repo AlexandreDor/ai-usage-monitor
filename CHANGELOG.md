@@ -6,8 +6,12 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ## [Unreleased]
 
-Changes for the next release will be recorded here before the version is
-updated.
+### Added
+
+- Estimate weekly limit value separately for each observed GPT model in
+  Analytics, using exclusive-model windows and explaining unavailable mixed
+  windows. Keep the aggregate estimate and localize the selector in English
+  and French.
 
 ## [0.1.1] - 2026-09-09
 

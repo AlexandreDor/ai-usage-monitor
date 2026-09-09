@@ -335,4 +335,57 @@ assert [row["marker"] for row in cadenced] == ["latest-first-bucket", "latest-se
 assert [row["scraped_at_epoch"] // 21600 for row in cadenced] == [0, 1], cadenced
 PY
 
+python3 - "$ROOT_DIR" "$database" <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(sys.argv[1]) / "local"))
+from analytics import weekly_limit_value
+from storage import connect_database
+from token_usage import load_pricing
+
+catalog = load_pricing(Path(sys.argv[1]) / "local/pricing.json")
+base, window = 1000000000, 43200
+with connect_database(Path(sys.argv[2])) as connection:
+    import sqlite3
+    connection.row_factory = sqlite3.Row
+    def estimate(now=base + 3 * window + 1000):
+        return weekly_limit_value(connection, catalog, base, base + 3 * window + 1, now=now)
+
+    result = estimate()
+    solo = result["by_model"][0]
+    assert solo["model"] == "gpt-5.6-sol"
+    assert solo["series"] == result["series"], "single-model multi-source estimate differs from aggregate"
+    assert solo["attribution"] == "exclusive_model_windows"
+    # Another GPT model invalidates only the overlapping windows for attribution.
+    connection.execute("""INSERT INTO token_usage_events
+        (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+        VALUES (?, 'codex', 'openai', 'gpt-5.6-terra', 300000, 'mixed-gpt')""",
+        (base + window // 2,))
+    mixed = estimate()
+    assert len(mixed["by_model"]) == 2
+    by_model = {item["model"]: item for item in mixed["by_model"]}
+    sol = by_model["gpt-5.6-sol"]
+    assert sol["series"][1]["reason"] == "mixed_models"
+    assert sol["series"][1]["value_usd"] is None
+    assert sol["series"][-1]["raw_value_usd"] == 75.0
+    assert sol["series"][-1]["value_usd"] == 75.0, "mixed window contaminated smoothing"
+    assert all(point["value_usd"] is None for point in by_model["gpt-5.6-terra"]["series"])
+    assert mixed["series"][1]["value_usd"] is not None, "aggregate lost mixed-model window"
+    stale = estimate(base + 3 * window + 5000)
+    assert all(item["series"][-1]["reason"] == "stale_data" for item in stale["by_model"])
+    # Non-GPT usage must also prevent attributing the quota to GPT.
+    connection.execute("UPDATE token_usage_events SET model = 'unknown-model' WHERE external_id = 'mixed-gpt'")
+    unknown = estimate()
+    assert len(unknown["by_model"]) == 1
+    assert unknown["by_model"][0]["series"][1]["reason"] == "mixed_models"
+    # Provider is part of identity; same model name is not silently combined.
+    connection.execute("UPDATE token_usage_events SET model = 'gpt-5.6-sol', provider = 'other' WHERE external_id = 'mixed-gpt'")
+    providers = estimate()["by_model"]
+    assert len(providers) == 2
+    assert {item["provider"] for item in providers} == {"openai", "other"}
+    assert all(item["series"][1]["value_usd"] is None for item in providers)
+    connection.execute("DELETE FROM token_usage_events")
+    assert estimate()["by_model"] == []
+PY
+
 printf 'PASS: weekly limit value analytics tests\n'

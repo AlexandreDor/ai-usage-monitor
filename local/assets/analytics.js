@@ -482,6 +482,7 @@ function weeklyValueQuality(value) {
 function weeklyValueReason(value) {
   const keys = {
     ambiguous_limit: 'weeklyValueReasonAmbiguousLimit',
+    mixed_models: 'weeklyValueReasonMixedModels',
     deadline_transition: 'weeklyValueReasonDeadlineTransition',
     incomplete_cycle: 'weeklyValueReasonIncompleteCycle',
     insufficient_quota_delta: 'weeklyValueReasonInsufficientDelta',
@@ -527,7 +528,24 @@ function renderWeeklyLimitValueTable(points) {
     body?.appendChild(row);
   }
 }
+let weeklyValueData = {};
+let weeklyValueModel = '';
 function renderWeeklyLimitValue(data = {}) {
+  weeklyValueData = data;
+  const selector = byId('weekly-limit-value-model');
+  const models = Array.isArray(data.by_model) ? data.by_model : [];
+  const key = item => JSON.stringify([item.provider, item.model]);
+  if (!models.some(item => key(item) === weeklyValueModel)) weeklyValueModel = '';
+  clearRows(selector);
+  for (const [value, label] of [['', t('weeklyValueAllModels')], ...models.map(item => [key(item), `${item.model} (${item.provider})`])]) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    selector.appendChild(option);
+  }
+  selector.value = weeklyValueModel;
+  const selected = models.find(item => key(item) === weeklyValueModel);
+  data = selected || data;
   const points = Array.isArray(data.series) ? data.series : [];
   const valid = points.filter(weeklyValuePointValid);
   byId('weekly-limit-value-empty').hidden = valid.length > 0;
@@ -541,7 +559,7 @@ function renderWeeklyLimitValue(data = {}) {
     : `${t('noWeeklyLimitValue')}${currentNotice}`;
   renderWeeklyLimitValueTable(points);
   weeklyLimitValueDatasets = [{
-    label: t('weeklyLimitValueTitle'),
+    label: selected ? `${selected.model} (${selected.provider})` : t('weeklyLimitValueTitle'),
     data: valid.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.value_usd) })),
     borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.10)',
     fill: true, borderWidth: 2, pointRadius: 4, tension: 0.2, spanGaps: false,
@@ -1005,6 +1023,10 @@ byId('select-gpt').addEventListener('click', () => {
   refresh();
 });
 byId('reset-filter').value = state.resetType;
+byId('weekly-limit-value-model').addEventListener('change', event => {
+  weeklyValueModel = event.target.value;
+  renderWeeklyLimitValue(weeklyValueData);
+});
 byId('reset-filter').addEventListener('change', event => { state.resetType = event.target.value; state.resetOffset = 0; refresh(); });
 byId('apply-dates').addEventListener('click', () => {
   state.fromDate = byId('from-date').value; state.toDate = byId('to-date').value; state.resetOffset = 0; state.breakdownOffset = 0;

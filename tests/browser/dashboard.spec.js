@@ -1120,3 +1120,24 @@ test('switches locale and currency and persists the preference across pages', as
   await expect(page.locator('.dashboard-links .external-link')).toContainText('Dépôt GitHub');
   await expect(page.locator('.page-nav')).toHaveCount(0);
 });
+
+
+test('selects independent weekly value model estimates and explains mixed windows', async ({ page }) => {
+  const value = analyticsPayload.weekly_limit_value;
+  const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: [
+    { ...value, provider: 'openai', model: 'gpt-5.6-sol', series: [{ ...value.series[0], value_usd: 150, raw_value_usd: 150 }] },
+    { ...value, provider: 'openai', model: 'gpt-5.6-terra', series: [{ ...value.series[0], value_usd: null, raw_value_usd: null, quality: 'unavailable', reason: 'mixed_models' }], unavailable_reasons: { mixed_models: 1 } },
+  ] } };
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+  await page.goto('/analytics.html');
+  const selector = page.getByLabel('Estimate', { exact: true });
+  await expect(selector.locator('option')).toHaveCount(3);
+  await selector.selectOption(JSON.stringify(['openai', 'gpt-5.6-sol']));
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].data[0].y)).toBe(150);
+  await expect(page.locator('#weekly-limit-value-data-body')).toContainText('$150.00');
+  await selector.selectOption(JSON.stringify(['openai', 'gpt-5.6-terra']));
+  await expect(page.locator('#weekly-limit-value-empty')).toBeVisible();
+  await expect(page.locator('#weekly-limit-value-data-body')).toContainText('shared quota cannot be attributed');
+  await selector.selectOption('');
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].data[0].y)).toBe(75);
+});
