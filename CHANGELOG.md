@@ -9,6 +9,25 @@ Git tag and the value in `VERSION` is the single source of truth.
 Changes for the next release will be recorded here before the version is
 updated.
 
+## [0.1.1] - 2026-09-09
+
+### Added
+
+- Detect full five-hour resets that remain at 100→100 with a later deadline,
+  run local hooks, and emit no network notifications.
+- Add GPT-6 Astra and GPT-5.6 Sol, Terra, and Luna to the model selector.
+- Add Astra Standard short-context pricing for input, cache-read,
+  cache-write, and output, including provider identifiers.
+
+### Changed
+
+- Harden the owner-scoped alert journal and state, recovery/retries/hooks, and
+  expiration of stale alerts.
+- Keep archive and anomaly records consistent.
+- Set UI defaults with the five-hour card visible, five-hour series/markers/
+  statistics hidden by default, and weekly reset analytics selected by
+  default.
+
 ## [0.1.0] - 2026-08-28
 
 ### Added
