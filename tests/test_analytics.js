@@ -97,4 +97,52 @@ if (!element('resets-body').children[0].children[5].textContent.includes('N/A'))
 if (!element('resets-body').children[0].children[5].textContent.includes('Cycle value applies')) fail('cycle cost N/A cause was not localized in the cell');
 if (!element('resets-body').children[0].children[5].getAttribute('aria-label').includes('N/A')) fail('cycle cost N/A aria label was lost');
 
+evaluate(`renderLimits({
+  series: [
+    { at: '2026-08-01T00:00:00Z', five_h_pct: 80, weekly_pct: 70, ideal_weekly_pct: 75 },
+    { at: '2026-08-02T00:00:00Z', five_h_pct: 60, weekly_pct: 65, ideal_weekly_pct: 70 }
+  ],
+  reset_markers: [
+    { window: '5h', at: '2026-08-01T05:00:00Z' },
+    { window: 'weekly', at: '2026-08-02T00:00:00Z' }
+  ]
+})`);
+if (evaluate('limitDatasets.find(dataset => dataset.datasetKey === "five-hour").hidden') !== true) fail('analytics 5-hour series was visible by default');
+if (evaluate('limitDatasets.find(dataset => dataset.datasetKey === "reset-5h").hidden') !== true) fail('analytics 5-hour marker was visible by default');
+if (evaluate('state.resetType') !== 'weekly') fail('analytics reset filter did not default to weekly');
+evaluate('limitsChart.data.datasets.find(dataset => dataset.datasetKey === "five-hour").hidden = false');
+evaluate(`renderLimits({
+  series: [{ at: '2026-08-03T00:00:00Z', five_h_pct: 55, weekly_pct: 60, ideal_weekly_pct: 65 }],
+  reset_markers: [{ window: '5h', at: '2026-08-03T05:00:00Z' }]
+})`);
+if (evaluate('limitDatasets.find(dataset => dataset.datasetKey === "five-hour").hidden') !== false) fail('analytics 5-hour selection was lost on refresh');
+
+// Legend preferences survive a payload where the 5-hour values are all null
+// and the corresponding series is omitted from limitDatasets.
+evaluate('limitsChart.data.datasets.find(dataset => dataset.datasetKey === "five-hour").hidden = false');
+evaluate(`renderLimits({
+  series: [{ at: '2026-08-04T00:00:00Z', five_h_pct: null, weekly_pct: 55, ideal_weekly_pct: 60 }],
+  reset_markers: []
+})`);
+if (evaluate('limitDatasets.some(dataset => dataset.datasetKey === "five-hour")')) fail('all-null 5-hour series was not omitted');
+evaluate(`renderLimits({
+  series: [{ at: '2026-08-05T00:00:00Z', five_h_pct: 45, weekly_pct: 50, ideal_weekly_pct: 55 }],
+  reset_markers: [{ window: '5h', at: '2026-08-05T05:00:00Z' }]
+})`);
+if (evaluate('limitDatasets.find(dataset => dataset.datasetKey === "five-hour").hidden') !== false) fail('5-hour visibility preference was lost after an all-null payload');
+
+// The same registry keeps a manually shown 5-hour marker visible when a
+// period without 5-hour reset events is followed by one containing a marker.
+evaluate('limitsChart.data.datasets.find(dataset => dataset.datasetKey === "reset-5h").hidden = false');
+evaluate(`renderLimits({
+  series: [{ at: '2026-08-06T00:00:00Z', five_h_pct: 40, weekly_pct: 45, ideal_weekly_pct: 50 }],
+  reset_markers: []
+})`);
+if (evaluate('limitDatasets.some(dataset => dataset.datasetKey === "reset-5h")')) fail('5-hour marker was not omitted without events');
+evaluate(`renderLimits({
+  series: [{ at: '2026-08-07T00:00:00Z', five_h_pct: 35, weekly_pct: 40, ideal_weekly_pct: 45 }],
+  reset_markers: [{ window: '5h', at: '2026-08-07T05:00:00Z' }]
+})`);
+if (evaluate('limitDatasets.find(dataset => dataset.datasetKey === "reset-5h").hidden') !== false) fail('5-hour marker visibility preference was lost after an absent-marker payload');
+
 console.log('PASS: analytics JavaScript tests');

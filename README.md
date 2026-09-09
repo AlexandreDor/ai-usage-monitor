@@ -14,11 +14,13 @@ reset probabilities from the independent Codex Forecast service.
 
 ### Live quota dashboard
 
-- Current remaining quota for the active 5-hour and weekly windows.
+- Current remaining quota for the active 5-hour and weekly windows, with both
+  dashboard cards visible by default.
 - Reset dates and weekly pace compared with ideal consumption.
 - Rolling history chart generated from local quota and Forecast snapshots.
-- Accessible quota gauges expose localized names and value text for the 5-hour
-  and weekly remaining windows.
+- The 5-hour series and reset markers are hidden by default in charts, and
+  5-hour reset statistics are hidden by default; they remain available from
+  the legend and filter selectors.
 - Mouse and touch exploration by nearest time slice, with a vertical cursor and
   one tooltip for every visible quota series at that time.
 - Automatic refresh based on the monitor collection interval.
@@ -40,13 +42,15 @@ The local Analytics page provides:
 - quota history, ideal weekly pace, and Forecast probabilities for 24 hours, 7,
   30, or 90 days, one year, all retained data, or a custom date range;
 - detected 5-hour and weekly reset history, including scheduled and early
-  weekly resets, with the last Forecast probabilities observed less than 45
+  weekly resets (weekly history is selected by default; All and 5-hour remain
+  available), with the last Forecast probabilities observed less than 45
   minutes before each reset when available;
 - local token consumption from Codex, OpenCode, and Hermes;
 - uncached input, cache read, cache write, output, reasoning, and total token
   counters;
-- filtering by application and model, with GPT-5.6 models selected by default
-  when available;
+- filtering by application and model, with GPT-5.6 Sol, Terra, and Luna plus
+  GPT-6 Astra selected by default when available; older GPT models remain
+  outside this quick selection;
 - quota, token, and API-equivalent cost charts;
 - implicit weekly-limit value estimates from all locally collected
   API-equivalent token-event costs (Codex, OpenCode, and Hermes) in a rolling
@@ -96,8 +100,11 @@ period-wide token or cost totals.
 - Configurable low-quota thresholds for the 5-hour and weekly windows.
 - One alert for the most critical threshold when several levels are crossed in
   a single collection.
-- Automatic notifications for scheduled 5-hour and weekly resets.
-- Detection of conservative early weekly refills.
+- Automatic notifications for scheduled 5-hour and weekly resets. A full
+  5-hour cycle observed as 100% → 100% with a later deadline is recorded and
+  runs local `5h:reset` hooks, but stays silent on Discord/Telegram.
+- Detection of conservative early weekly refills and full 5-hour cycles whose
+  quota stays at 100% while the reset deadline advances.
 - Discord and Telegram delivery with independent durable state per channel.
 - Bounded retries for temporary network errors without replaying a channel that
   already succeeded.
@@ -467,10 +474,21 @@ ALERT_SCRIPT_2_EVENTS=5h:50,5h:25,weekly:20
 | `ALERT_SCRIPT_<N>_EVENTS` | empty | Comma-separated `5h:reset`, `weekly:reset`, `5h:<0..100>`, or `weekly:<0..100>` selectors. |
 
 Indices may be sparse. Several scripts can handle the same event, and one
-script can handle several events. A configured script action is attempted once;
-failure or timeout is logged but not retried and does not stop later scripts.
+script can handle several events. A configured script action persists a pending
+intent before execution and clears it only after a successful return and state
+write. Failures and timeouts remain pending for a later poll and do not stop
+later scripts.
 Personal scripts can be stored under `local/scripts/`, whose contents are
 ignored by Git except for `.gitkeep`.
+
+The `5h:reset` selector runs for scheduled resets and for the observed full
+5-hour reset described above. Any same-owner pair of complete 100% observations
+with a strictly later deadline is local reset evidence, including when the old
+deadline has already passed; it runs the hook without creating a network reset
+occurrence. Each newly observed deadline is anchored to the first snapshot that
+reports it and is run once; repeated snapshots with that deadline are ignored.
+`ALERTS_ENABLED=0` acknowledges the event and records the script action without
+executing it.
 
 Scripts receive:
 
@@ -484,7 +502,16 @@ Scripts receive:
 | `CODEX_ALERT_RESET_LABEL` | Human-readable reset date when known |
 | `CODEX_ALERT_SCRAPED_AT` | Observation Unix timestamp |
 | `CODEX_ALERT_MESSAGE` | Human-readable alert text |
+| `CODEX_ALERT_ACTION_ID` | Stable 24-character ID of the configured script/event rule |
 | `CODEX_ALERT_RULE_INDEX` | Matching rule number |
+
+The pending intent is deliberately write-ahead: a crash after it is persisted
+but before the hook starts is replayed on the next poll. A crash after the hook
+has taken effect but before its successful completion is persisted can produce
+one duplicate execution; hooks with externally visible side effects should use
+`CODEX_ALERT_ACTION_ID` together with the event fields to implement their own
+idempotence. Observed local 5-hour resets remain local-only during retries:
+replaying their hook never creates a network reset occurrence.
 
 ### History and collection
 
@@ -504,8 +531,13 @@ transactionally to v4 on their next writable monitor cycle; `--check` does not
 open or migrate the archive.
 The detector tolerates quota noise up to 5 percentage points and reset-date
 movement up to 30 minutes; a disappeared reset date is confirmed after two
-valid observations. Planned deadline crossings and the recognized weekly
-refill pattern are excluded. Anomaly rows remain local even when no channel is
+valid observations. Planned deadline crossings, the recognized weekly refill
+pattern, and the recognized full 5-hour pattern are excluded. A 5-hour reset
+with 100% remaining is recognized only from two complete observations in the
+same limit group, with a strictly later valid deadline; the first observation
+carrying the new deadline anchors the event. Repeating that deadline is
+idempotent, while a deadline that stays the same, moves backwards, or belongs
+to another group does not trigger a reset. Anomaly rows remain local even when no channel is
 configured, and an interrupted journal registration is retried on a later
 cycle. Journaled anomaly records and inactive detector state follow
 `ARCHIVE_RETENTION_DAYS`; an anomaly still awaiting journal registration is
@@ -543,7 +575,10 @@ those boundaries and then merges the public rows; aliases and identifiers use
 the same periods. Unknown models are kept in reports and assigned zero
 estimated cost. The default Standard short-context rates are sourced from the
 [OpenAI API pricing page](https://developers.openai.com/api/docs/pricing) and
-its [API changelog](https://developers.openai.com/api/docs/changelog).
+its [API changelog](https://developers.openai.com/api/docs/changelog). GPT-6
+Astra's current base rates are documented on its
+[model page](https://developers.openai.com/api/docs/models/gpt-6-astra); the
+catalog excludes its long-context and alternate billing tiers.
 
 Example with Codex and OpenCode only:
 

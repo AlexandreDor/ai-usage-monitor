@@ -273,7 +273,7 @@ payload = build_payload(
     now=sol_boundary + 86400,
 )
 assert payload["pricing"] == {
-    "currency": "USD", "as_of": "2026-08-21", "valuation_mode": "effective_catalog"
+    "currency": "USD", "as_of": "2026-09-08", "valuation_mode": "effective_catalog"
 }
 assert payload["tokens"]["summary"]["estimated_cost_usd"] == 126.745, payload["tokens"]["summary"]
 breakdown = {(row["provider"], row["model"]): row["estimated_cost_usd"] for row in payload["tokens"]["breakdown"]}
@@ -321,6 +321,35 @@ for model, expected in expected_periods.items():
         for period in indexed_periods[("openai", model)]
     ]
     assert actual == expected, (model, actual)
+
+astra_database = test_root / "astra-pricing.sqlite3"
+with connect_database(astra_database) as connection:
+    connection.executemany(
+        """INSERT INTO token_usage_events(
+             occurred_at_epoch, source, provider, model, input_tokens,
+             cache_read_tokens, cache_write_tokens, output_tokens, external_id
+           ) VALUES (?, 'codex', ?, 'gpt-6-astra', ?, ?, ?, ?, ?)""",
+        [
+            (1787856000, "openai", 1_000_000, 2_000_000, 3_000_000, 4_000_000, "astra-direct"),
+            (1787856060, "openai-codex", 100_000, 200_000, 300_000, 400_000, "astra-codex-identifier"),
+            (1787856120, "auto", 50_000, 60_000, 70_000, 80_000, "astra-auto-identifier"),
+        ],
+    )
+astra_payload = build_payload(
+    astra_database,
+    root / "local" / "pricing.json",
+    {"from_date": "2026-08-01", "to_date": "2026-08-31"},
+    now=1787856600,
+)
+assert astra_payload["tokens"]["summary"]["estimated_cost_usd"] == 279.885, astra_payload["tokens"]["summary"]
+astra_breakdown = {
+    (row["provider"], row["model"]): row
+    for row in astra_payload["tokens"]["breakdown"]
+}
+assert astra_breakdown[("openai", "gpt-6-astra")]["estimated_cost_usd"] == 249.5, astra_breakdown
+assert astra_breakdown[("openai-codex", "gpt-6-astra")]["estimated_cost_usd"] == 24.95, astra_breakdown
+assert astra_breakdown[("auto", "gpt-6-astra")]["estimated_cost_usd"] == 5.435, astra_breakdown
+assert all(row["pricing_status"] == "priced" for row in astra_breakdown.values()), astra_breakdown
 v1 = {
     "schema_version": 1, "currency": "USD", "unknown_model_policy": "assumed_zero",
     "entries": [{"provider": "test", "model": "model", "input_per_million": 1,

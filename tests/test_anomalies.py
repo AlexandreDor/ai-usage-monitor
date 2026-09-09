@@ -68,6 +68,12 @@ class AnomalyDetectorTests(unittest.TestCase):
                              weekly_reset=1_000 + 1_800 + 1))
         self.assertEqual([], self.rows())
 
+    def test_full_five_hour_observed_reset_is_not_a_reset_shift(self):
+        previous_deadline = 10_000
+        self.observe(snapshot(100, five=100, five_reset=previous_deadline))
+        self.observe(snapshot(200, five=100, five_reset=previous_deadline + 900))
+        self.assertEqual([], self.rows("5h"))
+
     def test_weekly_quota_increase_is_reported_independently(self):
         self.observe(snapshot(100, five=50, weekly=40, weekly_reset=10_000))
         self.observe(snapshot(200, five=50, weekly=50, weekly_reset=10_000))

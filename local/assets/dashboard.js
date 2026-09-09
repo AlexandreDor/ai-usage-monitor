@@ -516,9 +516,51 @@ function historyTitle(points) {
     : t('historyTitleRange', { start, end });
 }
 
-function chartDatasets(points) {
+function chartDatasetVisibility(instance) {
+  const visibility = new Map();
+  for (const [index, dataset] of (instance?.data?.datasets || []).entries()) {
+    if (!dataset?.datasetKey) continue;
+    let visible = dataset.hidden !== true;
+    try {
+      if (typeof instance.isDatasetVisible === 'function') {
+        visible = instance.isDatasetVisible(index);
+      } else {
+        const meta = typeof instance.getDatasetMeta === 'function'
+          ? instance.getDatasetMeta(index)
+          : null;
+        if (meta?.hidden !== null && meta?.hidden !== undefined) visible = !meta.hidden;
+      }
+    } catch (_error) {
+      // Keep the dataset declaration as the fallback when Chart.js metadata is
+      // unavailable during a refresh or chart teardown.
+    }
+    visibility.set(dataset.datasetKey, visible);
+  }
+  return visibility;
+}
+
+function applyChartDatasetVisibility(instance, datasets, visibility) {
+  for (const [index, dataset] of datasets.entries()) {
+    if (!dataset?.datasetKey || !visibility.has(dataset.datasetKey)) continue;
+    const visible = visibility.get(dataset.datasetKey);
+    dataset.hidden = !visible;
+    try {
+      const meta = typeof instance.getDatasetMeta === 'function'
+        ? instance.getDatasetMeta(index)
+        : null;
+      if (meta) meta.hidden = visible ? null : true;
+    } catch (_error) {
+      // Dataset.hidden remains authoritative for a chart that cannot expose
+      // metadata while it is being rebuilt.
+    }
+  }
+}
+
+function chartDatasets(points, visibility = new Map()) {
+  const fiveHourVisible = visibility.has('five-hour') ? visibility.get('five-hour') : false;
   return [
     {
+      datasetKey: 'five-hour',
       label: t('fiveHourDataset'),
       data: points.map(point => ({ x: point.timestamp, y: point.fiveHour })),
       borderColor: '#22c55e',
@@ -529,8 +571,10 @@ function chartDatasets(points) {
       fill: true,
       spanGaps: false,
       valueKind: 'percent',
+      hidden: !fiveHourVisible,
     },
     {
+      datasetKey: 'weekly',
       label: t('weeklyDataset'),
       data: points.map(point => ({ x: point.timestamp, y: point.weekly })),
       borderColor: '#4ade80',
@@ -543,6 +587,7 @@ function chartDatasets(points) {
       valueKind: 'percent',
     },
     {
+      datasetKey: 'ideal-weekly',
       label: t('idealDataset'),
       data: points.map(point => ({
         x: point.timestamp,
@@ -559,6 +604,7 @@ function chartDatasets(points) {
       valueKind: 'percent',
     },
     {
+      datasetKey: 'forecast-24h',
       label: t('forecast24hDataset'),
       data: points.map(point => ({ x: point.timestamp, y: point.forecast24h })),
       borderColor: '#a78bfa',
@@ -571,6 +617,7 @@ function chartDatasets(points) {
       valueKind: 'percent',
     },
     {
+      datasetKey: 'forecast-6h',
       label: t('forecast6hDataset'),
       data: points.map(point => ({ x: point.timestamp, y: point.forecast6h })),
       borderColor: '#fbbf24',
@@ -604,7 +651,8 @@ function renderHistory(history) {
   dashboardHistoryPoints = points;
   historyFailure = null;
   historyFailureKey = null;
-  const datasets = chartDatasets(points);
+  const visibility = chartDatasetVisibility(chart);
+  const datasets = chartDatasets(points, visibility);
   const timeBounds = chartTimeBounds(points);
   document.getElementById('history-label').textContent = historyTitle(points);
   setHistoryState('valid');
@@ -620,6 +668,7 @@ function renderHistory(history) {
         delete xScale.max;
       }
       chart.data.datasets = datasets;
+      applyChartDatasetVisibility(chart, datasets, visibility);
       chart.update('none');
     } catch (error) {
       const chartError = historyError('chartFailed');
