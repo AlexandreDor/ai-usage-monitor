@@ -15,6 +15,7 @@ class FakeElement {
     this.children = [];
     this.attributes = {};
     this.dataset = {};
+    this.style = { setProperty: () => {} };
     this.className = '';
     this.classList = { add: () => {}, remove: () => {}, toggle: () => {} };
   }
@@ -145,12 +146,20 @@ evaluate(`renderLimits({
 })`);
 if (evaluate('limitDatasets.find(dataset => dataset.datasetKey === "reset-5h").hidden') !== false) fail('5-hour marker visibility preference was lost after an absent-marker payload');
 
-console.log('PASS: analytics JavaScript tests');
 
-// Preserve selection across refreshes, but reset when the model leaves the range.
-evaluate(`renderWeeklyLimitValue({ by_model: [{ provider: 'openai', model: 'gpt-5.6-sol', series: [] }] });
-  weeklyValueModel = JSON.stringify(['openai', 'gpt-5.6-sol']);
+// Five independent selections survive refreshes and temporary missing data.
+evaluate(`renderWeeklyLimitValue({ by_model: [{ provider: 'openai', model: 'gpt-5.6-sol', series: [] }] });`);
+if (evaluate('weeklyLimitValueDatasets.length') !== 5) fail('five default curves were not selected');
+if (evaluate('new Set(weeklyLimitValueDatasets.map(item => item.borderColor)).size') !== 5) fail('default curves do not have distinct colors');
+evaluate(`weeklyValueSelection.set('gpt-5.6-sol', false);
   renderWeeklyLimitValue(weeklyValueData);`);
-if (element('weekly-limit-value-model').value !== '["openai","gpt-5.6-sol"]') fail('weekly model selection lost on refresh');
+if (evaluate('weeklyLimitValueDatasets.length') !== 4) fail('model toggle did not remove its dataset');
 evaluate('renderWeeklyLimitValue({ series: [], by_model: [] })');
-if (element('weekly-limit-value-model').value !== '') fail('missing weekly model did not fall back to aggregate');
+if (evaluate('weeklyLimitValueDatasets.length') !== 4) fail('model selection lost when data disappeared');
+evaluate(`renderWeeklyLimitValue({ by_model: [{ provider: 'openai', model: 'gpt-5.6-sol', series: [] }] });`);
+if (evaluate('weeklyLimitValueDatasets.length') !== 4) fail('model selection lost when data returned');
+evaluate(`for (const key of weeklyValueSelection.keys()) weeklyValueSelection.set(key, false);
+  renderWeeklyLimitValue(weeklyValueData);`);
+if (evaluate('weeklyLimitValueDatasets.length') !== 0) fail('all curves cannot be deselected');
+if (!element('weekly-limit-value-chart-wrap').hidden) fail('empty selection showed a chart');
+console.log('PASS: analytics JavaScript tests');

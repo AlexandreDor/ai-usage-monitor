@@ -1122,22 +1122,48 @@ test('switches locale and currency and persists the preference across pages', as
 });
 
 
-test('selects independent weekly value model estimates and explains mixed windows', async ({ page }) => {
+
+test('compares the aggregate and four GPT weekly value curves by default', async ({ page }) => {
+  const value = analyticsPayload.weekly_limit_value;
+  const names = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-astra'];
+  const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: names.map((model, index) => ({
+    ...value, provider: 'openai', model, series: [{ ...value.series[0], value_usd: 100 + index * 25, raw_value_usd: 100 + index * 25 }],
+  })) } };
+  payload.weekly_limit_value.by_model.push({ ...value, provider: 'openai-codex', model: 'gpt-5.6-sol', series: [{ ...value.series[0], value_usd: null, quality: 'unavailable', reason: 'mixed_models' }] });
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+  await page.goto('/analytics.html');
+  const controls = page.locator('#weekly-limit-value-models');
+  await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(5);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.map(item => item.data[0].y))).toEqual([75, 100, 125, 150, 175]);
+  await expect.poll(() => page.evaluate(() => new Set(weeklyLimitValueChart.data.datasets.map(item => item.borderColor)).size)).toBe(5);
+  await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(5);
+  await expect(page.locator('#weekly-limit-value-data-body')).toContainText('gpt-6-astra');
+  const sol = controls.getByRole('button', { name: /gpt-5.6-sol/ });
+  await sol.click();
+  await expect(sol).toHaveAttribute('aria-pressed', 'false');
+  await expect(sol).toBeFocused();
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(4);
+  await sol.press('Space');
+  await expect(sol).toHaveAttribute('aria-pressed', 'true');
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(5);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  for (const button of await controls.getByRole('button').all()) await button.click();
+  await expect(page.locator('#weekly-limit-value-empty')).toBeVisible();
+  await controls.getByRole('button', { name: /All models/ }).click();
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].data[0].y)).toBe(75);
+});
+
+test('keeps missing GPT estimates visible without inventing curve points', async ({ page }) => {
   const value = analyticsPayload.weekly_limit_value;
   const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: [
-    { ...value, provider: 'openai', model: 'gpt-5.6-sol', series: [{ ...value.series[0], value_usd: 150, raw_value_usd: 150 }] },
     { ...value, provider: 'openai', model: 'gpt-5.6-terra', series: [{ ...value.series[0], value_usd: null, raw_value_usd: null, quality: 'unavailable', reason: 'mixed_models' }], unavailable_reasons: { mixed_models: 1 } },
   ] } };
   await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
   await page.goto('/analytics.html');
-  const selector = page.getByLabel('Estimate', { exact: true });
-  await expect(selector.locator('option')).toHaveCount(3);
-  await selector.selectOption(JSON.stringify(['openai', 'gpt-5.6-sol']));
-  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].data[0].y)).toBe(150);
-  await expect(page.locator('#weekly-limit-value-data-body')).toContainText('$150.00');
-  await selector.selectOption(JSON.stringify(['openai', 'gpt-5.6-terra']));
-  await expect(page.locator('#weekly-limit-value-empty')).toBeVisible();
+  const controls = page.locator('#weekly-limit-value-models');
+  await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(5);
+  await expect(controls.getByText('No estimate', { exact: true })).toHaveCount(4);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.slice(1).every(item => item.data.length === 0))).toBe(true);
   await expect(page.locator('#weekly-limit-value-data-body')).toContainText('shared quota cannot be attributed');
-  await selector.selectOption('');
-  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].data[0].y)).toBe(75);
 });
