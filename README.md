@@ -66,9 +66,10 @@ The local Analytics page provides:
   increases or sub-0.5-point drops, stale/incomplete observations, missing
   positive prices, invalid counters, and zero cost are shown as unavailable
   with a reason rather than silently extrapolated;
-- the weekly-limit value controls compare the aggregate, GPT-5.6 Luna, Terra,
+- the weekly-limit value controls compare GPT-5.6 Luna, Terra,
   Sol and GPT-6 Astra on one chart by default, with distinct colors and
-  independent toggles. Models without valid estimates are marked explicitly.
+  independent toggles. The aggregate curve is hidden by default and can be
+  enabled with its toggle. Models without valid estimates are marked explicitly.
   The data table identifies each series, including provider identity. These use the same twelve-hour windows,
   pricing, smoothing and quality checks, but only windows containing that model
   alone among locally collected events. Mixed-model windows are unavailable:

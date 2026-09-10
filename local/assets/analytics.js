@@ -566,7 +566,7 @@ function renderWeeklyLimitValue(data = {}) {
   clearRows(selector);
   for (const entry of entries) {
     if (!weeklyValueSelection.has(entry.key)) {
-      weeklyValueSelection.set(entry.key, entry.key === 'aggregate' || weeklyValueDefaults.includes(entry.model));
+      weeklyValueSelection.set(entry.key, weeklyValueDefaults.includes(entry.model));
     }
     const active = weeklyValueSelection.get(entry.key);
     const points = Array.isArray(entry.data.series) ? entry.data.series : [];

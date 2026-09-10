@@ -536,6 +536,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
     return route.fulfill({ json: analyticsPayload });
   });
   await page.goto('/analytics.html');
+  await page.locator('#weekly-limit-value-models').getByRole('button', { name: /All models/ }).click();
 
   await expect(page.locator('#total-tokens')).toHaveText('1.73M');
   await expect(page.locator('#assumed-zero-tokens')).toHaveCount(0);
@@ -1123,7 +1124,7 @@ test('switches locale and currency and persists the preference across pages', as
 
 
 
-test('compares the aggregate and four GPT weekly value curves by default', async ({ page }) => {
+test('shows four GPT curves by default and lets users enable the aggregate', async ({ page }) => {
   const value = analyticsPayload.weekly_limit_value;
   const names = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-astra'];
   const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: names.map((model, index) => ({
@@ -1133,22 +1134,23 @@ test('compares the aggregate and four GPT weekly value curves by default', async
   await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
   await page.goto('/analytics.html');
   const controls = page.locator('#weekly-limit-value-models');
-  await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(5);
-  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.map(item => item.data[0].y))).toEqual([75, 100, 125, 150, 175]);
-  await expect.poll(() => page.evaluate(() => new Set(weeklyLimitValueChart.data.datasets.map(item => item.borderColor)).size)).toBe(5);
-  await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(5);
+  await expect(controls.getByRole('button', { name: /All models/ })).toHaveAttribute('aria-pressed', 'false');
+  await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(4);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.map(item => item.data[0].y))).toEqual([100, 125, 150, 175]);
+  await expect.poll(() => page.evaluate(() => new Set(weeklyLimitValueChart.data.datasets.map(item => item.borderColor)).size)).toBe(4);
+  await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(4);
   await expect(page.locator('#weekly-limit-value-data-body')).toContainText('gpt-6-astra');
   const sol = controls.getByRole('button', { name: /gpt-5.6-sol/ });
   await sol.click();
   await expect(sol).toHaveAttribute('aria-pressed', 'false');
   await expect(sol).toBeFocused();
-  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(4);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(3);
   await sol.press('Space');
   await expect(sol).toHaveAttribute('aria-pressed', 'true');
-  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(5);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(4);
   await page.setViewportSize({ width: 390, height: 844 });
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  for (const button of await controls.getByRole('button').all()) await button.click();
+  for (const model of names) await controls.getByRole('button', { name: model, exact: true }).click();
   await expect(page.locator('#weekly-limit-value-empty')).toBeVisible();
   await controls.getByRole('button', { name: /All models/ }).click();
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].data[0].y)).toBe(75);
@@ -1162,8 +1164,9 @@ test('keeps missing GPT estimates visible without inventing curve points', async
   await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
   await page.goto('/analytics.html');
   const controls = page.locator('#weekly-limit-value-models');
-  await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(5);
+  await expect(controls.getByRole('button', { name: /All models/ })).toHaveAttribute('aria-pressed', 'false');
+  await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(4);
   await expect(controls.getByText('No estimate', { exact: true })).toHaveCount(4);
-  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.slice(1).every(item => item.data.length === 0))).toBe(true);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueDatasets.every(item => item.data.length === 0))).toBe(true);
   await expect(page.locator('#weekly-limit-value-data-body')).toContainText('shared quota cannot be attributed');
 });
