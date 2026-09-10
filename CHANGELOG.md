@@ -6,6 +6,8 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-10
+
 ### Added
 
 - Estimate weekly limit value separately for each observed GPT model in
@@ -13,6 +15,10 @@ Git tag and the value in `VERSION` is the single source of truth.
   windows. Compare GPT-5.6 Luna, Terra, Sol and GPT-6 Astra
   on one chart by default, with individual toggles localized in English and
   French. The aggregate curve is available but hidden by default.
+
+### Fixed
+
+- Scope release publication to this repository.
 
 ## [0.1.1] - 2026-09-09
 
