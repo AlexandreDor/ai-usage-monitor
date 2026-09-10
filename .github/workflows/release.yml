@@ -130,7 +130,7 @@ jobs:
           if [[ "$RELEASE_VERSION" == *-* ]]; then
             prerelease=(--prerelease)
           fi
-          gh release create "$RELEASE_TAG" \
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             "dist/codex-usage-monitor-${RELEASE_VERSION}.tar.gz" \
             "dist/codex-usage-monitor-${RELEASE_VERSION}.tar.gz.sha256" \
             --verify-tag --title "Codex Usage Monitor $RELEASE_TAG" --generate-notes "${prerelease[@]}"
