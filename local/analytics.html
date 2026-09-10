@@ -165,6 +165,11 @@
             <span class="sample-count" id="weekly-limit-value-window" data-i18n="analytics.weeklyLimitValueWindow">Rolling window · 12 h · one point / 6 h · USD</span>
           </div>
         </div>
+        <fieldset class="weekly-value-selector">
+          <legend data-i18n="analytics.weeklyValueModel">Curves to display</legend>
+          <div id="weekly-limit-value-models" class="weekly-value-models"></div>
+        </fieldset>
+        <p class="chart-description" data-i18n="analytics.weeklyValueModelDescription">Per-model estimates use only windows containing that GPT model alone. Mixed-model windows cannot be attributed; uncollected usage may affect estimates.</p>
         <p class="chart-description" data-i18n="analytics.weeklyLimitValueDescription">API-equivalent cost from all locally collected sources divided by the weekly quota fraction consumed in the same rolling twelve-hour window.</p>
         <p class="quality-legend" id="weekly-limit-value-quality" data-i18n="analytics.weeklyLimitValueQualityLegend">Quality: good · low confidence · volatile. The table includes the reason for every unavailable point.</p>
         <div class="chart-wrap" id="weekly-limit-value-chart-wrap"><canvas id="weekly-limit-value-chart" class="time-slice-chart" role="img" aria-describedby="weekly-limit-value-summary weekly-limit-value-table-caption"></canvas></div>
@@ -173,7 +178,7 @@
         <details class="chart-data-details">
           <summary data-i18n="analytics.showWeeklyLimitValueTable">Show weekly limit value table</summary>
           <div class="table-scroll">
-            <table class="chart-data-table weekly-value-table"><caption id="weekly-limit-value-table-caption" data-i18n="analytics.weeklyLimitValueTableCaption">Implicit weekly limit value data</caption><thead><tr><th data-i18n="analytics.date">Date</th><th data-i18n="analytics.observedCostUsd">Observed cost ($)</th><th data-i18n="analytics.quotaConsumed">Quota consumed</th><th data-i18n="analytics.rawValueUsd">Raw value ($)</th><th data-i18n="analytics.smoothedValueUsd">Smoothed value ($)</th><th data-i18n="analytics.quality">Quality</th><th data-i18n="analytics.explanation">Explanation</th></tr></thead><tbody id="weekly-limit-value-data-body"></tbody></table>
+            <table class="chart-data-table weekly-value-table"><caption id="weekly-limit-value-table-caption" data-i18n="analytics.weeklyLimitValueTableCaption">Implicit weekly limit value data</caption><thead><tr><th data-i18n="analytics.date">Date</th><th data-i18n="analytics.weeklyValueEstimate">Estimate</th><th data-i18n="analytics.observedCostUsd">Observed cost ($)</th><th data-i18n="analytics.quotaConsumed">Quota consumed</th><th data-i18n="analytics.rawValueUsd">Raw value ($)</th><th data-i18n="analytics.smoothedValueUsd">Smoothed value ($)</th><th data-i18n="analytics.quality">Quality</th><th data-i18n="analytics.explanation">Explanation</th></tr></thead><tbody id="weekly-limit-value-data-body"></tbody></table>
           </div>
         </details>
       </article>

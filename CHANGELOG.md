@@ -6,8 +6,13 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ## [Unreleased]
 
-Changes for the next release will be recorded here before the version is
-updated.
+### Added
+
+- Estimate weekly limit value separately for each observed GPT model in
+  Analytics, using exclusive-model windows and explaining unavailable mixed
+  windows. Compare the aggregate and GPT-5.6 Luna, Terra, Sol and GPT-6 Astra
+  on one chart by default, with individual toggles localized in English and
+  French.
 
 ## [0.1.1] - 2026-09-09
 
