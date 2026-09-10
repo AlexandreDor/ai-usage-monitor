@@ -325,11 +325,13 @@ def _load_cost_events(
     prices: dict[tuple[str, str], list[dict[str, Any]]],
     start: int,
     end: int,
+    *,
+    rows: list[sqlite3.Row] | None = None,
 ) -> list[tuple[int, float | None, str | None, str | None]]:
     """Load and price all locally collected token events for interval calculations."""
     if start >= end:
         return []
-    rows = connection.execute(
+    rows = rows if rows is not None else connection.execute(
         """SELECT occurred_at_epoch, provider, model, input_tokens,
                   cache_read_tokens, cache_write_tokens, output_tokens, quality
              FROM token_usage_events
@@ -367,7 +369,7 @@ def _interval_event_cost(
         return None, "no_events", False
     if event_index is not None:
         _epochs, prefix_cost, prefix_reasons, prefix_polled = event_index
-        for reason in ("invalid_event", "missing_price"):
+        for reason in ("invalid_event", "missing_price", "mixed_models"):
             if prefix_reasons[reason][last] - prefix_reasons[reason][first] > 0:
                 return None, reason, prefix_polled[last] - prefix_polled[first] > 0
         total = prefix_cost[last] - prefix_cost[first]
@@ -393,7 +395,7 @@ def _event_index(events: list[tuple[int, float | None, str | None, str | None]])
     """Build prefix arrays so thousands of twelve-hour windows stay bounded."""
     epochs = [item[0] for item in events]
     prefix_cost = [0.0]
-    prefix_reasons = {"invalid_event": [0], "missing_price": [0]}
+    prefix_reasons = {"invalid_event": [0], "missing_price": [0], "mixed_models": [0]}
     prefix_polled = [0]
     for _epoch, cost, reason, quality in events:
         prefix_cost.append(prefix_cost[-1] + (cost if cost is not None and math.isfinite(cost) else 0.0))
@@ -541,6 +543,53 @@ def weekly_limit_value(
     now: int | None = None,
     sample_interval_seconds: int = 900,
 ) -> dict[str, Any]:
+    """Keep the aggregate and estimate GPT models on exclusive-model windows.
+
+    The archive has no model-level quota counters. Other models in a window
+    therefore invalidate attribution instead of assigning the shared quota to
+    each model. As with the aggregate, uncollected usage remains a limitation.
+    """
+    identities = connection.execute(
+        """SELECT occurred_at_epoch, provider, model, input_tokens,
+                  cache_read_tokens, cache_write_tokens, output_tokens, quality
+           FROM token_usage_events
+           WHERE occurred_at_epoch >= ? AND occurred_at_epoch < ?
+           ORDER BY occurred_at_epoch, id""",
+        (start - WEEKLY_VALUE_MAX_WINDOW_SECONDS, end),
+    ).fetchall()
+    events = _load_cost_events(connection, price_index(catalog),
+                               start - WEEKLY_VALUE_MAX_WINDOW_SECONDS, end, rows=identities)
+    models = sorted({(row["provider"], row["model"]) for row in identities
+                     if isinstance(row["provider"], str)
+                     and isinstance(row["model"], str)
+                     and row["model"].lower().startswith("gpt-")})
+    kwargs = {"now": now, "sample_interval_seconds": sample_interval_seconds}
+    result = _weekly_limit_value(connection, catalog, start, end,
+                                 cost_events=events, **kwargs)
+    result["by_model"] = []
+    for provider, model in models:
+        model_events = [
+            event if (row["provider"], row["model"]) == (provider, model)
+            else (event[0], None, "mixed_models", event[3])
+            for row, event in zip(identities, events)
+        ]
+        estimate = _weekly_limit_value(connection, catalog, start, end,
+                                       cost_events=model_events, **kwargs)
+        result["by_model"].append({"provider": provider, "model": model,
+                                   "attribution": "exclusive_model_windows", **estimate})
+    return result
+
+
+def _weekly_limit_value(
+    connection: sqlite3.Connection,
+    catalog: dict[str, Any],
+    start: int,
+    end: int,
+    *,
+    now: int | None = None,
+    sample_interval_seconds: int = 900,
+    cost_events: list[tuple[int, float | None, str | None, str | None]] | None = None,
+) -> dict[str, Any]:
     """Build the twelve-hour implicit weekly-limit value series.
 
     This is intentionally independent of token source/model UI filters: it is
@@ -562,7 +611,7 @@ def weekly_limit_value(
     cadenced_count = len(cadenced_rows)
     selected_rows = _sample_rows(cadenced_rows, WEEKLY_VALUE_MAX_POINTS)
     row_epochs = _snapshot_epoch_index(rows)
-    events = _load_cost_events(
+    events = cost_events if cost_events is not None else _load_cost_events(
         connection,
         price_index(catalog),
         start - WEEKLY_VALUE_MAX_WINDOW_SECONDS,

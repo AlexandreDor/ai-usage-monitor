@@ -482,6 +482,7 @@ function weeklyValueQuality(value) {
 function weeklyValueReason(value) {
   const keys = {
     ambiguous_limit: 'weeklyValueReasonAmbiguousLimit',
+    mixed_models: 'weeklyValueReasonMixedModels',
     deadline_transition: 'weeklyValueReasonDeadlineTransition',
     incomplete_cycle: 'weeklyValueReasonIncompleteCycle',
     insufficient_quota_delta: 'weeklyValueReasonInsufficientDelta',
@@ -515,6 +516,7 @@ function renderWeeklyLimitValueTable(points) {
   for (const point of points) {
     const row = document.createElement('tr');
     cell(row, formatDate(point.at));
+    cell(row, point.estimateLabel || t('weeklyValueAllModels'));
     const observed = cell(row, formatUsd(point.observed_cost_usd), point.observed_cost_usd === null ? 'value-unavailable' : '');
     const consumed = finiteNumber(point.quota_consumed_pct_points);
     cell(row, consumed === null ? 'N/A' : formatPercent(consumed));
@@ -527,12 +529,76 @@ function renderWeeklyLimitValueTable(points) {
     body?.appendChild(row);
   }
 }
+let weeklyValueData = {};
+const weeklyValueSelection = new Map();
+const weeklyValueDefaults = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-astra'];
+const weeklyValueColors = ['#38bdf8', '#a78bfa', '#34d399', '#fbbf24', '#fb7185'];
 function renderWeeklyLimitValue(data = {}) {
-  const points = Array.isArray(data.series) ? data.series : [];
+  weeklyValueData = data;
+  const selector = byId('weekly-limit-value-models');
+  const models = Array.isArray(data.by_model) ? data.by_model : [];
+  const entries = [{ key: 'aggregate', label: t('weeklyValueAllModels'), color: weeklyValueColors[0], data }];
+  const modelNames = [...weeklyValueDefaults, ...new Set(models.map(item => item.model)
+    .filter(model => !weeklyValueDefaults.includes(model)))];
+  for (const model of modelNames) {
+    const estimates = models.filter(item => item.model === model);
+    // A shared quota window can be valid for only one provider/model pair.
+    // Join those points in one model curve without adding or averaging values.
+    const byTime = new Map();
+    for (const estimate of estimates) {
+      for (const point of Array.isArray(estimate.series) ? estimate.series : []) {
+        const previous = byTime.get(point.at);
+        if (!previous || weeklyValuePointValid(point)
+          || (!weeklyValuePointValid(previous) && previous.reason === 'mixed_models')) {
+          byTime.set(point.at, { ...point, provider: estimate.provider });
+        }
+      }
+    }
+    const series = [...byTime.values()].sort((left, right) => timestampMs(left.at) - timestampMs(right.at));
+    const reasons = {};
+    for (const point of series) if (point.reason) reasons[point.reason] = (reasons[point.reason] || 0) + 1;
+    const index = weeklyValueDefaults.indexOf(model);
+    entries.push({ key: model, label: model, model,
+      color: index >= 0 ? weeklyValueColors[index + 1] : '#94a3b8',
+      data: { series, unavailable_reasons: reasons } });
+  }
+  const selected = [];
+  clearRows(selector);
+  for (const entry of entries) {
+    if (!weeklyValueSelection.has(entry.key)) {
+      weeklyValueSelection.set(entry.key, weeklyValueDefaults.includes(entry.model));
+    }
+    const active = weeklyValueSelection.get(entry.key);
+    const points = Array.isArray(entry.data.series) ? entry.data.series : [];
+    const valid = points.filter(weeklyValuePointValid);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.dataset.weeklyModel = entry.key;
+    button.setAttribute('aria-pressed', String(active));
+    button.style.setProperty('--series-color', entry.color);
+    const swatch = document.createElement('span');
+    swatch.className = 'weekly-value-swatch';
+    swatch.setAttribute('aria-hidden', 'true');
+    button.appendChild(swatch);
+    const label = document.createElement('span');
+    label.textContent = entry.label;
+    button.appendChild(label);
+    if (!valid.length) {
+      const notice = document.createElement('span');
+      notice.className = 'weekly-value-no-data';
+      notice.textContent = t('weeklyValueNoPoints');
+      button.appendChild(notice);
+    }
+    selector.appendChild(button);
+    if (active) selected.push({ ...entry, points, valid });
+  }
+  const points = selected.flatMap(entry => entry.points.map(point => ({ ...point, estimateLabel: point.provider ? `${entry.label} (${point.provider})` : entry.label })))
+    .sort((left, right) => timestampMs(left.at) - timestampMs(right.at));
   const valid = points.filter(weeklyValuePointValid);
   byId('weekly-limit-value-empty').hidden = valid.length > 0;
   byId('weekly-limit-value-chart-wrap').hidden = valid.length === 0 || typeof Chart !== 'function';
-  const unavailable = Object.values(data.unavailable_reasons || {}).reduce((total, value) => total + safeNumber(value), 0);
+  const unavailable = selected.reduce((total, entry) => total + Object.values(entry.data.unavailable_reasons || {})
+    .reduce((count, value) => count + safeNumber(value), 0), 0);
   const currentNotice = data.current_status === 'stale_data'
     ? ` · ${t('weeklyValueCurrentUnavailable')}`
     : '';
@@ -540,15 +606,15 @@ function renderWeeklyLimitValue(data = {}) {
     ? `${t('weeklyLimitValueSummary', { valid: valid.length, unavailable, from: formatDate(valid[0].at), to: formatDate(valid[valid.length - 1].at) })}${currentNotice}`
     : `${t('noWeeklyLimitValue')}${currentNotice}`;
   renderWeeklyLimitValueTable(points);
-  weeklyLimitValueDatasets = [{
-    label: t('weeklyLimitValueTitle'),
-    data: valid.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.value_usd) })),
-    borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.10)',
-    fill: true, borderWidth: 2, pointRadius: 4, tension: 0.2, spanGaps: false,
-    pointBackgroundColor: valid.map(point => point.quality === 'volatile' ? '#fca5a5' : point.quality === 'low_confidence' ? '#fbbf24' : '#86efac'),
-    pointStyle: valid.map(point => point.quality === 'volatile' ? 'triangle' : point.quality === 'low_confidence' ? 'rectRot' : 'circle'),
+  weeklyLimitValueDatasets = selected.map(entry => ({
+    label: entry.label,
+    data: entry.valid.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.value_usd) })),
+    borderColor: entry.color, backgroundColor: entry.color,
+    fill: false, borderWidth: entry.key === 'aggregate' ? 3 : 2, pointRadius: 3, tension: 0.2, spanGaps: false,
+    pointBackgroundColor: entry.color,
+    pointStyle: entry.valid.map(point => point.quality === 'volatile' ? 'triangle' : point.quality === 'low_confidence' ? 'rectRot' : 'circle'),
     valueKind: 'usd',
-  }];
+  }));
   if (typeof Chart !== 'function' || !valid.length) {
     if (weeklyLimitValueChart) { weeklyLimitValueChart.destroy(); weeklyLimitValueChart = null; }
     return;
@@ -562,6 +628,7 @@ function renderWeeklyLimitValue(data = {}) {
   }
   const options = chartBase(valid);
   options.scales.y.ticks.callback = value => formatUsd(value);
+  options.plugins.legend.display = false;
   weeklyLimitValueChart = new Chart(byId('weekly-limit-value-chart').getContext('2d'), {
     type: 'line', data: { datasets: weeklyLimitValueDatasets }, options,
   });
@@ -1005,6 +1072,17 @@ byId('select-gpt').addEventListener('click', () => {
   refresh();
 });
 byId('reset-filter').value = state.resetType;
+byId('weekly-limit-value-models').addEventListener('click', event => {
+  const button = event.target.closest('button[data-weekly-model]');
+  if (!button) return;
+  const key = button.dataset.weeklyModel;
+  weeklyValueSelection.set(key, !weeklyValueSelection.get(key));
+  renderWeeklyLimitValue(weeklyValueData);
+  // Rebuilding translated controls must not lose keyboard focus.
+  for (const control of byId('weekly-limit-value-models').querySelectorAll('button')) {
+    if (control.dataset.weeklyModel === key) control.focus();
+  }
+});
 byId('reset-filter').addEventListener('change', event => { state.resetType = event.target.value; state.resetOffset = 0; refresh(); });
 byId('apply-dates').addEventListener('click', () => {
   state.fromDate = byId('from-date').value; state.toDate = byId('to-date').value; state.resetOffset = 0; state.breakdownOffset = 0;

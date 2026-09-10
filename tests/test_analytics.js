@@ -15,6 +15,7 @@ class FakeElement {
     this.children = [];
     this.attributes = {};
     this.dataset = {};
+    this.style = { setProperty: () => {} };
     this.className = '';
     this.classList = { add: () => {}, remove: () => {}, toggle: () => {} };
   }
@@ -67,7 +68,7 @@ for (const sourceName of ['preferences.js', 'chart-interactions.js', 'analytics.
 }
 function evaluate(expression) { return vm.runInContext(expression, context); }
 
-evaluate(`renderWeeklyLimitValue({
+evaluate(`weeklyValueSelection.set('aggregate', true); renderWeeklyLimitValue({
   series: [
     { at: '2026-08-01T00:00:00Z', window_start: '2026-07-31T12:00:00Z', window_seconds: 43200, observed_cost_usd: 1.5, quota_consumed_pct_points: 2, raw_value_usd: 75, value_usd: 75, quality: 'good', reason: null },
     { at: '2026-08-01T12:00:00Z', window_start: '2026-08-01T00:00:00Z', window_seconds: 43200, observed_cost_usd: null, quota_consumed_pct_points: 0.2, raw_value_usd: null, value_usd: null, quality: 'unavailable', reason: 'insufficient_quota_delta' }
@@ -145,4 +146,20 @@ evaluate(`renderLimits({
 })`);
 if (evaluate('limitDatasets.find(dataset => dataset.datasetKey === "reset-5h").hidden') !== false) fail('5-hour marker visibility preference was lost after an absent-marker payload');
 
+
+// Four independent selections survive refreshes and temporary missing data.
+evaluate(`weeklyValueSelection.clear(); renderWeeklyLimitValue({ by_model: [{ provider: 'openai', model: 'gpt-5.6-sol', series: [] }] });`);
+if (evaluate('weeklyLimitValueDatasets.length') !== 4) fail('four default curves were not selected');
+if (evaluate('new Set(weeklyLimitValueDatasets.map(item => item.borderColor)).size') !== 4) fail('default curves do not have distinct colors');
+evaluate(`weeklyValueSelection.set('gpt-5.6-sol', false);
+  renderWeeklyLimitValue(weeklyValueData);`);
+if (evaluate('weeklyLimitValueDatasets.length') !== 3) fail('model toggle did not remove its dataset');
+evaluate('renderWeeklyLimitValue({ series: [], by_model: [] })');
+if (evaluate('weeklyLimitValueDatasets.length') !== 3) fail('model selection lost when data disappeared');
+evaluate(`renderWeeklyLimitValue({ by_model: [{ provider: 'openai', model: 'gpt-5.6-sol', series: [] }] });`);
+if (evaluate('weeklyLimitValueDatasets.length') !== 3) fail('model selection lost when data returned');
+evaluate(`for (const key of weeklyValueSelection.keys()) weeklyValueSelection.set(key, false);
+  renderWeeklyLimitValue(weeklyValueData);`);
+if (evaluate('weeklyLimitValueDatasets.length') !== 0) fail('all curves cannot be deselected');
+if (!element('weekly-limit-value-chart-wrap').hidden) fail('empty selection showed a chart');
 console.log('PASS: analytics JavaScript tests');
