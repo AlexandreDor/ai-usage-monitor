@@ -55,6 +55,6 @@ with sqlite3.connect(sys.argv[1]) as connection:
     print(connection.execute("SELECT COUNT(*) FROM quota_anomalies WHERE journaled_at IS NULL").fetchone()[0])
 PYEOF
 )" "pending anomaly was not resumed"
-assert_eq 3 "$(wc -l < "$ALERT_LOG")" "anomaly seam did not retry pending windows"
+assert_eq 3 "$(grep -c ' · Anomaly$' "$ALERT_LOG")" "anomaly seam did not retry pending windows"
 
 printf 'PASS: monitor quota anomaly tests\n'

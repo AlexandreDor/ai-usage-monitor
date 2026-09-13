@@ -11,7 +11,13 @@ monitor_defaults
 ALERT_THRESHOLDS=80,70,50,25,10,5,4
 ALERT_LOG="${TEST_ROOT}/alerts"
 send_alert() { printf '%s\n' "$1" >> "$ALERT_LOG"; }
-count_alerts() { [[ -f "$ALERT_LOG" ]] && wc -l < "$ALERT_LOG" || printf '0\n'; }
+count_alerts() {
+  if [[ -f "$ALERT_LOG" ]]; then
+    grep -Ec ' · (Low balance|Reset)$' "$ALERT_LOG" || true
+  else
+    printf '0\n'
+  fi
+}
 run_sample() { check_thresholds "$1" 100 later unknown "${2:-}" '' "$3" >/dev/null; }
 now=2000000000
 
@@ -21,7 +27,7 @@ run_sample 70 '' "$((now + 1))"
 assert_eq 2 "$(count_alerts)" "80 to 70 crossing"
 run_sample 4 '' "$((now + 2))"
 assert_eq 3 "$(count_alerts)" "multi-threshold drop emitted more than once"
-assert_contains "$(tail -n 1 "$ALERT_LOG")" 'crossed 4% threshold' "most critical threshold not selected"
+assert_contains "$(<"$ALERT_LOG")" 'Threshold crossed: 4%' "most critical threshold not selected"
 
 run_sample 6 '' "$((now + 3))"
 run_sample 4 '' "$((now + 4))"
@@ -32,7 +38,7 @@ rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$ALERT_LOG"
 run_sample 4 "$reset_at" "$now"
 run_sample 100 '' "$((reset_at + 1))"
 assert_eq 2 "$(count_alerts)" "4 to 100 reset sequence"
-assert_contains "$(tail -n 1 "$ALERT_LOG")" 'limit reset' "reset alert missing"
+assert_contains "$(<"$ALERT_LOG")" '· Reset' "reset alert missing"
 
 rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$ALERT_LOG"
 decimal_reset_at=$((now + 600))
