@@ -61,6 +61,14 @@ count_file_lines() {
   [[ -f "$1" ]] && wc -l < "$1" || printf '0\n'
 }
 
+count_notifications() {
+  if [[ -f "$1" ]]; then
+    grep -Ec ' · (Low balance|Reset)$' "$1" || true
+  else
+    printf '0\n'
+  fi
+}
+
 reset_case() {
   rm -f "$STATE_FILE" "$STATE_FILE.interrupted" "$ALERT_DELIVERIES_FILE" \
     "$HOOK_LOG" "$NOTIFICATION_LOG"
@@ -87,7 +95,7 @@ assert_eq 5 "$(wc -l < "$HOOK_LOG")" "multi-threshold action count"
 actual_order="$(awk -F'|' '{print $2 ":" $1 ":" $4}' "$HOOK_LOG")"
 expected_order=$'5h:75:1\n5h:50:1\n5h:50:2\n5h:25:1\nweekly:50:1'
 assert_eq "$expected_order" "$actual_order" "script action ordering"
-assert_eq 0 "$(count_file_lines "$NOTIFICATION_LOG")" "independent script thresholds sent notifications"
+assert_eq 0 "$(count_notifications "$NOTIFICATION_LOG")" "independent script thresholds sent notifications"
 
 first_line="$(head -n 1 "$HOOK_LOG")"
 assert_contains "$first_line" "|threshold|1|$(dirname "$HOOK_ONE")|unset:unset:unset:unset:unset|eof|present|20|" "hook environment contract"
@@ -220,7 +228,7 @@ check_thresholds 100 28 unknown later '' "$old_weekly_deadline" "$now"
 check_thresholds 100 100 unknown later '' "$new_weekly_deadline" "$((now + 900))"
 assert_eq 1 "$(wc -l < "$HOOK_LOG")" "observed weekly reset script did not execute"
 assert_contains "$(head -n 1 "$HOOK_LOG")" '|weekly|reset|1|' "observed weekly reset event contract"
-assert_eq 1 "$(wc -l < "$NOTIFICATION_LOG")" "observed weekly reset notification was not sent"
+assert_eq 1 "$(count_notifications "$NOTIFICATION_LOG")" "observed weekly reset notification was not sent"
 check_thresholds 100 100 unknown later '' "$new_weekly_deadline" "$((now + 1800))"
 assert_eq 1 "$(wc -l < "$HOOK_LOG")" "observed weekly reset script was replayed"
 
@@ -315,7 +323,7 @@ cp "$CRASH_STATE" "$STATE_FILE"
 # shellcheck disable=SC2317,SC2329
 send_alert() { printf '%s\n' "$1" >> "$NOTIFICATION_LOG"; return 0; }
 check_thresholds 100 100 unknown later '' "$((old_weekly_deadline + 30 * 60))" "$((now + 2))" group-a
-assert_contains "$(tail -n 1 "$NOTIFICATION_LOG")" "weekly limit reset" "hook journal missed the following reset"
+assert_contains "$(<"$NOTIFICATION_LOG")" "📅 Codex · Weekly quota · Reset" "hook journal missed the following reset"
 
 # Notification retries remain independent from the one-shot script journal.
 reset_case
@@ -329,7 +337,7 @@ check_thresholds 80 100 later unknown "$((now + 10))" '' "$now" >/dev/null || tr
 check_thresholds 100 100 unknown unknown '' '' "$((now + 11))" >/dev/null || true
 check_thresholds 100 100 unknown unknown '' '' "$((now + 12))" >/dev/null || true
 assert_eq 1 "$(wc -l < "$HOOK_LOG")" "failed notification replayed reset script"
-assert_eq 2 "$(wc -l < "$NOTIFICATION_LOG")" "notification was not retried"
+assert_eq 2 "$(count_notifications "$NOTIFICATION_LOG")" "notification was not retried"
 
 # Script failures and timeouts remain pending for retry, do not prevent later
 # actions for the same threshold, and successful actions are not replayed.
@@ -459,7 +467,7 @@ assert_eq "" "$(state_value pending_script_5h_actions)" \
   "interrupted owner hook remained pending after acknowledgement"
 assert_eq "$owner_switch_action_id" "$(state_value suppressed_script_5h_actions)" \
   "interrupted owner hook was not durably suppressed"
-assert_eq 0 "$(count_file_lines "$NOTIFICATION_LOG")" \
+assert_eq 0 "$(count_notifications "$NOTIFICATION_LOG")" \
   "owner switch recovery emitted an unexpected notification"
 
 # If the initial interrupted-hook marker write fails, the old pending state is

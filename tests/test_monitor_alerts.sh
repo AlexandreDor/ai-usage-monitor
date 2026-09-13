@@ -285,7 +285,7 @@ send_alert() {
 }
 check_thresholds 100 100 "unknown" "later" "" "$((old_weekly_deadline + 30 * 60))" "$((now + 2))"
 assert_alert_count 2
-assert_contains "$(tail -n 1 "$ALERT_LOG")" "weekly limit reset" "failed threshold delivery hid the reset"
+assert_contains "$(tail -n 2 "$ALERT_LOG" | head -n 1)" "📅 Codex · Weekly quota · Reset" "failed threshold delivery hid the reset"
 [[ -z "$(state_value pending_weekly_threshold)" ]] || fail "old threshold remained pending after reset"
 
 # Legacy threshold baselines have no limit owner and are reinitialized from the
@@ -302,7 +302,7 @@ ALERT_THRESHOLDS=50
 check_thresholds 100 40 "unknown" "later" "" "$((now + 7 * 24 * 60 * 60 / 2))" "$now"
 assert_alert_count 1
 alert_message="$(<"$ALERT_LOG")"
-[[ "$alert_message" == *$'*Pace vs ideal:* -10.0 pts · 20.0% below'* ]] \
+[[ "$alert_message" == *$'Weekly pace vs ideal: -10.0 pts · 20.0% below'* ]] \
   || fail "weekly pace delta was missing from threshold alert"
 
 printf 'PASS: monitor reset alert tests\n'

@@ -665,6 +665,41 @@ PYEOF
 # ============================================================================
 # Alerting — direct curl to Discord/Telegram, no server needed
 # ============================================================================
+# Format every newly composed network notification in plain text.  Messages
+# are formatted before they enter the delivery journal, so an existing pending
+# payload remains immutable across retries and upgrades.
+format_alert_message() {
+  local kind="$1" window="$2" remaining="${3:-}" threshold="${4:-}"
+  local reset="${5:-}" pace="${6:-}" explanation="${7:-}"
+  local emoji quota
+  if [[ "$window" == 5h ]]; then
+    emoji='⏱️'
+    quota='5h quota'
+  else
+    emoji='📅'
+    quota='Weekly quota'
+  fi
+
+  case "$kind" in
+    threshold)
+      printf '%s Codex · %s · Low balance\nRemaining: %s%%\nThreshold crossed: %s%%\nResets: %s' \
+        "$emoji" "$quota" "$remaining" "$threshold" "$reset"
+      if [[ -n "$pace" ]]; then
+        printf '\n\nWeekly pace vs ideal: %s' "$pace"
+      fi
+      ;;
+    reset)
+      printf '%s Codex · %s · Reset\nA new usage cycle is available.' "$emoji" "$quota"
+      ;;
+    anomaly)
+      printf '%s Codex · %s · Anomaly\n%s' "$emoji" "$quota" "$explanation"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 send_discord() {
   local message="$1"
   local payload
@@ -793,11 +828,7 @@ network_reset_request_json() {
   local window="$1" limit_id="$2" reset_epoch="$3" created_at="$4"
   local channels message
   channels="$(configured_alert_channels_json)" || return 1
-  if [[ "$window" == 5h ]]; then
-    message="*Codex 5h limit reset.* A new usage cycle is available."
-  else
-    message="*Codex weekly limit reset.* A new usage cycle is available."
-  fi
+  message="$(format_alert_message reset "$window")" || return 1
   ALERT_REGISTER_MESSAGE="$message" python3 - "$window" "$limit_id" \
     "$reset_epoch" "$created_at" "$channels" <<'PYEOF'
 import json
@@ -871,6 +902,8 @@ journal_quota_anomalies() {
   while IFS=$'\x1f' read -r anomaly_id anomaly_type window limit_id detected before_pct after_pct before_reset after_reset message; do
     [[ -n "$anomaly_id" ]] || continue
     message="$(printf '%s' "$message" | base64 --decode)" || { rm -f "$pending_file"; return 1; }
+    message="$(format_alert_message anomaly "$window" '' '' '' '' "$message")" \
+      || { rm -f "$pending_file"; return 1; }
     event_data="$(python3 - "$limit_id" "$after_reset" "$before_pct" "$after_pct" \
       "$before_reset" "$detected" <<'PYEOF'
 import json
@@ -2616,8 +2649,10 @@ PYEOF
       [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ ]] && prev_weekly_pct="$weekly_pct"
     fi
   fi
-  payload="$(MIGRATION_FIVE_MESSAGE="*Codex 5h limit at ${five_h_pct}% remaining* (crossed ${pending_5h_threshold}% threshold). Resets at ${five_h_reset}" \
-    MIGRATION_WEEKLY_MESSAGE="*Codex weekly limit at ${weekly_pct}% remaining* (crossed ${pending_weekly_threshold}% threshold). Resets ${weekly_reset}" \
+  payload="$(MIGRATION_FIVE_MESSAGE="$(format_alert_message threshold 5h "$five_h_pct" "$pending_5h_threshold" "$five_h_reset")" \
+    MIGRATION_WEEKLY_MESSAGE="$(format_alert_message threshold weekly "$weekly_pct" "$pending_weekly_threshold" "$weekly_reset")" \
+    MIGRATION_FIVE_RESET_MESSAGE="$(format_alert_message reset 5h)" \
+    MIGRATION_WEEKLY_RESET_MESSAGE="$(format_alert_message reset weekly)" \
     python3 - "$state_version" "$now" "$five_h_owner" "$weekly_owner" "$channels" "$thresholds_csv" \
       "$pending_5h_threshold" "$pending_weekly_threshold" "$prev_5h_pct" "$prev_weekly_pct" \
       "$five_h_pct" "$weekly_pct" "$five_h_reconstruct_reset" "$weekly_reconstruct_reset" \
@@ -2673,9 +2708,9 @@ def reset(window, reset_at, last_reset, validity, event_limit_id, message, allow
 threshold("5h", pending_five, previous_five, five_pct, five_reset, os.environ["MIGRATION_FIVE_MESSAGE"], five_limit_id)
 threshold("weekly", pending_weekly, previous_weekly, weekly_pct, weekly_reset, os.environ["MIGRATION_WEEKLY_MESSAGE"], weekly_limit_id)
 reset("5h", five_reset, last_five_reset, 5 * 60 * 60, five_limit_id,
-      "*Codex 5h limit reset.* A new usage cycle is available.", allow_five)
+      os.environ["MIGRATION_FIVE_RESET_MESSAGE"], allow_five)
 reset("weekly", weekly_reset, last_weekly_reset, 7 * 24 * 60 * 60,
-      weekly_limit_id, "*Codex weekly limit reset.* A new usage cycle is available.", allow_weekly)
+      weekly_limit_id, os.environ["MIGRATION_WEEKLY_RESET_MESSAGE"], allow_weekly)
 print(json.dumps({"completed_at": now, "alerts": alerts}))
 PYEOF
 )" || return 1
@@ -2749,7 +2784,7 @@ check_thresholds() {
   local interrupted_script_identities=""
   local interrupted_script_actions=""
   local interrupted_script_failsafe_loaded=0
-  local thresholds state_key state_value pace pace_suffix t critical status=0 reset_age rule_position script_threshold
+  local thresholds state_key state_value pace t critical status=0 reset_age rule_position script_threshold
   local original_pending cycle_key covered_json registration_status disabled_notified transaction_epoch
   local weekly_cycle_key weekly_request_json
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 script_hook_error=0 initialize_script_baseline=0
@@ -2870,8 +2905,6 @@ check_thresholds() {
 
   mapfile -t thresholds < <(load_thresholds)
   pace="$(weekly_pace_vs_ideal "$weekly_pct" "$weekly_reset_at" "$scraped_at_epoch")"
-  pace_suffix=""
-  [[ -n "$pace" ]] && pace_suffix=$'\n'"*Pace vs ideal:* ${pace}"
   if [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ && "$weekly_reset_at" =~ ^[0-9]+$ ]] \
     && (( weekly_reset_at > 0 )); then
     weekly_observation_valid=1
@@ -3733,7 +3766,7 @@ check_thresholds() {
         last_notified_5h_reset_at="$five_h_armed_reset_at"
       elif register_network_alert reset 5h reset \
         "$cycle_key" \
-        "*Codex 5h limit reset.* A new usage cycle is available." \
+        "$(format_alert_message reset 5h)" \
         "{\"limit_id\":\"${limit_id}\",\"reset_epoch\":${five_h_armed_reset_at}}" \
         "$five_h_armed_reset_at" "$((five_h_armed_reset_at + 5 * 60 * 60))" false \
         "$cycle_key"; then
@@ -3821,7 +3854,7 @@ check_thresholds() {
         last_notified_weekly_reset_at="$weekly_armed_reset_at"
       elif register_network_alert reset weekly reset \
         "$cycle_key" \
-        "*Codex weekly limit reset.* A new usage cycle is available." \
+        "$(format_alert_message reset weekly)" \
         "{\"limit_id\":\"${limit_id}\",\"reset_epoch\":${weekly_armed_reset_at}}" \
         "$weekly_armed_reset_at" "$((weekly_armed_reset_at + 7 * 24 * 60 * 60))" false \
         "$cycle_key"; then
@@ -3963,7 +3996,7 @@ PYEOF
 )"
         registration_status=0
         register_network_alert threshold 5h "$critical" "$cycle_key" \
-          "*Codex 5h limit at ${five_h_pct}% remaining* (crossed ${critical}% threshold). Resets at ${five_h_reset}${pace_suffix}" \
+          "$(format_alert_message threshold 5h "$five_h_pct" "$critical" "$five_h_reset" "$pace")" \
           "{\"limit_id\":\"${limit_id}\",\"remaining_pct\":${five_h_pct},\"reset_epoch\":${five_h_armed_reset_at},\"covered_thresholds\":${covered_json}}" \
           "$scraped_at_epoch" "$five_h_armed_reset_at" true || registration_status=$?
         if (( registration_status == 2 )); then
@@ -4027,7 +4060,7 @@ PYEOF
 )"
         registration_status=0
         register_network_alert threshold weekly "$critical" "$cycle_key" \
-          "*Codex weekly limit at ${weekly_pct}% remaining* (crossed ${critical}% threshold). Resets ${weekly_reset}${pace_suffix}" \
+          "$(format_alert_message threshold weekly "$weekly_pct" "$critical" "$weekly_reset" "$pace")" \
           "{\"limit_id\":\"${limit_id}\",\"remaining_pct\":${weekly_pct},\"reset_epoch\":${weekly_armed_reset_at},\"covered_thresholds\":${covered_json}}" \
           "$scraped_at_epoch" "$weekly_armed_reset_at" true || registration_status=$?
         if (( registration_status == 2 )); then
