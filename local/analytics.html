@@ -169,8 +169,8 @@
           <legend data-i18n="analytics.weeklyValueModel">Curves to display</legend>
           <div id="weekly-limit-value-models" class="weekly-value-models"></div>
         </fieldset>
-        <p class="chart-description" data-i18n="analytics.weeklyValueModelDescription">Per-model estimates use only windows containing that GPT model alone. Mixed-model windows cannot be attributed; uncollected usage may affect estimates.</p>
-        <p class="chart-description" data-i18n="analytics.weeklyLimitValueDescription">API-equivalent cost from all locally collected sources divided by the weekly quota fraction consumed in the same rolling twelve-hour window.</p>
+        <p class="chart-description" data-i18n="analytics.weeklyValueModelDescription">Per-model values come from exclusive windows when available. Mixed windows may use a low-confidence fit from prior non-overlapping windows in the same quota cycle; uncollected usage may affect estimates.</p>
+        <p class="chart-description" data-i18n="analytics.weeklyLimitValueDescription">API-equivalent cost from all locally collected sources divided by the shared weekly quota fraction consumed in the same rolling twelve-hour window. Per-model mixed-window values are inferred, not model-level quota observations.</p>
         <p class="quality-legend" id="weekly-limit-value-quality" data-i18n="analytics.weeklyLimitValueQualityLegend">Quality: good · low confidence · volatile. The table includes the reason for every unavailable point.</p>
         <div class="chart-wrap" id="weekly-limit-value-chart-wrap"><canvas id="weekly-limit-value-chart" class="time-slice-chart" role="img" aria-describedby="weekly-limit-value-summary weekly-limit-value-table-caption"></canvas></div>
         <p class="empty-state" id="weekly-limit-value-empty" data-i18n="analytics.noWeeklyLimitValue" hidden>No comparable weekly limit value is available in this period.</p>

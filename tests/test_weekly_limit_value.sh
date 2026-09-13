@@ -335,6 +335,187 @@ assert [row["marker"] for row in cadenced] == ["latest-first-bucket", "latest-se
 assert [row["scraped_at_epoch"] // 21600 for row in cadenced] == [0, 1], cadenced
 PY
 
+python3 - "$ROOT_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "local"))
+from analytics import (
+    WEEKLY_VALUE_MIXED_REASON_FIXED_MIX,
+    WEEKLY_VALUE_MIXED_REASON_INSUFFICIENT_SAMPLES,
+    WEEKLY_VALUE_MIXED_REASON_TARGET_MISMATCH,
+    WEEKLY_VALUE_MIXED_REASON_UNSTABLE,
+    _fit_mixed_regression,
+    _mixed_training_fit,
+    _mixed_window_observation,
+)
+
+a = ("openai", "gpt-5.6-sol")
+b = ("openai", "gpt-5.6-terra")
+nuisance = ("other", "non-gpt-helper")
+
+# Recover known positive coefficients while accounting for a non-GPT nuisance
+# identity. The response is a shared quota fraction, not a per-model counter.
+samples = []
+for index in range(12):
+    costs = {
+        a: 50.0 + 10.0 * index,
+        b: 300.0 - 15.0 * index,
+        nuisance: 20.0 + (index % 3) * 25.0,
+    }
+    fraction = costs[a] / 100.0 + costs[b] / 200.0 + costs[nuisance] / 400.0
+    samples.append({"costs": costs, "fraction": fraction, "identities": set(costs)})
+fit = _fit_mixed_regression(samples, {a, b, nuisance})
+assert fit["ok"], fit
+assert abs(fit["coefficients"][a] - 0.01) < 1e-12, fit
+assert abs(fit["coefficients"][b] - 0.005) < 1e-12, fit
+assert abs(fit["coefficients"][nuisance] - 0.0025) < 1e-12, fit
+assert fit["max_relative_coefficient_error"] <= 0.5, fit
+
+insufficient = _fit_mixed_regression(samples[:4], {a, b})
+assert insufficient["reason"] == WEEKLY_VALUE_MIXED_REASON_INSUFFICIENT_SAMPLES, insufficient
+fixed = [
+    {"costs": {a: float(index), b: float(index * 2)}, "fraction": index / 100.0}
+    for index in range(1, 9)
+]
+fixed_fit = _fit_mixed_regression(fixed, {a, b})
+assert fixed_fit["reason"] == WEEKLY_VALUE_MIXED_REASON_FIXED_MIX, fixed_fit
+
+# A formally full-rank fit with too little signal relative to a one-point
+# quota-delta perturbation is refused even though its residual is zero.
+weak = []
+for index in range(8):
+    costs = {a: 1.0 + index / 10.0, b: 2.0 - index / 20.0}
+    weak.append({"costs": costs, "fraction": costs[a] / 1000.0 + costs[b] / 2000.0})
+weak_fit = _fit_mixed_regression(weak, {a, b})
+assert weak_fit["reason"] == WEEKLY_VALUE_MIXED_REASON_UNSTABLE, weak_fit
+
+# Training selection uses only prior, non-overlapping windows in one
+# uninterrupted regime. A future observation with a wildly different response
+# cannot change the recovered coefficients, and an explicit reset invalidates
+# the window containing it.
+window = 43200
+deadline = 100 * window
+rows = []
+quota = 100.0
+events = []
+for index in range(14):
+    rows.append({
+        "scraped_at_epoch": index * window,
+        "weekly_pct": quota,
+        "weekly_reset_at": deadline + (179 if index % 2 else 0),
+        "limit_id": "limit-fit",
+    })
+    if index == 13:
+        break
+    cost_a = 3.0 + (index % 4) * 3.0
+    cost_b = 4.0 + ((index * 3) % 5) * 3.0
+    fraction = cost_a * 0.005 + cost_b * 0.004
+    events.extend([
+        (index * window + window // 3, a, cost_a, None, "direct"),
+        (index * window + 2 * window // 3, b, cost_b, None, "direct"),
+    ])
+    quota -= fraction * 100.0
+epochs = [row["scraped_at_epoch"] for row in rows]
+event_epochs = [event[0] for event in events]
+target, reason = _mixed_window_observation(rows, epochs, rows[-1], events, event_epochs, set())
+assert reason is None and target is not None, (target, reason)
+selected = _mixed_training_fit(rows, epochs, rows, epochs, target, events, event_epochs, set())
+assert selected["ok"] and selected["sample_count"] >= 6, selected
+assert abs(selected["coefficients"][a] - 0.005) < 1e-12, selected
+assert abs(selected["coefficients"][b] - 0.004) < 1e-12, selected
+drifted_target = {**target, "fraction": target["fraction"] * 2.0}
+drifted = _mixed_training_fit(rows, epochs, rows, epochs, drifted_target, events, event_epochs, set())
+assert drifted["reason"] == WEEKLY_VALUE_MIXED_REASON_TARGET_MISMATCH, drifted
+
+future_events = [*events, (15 * window + 1, a, 1000000.0, None, "direct")]
+future_fit = _mixed_training_fit(
+    rows, epochs, rows, epochs, target, future_events,
+    [event[0] for event in future_events], set(),
+)
+assert future_fit["coefficients"] == selected["coefficients"], (selected, future_fit)
+reset_target, reset_reason = _mixed_window_observation(
+    rows, epochs, rows[8], events, event_epochs, {7 * window + window // 2},
+)
+assert reset_target is None and reset_reason == "reset_in_window", (reset_target, reset_reason)
+
+# Per-target history is bounded even if a caller supplies older same-regime
+# candidates directly.
+distant_target = {**target, "start_epoch": 100 * window, "end_epoch": 101 * window}
+distant = _mixed_training_fit(rows, epochs, rows, epochs, distant_target, events, event_epochs, set())
+assert distant["sample_count"] == 0, distant
+PY
+
+python3 - "$ROOT_DIR" "$TEST_ROOT/mixed-weekly-value.sqlite3" <<'PY'
+from pathlib import Path
+import sqlite3
+import sys
+
+root, database = Path(sys.argv[1]), Path(sys.argv[2])
+sys.path.insert(0, str(root / "local"))
+from analytics import weekly_limit_value
+from storage import connect_database
+from token_usage import load_pricing
+
+window = 43200
+deadline = 100 * window
+quota = 100.0
+with connect_database(database) as connection:
+    for index in range(14):
+        connection.execute(
+            "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (index * window, str(index * window), 80, None, None, quota, None,
+             deadline + (179 if index % 2 else 0), 900, 192, "limit-fit"),
+        )
+        if index == 13:
+            break
+        cost_sol = 3 + (index % 4) * 3
+        cost_terra = 4 + ((index * 3) % 5) * 3
+        connection.executemany(
+            """INSERT INTO token_usage_events
+               (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+               VALUES (?, 'codex', 'openai', ?, ?, ?)""",
+            [
+                (index * window + window // 3, "gpt-5.6-sol", cost_sol * 200000, f"sol-{index}"),
+                (index * window + 2 * window // 3, "gpt-5.6-terra", cost_terra * 400000, f"terra-{index}"),
+            ],
+        )
+        quota -= (cost_sol * 0.005 + cost_terra * 0.004) * 100
+    connection.row_factory = sqlite3.Row
+    catalog = load_pricing(root / "local/pricing.json")
+    target_epoch = 13 * window
+    result = weekly_limit_value(connection, catalog, target_epoch, target_epoch + 1, now=target_epoch)
+    by_model = {item["model"]: item for item in result["by_model"]}
+    assert result["series"][0]["value_usd"] is not None, result["series"]
+    assert result["mixed_model_diagnostics"]["inferred_points"] == 2, result["mixed_model_diagnostics"]
+    assert by_model["gpt-5.6-sol"]["attribution"] == "mixed_model_regression", by_model
+    assert by_model["gpt-5.6-terra"]["attribution"] == "mixed_model_regression", by_model
+    assert by_model["gpt-5.6-sol"]["series"][0]["value_usd"] == 200.0, by_model
+    assert by_model["gpt-5.6-terra"]["series"][0]["value_usd"] == 250.0, by_model
+    assert all(item["unavailable_reasons"].get("mixed_models", 0) == 0 for item in by_model.values()), by_model
+
+    wider = weekly_limit_value(connection, catalog, 12 * window, target_epoch + 1, now=target_epoch)
+    wider_by_model = {item["model"]: item for item in wider["by_model"]}
+    for model, expected in (("gpt-5.6-sol", 200.0), ("gpt-5.6-terra", 250.0)):
+        target = next(point for point in wider_by_model[model]["series"] if point["at"] == by_model[model]["series"][0]["at"])
+        assert target["value_usd"] == expected, (model, target)
+
+    stale = weekly_limit_value(connection, catalog, target_epoch, target_epoch + 1, now=target_epoch + 1801)
+    assert all(item["series"][0]["reason"] == "stale_data" for item in stale["by_model"]), stale["by_model"]
+    assert stale["mixed_model_diagnostics"]["inferred_points"] == 0, stale["mixed_model_diagnostics"]
+
+    connection.execute(
+        """INSERT INTO token_usage_events
+           (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+           VALUES (?, 'codex', 'openai', 'unpriced-target-model', 1000, 'unpriced-target')""",
+        (12 * window + window // 2,),
+    )
+    missing = weekly_limit_value(connection, catalog, target_epoch, target_epoch + 1, now=target_epoch)
+    assert missing["series"][0]["reason"] == "missing_price", missing["series"]
+    assert missing["mixed_model_diagnostics"]["inferred_points"] == 0, missing["mixed_model_diagnostics"]
+    assert all(item["series"][0]["value_usd"] is None for item in missing["by_model"]), missing["by_model"]
+PY
+
 python3 - "$ROOT_DIR" "$database" <<'PY'
 from pathlib import Path
 import sys

@@ -70,11 +70,26 @@ The local Analytics page provides:
   Sol and GPT-6 Astra on one chart by default, with distinct colors and
   independent toggles. The aggregate curve is hidden by default and can be
   enabled with its toggle. Models without valid estimates are marked explicitly.
-  The data table identifies each series, including provider identity. These use the same twelve-hour windows,
-  pricing, smoothing and quality checks, but only windows containing that model
-  alone among locally collected events. Mixed-model windows are unavailable:
-  the archive records a shared quota, so its consumption cannot be attributed
-  to individual models. Uncollected usage can still bias these estimates.
+  The data table identifies each series, including provider identity. All
+  series use the same twelve-hour windows, pricing, and validity checks.
+  Exclusive-model windows retain the short median smoothing described above.
+  A mixed-model window uses the fitted inverse coefficient directly, without
+  an additional smoothing pass, and can receive a low-confidence inferred value
+  only from prior, non-overlapping twelve-hour windows in the same uninterrupted
+  limit/reset-deadline regime, bounded to 28 days independently of the selected
+  display range. The no-intercept fit accounts for every priced provider/model
+  identity in those windows, including non-GPT usage, and estimates only GPT
+  identities present in the target window. It requires at least
+  `max(6, 2 × predictors + 2)` samples, full rank, a scaled condition number no
+  greater than 10,000, positive coefficients, relative RMSE no greater than
+  25%, and coefficients whose worst-case movement under an assumed 1-point
+  quota-delta rounding perturbation is no greater than 50%. The held-out target
+  must also match the fitted shared quota drop within the greater of one
+  percentage point or 25% of its observed drop. Failed checks keep the
+  point unavailable with a reason. These diagnostics are conservative fit
+  checks, not confidence intervals: the archive records only a shared quota,
+  so model coefficients and values are inferred. Uncollected usage can still
+  bias these estimates.
   The aggregate remains available, independently of token breakdown filters.
 - weekly reset rows include `Estimated cycle cost ($)` for the complete
   observable all-source cycle and `Extrapolated 100% value ($)` when quota

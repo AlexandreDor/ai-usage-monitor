@@ -483,6 +483,14 @@ function weeklyValueReason(value) {
   const keys = {
     ambiguous_limit: 'weeklyValueReasonAmbiguousLimit',
     mixed_models: 'weeklyValueReasonMixedModels',
+    mixed_model_insufficient_samples: 'weeklyValueReasonMixedInsufficient',
+    mixed_model_fixed_mix: 'weeklyValueReasonMixedFixedMix',
+    mixed_model_ill_conditioned: 'weeklyValueReasonMixedIllConditioned',
+    mixed_model_poor_fit: 'weeklyValueReasonMixedPoorFit',
+    mixed_model_non_positive_coefficients: 'weeklyValueReasonMixedNonPositive',
+    mixed_model_unstable_coefficients: 'weeklyValueReasonMixedUnstable',
+    mixed_model_target_absent: 'weeklyValueReasonMixedTargetAbsent',
+    mixed_model_target_mismatch: 'weeklyValueReasonMixedTargetMismatch',
     deadline_transition: 'weeklyValueReasonDeadlineTransition',
     incomplete_cycle: 'weeklyValueReasonIncompleteCycle',
     insufficient_quota_delta: 'weeklyValueReasonInsufficientDelta',
@@ -524,7 +532,15 @@ function renderWeeklyLimitValueTable(points) {
     cell(row, formatUsd(point.value_usd), point.value_usd === null ? 'value-unavailable' : '');
     const quality = cell(row, weeklyValueQuality(point.quality), `quality-${point.quality || 'unavailable'}`);
     if (point.dispersion_pct !== undefined && point.dispersion_pct !== null) quality.title = `${formatPercent(point.dispersion_pct)} ${t('weeklyValueDispersion')}`;
-    const reason = cell(row, point.reason ? weeklyValueReason(point.reason) : t('weeklyValueAvailable'));
+    const reasonText = point.inferred
+      ? t('weeklyValueInferred')
+      : point.mixed_model_reason ? weeklyValueReason(point.mixed_model_reason)
+        : point.reason ? weeklyValueReason(point.reason) : t('weeklyValueAvailable');
+    const reason = cell(row, reasonText, point.inferred ? 'value-inferred' : '');
+    if (point.inferred) {
+      reason.title = t('weeklyValueInferredTitle', { samples: point.training_sample_count ?? '?' });
+      reason.setAttribute('aria-label', reasonText);
+    }
     if (point.reason) reason.className = 'value-unavailable';
     body?.appendChild(row);
   }
@@ -532,7 +548,7 @@ function renderWeeklyLimitValueTable(points) {
 let weeklyValueData = {};
 const weeklyValueSelection = new Map();
 const weeklyValueDefaults = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-astra'];
-const weeklyValueColors = ['#38bdf8', '#a78bfa', '#34d399', '#fbbf24', '#fb7185'];
+const weeklyValueColors = ['#38bdf8', '#a78bfa', '#34d399', '#fbbf24', '#fb7185', '#60a5fa', '#f97316'];
 function renderWeeklyLimitValue(data = {}) {
   weeklyValueData = data;
   const selector = byId('weekly-limit-value-models');
@@ -540,33 +556,40 @@ function renderWeeklyLimitValue(data = {}) {
   const entries = [{ key: 'aggregate', label: t('weeklyValueAllModels'), color: weeklyValueColors[0], data }];
   const modelNames = [...weeklyValueDefaults, ...new Set(models.map(item => item.model)
     .filter(model => !weeklyValueDefaults.includes(model)))];
+  const colorsForEntry = index => weeklyValueColors[index % weeklyValueColors.length];
+  let curveIndex = 0;
   for (const model of modelNames) {
     const estimates = models.filter(item => item.model === model);
-    // A shared quota window can be valid for only one provider/model pair.
-    // Join those points in one model curve without adding or averaging values.
-    const byTime = new Map();
-    for (const estimate of estimates) {
-      for (const point of Array.isArray(estimate.series) ? estimate.series : []) {
-        const previous = byTime.get(point.at);
-        if (!previous || weeklyValuePointValid(point)
-          || (!weeklyValuePointValid(previous) && previous.reason === 'mixed_models')) {
-          byTime.set(point.at, { ...point, provider: estimate.provider });
-        }
-      }
+    const curves = estimates.length ? estimates : [{ provider: null, model, series: [], unavailable_reasons: {} }];
+    for (const estimate of curves) {
+      const provider = estimate.provider || '';
+      const key = provider ? `${provider}/${model}` : model;
+      const label = provider ? `${model} (${provider})` : model;
+      const series = (Array.isArray(estimate.series) ? estimate.series : [])
+        .map(point => ({ ...point, provider: point.provider || provider }))
+        .sort((left, right) => timestampMs(left.at) - timestampMs(right.at));
+      const reasons = estimate.unavailable_reasons || {};
+      const color = colorsForEntry(curveIndex + 1);
+      entries.push({ key, label, model, provider,
+        color, data: { ...estimate, series, unavailable_reasons: reasons } });
+      curveIndex += 1;
     }
-    const series = [...byTime.values()].sort((left, right) => timestampMs(left.at) - timestampMs(right.at));
-    const reasons = {};
-    for (const point of series) if (point.reason) reasons[point.reason] = (reasons[point.reason] || 0) + 1;
-    const index = weeklyValueDefaults.indexOf(model);
-    entries.push({ key: model, label: model, model,
-      color: index >= 0 ? weeklyValueColors[index + 1] : '#94a3b8',
-      data: { series, unavailable_reasons: reasons } });
   }
   const selected = [];
   clearRows(selector);
   for (const entry of entries) {
     if (!weeklyValueSelection.has(entry.key)) {
-      weeklyValueSelection.set(entry.key, weeklyValueDefaults.includes(entry.model));
+      let inherited;
+      if (entry.provider && weeklyValueSelection.has(entry.model)) {
+        inherited = weeklyValueSelection.get(entry.model);
+      } else if (!entry.provider && entry.model) {
+        const suffix = `/${entry.model}`;
+        const variants = [...weeklyValueSelection.entries()]
+          .filter(([key]) => key.endsWith(suffix)).map(([, active]) => active);
+        if (variants.length) inherited = variants.some(Boolean);
+      }
+      weeklyValueSelection.set(entry.key,
+        inherited === undefined ? weeklyValueDefaults.includes(entry.model) : inherited);
     }
     const active = weeklyValueSelection.get(entry.key);
     const points = Array.isArray(entry.data.series) ? entry.data.series : [];
@@ -592,7 +615,7 @@ function renderWeeklyLimitValue(data = {}) {
     selector.appendChild(button);
     if (active) selected.push({ ...entry, points, valid });
   }
-  const points = selected.flatMap(entry => entry.points.map(point => ({ ...point, estimateLabel: point.provider ? `${entry.label} (${point.provider})` : entry.label })))
+  const points = selected.flatMap(entry => entry.points.map(point => ({ ...point, estimateLabel: entry.label })))
     .sort((left, right) => timestampMs(left.at) - timestampMs(right.at));
   const valid = points.filter(weeklyValuePointValid);
   byId('weekly-limit-value-empty').hidden = valid.length > 0;
@@ -612,7 +635,7 @@ function renderWeeklyLimitValue(data = {}) {
     borderColor: entry.color, backgroundColor: entry.color,
     fill: false, borderWidth: entry.key === 'aggregate' ? 3 : 2, pointRadius: 3, tension: 0.2, spanGaps: false,
     pointBackgroundColor: entry.color,
-    pointStyle: entry.valid.map(point => point.quality === 'volatile' ? 'triangle' : point.quality === 'low_confidence' ? 'rectRot' : 'circle'),
+    pointStyle: entry.valid.map(point => point.inferred ? 'star' : point.quality === 'volatile' ? 'triangle' : point.quality === 'low_confidence' ? 'rectRot' : 'circle'),
     valueKind: 'usd',
   }));
   if (typeof Chart !== 'function' || !valid.length) {

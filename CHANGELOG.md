@@ -6,6 +6,14 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ## [Unreleased]
 
+### Changed
+
+- Infer low-confidence per-model weekly values for eligible mixed-model windows
+  from a bounded set of prior, non-overlapping windows in the same quota cycle.
+  Full-rank, conditioning, fit, positive-coefficient, and quota-rounding
+  stability checks keep unsafe attributions unavailable, while the aggregate
+  continues to include every locally collected source.
+
 ## [0.1.2] - 2026-09-10
 
 ### Added

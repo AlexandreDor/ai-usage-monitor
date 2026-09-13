@@ -39,6 +39,27 @@ WEEKLY_VALUE_POINT_INTERVAL_SECONDS = 6 * 3600
 WEEKLY_VALUE_MIN_QUOTA_DELTA_POINTS = 0.5
 WEEKLY_VALUE_MAX_POINTS = 10_000
 WEEKLY_VALUE_STALE_REASON = "stale_data"
+# Mixed-model attribution is deliberately conservative.  A target window is
+# allowed to borrow at most four weeks of already observed, non-overlapping
+# windows for its regression.  Keeping this horizon independent of the
+# selected display range prevents changing the date picker from changing the
+# answer for a point.
+WEEKLY_VALUE_MIXED_TRAINING_HORIZON_SECONDS = 28 * 86400
+WEEKLY_VALUE_MIXED_MIN_SAMPLES = 6
+WEEKLY_VALUE_MIXED_MAX_CONDITION = 10_000.0
+WEEKLY_VALUE_MIXED_MAX_RMSE_FRACTION = 0.25
+WEEKLY_VALUE_MIXED_MAX_TARGET_ERROR_FRACTION = 0.25
+WEEKLY_VALUE_MIXED_QUANTIZATION_FLOOR_POINTS = 1.0
+WEEKLY_VALUE_MIXED_MAX_COEFFICIENT_ERROR_FRACTION = 0.5
+WEEKLY_VALUE_MIXED_MAX_PREDICTORS = 32
+WEEKLY_VALUE_MIXED_REASON_INSUFFICIENT_SAMPLES = "mixed_model_insufficient_samples"
+WEEKLY_VALUE_MIXED_REASON_FIXED_MIX = "mixed_model_fixed_mix"
+WEEKLY_VALUE_MIXED_REASON_ILL_CONDITIONED = "mixed_model_ill_conditioned"
+WEEKLY_VALUE_MIXED_REASON_POOR_FIT = "mixed_model_poor_fit"
+WEEKLY_VALUE_MIXED_REASON_NON_POSITIVE = "mixed_model_non_positive_coefficients"
+WEEKLY_VALUE_MIXED_REASON_UNSTABLE = "mixed_model_unstable_coefficients"
+WEEKLY_VALUE_MIXED_REASON_NO_TARGET = "mixed_model_target_absent"
+WEEKLY_VALUE_MIXED_REASON_TARGET_MISMATCH = "mixed_model_target_mismatch"
 # Keep this aligned with anomalies.RESET_OSCILLATION_MIN_DELTA_SECONDS. A
 # smaller movement is collector jitter; a change of at least three minutes is
 # a real deadline transition. The strict comparison in the helper below keeps
@@ -405,6 +426,462 @@ def _event_index(events: list[tuple[int, float | None, str | None, str | None]])
     return epochs, prefix_cost, prefix_reasons, prefix_polled
 
 
+def _event_identity(row: sqlite3.Row | dict[str, Any]) -> tuple[str, str] | None:
+    """Return the normalized provider/model identity for one token event."""
+    provider = _row_value(row, "provider")
+    model = _row_value(row, "model")
+    if not isinstance(provider, str) or not provider.strip() or not isinstance(model, str) or not model.strip():
+        return None
+    return provider.strip().lower(), model.strip().lower()
+
+
+def _identity_events(
+    rows: list[sqlite3.Row],
+    events: list[tuple[int, float | None, str | None, str | None]],
+) -> list[tuple[int, tuple[str, str] | None, float | None, str | None, str | None]]:
+    """Attach provider/model identities to the already-priced event tuples."""
+    return [
+        (event[0], _event_identity(row), event[1], event[2], event[3])
+        for row, event in zip(rows, events)
+    ]
+
+
+def _interval_identity_costs(
+    events: list[tuple[int, tuple[str, str] | None, float | None, str | None, str | None]],
+    start: int,
+    end: int,
+    epochs: list[int] | None = None,
+) -> tuple[dict[tuple[str, str], float] | None, set[tuple[str, str]], str | None, bool]:
+    """Return per-identity costs, identities seen, an invalidation reason, and polling state."""
+    if start >= end or not events:
+        return None, set(), "no_events", False
+    event_epochs = epochs if epochs is not None else [event[0] for event in events]
+    first = bisect.bisect_left(event_epochs, start)
+    last = bisect.bisect_left(event_epochs, end)
+    if first >= last:
+        return None, set(), "no_events", False
+    costs: dict[tuple[str, str], float] = {}
+    identities: set[tuple[str, str]] = set()
+    polled_delta = False
+    for epoch, identity, cost, reason, quality in events[first:last]:
+        polled_delta = polled_delta or quality == "polled_delta"
+        if identity is None:
+            return None, identities, "invalid_event", polled_delta
+        identities.add(identity)
+        if reason is not None:
+            return None, identities, reason, polled_delta
+        if cost is None or not math.isfinite(cost):
+            return None, identities, "invalid_event", polled_delta
+        costs[identity] = costs.get(identity, 0.0) + float(cost)
+    total = sum(costs.values())
+    if not math.isfinite(total) or total <= 0:
+        return None, identities, "no_cost", polled_delta
+    return costs, identities, None, polled_delta
+
+
+def _mixed_window_observation(
+    rows: list[sqlite3.Row],
+    row_epochs: list[int],
+    end_row: sqlite3.Row,
+    identity_events: list[tuple[int, tuple[str, str] | None, float | None, str | None, str | None]],
+    identity_event_epochs: list[int],
+    reset_epochs: set[int],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Build a validated quota/cost observation for a candidate regression row."""
+    end_epoch = end_row["scraped_at_epoch"]
+    if not isinstance(end_epoch, int) or not _finite_quota_number(end_row["weekly_pct"]):
+        return None, "invalid_quota_pct"
+    start_row, reason = _window_start(rows, end_row, end_epoch, row_epochs)
+    if start_row is None:
+        return None, reason or "window_duration"
+    start_epoch = start_row["scraped_at_epoch"]
+    if reason is not None:
+        return None, reason
+    if any(start_epoch < reset_at <= end_epoch for reset_at in reset_epochs):
+        return None, "reset_in_window"
+    delta = float(start_row["weekly_pct"]) - float(end_row["weekly_pct"])
+    if delta <= 0:
+        return None, "quota_increase" if delta < 0 else "zero_quota_delta"
+    if delta < WEEKLY_VALUE_MIN_QUOTA_DELTA_POINTS:
+        return None, "insufficient_quota_delta"
+    costs, identities, cost_reason, polled_delta = _interval_identity_costs(
+        identity_events, start_epoch, end_epoch, identity_event_epochs,
+    )
+    if cost_reason is not None or costs is None:
+        return None, cost_reason or "no_cost"
+    limit_id = start_row["limit_id"]
+    deadline = start_row["weekly_reset_at"]
+    if not isinstance(limit_id, str) or not limit_id or not isinstance(deadline, int):
+        return None, "missing_limit_id" if not isinstance(limit_id, str) or not limit_id else "missing_deadline"
+    return {
+        "start_epoch": start_epoch,
+        "end_epoch": end_epoch,
+        "fraction": delta / 100.0,
+        "costs": costs,
+        "identities": identities,
+        "limit_id": limit_id,
+        "deadline": deadline,
+        "polled_delta": polled_delta,
+    }, None
+
+
+def _mixed_matrix_rank_and_qr(
+    matrix: list[list[float]],
+) -> tuple[int, float, list[list[float]], list[list[float]]]:
+    """Modified Gram-Schmidt QR for a small, column-scaled design matrix."""
+    if not matrix:
+        return 0, math.inf, [], []
+    row_count = len(matrix)
+    column_count = len(matrix[0]) if matrix[0] else 0
+    if not column_count:
+        return 0, math.inf, [], []
+    columns = [[float(matrix[row][column]) for row in range(row_count)] for column in range(column_count)]
+    scales = [math.sqrt(sum(value * value for value in column)) for column in columns]
+    normalized = [
+        [value / scale for value in column] if scale > 0 and math.isfinite(scale) else [0.0] * row_count
+        for column, scale in zip(columns, scales)
+    ]
+    q_columns: list[list[float]] = []
+    r = [[0.0] * column_count for _ in range(column_count)]
+    tolerance = 1e-10
+    for column_index, source in enumerate(normalized):
+        vector = source[:]
+        for q_index, q_column in enumerate(q_columns):
+            projection = sum(q_column[row] * vector[row] for row in range(row_count))
+            r[q_index][column_index] = projection
+            for row in range(row_count):
+                vector[row] -= projection * q_column[row]
+        norm = math.sqrt(sum(value * value for value in vector))
+        original_norm = math.sqrt(sum(value * value for value in source))
+        if original_norm <= 0 or norm <= tolerance:
+            return len(q_columns), math.inf, q_columns, r
+        r[column_index][column_index] = norm
+        q_columns.append([value / norm for value in vector])
+    rank = len(q_columns)
+    # The singular values of the column-normalized design matrix are the
+    # square roots of the eigenvalues of its Gram matrix.  A Jacobi sweep is
+    # accurate enough for this deliberately small (at most 32-column) system
+    # and gives the actual 2-norm condition estimate rather than an R-diagonal
+    # proxy.
+    gram = [
+        [sum(normalized[left][row] * normalized[right][row] for row in range(row_count))
+         for right in range(column_count)]
+        for left in range(column_count)
+    ]
+    for _ in range(50 * column_count * column_count):
+        largest, pivot_left, pivot_right = 0.0, 0, 0
+        for left in range(column_count):
+            for right in range(left + 1, column_count):
+                if abs(gram[left][right]) > largest:
+                    largest, pivot_left, pivot_right = abs(gram[left][right]), left, right
+        if largest <= 1e-12:
+            break
+        left, right = pivot_left, pivot_right
+        angle = 0.5 * math.atan2(2.0 * gram[left][right], gram[right][right] - gram[left][left])
+        cosine, sine = math.cos(angle), math.sin(angle)
+        for index in range(column_count):
+            if index in (left, right):
+                continue
+            old_left, old_right = gram[index][left], gram[index][right]
+            gram[index][left] = gram[left][index] = cosine * old_left - sine * old_right
+            gram[index][right] = gram[right][index] = sine * old_left + cosine * old_right
+        old_left, old_right, cross = gram[left][left], gram[right][right], gram[left][right]
+        gram[left][left] = cosine * cosine * old_left - 2 * sine * cosine * cross + sine * sine * old_right
+        gram[right][right] = sine * sine * old_left + 2 * sine * cosine * cross + cosine * cosine * old_right
+        gram[left][right] = gram[right][left] = 0.0
+    eigenvalues = [max(0.0, gram[index][index]) for index in range(column_count)]
+    condition = (
+        math.sqrt(max(eigenvalues) / min(eigenvalues))
+        if eigenvalues and min(eigenvalues) > 1e-14 else math.inf
+    )
+    return rank, condition, q_columns, r
+
+
+def _mixed_qr_solve(
+    q_columns: list[list[float]],
+    r: list[list[float]],
+    response: list[float],
+) -> list[float] | None:
+    """Solve a full-rank, column-scaled least-squares system from its QR."""
+    count = len(q_columns)
+    projected = [sum(q_columns[index][row] * response[row] for row in range(len(response)))
+                 for index in range(count)]
+    coefficients = [0.0] * count
+    for index in range(count - 1, -1, -1):
+        diagonal = r[index][index]
+        if not math.isfinite(diagonal) or abs(diagonal) <= 1e-12:
+            return None
+        remainder = projected[index] - sum(
+            r[index][later] * coefficients[later] for later in range(index + 1, count)
+        )
+        coefficients[index] = remainder / diagonal
+    return coefficients
+
+
+def _fit_mixed_regression(
+    samples: list[dict[str, Any]],
+    feature_identities: set[tuple[str, str]],
+) -> dict[str, Any]:
+    """Fit fraction consumed = sum(cost_by_identity * positive coefficient).
+
+    This intentionally uses a small standard-library solver.  The columns are
+    normalized before QR so USD magnitudes do not determine numerical rank.
+    The returned diagnostics are heuristics, not confidence intervals: quota
+    percentages are rounded and the archive has no model-level quota counter.
+    """
+    identities = sorted(feature_identities)
+    predictor_count = len(identities)
+    sample_count = len(samples)
+    minimum_samples = max(WEEKLY_VALUE_MIXED_MIN_SAMPLES, 2 * predictor_count + 2)
+    if predictor_count < 2:
+        return {"ok": False, "reason": WEEKLY_VALUE_MIXED_REASON_FIXED_MIX,
+                "sample_count": sample_count, "predictor_count": predictor_count,
+                "minimum_samples": minimum_samples}
+    if predictor_count > WEEKLY_VALUE_MIXED_MAX_PREDICTORS:
+        return {"ok": False, "reason": WEEKLY_VALUE_MIXED_REASON_ILL_CONDITIONED,
+                "sample_count": sample_count, "predictor_count": predictor_count,
+                "minimum_samples": minimum_samples}
+    if sample_count < minimum_samples:
+        return {"ok": False, "reason": WEEKLY_VALUE_MIXED_REASON_INSUFFICIENT_SAMPLES,
+                "sample_count": sample_count, "predictor_count": predictor_count,
+                "minimum_samples": minimum_samples}
+    matrix = [
+        [float(sample["costs"].get(identity, 0.0)) for identity in identities]
+        for sample in samples
+    ]
+    response = [float(sample["fraction"]) for sample in samples]
+    rank, condition, q_columns, r = _mixed_matrix_rank_and_qr(matrix)
+    if rank < predictor_count:
+        return {"ok": False, "reason": WEEKLY_VALUE_MIXED_REASON_FIXED_MIX,
+                "sample_count": sample_count, "predictor_count": predictor_count,
+                "rank": rank, "condition_number": None if not math.isfinite(condition) else condition,
+                "minimum_samples": minimum_samples}
+    if not math.isfinite(condition) or condition > WEEKLY_VALUE_MIXED_MAX_CONDITION:
+        return {"ok": False, "reason": WEEKLY_VALUE_MIXED_REASON_ILL_CONDITIONED,
+                "sample_count": sample_count, "predictor_count": predictor_count,
+                "rank": rank, "condition_number": condition,
+                "minimum_samples": minimum_samples}
+    scaled_coefficients = _mixed_qr_solve(q_columns, r, response)
+    if scaled_coefficients is None:
+        return {"ok": False, "reason": WEEKLY_VALUE_MIXED_REASON_FIXED_MIX,
+                "sample_count": sample_count, "predictor_count": predictor_count,
+                "rank": rank, "condition_number": condition,
+                "minimum_samples": minimum_samples}
+    # QR was computed on unit-norm columns.  Convert back to fraction/USD.
+    scales = [math.sqrt(sum(matrix[row][column] * matrix[row][column] for row in range(sample_count)))
+              for column in range(predictor_count)]
+    coefficients = [scaled / scale for scaled, scale in zip(scaled_coefficients, scales)]
+    if any(not math.isfinite(value) or value <= 0 for value in coefficients):
+        return {"ok": False, "reason": WEEKLY_VALUE_MIXED_REASON_NON_POSITIVE,
+                "sample_count": sample_count, "predictor_count": predictor_count,
+                "rank": rank, "condition_number": condition,
+                "minimum_samples": minimum_samples}
+    # Treat each stored quota delta as if rounding could move it by one full
+    # percentage point. This is an explicit conservative sensitivity bound,
+    # not a claim about the provider's counter precision.
+    # Compute a worst-case bound with the exact pseudoinverse row sums.  Reject
+    # a fit if any coefficient could cross zero or move by more than half under
+    # those bounded perturbations, even when the residual happens to be small.
+    response_floor = WEEKLY_VALUE_MIXED_QUANTIZATION_FLOOR_POINTS / 100.0
+    coefficient_error_bounds: list[float] = []
+    for coefficient_index, scale in enumerate(scales):
+        sensitivity = 0.0
+        for sample_index in range(sample_count):
+            unit = [0.0] * sample_count
+            unit[sample_index] = 1.0
+            influence = _mixed_qr_solve(q_columns, r, unit)
+            if influence is None:
+                sensitivity = math.inf
+                break
+            sensitivity += abs(influence[coefficient_index] / scale)
+        coefficient_error_bounds.append(response_floor * sensitivity)
+    relative_coefficient_errors = [
+        error / coefficient for error, coefficient in zip(coefficient_error_bounds, coefficients)
+    ]
+    if any(
+        not math.isfinite(error) or coefficient - error <= 0
+        or relative > WEEKLY_VALUE_MIXED_MAX_COEFFICIENT_ERROR_FRACTION
+        for coefficient, error, relative in zip(
+            coefficients, coefficient_error_bounds, relative_coefficient_errors,
+        )
+    ):
+        return {"ok": False, "reason": WEEKLY_VALUE_MIXED_REASON_UNSTABLE,
+                "sample_count": sample_count, "predictor_count": predictor_count,
+                "rank": rank, "condition_number": condition,
+                "minimum_samples": minimum_samples,
+                "max_relative_coefficient_error": max(relative_coefficient_errors)}
+    residuals = [
+        sample["fraction"] - sum(sample["costs"].get(identity, 0.0) * coefficient
+                                  for identity, coefficient in zip(identities, coefficients))
+        for sample in samples
+    ]
+    residual_sum = sum(value * value for value in residuals)
+    denominator = max(1, sample_count - predictor_count)
+    rmse = math.sqrt(residual_sum / denominator)
+    mean_response = sum(abs(value) for value in response) / max(1, sample_count)
+    fit_scale = max(mean_response, WEEKLY_VALUE_MIXED_QUANTIZATION_FLOOR_POINTS / 100.0)
+    relative_rmse = rmse / fit_scale
+    if not math.isfinite(rmse) or relative_rmse > WEEKLY_VALUE_MIXED_MAX_RMSE_FRACTION:
+        return {"ok": False, "reason": WEEKLY_VALUE_MIXED_REASON_POOR_FIT,
+                "sample_count": sample_count, "predictor_count": predictor_count,
+                "rank": rank, "condition_number": condition,
+                "minimum_samples": minimum_samples, "rmse_fraction": rmse,
+                "relative_rmse": relative_rmse}
+    return {
+        "ok": True,
+        "identities": identities,
+        "coefficients": dict(zip(identities, coefficients)),
+        "sample_count": sample_count,
+        "predictor_count": predictor_count,
+        "rank": rank,
+        "condition_number": condition,
+        "minimum_samples": minimum_samples,
+        "rmse_fraction": rmse,
+        "relative_rmse": relative_rmse,
+        "max_abs_residual_fraction": max(abs(value) for value in residuals),
+        "max_relative_coefficient_error": max(relative_coefficient_errors),
+        "quantization_floor_pct_points": WEEKLY_VALUE_MIXED_QUANTIZATION_FLOOR_POINTS,
+    }
+
+
+def _mixed_training_fit(
+    rows: list[sqlite3.Row],
+    row_epochs: list[int],
+    candidate_rows: list[sqlite3.Row],
+    candidate_epochs: list[int],
+    target: dict[str, Any],
+    identity_events: list[tuple[int, tuple[str, str] | None, float | None, str | None, str | None]],
+    identity_event_epochs: list[int],
+    reset_epochs: set[int],
+) -> dict[str, Any]:
+    """Fit a target's historical mixed-model attribution without future data."""
+    target_start = int(target["start_epoch"])
+    target_limit = target["limit_id"]
+    target_deadline = target["deadline"]
+    horizon_start = target_start - WEEKLY_VALUE_MIXED_TRAINING_HORIZON_SECONDS
+    # Do not allow an earlier regime with the same identifier to re-enter the
+    # training set after an intervening deadline or limit transition.
+    regime_start = horizon_start
+    row_left = bisect.bisect_left(row_epochs, horizon_start)
+    row_right = bisect.bisect_right(row_epochs, target_start)
+    for row in reversed(rows[row_left:row_right]):
+        epoch = row["scraped_at_epoch"]
+        if (
+            row["limit_id"] != target_limit
+            or not _weekly_deadlines_equivalent(row["weekly_reset_at"], target_deadline)
+        ):
+            regime_start = epoch + 1
+            break
+    eligible: list[dict[str, Any]] = []
+    # Candidate rows are chronological six-hour buckets.  A candidate ending
+    # at the target window's start shares only a boundary with that target and
+    # is therefore still entirely historical.  Walking backward and keeping
+    # each candidate at least one window apart avoids treating overlapping
+    # twelve-hour windows as independent observations.
+    next_start = target_start
+    candidate_left = bisect.bisect_left(candidate_epochs, regime_start)
+    candidate_right = bisect.bisect_right(candidate_epochs, target_start)
+    for end_row in reversed(candidate_rows[candidate_left:candidate_right]):
+        end_epoch = end_row["scraped_at_epoch"]
+        if not isinstance(end_epoch, int) or end_epoch > next_start:
+            continue
+        observation, reason = _mixed_window_observation(
+            rows, row_epochs, end_row, identity_events, identity_event_epochs, reset_epochs,
+        )
+        if observation is None or reason is not None:
+            continue
+        if observation["start_epoch"] < regime_start or observation["end_epoch"] > next_start:
+            continue
+        if (
+            observation["limit_id"] != target_limit
+            or not _weekly_deadlines_equivalent(observation["deadline"], target_deadline)
+        ):
+            continue
+        eligible.append(observation)
+        next_start = observation["start_epoch"]
+    eligible.reverse()
+    target_identities = set(target["identities"])
+    feature_identities = target_identities | {
+        identity for sample in eligible for identity in sample["identities"]
+    }
+    result = _fit_mixed_regression(eligible, feature_identities)
+    if result.get("ok"):
+        predicted_fraction = sum(
+            float(target["costs"].get(identity, 0.0)) * float(coefficient)
+            for identity, coefficient in result["coefficients"].items()
+        )
+        target_fraction = float(target["fraction"])
+        target_error = abs(target_fraction - predicted_fraction)
+        target_tolerance = max(
+            WEEKLY_VALUE_MIXED_QUANTIZATION_FLOOR_POINTS / 100.0,
+            WEEKLY_VALUE_MIXED_MAX_TARGET_ERROR_FRACTION * abs(target_fraction),
+        )
+        result["target_predicted_fraction"] = predicted_fraction
+        result["target_error_fraction"] = target_error
+        result["target_tolerance_fraction"] = target_tolerance
+        if not math.isfinite(predicted_fraction) or target_error > target_tolerance:
+            result["ok"] = False
+            result["reason"] = WEEKLY_VALUE_MIXED_REASON_TARGET_MISMATCH
+    result["target_identities"] = sorted(target_identities)
+    result["regime_limit_id"] = target["limit_id"]
+    result["regime_deadline"] = target["deadline"]
+    return result
+
+
+def _mixed_point_from_fit(
+    point: dict[str, Any],
+    target: dict[str, Any],
+    identity: tuple[str, str],
+    fit: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Annotate one per-model point with a successful mixed-window estimate."""
+    coefficient = fit.get("coefficients", {}).get(identity)
+    if not isinstance(coefficient, (int, float)) or not math.isfinite(float(coefficient)) or coefficient <= 0:
+        return None
+    value = 1.0 / float(coefficient)
+    if not math.isfinite(value) or value <= 0:
+        return None
+    result = dict(point)
+    # Quota consumption and total API-equivalent cost are directly observed
+    # shared-window quantities.  Only the coefficient/value attribution is
+    # inferred; keeping both fields visible prevents readers from mistaking a
+    # model's fitted value for a model-level quota counter.
+    result["observed_cost_usd"] = round(sum(target["costs"].values()), 8)
+    result["inferred_model_cost_usd"] = round(target["costs"].get(identity, 0.0), 8)
+    result["raw_value_usd"] = round(value, 8)
+    result["value_usd"] = round(value, 8)
+    result["quality"] = "low_confidence"
+    result["reason"] = None
+    result["attribution"] = "mixed_model_regression"
+    result["inferred"] = True
+    result["coefficient_fraction_per_usd"] = round(float(coefficient), 12)
+    result["training_sample_count"] = fit.get("sample_count")
+    result["training_predictor_count"] = fit.get("predictor_count")
+    result["training_rank"] = fit.get("rank")
+    result["training_condition_number"] = (
+        round(float(fit["condition_number"]), 6)
+        if isinstance(fit.get("condition_number"), (int, float)) and math.isfinite(float(fit["condition_number"]))
+        else None
+    )
+    result["training_rmse_fraction"] = (
+        round(float(fit["rmse_fraction"]), 8)
+        if isinstance(fit.get("rmse_fraction"), (int, float)) and math.isfinite(float(fit["rmse_fraction"]))
+        else None
+    )
+    result["training_relative_rmse"] = (
+        round(float(fit["relative_rmse"]), 8)
+        if isinstance(fit.get("relative_rmse"), (int, float)) and math.isfinite(float(fit["relative_rmse"]))
+        else None
+    )
+    result["training_max_abs_residual_fraction"] = (
+        round(float(fit["max_abs_residual_fraction"]), 8)
+        if isinstance(fit.get("max_abs_residual_fraction"), (int, float)) and math.isfinite(float(fit["max_abs_residual_fraction"]))
+        else None
+    )
+    result["quota_quantization_floor_pct_points"] = fit.get("quantization_floor_pct_points")
+    return result
+
+
 def _weekly_deadlines_equivalent(left: Any, right: Any) -> bool:
     """Return whether two weekly reset deadlines describe the same cycle."""
     return (
@@ -543,40 +1020,159 @@ def weekly_limit_value(
     now: int | None = None,
     sample_interval_seconds: int = 900,
 ) -> dict[str, Any]:
-    """Keep the aggregate and estimate GPT models on exclusive-model windows.
+    """Build the aggregate and per-model weekly-value estimates.
 
-    The archive has no model-level quota counters. Other models in a window
-    therefore invalidate attribution instead of assigning the shared quota to
-    each model. As with the aggregate, uncollected usage remains a limitation.
+    Aggregate values remain quota-wide.  A model's directly observed estimate
+    still uses an exclusive window; when a target window contains multiple
+    priced provider/model identities, a bounded historical regression may
+    provide an explicitly low-confidence inferred value.  The archive has no
+    model-level quota counters, so the inferred coefficient is a statistical
+    attribution of the shared observed quota drop rather than a model quota
+    measurement.
     """
+    prices = price_index(catalog)
+    history_start = start - WEEKLY_VALUE_MAX_WINDOW_SECONDS - WEEKLY_VALUE_MIXED_TRAINING_HORIZON_SECONDS
     identities = connection.execute(
         """SELECT occurred_at_epoch, provider, model, input_tokens,
                   cache_read_tokens, cache_write_tokens, output_tokens, quality
            FROM token_usage_events
            WHERE occurred_at_epoch >= ? AND occurred_at_epoch < ?
            ORDER BY occurred_at_epoch, id""",
-        (start - WEEKLY_VALUE_MAX_WINDOW_SECONDS, end),
+        (history_start, end),
     ).fetchall()
-    events = _load_cost_events(connection, price_index(catalog),
-                               start - WEEKLY_VALUE_MAX_WINDOW_SECONDS, end, rows=identities)
+    events = _load_cost_events(connection, prices, history_start, end, rows=identities)
+    display_start = start - WEEKLY_VALUE_MAX_WINDOW_SECONDS
     models = sorted({(row["provider"], row["model"]) for row in identities
-                     if isinstance(row["provider"], str)
+                     if isinstance(row["occurred_at_epoch"], int)
+                     and display_start <= row["occurred_at_epoch"]
+                     and isinstance(row["provider"], str)
                      and isinstance(row["model"], str)
                      and row["model"].lower().startswith("gpt-")})
     kwargs = {"now": now, "sample_interval_seconds": sample_interval_seconds}
     result = _weekly_limit_value(connection, catalog, start, end,
                                  cost_events=events, **kwargs)
+
+    history_rows = connection.execute(
+        """SELECT scraped_at_epoch, weekly_pct, weekly_reset_at, limit_id,
+                  sample_interval_seconds
+             FROM snapshots
+            WHERE scraped_at_epoch >= ? AND scraped_at_epoch < ?
+            ORDER BY scraped_at_epoch""",
+        (history_start, end),
+    ).fetchall()
+    history_rows = [row for row in history_rows if isinstance(row["scraped_at_epoch"], int)]
+    history_epochs = _snapshot_epoch_index(history_rows)
+    candidate_rows = _cadence_rows(history_rows)
+    candidate_epochs = _snapshot_epoch_index(candidate_rows)
+    target_rows = _sample_rows(
+        _cadence_rows([row for row in history_rows if start <= row["scraped_at_epoch"] < end]),
+        WEEKLY_VALUE_MAX_POINTS,
+    )
+    target_rows_by_at = {
+        iso_utc(row["scraped_at_epoch"]): row
+        for row in target_rows
+    }
+    identity_events = _identity_events(identities, events)
+    identity_event_epochs = [event[0] for event in identity_events]
+    reset_epochs = {
+        row[0]
+        for row in connection.execute(
+            """SELECT reset_at_epoch FROM reset_events
+                WHERE window = 'weekly' AND reset_at_epoch >= ? AND reset_at_epoch <= ?""",
+            (history_start, end),
+        )
+        if isinstance(row[0], int)
+    }
+    target_observations: dict[int, dict[str, Any]] = {}
+    for target_row in target_rows:
+        observation, observation_reason = _mixed_window_observation(
+            history_rows, history_epochs, target_row, identity_events, identity_event_epochs, reset_epochs,
+        )
+        if observation is not None and observation_reason is None and len(observation["identities"]) > 1:
+            target_observations[target_row["scraped_at_epoch"]] = observation
+    mixed_fit_cache: dict[int, dict[str, Any]] = {}
+    mixed_rejections: dict[str, int] = {}
+    mixed_inferred_points = 0
+    mixed_target_windows = len(target_observations)
     result["by_model"] = []
     for provider, model in models:
+        identity = (str(provider).strip().lower(), str(model).strip().lower())
         model_events = [
-            event if (row["provider"], row["model"]) == (provider, model)
+            event if _event_identity(row) == identity
             else (event[0], None, "mixed_models", event[3])
             for row, event in zip(identities, events)
         ]
         estimate = _weekly_limit_value(connection, catalog, start, end,
                                        cost_events=model_events, **kwargs)
+        used_regression = False
+        for point_index, point in enumerate(estimate["series"]):
+            if point.get("reason") != "mixed_models":
+                continue
+            point_at = point.get("at")
+            target_row = target_rows_by_at.get(point_at)
+            target = target_observations.get(target_row["scraped_at_epoch"]) if target_row is not None else None
+            if target is None:
+                continue
+            if identity not in target["identities"]:
+                point["mixed_model_reason"] = WEEKLY_VALUE_MIXED_REASON_NO_TARGET
+                mixed_rejections[WEEKLY_VALUE_MIXED_REASON_NO_TARGET] = mixed_rejections.get(
+                    WEEKLY_VALUE_MIXED_REASON_NO_TARGET, 0,
+                ) + 1
+                continue
+            target_epoch = target["end_epoch"]
+            fit = mixed_fit_cache.get(target_epoch)
+            if fit is None:
+                fit = _mixed_training_fit(
+                    history_rows, history_epochs, candidate_rows, candidate_epochs, target,
+                    identity_events, identity_event_epochs, reset_epochs,
+                )
+                mixed_fit_cache[target_epoch] = fit
+            if fit.get("ok"):
+                inferred = _mixed_point_from_fit(point, target, identity, fit)
+                if inferred is not None:
+                    estimate["series"][point_index] = inferred
+                    used_regression = True
+                    mixed_inferred_points += 1
+                    continue
+            failure_reason = fit.get("reason", WEEKLY_VALUE_MIXED_REASON_INSUFFICIENT_SAMPLES)
+            point["mixed_model_reason"] = failure_reason
+            for field in (
+                "sample_count", "predictor_count", "minimum_samples", "rank",
+                "condition_number", "rmse_fraction", "relative_rmse",
+                "max_relative_coefficient_error",
+                "target_predicted_fraction", "target_error_fraction", "target_tolerance_fraction",
+            ):
+                if field in fit:
+                    point[f"mixed_model_{field}"] = fit[field]
+            mixed_rejections[failure_reason] = mixed_rejections.get(failure_reason, 0) + 1
+        estimate["unavailable_reasons"] = {}
+        for point in estimate["series"]:
+            if point.get("reason"):
+                reason = str(point["reason"])
+                estimate["unavailable_reasons"][reason] = estimate["unavailable_reasons"].get(reason, 0) + 1
+        if used_regression:
+            estimate_attribution = "mixed_model_regression"
+        else:
+            estimate_attribution = "exclusive_model_windows"
+        estimate["mixed_model_fallback"] = "historical_ols_no_intercept"
         result["by_model"].append({"provider": provider, "model": model,
-                                   "attribution": "exclusive_model_windows", **estimate})
+                                   "attribution": estimate_attribution, **estimate})
+    result["mixed_model_diagnostics"] = {
+        "method": "historical_ols_no_intercept",
+        "training_horizon_seconds": WEEKLY_VALUE_MIXED_TRAINING_HORIZON_SECONDS,
+        "minimum_samples": WEEKLY_VALUE_MIXED_MIN_SAMPLES,
+        "max_condition_number": WEEKLY_VALUE_MIXED_MAX_CONDITION,
+        "max_relative_rmse": WEEKLY_VALUE_MIXED_MAX_RMSE_FRACTION,
+        "max_target_error_fraction": WEEKLY_VALUE_MIXED_MAX_TARGET_ERROR_FRACTION,
+        "quota_quantization_floor_pct_points": WEEKLY_VALUE_MIXED_QUANTIZATION_FLOOR_POINTS,
+        "max_relative_coefficient_error": WEEKLY_VALUE_MIXED_MAX_COEFFICIENT_ERROR_FRACTION,
+        "target_mixed_windows": mixed_target_windows,
+        "inferred_points": mixed_inferred_points,
+        "rejected_points": sum(mixed_rejections.values()),
+        "rejected_reasons": mixed_rejections,
+        "confidence": "low",
+        "shared_quota_note": "Quota drops are observed at the shared limit; provider/model coefficients and values are inferred.",
+    }
     return result
 
 
