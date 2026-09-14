@@ -1218,3 +1218,33 @@ test('distinguishes carried weekly values from newly calculated points', async (
     return [dataset.pointStyle[1], dataset.pointBackgroundColor[1], dataset.segment.borderDash({ p0DataIndex: 0, p1DataIndex: 1 })];
   })).toEqual(['circle', 'transparent', [6, 4]]);
 });
+
+test('shows uncertain model values and sensitivity ranges including unbounded carry', async ({ page }) => {
+  const value = analyticsPayload.weekly_limit_value;
+  const uncertain = {
+    ...value.series[0], value_usd: 60, raw_value_usd: 60, inferred: true,
+    quality: 'high_uncertainty', reason: null, value_lower_usd: 35, value_upper_usd: 150,
+    uncertainty_method: 'assumed_1_point_quota_error_sensitivity',
+    coefficient_fraction_per_usd: 1 / 60, coefficient_error_bound_fraction_per_usd: 0.01,
+  };
+  const carried = { ...uncertain, value_upper_usd: null, carried: true, source_at: uncertain.at,
+    source_age_seconds: 3600, source_quality: 'high_uncertainty', source_method: 'mixed_model_regression',
+    carried_from_reason: 'mixed_model_target_absent' };
+  const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: [
+    { model: 'gpt-5.6-luna', providers: ['openai'], series: [uncertain], unavailable_reasons: {} },
+    { model: 'gpt-5.6-terra', providers: ['openai'], series: [carried], unavailable_reasons: {} },
+  ] } };
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+  await page.goto('/analytics.html');
+  const table = page.locator('#weekly-limit-value-data-body');
+  await expect(table.locator('tr').filter({ hasText: 'gpt-5.6-luna' })).toContainText('$35.00–$150.00');
+  const terra = table.locator('tr').filter({ hasText: 'gpt-5.6-terra' });
+  await expect(terra).toContainText('$35.00–unbounded');
+  await expect(terra.locator('.value-carried')).toContainText('High uncertainty');
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.slice(0, 2)
+    .map(d => [d.pointStyle[0], d.uncertaintyBounds[0].upper]))).toEqual([['crossRot', 150], ['crossRot', null]]);
+  await expect(page.locator('#weekly-limit-value-quality')).toContainText('not statistical confidence intervals');
+  expect(errors).toEqual([]);
+});

@@ -88,8 +88,13 @@ The local Analytics page provides:
   identities present in the target window. It requires at least
   `max(6, 2 × predictors + 2)` samples, full rank, a scaled condition number no
   greater than 10,000, positive coefficients, relative RMSE no greater than
-  25%, and coefficients whose worst-case movement under an assumed 1-point
-  quota-delta rounding perturbation is no greater than 50%. The held-out target
+  25%. Coefficients whose worst-case movement under an assumed one-point
+  quota-delta perturbation exceeds 50% are displayed as high uncertainty,
+  with cross markers and sensitivity bars rather than hidden. Value bounds
+  invert the coefficient bounds; an upper bound crossing zero is explicitly
+  unbounded. Bars extending beyond the chart use arrows; exact bounds are
+  available in the table. These sensitivity ranges are not 95% confidence
+  intervals. The held-out target
   must also match the fitted shared quota drop within the greater of one
   percentage point or 25% of its observed drop. Failed checks keep the
   point unavailable with a reason. These diagnostics are conservative fit
@@ -99,7 +104,8 @@ The local Analytics page provides:
   After a direct or inferred per-model value is accepted, it may be carried for
   up to seven days through ordinary unavailable points and weekly resets. A
   carried point retains the original source date, age, and method and is shown
-  with a hollow marker and dashed line. Limit changes, contradictory quota
+  with a hollow marker and dashed line (cross markers for high uncertainty).
+  Carried estimates preserve their source sensitivity bounds and high uncertainty. Limit changes, contradictory quota
   movement, malformed observations, missing prices, and stale current data
   clear the carry instead of extending it.
   The aggregate remains available, independently of token breakdown filters.

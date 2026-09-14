@@ -8,13 +8,16 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Changed
 
+- Show unstable but identifiable positive model estimates with high-uncertainty
+  markers and sensitivity ranges, including explicit unbounded upper ranges.
+
 - Combine provider aliases of the same model into one weekly-value predictor,
   curve, and toggle while retaining provider-specific event pricing.
 - Infer low-confidence per-model weekly values for eligible mixed-model usage
   from adaptive, non-overlapping observations retained across completed weekly
   cycles for up to 28 days.
-  Full-rank, conditioning, fit, positive-coefficient, and quota-rounding
-  stability checks keep unsafe attributions unavailable, while the aggregate
+  Full-rank, conditioning, fit, and positive-coefficient checks keep
+  unsolvable attributions unavailable, while the aggregate
   continues to include every locally collected source.
 - Carry the last accepted direct or inferred per-model value for up to seven
   days across ordinary gaps and weekly resets, with its source date, age,
@@ -46,6 +49,9 @@ Git tag and the value in `VERSION` is the single source of truth.
   cache-write, and output, including provider identifiers.
 
 ### Changed
+
+- Show unstable but identifiable positive model estimates with high-uncertainty
+  markers and sensitivity ranges, including explicit unbounded upper ranges.
 
 - Harden the owner-scoped alert journal and state, recovery/retries/hooks, and
   expiration of stale alerts.

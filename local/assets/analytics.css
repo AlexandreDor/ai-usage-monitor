@@ -257,7 +257,9 @@ input { display: block; min-height: 36px; margin-top: 4px; padding: 7px 10px; }
 .weekly-value-table td:nth-child(7) { min-width: 120px; }
 .weekly-value-table .quality-good { color: #86efac; }
 .weekly-value-table .quality-low_confidence { color: #fde68a; }
+.weekly-value-table .quality-high_uncertainty { color: #fb7185; font-weight: 700; }
 .weekly-value-table .quality-volatile { color: #fca5a5; }
+.weekly-value-table .value-sensitivity { color: #cbd5e1; white-space: nowrap; }
 .weekly-value-table .quality-unavailable,
 .weekly-value-table .value-unavailable { color: var(--muted); }
 .chart-data-details { margin-top: 12px; color: var(--muted); font-size: .76rem; }

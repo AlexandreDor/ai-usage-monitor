@@ -683,9 +683,9 @@ def _fit_mixed_regression(
     # Treat each stored quota delta as if rounding could move it by one full
     # percentage point. This is an explicit conservative sensitivity bound,
     # not a claim about the provider's counter precision.
-    # Compute a worst-case bound with the exact pseudoinverse row sums.  Reject
-    # a fit if any coefficient could cross zero or move by more than half under
-    # those bounded perturbations, even when the residual happens to be small.
+    # Compute a worst-case bound with the exact pseudoinverse row sums. Fits
+    # that cross zero or move by more than half remain usable, but are exposed
+    # as high-uncertainty estimates with their sensitivity bounds.
     response_floor = WEEKLY_VALUE_MIXED_QUANTIZATION_FLOOR_POINTS / 100.0
     coefficient_error_bounds: list[float] = []
     for coefficient_index, scale in enumerate(scales):
@@ -731,6 +731,8 @@ def _fit_mixed_regression(
         "ok": True,
         "identities": identities,
         "coefficients": dict(zip(identities, coefficients)),
+        "coefficient_error_bounds": dict(zip(identities, coefficient_error_bounds)),
+        "relative_coefficient_errors": dict(zip(identities, relative_coefficient_errors)),
         "sample_count": sample_count,
         "predictor_count": predictor_count,
         "rank": rank,
@@ -980,8 +982,6 @@ def _mixed_point_from_fit(
 ) -> dict[str, Any] | None:
     """Annotate one per-model point with a successful mixed-window estimate."""
     coefficient = fit.get("coefficients", {}).get(identity)
-    if identity in fit.get("unstable_identities", []):
-        return None
     if not isinstance(coefficient, (int, float)) or not math.isfinite(float(coefficient)) or coefficient <= 0:
         return None
     value = 1.0 / float(coefficient)
@@ -996,11 +996,31 @@ def _mixed_point_from_fit(
     result["inferred_model_cost_usd"] = round(target["costs"].get(identity, 0.0), 8)
     result["raw_value_usd"] = round(value, 8)
     result["value_usd"] = round(value, 8)
-    result["quality"] = "low_confidence"
+    coefficient_error = fit.get("coefficient_error_bounds", {}).get(identity)
+    if not isinstance(coefficient_error, (int, float)) or coefficient_error < 0:
+        coefficient_error = math.inf
+    coefficient_error = float(coefficient_error)
+    lower_value = 0.0 if not math.isfinite(coefficient_error) else 1.0 / (float(coefficient) + coefficient_error)
+    upper_denominator = float(coefficient) - coefficient_error
+    upper_value = 1.0 / upper_denominator if math.isfinite(upper_denominator) and upper_denominator > 0 else None
+    unstable = identity in fit.get("unstable_identities", []) or not math.isfinite(coefficient_error)
+    result["quality"] = "high_uncertainty" if unstable else "low_confidence"
     result["reason"] = None
     result["attribution"] = "mixed_model_regression"
     result["inferred"] = True
     result["coefficient_fraction_per_usd"] = round(float(coefficient), 12)
+    result["coefficient_error_bound_fraction_per_usd"] = (
+        round(coefficient_error, 12) if math.isfinite(coefficient_error) else None
+    )
+    relative_error = fit.get("relative_coefficient_errors", {}).get(identity)
+    result["coefficient_relative_error"] = (
+        round(float(relative_error), 8)
+        if isinstance(relative_error, (int, float)) and math.isfinite(float(relative_error))
+        else None
+    )
+    result["value_lower_usd"] = round(lower_value, 8)
+    result["value_upper_usd"] = round(upper_value, 8) if upper_value is not None else None
+    result["uncertainty_method"] = "assumed_1_point_quota_error_sensitivity"
     result["training_sample_count"] = fit.get("sample_count")
     result["training_predictor_count"] = fit.get("predictor_count")
     result["training_rank"] = fit.get("rank")
@@ -1058,6 +1078,16 @@ def _carry_weekly_model_values(series: list[dict[str, Any]]) -> int:
                     "mixed_model_regression" if point.get("inferred") else "exclusive_model_window"
                 ),
                 "quality": point.get("quality"),
+                "uncertainty": {
+                    key: point.get(key)
+                    for key in (
+                        "coefficient_fraction_per_usd",
+                        "coefficient_error_bound_fraction_per_usd",
+                        "coefficient_relative_error", "value_lower_usd", "value_upper_usd",
+                        "uncertainty_method",
+                    )
+                    if key in point
+                },
             }
             continue
         reason = point.get("mixed_model_reason") or point.get("reason")
@@ -1076,13 +1106,16 @@ def _carry_weekly_model_values(series: list[dict[str, Any]]) -> int:
             continue
         point["value_usd"] = source["value_usd"]
         point["raw_value_usd"] = None
-        point["quality"] = "low_confidence"
+        point["quality"] = (
+            "high_uncertainty" if source["quality"] == "high_uncertainty" else "low_confidence"
+        )
         point["carried"] = True
         point["carried_from_reason"] = reason
         point["source_at"] = source["at_iso"]
         point["source_age_seconds"] = age
         point["source_method"] = source["method"]
         point["source_quality"] = source["quality"]
+        point.update(source["uncertainty"])
         point["reason"] = None
         carried += 1
     return carried

@@ -349,6 +349,7 @@ from analytics import (
     _adaptive_training_observations,
     _carry_weekly_model_values,
     _fit_mixed_regression,
+    _mixed_point_from_fit,
     _mixed_training_fit,
     _mixed_window_observation,
 )
@@ -374,6 +375,13 @@ assert abs(fit["coefficients"][a] - 0.01) < 1e-12, fit
 assert abs(fit["coefficients"][b] - 0.005) < 1e-12, fit
 assert abs(fit["coefficients"][nuisance] - 0.0025) < 1e-12, fit
 assert fit["max_relative_coefficient_error"] <= 0.5, fit
+stable_point = _mixed_point_from_fit(
+    {"quality": "unavailable"}, {"costs": {a: 10.0, b: 20.0, nuisance: 5.0}}, a, fit,
+)
+assert stable_point["quality"] == "low_confidence", stable_point
+assert 0 < stable_point["value_lower_usd"] < stable_point["value_usd"] < stable_point["value_upper_usd"], stable_point
+assert stable_point["coefficient_error_bound_fraction_per_usd"] > 0, stable_point
+assert stable_point["uncertainty_method"] == "assumed_1_point_quota_error_sensitivity", stable_point
 
 insufficient = _fit_mixed_regression(samples[:4], {a, b})
 assert insufficient["reason"] == WEEKLY_VALUE_MIXED_REASON_INSUFFICIENT_SAMPLES, insufficient
@@ -384,14 +392,21 @@ fixed = [
 fixed_fit = _fit_mixed_regression(fixed, {a, b})
 assert fixed_fit["reason"] == WEEKLY_VALUE_MIXED_REASON_FIXED_MIX, fixed_fit
 
-# A formally full-rank fit with too little signal relative to a one-point
-# quota-delta perturbation is refused even though its residual is zero.
+# A formally full-rank fit with little signal remains publishable, but its
+# one-point quota-error sensitivity is explicit and has no finite upper bound.
 weak = []
 for index in range(8):
     costs = {a: 1.0 + index / 10.0, b: 2.0 - index / 20.0}
     weak.append({"costs": costs, "fraction": costs[a] / 1000.0 + costs[b] / 2000.0})
 weak_fit = _fit_mixed_regression(weak, {a, b})
 assert weak_fit["ok"] and set(weak_fit["unstable_identities"]) == {a, b}, weak_fit
+weak_point = _mixed_point_from_fit(
+    {"quality": "unavailable"}, {"costs": {a: 1.7, b: 1.65}}, a, weak_fit,
+)
+assert weak_point["value_usd"] == 1000.0, weak_point
+assert weak_point["quality"] == "high_uncertainty", weak_point
+assert 0 < weak_point["value_lower_usd"] < weak_point["value_usd"], weak_point
+assert weak_point["value_upper_usd"] is None, weak_point
 
 # Training selection uses only prior, non-overlapping windows in one
 # uninterrupted regime. A future observation with a wildly different response
@@ -520,6 +535,20 @@ contradiction = [{**base_point}, {**reset_gap, "reason": "mixed_models",
 assert _carry_weekly_model_values(contradiction) == 0
 changed = [{**base_point}, {**reset_gap, "_limit_regime": 3}]
 assert _carry_weekly_model_values(changed) == 0
+uncertain_source = {
+    **base_point, "quality": "high_uncertainty", "value_usd": 80.0, "raw_value_usd": 80.0,
+    "coefficient_fraction_per_usd": 0.0125,
+    "coefficient_error_bound_fraction_per_usd": 0.01,
+    "coefficient_relative_error": 0.8, "value_lower_usd": 44.44444444,
+    "value_upper_usd": 400.0,
+    "uncertainty_method": "assumed_1_point_quota_error_sensitivity",
+}
+uncertain_gap = {**reset_gap}
+assert _carry_weekly_model_values([uncertain_source, uncertain_gap]) == 1
+assert uncertain_gap["quality"] == uncertain_gap["source_quality"] == "high_uncertainty", uncertain_gap
+assert uncertain_gap["source_at"] == uncertain_source["at"], uncertain_gap
+assert uncertain_gap["value_lower_usd"] == uncertain_source["value_lower_usd"], uncertain_gap
+assert uncertain_gap["value_upper_usd"] == uncertain_source["value_upper_usd"], uncertain_gap
 PY
 
 python3 - "$ROOT_DIR" "$TEST_ROOT/mixed-weekly-value.sqlite3" <<'PY'
@@ -545,8 +574,10 @@ with connect_database(database) as connection:
         )
         if index == 13:
             break
-        cost_sol = 3 + (index % 4) * 3
-        cost_terra = 4 + ((index * 3) % 5) * 3
+        # Full-rank but deliberately weakly separated predictors exercise the
+        # published high-uncertainty path through the real SQLite pipeline.
+        cost_sol = 10 + index
+        cost_terra = 20 - index / 2
         connection.executemany(
             """INSERT INTO token_usage_events
                (occurred_at_epoch, source, provider, model, input_tokens, external_id)
@@ -556,7 +587,7 @@ with connect_database(database) as connection:
                 (index * window + 2 * window // 3, "gpt-5.6-terra", cost_terra * 400000, f"terra-{index}"),
             ],
         )
-        quota -= (cost_sol * 0.005 + cost_terra * 0.004) * 100
+        quota -= (cost_sol * 0.001 + cost_terra * 0.0005) * 100
     connection.row_factory = sqlite3.Row
     catalog = load_pricing(root / "local/pricing.json")
     target_epoch = 13 * window
@@ -567,13 +598,19 @@ with connect_database(database) as connection:
     assert result["mixed_model_diagnostics"]["inferred_points"] == 2, result["mixed_model_diagnostics"]
     assert by_model["gpt-5.6-sol"]["attribution"] == "mixed_model_regression", by_model
     assert by_model["gpt-5.6-terra"]["attribution"] == "mixed_model_regression", by_model
-    assert by_model["gpt-5.6-sol"]["series"][0]["value_usd"] == 200.0, by_model
-    assert by_model["gpt-5.6-terra"]["series"][0]["value_usd"] == 250.0, by_model
+    assert by_model["gpt-5.6-sol"]["series"][0]["value_usd"] == 1000.0, by_model
+    assert by_model["gpt-5.6-terra"]["series"][0]["value_usd"] == 2000.0, by_model
+    for item in by_model.values():
+        point = item["series"][0]
+        assert point["quality"] == "high_uncertainty", point
+        assert point["coefficient_error_bound_fraction_per_usd"] > point["coefficient_fraction_per_usd"], point
+        assert 0 < point["value_lower_usd"] < point["value_usd"], point
+        assert point["value_upper_usd"] is None, point
     assert all(item["unavailable_reasons"].get("mixed_models", 0) == 0 for item in by_model.values()), by_model
 
     wider = weekly_limit_value(connection, catalog, 12 * window, target_epoch + 1, now=target_epoch)
     wider_by_model = {item["model"]: item for item in wider["by_model"]}
-    for model, expected in (("gpt-5.6-sol", 200.0), ("gpt-5.6-terra", 250.0)):
+    for model, expected in (("gpt-5.6-sol", 1000.0), ("gpt-5.6-terra", 2000.0)):
         target = next(point for point in wider_by_model[model]["series"] if point["at"] == by_model[model]["series"][0]["at"])
         assert target["value_usd"] == expected, (model, target)
 
@@ -587,7 +624,7 @@ with connect_database(database) as connection:
     assert len(merged["by_model"]) == 2
     sol = next(item for item in merged["by_model"] if item["model"] == 'gpt-5.6-sol')
     assert sol["providers"] == ['openai', 'openai-codex']
-    assert sol["series"][0]["value_usd"] == 200.0
+    assert sol["series"][0]["value_usd"] == 1000.0
     assert sol["series"][0]["training_predictor_count"] == 2
 
     stale = weekly_limit_value(connection, catalog, target_epoch, target_epoch + 1, now=target_epoch + 1801)

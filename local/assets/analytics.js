@@ -518,6 +518,15 @@ function weeklyValueReason(value) {
 function weeklyValuePointValid(point) {
   return point && finiteNumber(point.value_usd) !== null && point.quality && point.quality !== 'unavailable';
 }
+function weeklyValueSensitivity(point) {
+  if (point?.uncertainty_method !== 'assumed_1_point_quota_error_sensitivity') return null;
+  const lower = finiteNumber(point.value_lower_usd);
+  const upper = finiteNumber(point.value_upper_usd);
+  if (lower === null) return null;
+  return upper === null
+    ? t('weeklyValueSensitivityUnbounded', { lower: formatUsd(lower) })
+    : t('weeklyValueSensitivityBounded', { lower: formatUsd(lower), upper: formatUsd(upper) });
+}
 function renderWeeklyLimitValueTable(points) {
   const body = byId('weekly-limit-value-data-body');
   clearRows(body);
@@ -533,10 +542,19 @@ function renderWeeklyLimitValueTable(points) {
     cell(row, consumed === null ? 'N/A' : formatPercent(consumed));
     cell(row, formatUsd(point.raw_value_usd), point.raw_value_usd === null ? 'value-unavailable' : '');
     cell(row, formatUsd(point.value_usd), point.value_usd === null ? 'value-unavailable' : '');
+    const sensitivity = weeklyValueSensitivity(point);
+    const sensitivityCell = cell(row, sensitivity || EMPTY_VALUE, sensitivity ? 'value-sensitivity' : '');
+    if (sensitivity && finiteNumber(point.coefficient_fraction_per_usd) !== null) {
+      const error = finiteNumber(point.coefficient_error_bound_fraction_per_usd);
+      sensitivityCell.title = t('weeklyValueSensitivityTitle', {
+        coefficient: point.coefficient_fraction_per_usd,
+        error: error === null ? t('weeklyValueUnbounded') : error,
+      });
+    }
     const quality = cell(row, weeklyValueQuality(point.quality), `quality-${point.quality || 'unavailable'}`);
     if (point.dispersion_pct !== undefined && point.dispersion_pct !== null) quality.title = `${formatPercent(point.dispersion_pct)} ${t('weeklyValueDispersion')}`;
     let reasonText = point.carried
-      ? t('weeklyValueCarried', { date: formatDate(point.source_at) })
+      ? t('weeklyValueCarried', { date: formatDate(point.source_at), quality: weeklyValueQuality(point.quality) })
       : point.inferred ? t('weeklyValueInferred')
       : point.mixed_model_reason ? weeklyValueReason(point.mixed_model_reason)
         : point.reason ? weeklyValueReason(point.reason) : t('weeklyValueAvailable');
@@ -572,6 +590,58 @@ const weeklyValueModelColors = new Map([
   ['gpt-5.6-sol', '#fbbf24'],
   ['gpt-6-astra', '#fb7185'],
 ]);
+const weeklyValueUncertaintyPlugin = {
+  id: 'weeklyValueUncertainty',
+  afterDatasetsDraw(chart) {
+    const { ctx, chartArea } = chart;
+    if (!ctx || !chartArea) return;
+    chart.data.datasets.forEach((dataset, datasetIndex) => {
+      if (typeof chart.isDatasetVisible === 'function' && !chart.isDatasetVisible(datasetIndex)) return;
+      const bounds = Array.isArray(dataset.uncertaintyBounds) ? dataset.uncertaintyBounds : [];
+      if (!bounds.length) return;
+      const meta = chart.getDatasetMeta(datasetIndex);
+      const scale = chart.scales?.y;
+      if (!meta || !scale) return;
+      ctx.save();
+      ctx.strokeStyle = dataset.borderColor;
+      ctx.globalAlpha = 0.45;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 3]);
+      bounds.forEach((bound, index) => {
+        const element = meta.data?.[index];
+        if (!element || !bound || bound.lower === null) return;
+        const x = element.x;
+        const rawLowerY = scale.getPixelForValue(bound.lower);
+        const rawUpperY = bound.upper === null ? -Infinity : scale.getPixelForValue(bound.upper);
+        const lowerOffscale = rawLowerY > chartArea.bottom;
+        const upperOffscale = rawUpperY < chartArea.top;
+        const lowerY = lowerOffscale ? chartArea.bottom - 3 : Math.max(chartArea.top, rawLowerY);
+        const upperY = upperOffscale ? chartArea.top + 3 : Math.min(chartArea.bottom, rawUpperY);
+        ctx.beginPath();
+        ctx.moveTo(x, lowerY);
+        ctx.lineTo(x, upperY);
+        if (lowerOffscale) {
+          ctx.moveTo(x - 4, chartArea.bottom - 8);
+          ctx.lineTo(x, chartArea.bottom - 3);
+          ctx.lineTo(x + 4, chartArea.bottom - 8);
+        } else {
+          ctx.moveTo(x - 4, lowerY);
+          ctx.lineTo(x + 4, lowerY);
+        }
+        if (upperOffscale) {
+          ctx.moveTo(x - 4, chartArea.top + 8);
+          ctx.lineTo(x, chartArea.top + 3);
+          ctx.lineTo(x + 4, chartArea.top + 8);
+        } else {
+          ctx.moveTo(x - 4, upperY);
+          ctx.lineTo(x + 4, upperY);
+        }
+        ctx.stroke();
+      });
+      ctx.restore();
+    });
+  },
+};
 function weeklyValueModelKey(model) {
   return String(model || '').trim().toLowerCase();
 }
@@ -663,7 +733,10 @@ function renderWeeklyLimitValue(data = {}) {
     pointBorderColor: entry.color,
     pointBorderWidth: entry.valid.map(point => point.carried ? 2 : 1),
     pointRadius: entry.valid.map(point => point.carried ? 4 : 3),
-    pointStyle: entry.valid.map(point => point.carried ? 'circle' : point.inferred ? 'star' : point.quality === 'volatile' ? 'triangle' : point.quality === 'low_confidence' ? 'rectRot' : 'circle'),
+    pointStyle: entry.valid.map(point => point.quality === 'high_uncertainty' ? 'crossRot' : point.carried ? 'circle' : point.inferred ? 'star' : point.quality === 'volatile' ? 'triangle' : point.quality === 'low_confidence' ? 'rectRot' : 'circle'),
+    uncertaintyBounds: entry.valid.map(point => ({
+      lower: finiteNumber(point.value_lower_usd), upper: finiteNumber(point.value_upper_usd),
+    })),
     segment: { borderDash: context => {
       const left = entry.valid[context.p0DataIndex];
       const right = entry.valid[context.p1DataIndex];
@@ -686,7 +759,7 @@ function renderWeeklyLimitValue(data = {}) {
   options.scales.y.ticks.callback = value => formatUsd(value);
   options.plugins.legend.display = false;
   weeklyLimitValueChart = new Chart(byId('weekly-limit-value-chart').getContext('2d'), {
-    type: 'line', data: { datasets: weeklyLimitValueDatasets }, options,
+    type: 'line', data: { datasets: weeklyLimitValueDatasets }, options, plugins: [weeklyValueUncertaintyPlugin],
   });
 }
 
