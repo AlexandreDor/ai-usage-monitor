@@ -8,6 +8,8 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Changed
 
+- Combine provider aliases of the same model into one weekly-value predictor,
+  curve, and toggle while retaining provider-specific event pricing.
 - Infer low-confidence per-model weekly values for eligible mixed-model windows
   from a bounded set of prior, non-overlapping windows in the same quota cycle.
   Full-rank, conditioning, fit, positive-coefficient, and quota-rounding

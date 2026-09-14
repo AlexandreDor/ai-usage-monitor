@@ -151,7 +151,7 @@ if (evaluate('limitDatasets.find(dataset => dataset.datasetKey === "reset-5h").h
 evaluate(`weeklyValueSelection.clear(); renderWeeklyLimitValue({ by_model: [{ provider: 'openai', model: 'gpt-5.6-sol', series: [] }] });`);
 if (evaluate('weeklyLimitValueDatasets.length') !== 4) fail('four default curves were not selected');
 if (evaluate('new Set(weeklyLimitValueDatasets.map(item => item.borderColor)).size') !== 4) fail('default curves do not have distinct colors');
-evaluate(`weeklyValueSelection.set('openai/gpt-5.6-sol', false);
+evaluate(`weeklyValueSelection.set('gpt-5.6-sol', false);
   renderWeeklyLimitValue(weeklyValueData);`);
 if (evaluate('weeklyLimitValueDatasets.length') !== 3) fail('model toggle did not remove its dataset');
 evaluate('renderWeeklyLimitValue({ series: [], by_model: [] })');

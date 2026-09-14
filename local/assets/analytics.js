@@ -524,7 +524,10 @@ function renderWeeklyLimitValueTable(points) {
   for (const point of points) {
     const row = document.createElement('tr');
     cell(row, formatDate(point.at));
-    cell(row, point.estimateLabel || t('weeklyValueAllModels'));
+    const estimate = cell(row, point.estimateLabel || t('weeklyValueAllModels'));
+    if (Array.isArray(point.estimateProviders) && point.estimateProviders.length) {
+      estimate.title = point.estimateProviders.join(', ');
+    }
     const observed = cell(row, formatUsd(point.observed_cost_usd), point.observed_cost_usd === null ? 'value-unavailable' : '');
     const consumed = finiteNumber(point.quota_consumed_pct_points);
     cell(row, consumed === null ? 'N/A' : formatPercent(consumed));
@@ -532,10 +535,16 @@ function renderWeeklyLimitValueTable(points) {
     cell(row, formatUsd(point.value_usd), point.value_usd === null ? 'value-unavailable' : '');
     const quality = cell(row, weeklyValueQuality(point.quality), `quality-${point.quality || 'unavailable'}`);
     if (point.dispersion_pct !== undefined && point.dispersion_pct !== null) quality.title = `${formatPercent(point.dispersion_pct)} ${t('weeklyValueDispersion')}`;
-    const reasonText = point.inferred
+    let reasonText = point.inferred
       ? t('weeklyValueInferred')
       : point.mixed_model_reason ? weeklyValueReason(point.mixed_model_reason)
         : point.reason ? weeklyValueReason(point.reason) : t('weeklyValueAvailable');
+    if (point.mixed_model_reason === 'mixed_model_insufficient_samples'
+      && Number.isFinite(point.mixed_model_sample_count) && Number.isFinite(point.mixed_model_minimum_samples)) {
+      reasonText = t('weeklyValueMixedSampleCounts', {
+        samples: point.mixed_model_sample_count, minimum: point.mixed_model_minimum_samples,
+      });
+    }
     const reason = cell(row, reasonText, point.inferred ? 'value-inferred' : '');
     if (point.inferred) {
       reason.title = t('weeklyValueInferredTitle', { samples: point.training_sample_count ?? '?' });
@@ -549,40 +558,47 @@ let weeklyValueData = {};
 const weeklyValueSelection = new Map();
 const weeklyValueDefaults = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-astra'];
 const weeklyValueColors = ['#38bdf8', '#a78bfa', '#34d399', '#fbbf24', '#fb7185', '#60a5fa', '#f97316'];
+const weeklyValueModelColors = new Map([
+  ['gpt-5.6-luna', '#a78bfa'],
+  ['gpt-5.6-terra', '#34d399'],
+  ['gpt-5.6-sol', '#fbbf24'],
+  ['gpt-6-astra', '#fb7185'],
+]);
+function weeklyValueModelKey(model) {
+  return String(model || '').trim().toLowerCase();
+}
 function renderWeeklyLimitValue(data = {}) {
   weeklyValueData = data;
   const selector = byId('weekly-limit-value-models');
   const models = Array.isArray(data.by_model) ? data.by_model : [];
   const entries = [{ key: 'aggregate', label: t('weeklyValueAllModels'), color: weeklyValueColors[0], data }];
-  const modelNames = [...weeklyValueDefaults, ...new Set(models.map(item => item.model)
-    .filter(model => !weeklyValueDefaults.includes(model)))];
+  const estimatesByModel = new Map();
+  for (const estimate of models) {
+    const modelKey = weeklyValueModelKey(estimate.model);
+    if (modelKey && !estimatesByModel.has(modelKey)) estimatesByModel.set(modelKey, estimate);
+  }
+  const modelNames = [...weeklyValueDefaults, ...[...estimatesByModel.keys()]
+    .filter(model => !weeklyValueDefaults.includes(model))];
   const colorsForEntry = index => weeklyValueColors[index % weeklyValueColors.length];
-  let curveIndex = 0;
-  for (const model of modelNames) {
-    const estimates = models.filter(item => item.model === model);
-    const curves = estimates.length ? estimates : [{ provider: null, model, series: [], unavailable_reasons: {} }];
-    for (const estimate of curves) {
-      const provider = estimate.provider || '';
-      const key = provider ? `${provider}/${model}` : model;
-      const label = provider ? `${model} (${provider})` : model;
-      const series = (Array.isArray(estimate.series) ? estimate.series : [])
-        .map(point => ({ ...point, provider: point.provider || provider }))
-        .sort((left, right) => timestampMs(left.at) - timestampMs(right.at));
-      const reasons = estimate.unavailable_reasons || {};
-      const color = colorsForEntry(curveIndex + 1);
-      entries.push({ key, label, model, provider,
-        color, data: { ...estimate, series, unavailable_reasons: reasons } });
-      curveIndex += 1;
-    }
+  for (const [index, model] of modelNames.entries()) {
+    const estimate = estimatesByModel.get(model) || { model, providers: [], series: [], unavailable_reasons: {} };
+    const providers = Array.isArray(estimate.providers)
+      ? estimate.providers.filter(provider => typeof provider === 'string' && provider)
+      : estimate.provider ? [estimate.provider] : [];
+    const series = (Array.isArray(estimate.series) ? estimate.series : [])
+      .map(point => ({ ...point, estimateProviders: providers }))
+      .sort((left, right) => timestampMs(left.at) - timestampMs(right.at));
+    const reasons = estimate.unavailable_reasons || {};
+    entries.push({ key: model, label: estimate.model || model, model, providers,
+      color: weeklyValueModelColors.get(model) || colorsForEntry(index + 5),
+      data: { ...estimate, series, unavailable_reasons: reasons } });
   }
   const selected = [];
   clearRows(selector);
   for (const entry of entries) {
     if (!weeklyValueSelection.has(entry.key)) {
       let inherited;
-      if (entry.provider && weeklyValueSelection.has(entry.model)) {
-        inherited = weeklyValueSelection.get(entry.model);
-      } else if (!entry.provider && entry.model) {
+      if (entry.model) {
         const suffix = `/${entry.model}`;
         const variants = [...weeklyValueSelection.entries()]
           .filter(([key]) => key.endsWith(suffix)).map(([, active]) => active);
@@ -598,6 +614,7 @@ function renderWeeklyLimitValue(data = {}) {
     button.type = 'button';
     button.dataset.weeklyModel = entry.key;
     button.setAttribute('aria-pressed', String(active));
+    if (entry.providers?.length) button.title = entry.providers.join(', ');
     button.style.setProperty('--series-color', entry.color);
     const swatch = document.createElement('span');
     swatch.className = 'weekly-value-swatch';

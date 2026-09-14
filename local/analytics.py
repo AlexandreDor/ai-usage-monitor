@@ -426,20 +426,19 @@ def _event_index(events: list[tuple[int, float | None, str | None, str | None]])
     return epochs, prefix_cost, prefix_reasons, prefix_polled
 
 
-def _event_identity(row: sqlite3.Row | dict[str, Any]) -> tuple[str, str] | None:
-    """Return the normalized provider/model identity for one token event."""
-    provider = _row_value(row, "provider")
+def _event_identity(row: sqlite3.Row | dict[str, Any]) -> str | None:
+    """Return the normalized model identity for one already-priced token event."""
     model = _row_value(row, "model")
-    if not isinstance(provider, str) or not provider.strip() or not isinstance(model, str) or not model.strip():
+    if not isinstance(model, str) or not model.strip():
         return None
-    return provider.strip().lower(), model.strip().lower()
+    return model.strip().lower()
 
 
 def _identity_events(
     rows: list[sqlite3.Row],
     events: list[tuple[int, float | None, str | None, str | None]],
-) -> list[tuple[int, tuple[str, str] | None, float | None, str | None, str | None]]:
-    """Attach provider/model identities to the already-priced event tuples."""
+) -> list[tuple[int, str | None, float | None, str | None, str | None]]:
+    """Attach model identities to event costs priced through their original providers."""
     return [
         (event[0], _event_identity(row), event[1], event[2], event[3])
         for row, event in zip(rows, events)
@@ -447,11 +446,11 @@ def _identity_events(
 
 
 def _interval_identity_costs(
-    events: list[tuple[int, tuple[str, str] | None, float | None, str | None, str | None]],
+    events: list[tuple[int, str | None, float | None, str | None, str | None]],
     start: int,
     end: int,
     epochs: list[int] | None = None,
-) -> tuple[dict[tuple[str, str], float] | None, set[tuple[str, str]], str | None, bool]:
+) -> tuple[dict[str, float] | None, set[str], str | None, bool]:
     """Return per-identity costs, identities seen, an invalidation reason, and polling state."""
     if start >= end or not events:
         return None, set(), "no_events", False
@@ -460,8 +459,8 @@ def _interval_identity_costs(
     last = bisect.bisect_left(event_epochs, end)
     if first >= last:
         return None, set(), "no_events", False
-    costs: dict[tuple[str, str], float] = {}
-    identities: set[tuple[str, str]] = set()
+    costs: dict[str, float] = {}
+    identities: set[str] = set()
     polled_delta = False
     for epoch, identity, cost, reason, quality in events[first:last]:
         polled_delta = polled_delta or quality == "polled_delta"
@@ -483,7 +482,7 @@ def _mixed_window_observation(
     rows: list[sqlite3.Row],
     row_epochs: list[int],
     end_row: sqlite3.Row,
-    identity_events: list[tuple[int, tuple[str, str] | None, float | None, str | None, str | None]],
+    identity_events: list[tuple[int, str | None, float | None, str | None, str | None]],
     identity_event_epochs: list[int],
     reset_epochs: set[int],
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -620,7 +619,7 @@ def _mixed_qr_solve(
 
 def _fit_mixed_regression(
     samples: list[dict[str, Any]],
-    feature_identities: set[tuple[str, str]],
+    feature_identities: set[str],
 ) -> dict[str, Any]:
     """Fit fraction consumed = sum(cost_by_identity * positive coefficient).
 
@@ -750,7 +749,7 @@ def _mixed_training_fit(
     candidate_rows: list[sqlite3.Row],
     candidate_epochs: list[int],
     target: dict[str, Any],
-    identity_events: list[tuple[int, tuple[str, str] | None, float | None, str | None, str | None]],
+    identity_events: list[tuple[int, str | None, float | None, str | None, str | None]],
     identity_event_epochs: list[int],
     reset_epochs: set[int],
 ) -> dict[str, Any]:
@@ -831,7 +830,7 @@ def _mixed_training_fit(
 def _mixed_point_from_fit(
     point: dict[str, Any],
     target: dict[str, Any],
-    identity: tuple[str, str],
+    identity: str,
     fit: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Annotate one per-model point with a successful mixed-window estimate."""
@@ -1024,7 +1023,7 @@ def weekly_limit_value(
 
     Aggregate values remain quota-wide.  A model's directly observed estimate
     still uses an exclusive window; when a target window contains multiple
-    priced provider/model identities, a bounded historical regression may
+    priced model identities, a bounded historical regression may
     provide an explicitly low-confidence inferred value.  The archive has no
     model-level quota counters, so the inferred coefficient is a statistical
     attribution of the shared observed quota drop rather than a model quota
@@ -1042,12 +1041,11 @@ def weekly_limit_value(
     ).fetchall()
     events = _load_cost_events(connection, prices, history_start, end, rows=identities)
     display_start = start - WEEKLY_VALUE_MAX_WINDOW_SECONDS
-    models = sorted({(row["provider"], row["model"]) for row in identities
+    models = sorted({row["model"].strip().lower() for row in identities
                      if isinstance(row["occurred_at_epoch"], int)
                      and display_start <= row["occurred_at_epoch"]
-                     and isinstance(row["provider"], str)
                      and isinstance(row["model"], str)
-                     and row["model"].lower().startswith("gpt-")})
+                     and row["model"].strip().lower().startswith("gpt-")})
     kwargs = {"now": now, "sample_interval_seconds": sample_interval_seconds}
     result = _weekly_limit_value(connection, catalog, start, end,
                                  cost_events=events, **kwargs)
@@ -1095,8 +1093,14 @@ def weekly_limit_value(
     mixed_inferred_points = 0
     mixed_target_windows = len(target_observations)
     result["by_model"] = []
-    for provider, model in models:
-        identity = (str(provider).strip().lower(), str(model).strip().lower())
+    for model in models:
+        identity = model
+        providers = sorted({
+            row["provider"].strip().lower()
+            for row in identities
+            if _event_identity(row) == identity
+            and isinstance(row["provider"], str) and row["provider"].strip()
+        })
         model_events = [
             event if _event_identity(row) == identity
             else (event[0], None, "mixed_models", event[3])
@@ -1155,7 +1159,7 @@ def weekly_limit_value(
         else:
             estimate_attribution = "exclusive_model_windows"
         estimate["mixed_model_fallback"] = "historical_ols_no_intercept"
-        result["by_model"].append({"provider": provider, "model": model,
+        result["by_model"].append({"model": model, "providers": providers,
                                    "attribution": estimate_attribution, **estimate})
     result["mixed_model_diagnostics"] = {
         "method": "historical_ols_no_intercept",
@@ -1171,7 +1175,7 @@ def weekly_limit_value(
         "rejected_points": sum(mixed_rejections.values()),
         "rejected_reasons": mixed_rejections,
         "confidence": "low",
-        "shared_quota_note": "Quota drops are observed at the shared limit; provider/model coefficients and values are inferred.",
+        "shared_quota_note": "Quota drops are observed at the shared limit; model coefficients and values are inferred.",
     }
     return result
 

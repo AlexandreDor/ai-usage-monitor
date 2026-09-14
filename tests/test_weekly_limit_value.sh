@@ -500,6 +500,19 @@ with connect_database(database) as connection:
         target = next(point for point in wider_by_model[model]["series"] if point["at"] == by_model[model]["series"][0]["at"])
         assert target["value_usd"] == expected, (model, target)
 
+    # Split each Sol event over two routes without changing its total cost.
+    connection.execute("UPDATE token_usage_events SET input_tokens = input_tokens / 2 WHERE model = 'gpt-5.6-sol'")
+    connection.execute("""INSERT INTO token_usage_events
+        (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+        SELECT occurred_at_epoch, source, 'openai-codex', model, input_tokens, external_id || '-route'
+        FROM token_usage_events WHERE model = 'gpt-5.6-sol'""")
+    merged = weekly_limit_value(connection, catalog, target_epoch, target_epoch + 1, now=target_epoch)
+    assert len(merged["by_model"]) == 2
+    sol = next(item for item in merged["by_model"] if item["model"] == 'gpt-5.6-sol')
+    assert sol["providers"] == ['openai', 'openai-codex']
+    assert sol["series"][0]["value_usd"] == 200.0
+    assert sol["series"][0]["training_predictor_count"] == 2
+
     stale = weekly_limit_value(connection, catalog, target_epoch, target_epoch + 1, now=target_epoch + 1801)
     assert all(item["series"][0]["reason"] == "stale_data" for item in stale["by_model"]), stale["by_model"]
     assert stale["mixed_model_diagnostics"]["inferred_points"] == 0, stale["mixed_model_diagnostics"]
@@ -559,12 +572,16 @@ with connect_database(Path(sys.argv[2])) as connection:
     unknown = estimate()
     assert len(unknown["by_model"]) == 1
     assert unknown["by_model"][0]["series"][1]["reason"] == "mixed_models"
-    # Provider is part of identity; same model name is not silently combined.
+    # Same model routes aggregate after provider-specific pricing; unknown prices still invalidate.
     connection.execute("UPDATE token_usage_events SET model = 'gpt-5.6-sol', provider = 'other' WHERE external_id = 'mixed-gpt'")
     providers = estimate()["by_model"]
-    assert len(providers) == 2
-    assert {item["provider"] for item in providers} == {"openai", "other"}
+    assert len(providers) == 1
+    assert set(providers[0]["providers"]) == {"openai", "other"}
     assert all(item["series"][1]["value_usd"] is None for item in providers)
+    connection.execute("UPDATE token_usage_events SET provider = 'openai-codex' WHERE external_id = 'mixed-gpt'")
+    merged = estimate()
+    assert len(merged["by_model"]) == 1
+    assert merged["by_model"][0]["series"] == merged["series"], "same-model routes must sum costs before attribution"
     connection.execute("DELETE FROM token_usage_events")
     assert estimate()["by_model"] == []
 PY

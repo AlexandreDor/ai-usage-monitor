@@ -1128,31 +1128,31 @@ test('shows four GPT curves by default and lets users enable the aggregate', asy
   const value = analyticsPayload.weekly_limit_value;
   const names = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-astra'];
   const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: names.map((model, index) => ({
-    ...value, provider: 'openai', model, series: [{ ...value.series[0], value_usd: 100 + index * 25, raw_value_usd: 100 + index * 25 }],
+    ...value, providers: model === 'gpt-5.6-sol' ? ['auto', 'openai', 'openai-codex'] : ['openai'], model, series: [{ ...value.series[0], value_usd: 100 + index * 25, raw_value_usd: 100 + index * 25 }],
   })) } };
-  payload.weekly_limit_value.by_model.push({ ...value, provider: 'openai-codex', model: 'gpt-5.6-sol', series: [{ ...value.series[0], value_usd: 225, raw_value_usd: 225 }] });
   await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
   await page.goto('/analytics.html');
   const controls = page.locator('#weekly-limit-value-models');
   await expect(controls.getByRole('button', { name: /All models/ })).toHaveAttribute('aria-pressed', 'false');
-  await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(5);
-  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.map(item => item.data[0].y))).toEqual([100, 125, 150, 225, 175]);
-  await expect.poll(() => page.evaluate(() => new Set(weeklyLimitValueChart.data.datasets.map(item => item.borderColor)).size)).toBe(5);
-  await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(5);
+  await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(4);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.map(item => item.data[0].y))).toEqual([100, 125, 150, 175]);
+  await expect.poll(() => page.evaluate(() => new Set(weeklyLimitValueChart.data.datasets.map(item => item.borderColor)).size)).toBe(4);
+  await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(4);
   await expect(page.locator('#weekly-limit-value-data-body')).toContainText('gpt-6-astra');
-  await expect(controls.getByRole('button', { name: 'gpt-5.6-sol (openai)', exact: true })).toBeVisible();
-  await expect(controls.getByRole('button', { name: 'gpt-5.6-sol (openai-codex)', exact: true })).toBeVisible();
-  const sol = controls.getByRole('button', { name: 'gpt-5.6-sol (openai)', exact: true });
+  await expect(controls.getByRole('button', { name: 'gpt-5.6-sol', exact: true })).toBeVisible();
+  const sol = controls.getByRole('button', { name: 'gpt-5.6-sol', exact: true });
+  await expect(sol).toHaveAttribute('title', 'auto, openai, openai-codex');
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.map(item => item.borderColor))).toEqual(['#a78bfa', '#34d399', '#fbbf24', '#fb7185']);
   await sol.click();
   await expect(sol).toHaveAttribute('aria-pressed', 'false');
   await expect(sol).toBeFocused();
-  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(4);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(3);
   await sol.press('Space');
   await expect(sol).toHaveAttribute('aria-pressed', 'true');
-  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(5);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(4);
   await page.setViewportSize({ width: 390, height: 844 });
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  for (let index = 0; index < 5; index += 1) {
+  for (let index = 0; index < 4; index += 1) {
     await controls.locator('button[aria-pressed="true"]').first().click();
   }
   await expect(page.locator('#weekly-limit-value-empty')).toBeVisible();
@@ -1163,7 +1163,7 @@ test('shows four GPT curves by default and lets users enable the aggregate', asy
 test('keeps missing GPT estimates visible without inventing curve points', async ({ page }) => {
   const value = analyticsPayload.weekly_limit_value;
   const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: [
-    { ...value, provider: 'openai', model: 'gpt-5.6-terra', series: [{ ...value.series[0], value_usd: null, raw_value_usd: null, quality: 'unavailable', reason: 'mixed_models' }], unavailable_reasons: { mixed_models: 1 } },
+    { ...value, provider: 'openai', model: 'gpt-5.6-terra', series: [{ ...value.series[0], value_usd: null, raw_value_usd: null, quality: 'unavailable', reason: 'mixed_models', mixed_model_reason: 'mixed_model_insufficient_samples', mixed_model_sample_count: 2, mixed_model_minimum_samples: 8 }], unavailable_reasons: { mixed_models: 1 } },
   ] } };
   await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
   await page.goto('/analytics.html');
@@ -1172,7 +1172,7 @@ test('keeps missing GPT estimates visible without inventing curve points', async
   await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(4);
   await expect(controls.getByText('No estimate', { exact: true })).toHaveCount(4);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueDatasets.every(item => item.data.length === 0))).toBe(true);
-  await expect(page.locator('#weekly-limit-value-data-body')).toContainText('could not be attributed safely');
+  await expect(page.locator('#weekly-limit-value-data-body')).toContainText('2 prior non-overlapping windows available; 8 required');
 });
 
 test('labels mixed-window inference as shared-quota and low confidence', async ({ page }) => {
@@ -1192,5 +1192,5 @@ test('labels mixed-window inference as shared-quota and low confidence', async (
   await expect(row).toContainText('Inferred from shared quota');
   await expect(row.locator('.value-inferred')).toHaveAttribute('title', /8 prior non-overlapping windows/);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets
-    .find(item => item.label === 'gpt-5.6-sol (openai)').pointStyle[0])).toBe('star');
+    .find(item => item.label === 'gpt-5.6-sol').pointStyle[0])).toBe('star');
 });

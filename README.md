@@ -70,14 +70,16 @@ The local Analytics page provides:
   Sol and GPT-6 Astra on one chart by default, with distinct colors and
   independent toggles. The aggregate curve is hidden by default and can be
   enabled with its toggle. Models without valid estimates are marked explicitly.
-  The data table identifies each series, including provider identity. All
+  Events are priced using their recorded provider, then costs with the same
+  normalized model name are summed into one model curve. The data includes the
+  contributing providers as provenance. All
   series use the same twelve-hour windows, pricing, and validity checks.
   Exclusive-model windows retain the short median smoothing described above.
   A mixed-model window uses the fitted inverse coefficient directly, without
   an additional smoothing pass, and can receive a low-confidence inferred value
   only from prior, non-overlapping twelve-hour windows in the same uninterrupted
   limit/reset-deadline regime, bounded to 28 days independently of the selected
-  display range. The no-intercept fit accounts for every priced provider/model
+  display range. The no-intercept fit accounts for every priced model
   identity in those windows, including non-GPT usage, and estimates only GPT
   identities present in the target window. It requires at least
   `max(6, 2 × predictors + 2)` samples, full rank, a scaled condition number no
