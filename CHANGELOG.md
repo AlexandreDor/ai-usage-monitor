@@ -10,11 +10,16 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 - Combine provider aliases of the same model into one weekly-value predictor,
   curve, and toggle while retaining provider-specific event pricing.
-- Infer low-confidence per-model weekly values for eligible mixed-model windows
-  from a bounded set of prior, non-overlapping windows in the same quota cycle.
+- Infer low-confidence per-model weekly values for eligible mixed-model usage
+  from adaptive, non-overlapping observations retained across completed weekly
+  cycles for up to 28 days.
   Full-rank, conditioning, fit, positive-coefficient, and quota-rounding
   stability checks keep unsafe attributions unavailable, while the aggregate
   continues to include every locally collected source.
+- Carry the last accepted direct or inferred per-model value for up to seven
+  days across ordinary gaps and weekly resets, with its source date, age,
+  method, and low-confidence styling. Contradictions, malformed data, stale
+  samples, and limit changes clear the carried value.
 
 ## [0.1.2] - 2026-09-10
 

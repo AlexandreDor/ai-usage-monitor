@@ -345,6 +345,9 @@ from analytics import (
     WEEKLY_VALUE_MIXED_REASON_INSUFFICIENT_SAMPLES,
     WEEKLY_VALUE_MIXED_REASON_TARGET_MISMATCH,
     WEEKLY_VALUE_MIXED_REASON_UNSTABLE,
+    _adaptive_target_observation,
+    _adaptive_training_observations,
+    _carry_weekly_model_values,
     _fit_mixed_regression,
     _mixed_training_fit,
     _mixed_window_observation,
@@ -388,13 +391,13 @@ for index in range(8):
     costs = {a: 1.0 + index / 10.0, b: 2.0 - index / 20.0}
     weak.append({"costs": costs, "fraction": costs[a] / 1000.0 + costs[b] / 2000.0})
 weak_fit = _fit_mixed_regression(weak, {a, b})
-assert weak_fit["reason"] == WEEKLY_VALUE_MIXED_REASON_UNSTABLE, weak_fit
+assert weak_fit["ok"] and set(weak_fit["unstable_identities"]) == {a, b}, weak_fit
 
 # Training selection uses only prior, non-overlapping windows in one
 # uninterrupted regime. A future observation with a wildly different response
 # cannot change the recovered coefficients, and an explicit reset invalidates
 # the window containing it.
-window = 43200
+window = 3600
 deadline = 100 * window
 rows = []
 quota = 100.0
@@ -418,7 +421,7 @@ for index in range(14):
     quota -= fraction * 100.0
 epochs = [row["scraped_at_epoch"] for row in rows]
 event_epochs = [event[0] for event in events]
-target, reason = _mixed_window_observation(rows, epochs, rows[-1], events, event_epochs, set())
+target, reason = _adaptive_target_observation(rows, epochs, rows[-1], events, event_epochs, set())
 assert reason is None and target is not None, (target, reason)
 selected = _mixed_training_fit(rows, epochs, rows, epochs, target, events, event_epochs, set())
 assert selected["ok"] and selected["sample_count"] >= 6, selected
@@ -435,15 +438,88 @@ future_fit = _mixed_training_fit(
 )
 assert future_fit["coefficients"] == selected["coefficients"], (selected, future_fit)
 reset_target, reset_reason = _mixed_window_observation(
-    rows, epochs, rows[8], events, event_epochs, {7 * window + window // 2},
+    rows, epochs, rows[-1], events, event_epochs, {7 * window + window // 2},
 )
-assert reset_target is None and reset_reason == "reset_in_window", (reset_target, reset_reason)
+assert reset_target is None, (reset_target, reset_reason)
 
 # Per-target history is bounded even if a caller supplies older same-regime
 # candidates directly.
-distant_target = {**target, "start_epoch": 100 * window, "end_epoch": 101 * window}
+distant_target = {**target, "start_epoch": 1000 * window, "end_epoch": 1001 * window}
 distant = _mixed_training_fit(rows, epochs, rows, epochs, distant_target, events, event_epochs, set())
 assert distant["sample_count"] == 0, distant
+
+# Adaptive observations are causal and non-overlapping, survive weekly deadline
+# changes between observations, and reject crossings, long gaps, hidden quota
+# increases, and an intervening limit that later returns to the same id.
+adaptive_rows = [
+    {"scraped_at_epoch": 0, "weekly_pct": 100.0, "weekly_reset_at": 10000, "limit_id": "a"},
+    {"scraped_at_epoch": 900, "weekly_pct": 99.0, "weekly_reset_at": 10000, "limit_id": "a"},
+    {"scraped_at_epoch": 1800, "weekly_pct": 98.0, "weekly_reset_at": 10000, "limit_id": "a"},
+    {"scraped_at_epoch": 2700, "weekly_pct": 100.0, "weekly_reset_at": 20000, "limit_id": "a"},
+    {"scraped_at_epoch": 3600, "weekly_pct": 98.0, "weekly_reset_at": 20000, "limit_id": "a"},
+]
+adaptive_events = [
+    (450, a, 1.0, None, "direct"), (1350, b, 1.0, None, "direct"),
+    (3150, a, 1.0, None, "direct"), (3500, b, 1.0, None, "direct"),
+]
+adaptive_epochs = [row["scraped_at_epoch"] for row in adaptive_rows]
+adaptive_event_epochs = [event[0] for event in adaptive_events]
+observations = _adaptive_training_observations(
+    adaptive_rows, adaptive_epochs, 0, 3600, "a", adaptive_events, adaptive_event_epochs, set(),
+)
+assert [(item["start_epoch"], item["end_epoch"]) for item in observations] == [(0, 1800), (2700, 3600)], observations
+assert all(item["end_epoch"] <= observations[index + 1]["start_epoch"]
+           for index, item in enumerate(observations[:-1])), observations
+assert _adaptive_training_observations(
+    adaptive_rows, adaptive_epochs, 0, 3600, "a", adaptive_events, adaptive_event_epochs, {1500},
+)[0]["end_epoch"] == 3600
+
+increased = [dict(row) for row in adaptive_rows[:3]]
+increased[1]["weekly_pct"] = 100.5
+assert not _adaptive_training_observations(
+    increased, adaptive_epochs[:3], 0, 1800, "a", adaptive_events, adaptive_event_epochs, set(),
+)
+gapped = [dict(adaptive_rows[0]), {**adaptive_rows[2], "scraped_at_epoch": 6000}]
+assert not _adaptive_training_observations(
+    gapped, [0, 6000], 0, 6000, "a", adaptive_events, adaptive_event_epochs, set(),
+)
+returned = [dict(row) for row in adaptive_rows[:3]]
+returned[1]["limit_id"] = "b"
+assert not _adaptive_training_observations(
+    returned, adaptive_epochs[:3], 0, 1800, "a", adaptive_events, adaptive_event_epochs, set(),
+)
+expired_deadline = [
+    {"scraped_at_epoch": epoch, "weekly_pct": quota, "weekly_reset_at": 1000, "limit_id": "a"}
+    for epoch, quota in ((2000, 100.0), (2900, 99.0), (3800, 98.0))
+]
+assert not _adaptive_training_observations(
+    expired_deadline, [2000, 2900, 3800], 2000, 3800, "a",
+    adaptive_events, adaptive_event_epochs, set(),
+)
+assert _adaptive_target_observation(
+    expired_deadline, [2000, 2900, 3800], expired_deadline[-1],
+    adaptive_events, adaptive_event_epochs, set(),
+)[0] is None
+
+# Carry preserves the original source, can bridge a reset, expires after seven
+# days, and clears on contradictions or any intervening limit regime.
+base_point = {"at": "1970-01-01T00:00:00Z", "at_epoch": 0, "limit_id": "a",
+              "_limit_regime": 1, "value_usd": 100.0, "raw_value_usd": 100.0,
+              "quality": "good", "reason": None}
+reset_gap = {"at": "1970-01-01T06:00:00Z", "at_epoch": 21600, "limit_id": "a",
+             "_limit_regime": 1, "value_usd": None, "raw_value_usd": None,
+             "quality": "unavailable", "reason": "reset_in_window"}
+expired = {**reset_gap, "at_epoch": 604801, "at": "1970-01-08T00:00:01Z"}
+carry_series = [base_point, reset_gap, expired]
+assert _carry_weekly_model_values(carry_series) == 1
+assert reset_gap["carried"] and reset_gap["source_at"] == base_point["at"]
+assert reset_gap["source_age_seconds"] == 21600 and reset_gap["source_method"] == "exclusive_model_window"
+assert expired["quality"] == "unavailable"
+contradiction = [{**base_point}, {**reset_gap, "reason": "mixed_models",
+    "mixed_model_reason": WEEKLY_VALUE_MIXED_REASON_TARGET_MISMATCH}]
+assert _carry_weekly_model_values(contradiction) == 0
+changed = [{**base_point}, {**reset_gap, "_limit_regime": 3}]
+assert _carry_weekly_model_values(changed) == 0
 PY
 
 python3 - "$ROOT_DIR" "$TEST_ROOT/mixed-weekly-value.sqlite3" <<'PY'
@@ -457,7 +533,7 @@ from analytics import weekly_limit_value
 from storage import connect_database
 from token_usage import load_pricing
 
-window = 43200
+window = 3600
 deadline = 100 * window
 quota = 100.0
 with connect_database(database) as connection:
@@ -486,6 +562,7 @@ with connect_database(database) as connection:
     target_epoch = 13 * window
     result = weekly_limit_value(connection, catalog, target_epoch, target_epoch + 1, now=target_epoch)
     by_model = {item["model"]: item for item in result["by_model"]}
+    assert all(item["returned_points"] == len(item["series"]) == 1 for item in by_model.values()), by_model
     assert result["series"][0]["value_usd"] is not None, result["series"]
     assert result["mixed_model_diagnostics"]["inferred_points"] == 2, result["mixed_model_diagnostics"]
     assert by_model["gpt-5.6-sol"]["attribution"] == "mixed_model_regression", by_model
@@ -548,7 +625,10 @@ with connect_database(Path(sys.argv[2])) as connection:
     result = estimate()
     solo = result["by_model"][0]
     assert solo["model"] == "gpt-5.6-sol"
-    assert solo["series"] == result["series"], "single-model multi-source estimate differs from aggregate"
+    aggregate_by_at = {point["at"]: point for point in result["series"]}
+    assert all(point == aggregate_by_at[point["at"]]
+               for point in solo["series"] if not point.get("carried")), \
+        "single-model direct estimates differ from aggregate"
     assert solo["attribution"] == "exclusive_model_windows"
     # Another GPT model invalidates only the overlapping windows for attribution.
     connection.execute("""INSERT INTO token_usage_events
@@ -581,7 +661,10 @@ with connect_database(Path(sys.argv[2])) as connection:
     connection.execute("UPDATE token_usage_events SET provider = 'openai-codex' WHERE external_id = 'mixed-gpt'")
     merged = estimate()
     assert len(merged["by_model"]) == 1
-    assert merged["by_model"][0]["series"] == merged["series"], "same-model routes must sum costs before attribution"
+    aggregate_by_at = {point["at"]: point for point in merged["series"]}
+    assert all(point == aggregate_by_at[point["at"]]
+               for point in merged["by_model"][0]["series"] if not point.get("carried")), \
+        "same-model routes must sum costs before attribution"
     connection.execute("DELETE FROM token_usage_events")
     assert estimate()["by_model"] == []
 PY

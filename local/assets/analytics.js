@@ -535,18 +535,26 @@ function renderWeeklyLimitValueTable(points) {
     cell(row, formatUsd(point.value_usd), point.value_usd === null ? 'value-unavailable' : '');
     const quality = cell(row, weeklyValueQuality(point.quality), `quality-${point.quality || 'unavailable'}`);
     if (point.dispersion_pct !== undefined && point.dispersion_pct !== null) quality.title = `${formatPercent(point.dispersion_pct)} ${t('weeklyValueDispersion')}`;
-    let reasonText = point.inferred
-      ? t('weeklyValueInferred')
+    let reasonText = point.carried
+      ? t('weeklyValueCarried', { date: formatDate(point.source_at) })
+      : point.inferred ? t('weeklyValueInferred')
       : point.mixed_model_reason ? weeklyValueReason(point.mixed_model_reason)
         : point.reason ? weeklyValueReason(point.reason) : t('weeklyValueAvailable');
-    if (point.mixed_model_reason === 'mixed_model_insufficient_samples'
+    if (!point.carried && point.mixed_model_reason === 'mixed_model_insufficient_samples'
       && Number.isFinite(point.mixed_model_sample_count) && Number.isFinite(point.mixed_model_minimum_samples)) {
       reasonText = t('weeklyValueMixedSampleCounts', {
         samples: point.mixed_model_sample_count, minimum: point.mixed_model_minimum_samples,
       });
     }
-    const reason = cell(row, reasonText, point.inferred ? 'value-inferred' : '');
-    if (point.inferred) {
+    const reason = cell(row, reasonText, point.carried ? 'value-carried' : point.inferred ? 'value-inferred' : '');
+    if (point.carried) {
+      reason.title = t('weeklyValueCarriedTitle', {
+        date: formatDate(point.source_at), age: formatDuration(point.source_age_seconds),
+        method: point.source_method === 'mixed_model_regression' ? t('weeklyValueCarriedInferred') : t('weeklyValueCarriedDirect'),
+        reason: weeklyValueReason(point.carried_from_reason),
+      });
+      reason.setAttribute('aria-label', reasonText);
+    } else if (point.inferred) {
       reason.title = t('weeklyValueInferredTitle', { samples: point.training_sample_count ?? '?' });
       reason.setAttribute('aria-label', reasonText);
     }
@@ -651,8 +659,16 @@ function renderWeeklyLimitValue(data = {}) {
     data: entry.valid.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.value_usd) })),
     borderColor: entry.color, backgroundColor: entry.color,
     fill: false, borderWidth: entry.key === 'aggregate' ? 3 : 2, pointRadius: 3, tension: 0.2, spanGaps: false,
-    pointBackgroundColor: entry.color,
-    pointStyle: entry.valid.map(point => point.inferred ? 'star' : point.quality === 'volatile' ? 'triangle' : point.quality === 'low_confidence' ? 'rectRot' : 'circle'),
+    pointBackgroundColor: entry.valid.map(point => point.carried ? 'transparent' : entry.color),
+    pointBorderColor: entry.color,
+    pointBorderWidth: entry.valid.map(point => point.carried ? 2 : 1),
+    pointRadius: entry.valid.map(point => point.carried ? 4 : 3),
+    pointStyle: entry.valid.map(point => point.carried ? 'circle' : point.inferred ? 'star' : point.quality === 'volatile' ? 'triangle' : point.quality === 'low_confidence' ? 'rectRot' : 'circle'),
+    segment: { borderDash: context => {
+      const left = entry.valid[context.p0DataIndex];
+      const right = entry.valid[context.p1DataIndex];
+      return left?.carried || right?.carried ? [6, 4] : undefined;
+    } },
     valueKind: 'usd',
   }));
   if (typeof Chart !== 'function' || !valid.length) {

@@ -556,7 +556,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#tokens-chart-card')).toBeHidden();
   await expect(page.locator('#weekly-limit-value-card')).toBeVisible();
   await expect(page.locator('#weekly-limit-value-window')).toContainText('one point / 6 h');
-  await expect(page.locator('#weekly-limit-value-summary')).toContainText('1 valid twelve-hour estimate');
+  await expect(page.locator('#weekly-limit-value-summary')).toContainText('1 displayed estimate');
   await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(1);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].data[0].y)).toBe(75);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].valueKind)).toBe('usd');
@@ -1193,4 +1193,28 @@ test('labels mixed-window inference as shared-quota and low confidence', async (
   await expect(row.locator('.value-inferred')).toHaveAttribute('title', /8 prior non-overlapping windows/);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets
     .find(item => item.label === 'gpt-5.6-sol').pointStyle[0])).toBe('star');
+});
+
+test('distinguishes carried weekly values from newly calculated points', async ({ page }) => {
+  const value = analyticsPayload.weekly_limit_value;
+  const direct = { ...value.series[0], at: '2026-08-03T18:00:00Z', value_usd: 125, raw_value_usd: 125 };
+  const carried = {
+    ...direct, at: '2026-08-04T00:00:00Z', raw_value_usd: null,
+    quality: 'low_confidence', reason: null, carried: true,
+    carried_from_reason: 'reset_in_window', source_at: direct.at,
+    mixed_model_reason: 'mixed_model_insufficient_samples', mixed_model_sample_count: 2, mixed_model_minimum_samples: 8,
+    source_age_seconds: 21600, source_method: 'exclusive_model_window', source_quality: 'good',
+  };
+  const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: [
+    { ...value, provider: 'openai', model: 'gpt-5.6-sol', series: [direct, carried], unavailable_reasons: {} },
+  ] } };
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+  await page.goto('/analytics.html');
+  const row = page.locator('#weekly-limit-value-data-body tr').filter({ hasText: 'Carried from' });
+  await expect(row).toContainText('Low confidence');
+  await expect(row.locator('.value-carried')).toHaveAttribute('title', /Direct exclusive-window estimate.*6h old.*reset/i);
+  await expect.poll(() => page.evaluate(() => {
+    const dataset = weeklyLimitValueChart.data.datasets.find(item => item.label === 'gpt-5.6-sol');
+    return [dataset.pointStyle[1], dataset.pointBackgroundColor[1], dataset.segment.borderDash({ p0DataIndex: 0, p1DataIndex: 1 })];
+  })).toEqual(['circle', 'transparent', [6, 4]]);
 });

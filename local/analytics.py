@@ -45,6 +45,11 @@ WEEKLY_VALUE_STALE_REASON = "stale_data"
 # selected display range prevents changing the date picker from changing the
 # answer for a point.
 WEEKLY_VALUE_MIXED_TRAINING_HORIZON_SECONDS = 28 * 86400
+WEEKLY_VALUE_TRAINING_MIN_WINDOW_SECONDS = 15 * 60
+WEEKLY_VALUE_TRAINING_MAX_WINDOW_SECONDS = 12 * 3600
+WEEKLY_VALUE_TRAINING_MIN_QUOTA_DELTA_POINTS = 2.0
+WEEKLY_VALUE_TRAINING_MAX_SNAPSHOT_GAP_SECONDS = 90 * 60
+WEEKLY_VALUE_CARRY_MAX_AGE_SECONDS = 7 * 86400
 WEEKLY_VALUE_MIXED_MIN_SAMPLES = 6
 WEEKLY_VALUE_MIXED_MAX_CONDITION = 10_000.0
 WEEKLY_VALUE_MIXED_MAX_RMSE_FRACTION = 0.25
@@ -697,18 +702,14 @@ def _fit_mixed_regression(
     relative_coefficient_errors = [
         error / coefficient for error, coefficient in zip(coefficient_error_bounds, coefficients)
     ]
-    if any(
-        not math.isfinite(error) or coefficient - error <= 0
-        or relative > WEEKLY_VALUE_MIXED_MAX_COEFFICIENT_ERROR_FRACTION
-        for coefficient, error, relative in zip(
-            coefficients, coefficient_error_bounds, relative_coefficient_errors,
+    unstable_identities = [
+        identity
+        for identity, coefficient, error, relative in zip(
+            identities, coefficients, coefficient_error_bounds, relative_coefficient_errors,
         )
-    ):
-        return {"ok": False, "reason": WEEKLY_VALUE_MIXED_REASON_UNSTABLE,
-                "sample_count": sample_count, "predictor_count": predictor_count,
-                "rank": rank, "condition_number": condition,
-                "minimum_samples": minimum_samples,
-                "max_relative_coefficient_error": max(relative_coefficient_errors)}
+        if not math.isfinite(error) or coefficient - error <= 0
+        or relative > WEEKLY_VALUE_MIXED_MAX_COEFFICIENT_ERROR_FRACTION
+    ]
     residuals = [
         sample["fraction"] - sum(sample["costs"].get(identity, 0.0) * coefficient
                                   for identity, coefficient in zip(identities, coefficients))
@@ -739,6 +740,7 @@ def _fit_mixed_regression(
         "relative_rmse": relative_rmse,
         "max_abs_residual_fraction": max(abs(value) for value in residuals),
         "max_relative_coefficient_error": max(relative_coefficient_errors),
+        "unstable_identities": unstable_identities,
         "quantization_floor_pct_points": WEEKLY_VALUE_MIXED_QUANTIZATION_FLOOR_POINTS,
     }
 
@@ -756,49 +758,27 @@ def _mixed_training_fit(
     """Fit a target's historical mixed-model attribution without future data."""
     target_start = int(target["start_epoch"])
     target_limit = target["limit_id"]
-    target_deadline = target["deadline"]
     horizon_start = target_start - WEEKLY_VALUE_MIXED_TRAINING_HORIZON_SECONDS
     # Do not allow an earlier regime with the same identifier to re-enter the
-    # training set after an intervening deadline or limit transition.
+    # training set after an intervening limit transition. Weekly deadline
+    # changes split observations, but completed observations from earlier
+    # cycles remain useful.
     regime_start = horizon_start
     row_left = bisect.bisect_left(row_epochs, horizon_start)
     row_right = bisect.bisect_right(row_epochs, target_start)
     for row in reversed(rows[row_left:row_right]):
         epoch = row["scraped_at_epoch"]
         if (
-            row["limit_id"] != target_limit
-            or not _weekly_deadlines_equivalent(row["weekly_reset_at"], target_deadline)
+            not isinstance(row["limit_id"], str)
+            or not row["limit_id"]
+            or row["limit_id"] != target_limit
         ):
             regime_start = epoch + 1
             break
-    eligible: list[dict[str, Any]] = []
-    # Candidate rows are chronological six-hour buckets.  A candidate ending
-    # at the target window's start shares only a boundary with that target and
-    # is therefore still entirely historical.  Walking backward and keeping
-    # each candidate at least one window apart avoids treating overlapping
-    # twelve-hour windows as independent observations.
-    next_start = target_start
-    candidate_left = bisect.bisect_left(candidate_epochs, regime_start)
-    candidate_right = bisect.bisect_right(candidate_epochs, target_start)
-    for end_row in reversed(candidate_rows[candidate_left:candidate_right]):
-        end_epoch = end_row["scraped_at_epoch"]
-        if not isinstance(end_epoch, int) or end_epoch > next_start:
-            continue
-        observation, reason = _mixed_window_observation(
-            rows, row_epochs, end_row, identity_events, identity_event_epochs, reset_epochs,
-        )
-        if observation is None or reason is not None:
-            continue
-        if observation["start_epoch"] < regime_start or observation["end_epoch"] > next_start:
-            continue
-        if (
-            observation["limit_id"] != target_limit
-            or not _weekly_deadlines_equivalent(observation["deadline"], target_deadline)
-        ):
-            continue
-        eligible.append(observation)
-        next_start = observation["start_epoch"]
-    eligible.reverse()
+    eligible = _adaptive_training_observations(
+        rows, row_epochs, regime_start, target_start, target_limit,
+        identity_events, identity_event_epochs, reset_epochs,
+    )
     target_identities = set(target["identities"])
     feature_identities = target_identities | {
         identity for sample in eligible for identity in sample["identities"]
@@ -827,6 +807,171 @@ def _mixed_training_fit(
     return result
 
 
+def _adaptive_training_observations(
+    rows: list[sqlite3.Row],
+    row_epochs: list[int],
+    start_epoch: int,
+    end_epoch: int,
+    limit_id: str,
+    identity_events: list[tuple[int, str | None, float | None, str | None, str | None]],
+    identity_event_epochs: list[int],
+    reset_epochs: set[int],
+) -> list[dict[str, Any]]:
+    """Build causal, non-overlapping observations once quota signal is measurable."""
+    left = bisect.bisect_left(row_epochs, start_epoch)
+    right = bisect.bisect_right(row_epochs, end_epoch)
+    candidates = rows[left:right]
+    observations: list[dict[str, Any]] = []
+    start_index = 0
+    while start_index < len(candidates) - 1:
+        start_row = candidates[start_index]
+        start_at = start_row["scraped_at_epoch"]
+        if (
+            not isinstance(start_at, int)
+            or start_row["limit_id"] != limit_id
+            or not _finite_quota_number(start_row["weekly_pct"])
+            or not isinstance(start_row["weekly_reset_at"], int)
+            or start_row["weekly_reset_at"] <= start_at
+        ):
+            start_index += 1
+            continue
+        accepted = False
+        previous_at = start_at
+        previous_quota = float(start_row["weekly_pct"])
+        for end_index in range(start_index + 1, len(candidates)):
+            end_row = candidates[end_index]
+            at = end_row["scraped_at_epoch"]
+            if not isinstance(at, int) or at <= previous_at:
+                start_index = end_index
+                break
+            if at - previous_at > WEEKLY_VALUE_TRAINING_MAX_SNAPSHOT_GAP_SECONDS:
+                start_index = end_index
+                break
+            duration = at - start_at
+            if duration > WEEKLY_VALUE_TRAINING_MAX_WINDOW_SECONDS:
+                start_index += 1
+                break
+            if (
+                end_row["limit_id"] != limit_id
+                or not _finite_quota_number(end_row["weekly_pct"])
+                or not isinstance(end_row["weekly_reset_at"], int)
+                or end_row["weekly_reset_at"] <= at
+                or not _weekly_deadlines_equivalent(start_row["weekly_reset_at"], end_row["weekly_reset_at"])
+                or any(previous_at < reset_at <= at for reset_at in reset_epochs)
+            ):
+                start_index = end_index
+                break
+            current_quota = float(end_row["weekly_pct"])
+            if current_quota > previous_quota:
+                start_index = end_index
+                break
+            delta = float(start_row["weekly_pct"]) - float(end_row["weekly_pct"])
+            if delta < 0:
+                start_index = end_index
+                break
+            previous_at = at
+            previous_quota = current_quota
+            if duration < WEEKLY_VALUE_TRAINING_MIN_WINDOW_SECONDS:
+                continue
+            if delta < WEEKLY_VALUE_TRAINING_MIN_QUOTA_DELTA_POINTS:
+                continue
+            costs, identities, reason, polled_delta = _interval_identity_costs(
+                identity_events, start_at, at, identity_event_epochs,
+            )
+            if reason is None and costs is not None:
+                observations.append({
+                    "start_epoch": start_at,
+                    "end_epoch": at,
+                    "fraction": delta / 100.0,
+                    "costs": costs,
+                    "identities": identities,
+                    "limit_id": limit_id,
+                    "deadline": start_row["weekly_reset_at"],
+                    "polled_delta": polled_delta,
+                })
+            # Accepted training windows never overlap. Invalid cost evidence is
+            # also consumed so a later interval cannot silently omit it.
+            start_index = end_index
+            accepted = True
+            break
+        else:
+            break
+        if not accepted and start_index >= len(candidates) - 1:
+            break
+    return observations
+
+
+def _adaptive_target_observation(
+    rows: list[sqlite3.Row],
+    row_epochs: list[int],
+    end_row: sqlite3.Row,
+    identity_events: list[tuple[int, str | None, float | None, str | None, str | None]],
+    identity_event_epochs: list[int],
+    reset_epochs: set[int],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return the shortest recent mixed interval with measurable quota use."""
+    end_at = end_row["scraped_at_epoch"]
+    limit_id = end_row["limit_id"]
+    deadline = end_row["weekly_reset_at"]
+    if (
+        not isinstance(end_at, int)
+        or not isinstance(limit_id, str) or not limit_id
+        or not isinstance(deadline, int)
+        or deadline <= end_at
+        or not _finite_quota_number(end_row["weekly_pct"])
+    ):
+        return None, "invalid_quota_pct"
+    left = bisect.bisect_left(row_epochs, end_at - WEEKLY_VALUE_TRAINING_MAX_WINDOW_SECONDS)
+    right = bisect.bisect_left(row_epochs, end_at)
+    candidates = rows[left:right]
+    previous_at = end_at
+    previous_quota = float(end_row["weekly_pct"])
+    for start_row in reversed(candidates):
+        start_at = start_row["scraped_at_epoch"]
+        if not isinstance(start_at, int) or previous_at - start_at > WEEKLY_VALUE_TRAINING_MAX_SNAPSHOT_GAP_SECONDS:
+            return None, "window_duration"
+        if (
+            start_row["limit_id"] != limit_id
+            or not isinstance(start_row["limit_id"], str) or not start_row["limit_id"]
+        ):
+            return None, "limit_transition"
+        if (
+            not isinstance(start_row["weekly_reset_at"], int)
+            or start_row["weekly_reset_at"] <= start_at
+            or not _weekly_deadlines_equivalent(start_row["weekly_reset_at"], deadline)
+            or any(start_at < reset_at <= previous_at for reset_at in reset_epochs)
+        ):
+            return None, "reset_in_window"
+        if not _finite_quota_number(start_row["weekly_pct"]):
+            return None, "invalid_quota_pct"
+        current_quota = float(start_row["weekly_pct"])
+        # Walking backward, a lower earlier quota means the forward interval
+        # contained an increase or reset that cannot be attributed to usage.
+        if current_quota < previous_quota:
+            return None, "quota_increase"
+        duration = end_at - start_at
+        delta = current_quota - float(end_row["weekly_pct"])
+        if duration >= WEEKLY_VALUE_TRAINING_MIN_WINDOW_SECONDS and delta >= WEEKLY_VALUE_TRAINING_MIN_QUOTA_DELTA_POINTS:
+            costs, identities, reason, polled_delta = _interval_identity_costs(
+                identity_events, start_at, end_at, identity_event_epochs,
+            )
+            if reason is not None or costs is None:
+                return None, reason
+            return {
+                "start_epoch": start_at,
+                "end_epoch": end_at,
+                "fraction": delta / 100.0,
+                "costs": costs,
+                "identities": identities,
+                "limit_id": limit_id,
+                "deadline": deadline,
+                "polled_delta": polled_delta,
+            }, None
+        previous_at = start_at
+        previous_quota = current_quota
+    return None, "insufficient_quota_delta"
+
+
 def _mixed_point_from_fit(
     point: dict[str, Any],
     target: dict[str, Any],
@@ -835,6 +980,8 @@ def _mixed_point_from_fit(
 ) -> dict[str, Any] | None:
     """Annotate one per-model point with a successful mixed-window estimate."""
     coefficient = fit.get("coefficients", {}).get(identity)
+    if identity in fit.get("unstable_identities", []):
+        return None
     if not isinstance(coefficient, (int, float)) or not math.isfinite(float(coefficient)) or coefficient <= 0:
         return None
     value = 1.0 / float(coefficient)
@@ -879,6 +1026,76 @@ def _mixed_point_from_fit(
     )
     result["quota_quantization_floor_pct_points"] = fit.get("quantization_floor_pct_points")
     return result
+
+
+WEEKLY_VALUE_CARRY_BLOCKING_REASONS = {
+    "ambiguous_limit", "invalid_event", "invalid_quota_pct", "invalid_value",
+    "limit_transition", "missing_deadline", "missing_limit_id", "missing_price",
+    "quota_increase", WEEKLY_VALUE_STALE_REASON,
+    WEEKLY_VALUE_MIXED_REASON_TARGET_MISMATCH,
+}
+
+
+def _carry_weekly_model_values(series: list[dict[str, Any]]) -> int:
+    """Fill eligible gaps from the last accepted value without changing its age."""
+    source: dict[str, Any] | None = None
+    carried = 0
+    for point in series:
+        at = point.get("at_epoch")
+        limit_id = point.get("limit_id")
+        if not isinstance(at, int):
+            source = None
+            continue
+        if weekly_value_point_available(point):
+            source = {
+                "at": at,
+                "at_iso": point.get("at"),
+                "limit_id": limit_id,
+                "limit_regime": point.get("_limit_regime"),
+                "value_usd": point.get("value_usd"),
+                "raw_value_usd": point.get("raw_value_usd"),
+                "method": point.get("attribution") or (
+                    "mixed_model_regression" if point.get("inferred") else "exclusive_model_window"
+                ),
+                "quality": point.get("quality"),
+            }
+            continue
+        reason = point.get("mixed_model_reason") or point.get("reason")
+        if (
+            reason in WEEKLY_VALUE_CARRY_BLOCKING_REASONS
+            or not isinstance(limit_id, str) or not limit_id
+            or source is None
+            or source["limit_id"] != limit_id
+            or source["limit_regime"] != point.get("_limit_regime")
+        ):
+            source = None
+            continue
+        age = at - int(source["at"])
+        if age < 0 or age > WEEKLY_VALUE_CARRY_MAX_AGE_SECONDS:
+            source = None
+            continue
+        point["value_usd"] = source["value_usd"]
+        point["raw_value_usd"] = None
+        point["quality"] = "low_confidence"
+        point["carried"] = True
+        point["carried_from_reason"] = reason
+        point["source_at"] = source["at_iso"]
+        point["source_age_seconds"] = age
+        point["source_method"] = source["method"]
+        point["source_quality"] = source["quality"]
+        point["reason"] = None
+        carried += 1
+    return carried
+
+
+def weekly_value_point_available(point: dict[str, Any]) -> bool:
+    value = point.get("value_usd")
+    return (
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        and math.isfinite(float(value)) and float(value) > 0
+        and point.get("quality") not in (None, "unavailable")
+        and not point.get("carried")
+    )
 
 
 def _weekly_deadlines_equivalent(left: Any, right: Any) -> bool:
@@ -1030,7 +1247,8 @@ def weekly_limit_value(
     measurement.
     """
     prices = price_index(catalog)
-    history_start = start - WEEKLY_VALUE_MAX_WINDOW_SECONDS - WEEKLY_VALUE_MIXED_TRAINING_HORIZON_SECONDS
+    evaluation_start = start - WEEKLY_VALUE_CARRY_MAX_AGE_SECONDS - 2 * WEEKLY_VALUE_POINT_INTERVAL_SECONDS
+    history_start = evaluation_start - WEEKLY_VALUE_MAX_WINDOW_SECONDS - WEEKLY_VALUE_MIXED_TRAINING_HORIZON_SECONDS
     identities = connection.execute(
         """SELECT occurred_at_epoch, provider, model, input_tokens,
                   cache_read_tokens, cache_write_tokens, output_tokens, quality
@@ -1040,7 +1258,7 @@ def weekly_limit_value(
         (history_start, end),
     ).fetchall()
     events = _load_cost_events(connection, prices, history_start, end, rows=identities)
-    display_start = start - WEEKLY_VALUE_MAX_WINDOW_SECONDS
+    display_start = evaluation_start - WEEKLY_VALUE_MAX_WINDOW_SECONDS
     models = sorted({row["model"].strip().lower() for row in identities
                      if isinstance(row["occurred_at_epoch"], int)
                      and display_start <= row["occurred_at_epoch"]
@@ -1063,7 +1281,7 @@ def weekly_limit_value(
     candidate_rows = _cadence_rows(history_rows)
     candidate_epochs = _snapshot_epoch_index(candidate_rows)
     target_rows = _sample_rows(
-        _cadence_rows([row for row in history_rows if start <= row["scraped_at_epoch"] < end]),
+        _cadence_rows([row for row in history_rows if evaluation_start <= row["scraped_at_epoch"] < end]),
         WEEKLY_VALUE_MAX_POINTS,
     )
     target_rows_by_at = {
@@ -1082,16 +1300,31 @@ def weekly_limit_value(
         if isinstance(row[0], int)
     }
     target_observations: dict[int, dict[str, Any]] = {}
+    target_observation_reasons: dict[int, str] = {}
     for target_row in target_rows:
-        observation, observation_reason = _mixed_window_observation(
+        observation, observation_reason = _adaptive_target_observation(
             history_rows, history_epochs, target_row, identity_events, identity_event_epochs, reset_epochs,
         )
         if observation is not None and observation_reason is None and len(observation["identities"]) > 1:
             target_observations[target_row["scraped_at_epoch"]] = observation
+        elif observation_reason is not None:
+            target_observation_reasons[target_row["scraped_at_epoch"]] = observation_reason
     mixed_fit_cache: dict[int, dict[str, Any]] = {}
     mixed_rejections: dict[str, int] = {}
     mixed_inferred_points = 0
-    mixed_target_windows = len(target_observations)
+    mixed_target_windows = sum(epoch >= start for epoch in target_observations)
+    limit_regime_by_epoch: dict[int, int] = {}
+    regime_number = 0
+    previous_limit: str | None = None
+    for row in history_rows:
+        epoch = row["scraped_at_epoch"]
+        if epoch < evaluation_start:
+            continue
+        row_limit = row["limit_id"] if isinstance(row["limit_id"], str) and row["limit_id"] else None
+        if row_limit is None or row_limit != previous_limit:
+            regime_number += 1
+        limit_regime_by_epoch[epoch] = regime_number
+        previous_limit = row_limit
     result["by_model"] = []
     for model in models:
         identity = model
@@ -1106,16 +1339,20 @@ def weekly_limit_value(
             else (event[0], None, "mixed_models", event[3])
             for row, event in zip(identities, events)
         ]
-        estimate = _weekly_limit_value(connection, catalog, start, end,
+        estimate = _weekly_limit_value(connection, catalog, evaluation_start, end,
                                        cost_events=model_events, **kwargs)
         used_regression = False
         for point_index, point in enumerate(estimate["series"]):
-            if point.get("reason") != "mixed_models":
+            if point.get("quality") != "unavailable" or point.get("reason") == WEEKLY_VALUE_STALE_REASON:
                 continue
             point_at = point.get("at")
             target_row = target_rows_by_at.get(point_at)
             target = target_observations.get(target_row["scraped_at_epoch"]) if target_row is not None else None
             if target is None:
+                if target_row is not None:
+                    adaptive_reason = target_observation_reasons.get(target_row["scraped_at_epoch"])
+                    if adaptive_reason in WEEKLY_VALUE_CARRY_BLOCKING_REASONS:
+                        point["mixed_model_reason"] = adaptive_reason
                 continue
             if identity not in target["identities"]:
                 point["mixed_model_reason"] = WEEKLY_VALUE_MIXED_REASON_NO_TARGET
@@ -1134,11 +1371,20 @@ def weekly_limit_value(
             if fit.get("ok"):
                 inferred = _mixed_point_from_fit(point, target, identity, fit)
                 if inferred is not None:
+                    inferred["window_start"] = iso_utc(target["start_epoch"])
+                    inferred["window_seconds"] = target["end_epoch"] - target["start_epoch"]
+                    inferred["quota_consumed_pct_points"] = round(target["fraction"] * 100.0, 3)
+                    inferred["consumed_fraction"] = round(target["fraction"], 8)
                     estimate["series"][point_index] = inferred
                     used_regression = True
-                    mixed_inferred_points += 1
+                    if target_epoch >= start:
+                        mixed_inferred_points += 1
                     continue
-            failure_reason = fit.get("reason", WEEKLY_VALUE_MIXED_REASON_INSUFFICIENT_SAMPLES)
+            failure_reason = (
+                WEEKLY_VALUE_MIXED_REASON_UNSTABLE
+                if fit.get("ok") and identity in fit.get("unstable_identities", [])
+                else fit.get("reason", WEEKLY_VALUE_MIXED_REASON_INSUFFICIENT_SAMPLES)
+            )
             point["mixed_model_reason"] = failure_reason
             for field in (
                 "sample_count", "predictor_count", "minimum_samples", "rank",
@@ -1148,7 +1394,25 @@ def weekly_limit_value(
             ):
                 if field in fit:
                     point[f"mixed_model_{field}"] = fit[field]
-            mixed_rejections[failure_reason] = mixed_rejections.get(failure_reason, 0) + 1
+            if target_epoch >= start:
+                mixed_rejections[failure_reason] = mixed_rejections.get(failure_reason, 0) + 1
+        for point, target_row in zip(estimate["series"], target_rows):
+            point["at_epoch"] = target_row["scraped_at_epoch"]
+            point["_limit_regime"] = limit_regime_by_epoch.get(target_row["scraped_at_epoch"])
+        _carry_weekly_model_values(estimate["series"])
+        estimate["series"] = [
+            point for point in estimate["series"]
+            if isinstance(point.get("at_epoch"), int) and point["at_epoch"] >= start
+        ]
+        display_candidate_count = sum(start <= row["scraped_at_epoch"] < end for row in history_rows)
+        display_cadenced_count = len(_cadence_rows([
+            row for row in history_rows if start <= row["scraped_at_epoch"] < end
+        ]))
+        estimate["candidate_points"] = display_candidate_count
+        estimate["cadenced_points"] = display_cadenced_count
+        estimate["returned_points"] = len(estimate["series"])
+        estimate["omitted_points"] = display_candidate_count - len(estimate["series"])
+        estimate["points_reduced"] = display_candidate_count > len(estimate["series"])
         estimate["unavailable_reasons"] = {}
         for point in estimate["series"]:
             if point.get("reason"):
@@ -1159,11 +1423,21 @@ def weekly_limit_value(
         else:
             estimate_attribution = "exclusive_model_windows"
         estimate["mixed_model_fallback"] = "historical_ols_no_intercept"
+        estimate["carried_points"] = sum(bool(point.get("carried")) for point in estimate["series"])
+        estimate["carry_max_age_seconds"] = WEEKLY_VALUE_CARRY_MAX_AGE_SECONDS
+        for point in estimate["series"]:
+            point.pop("at_epoch", None)
+            point.pop("_limit_regime", None)
         result["by_model"].append({"model": model, "providers": providers,
                                    "attribution": estimate_attribution, **estimate})
     result["mixed_model_diagnostics"] = {
         "method": "historical_ols_no_intercept",
         "training_horizon_seconds": WEEKLY_VALUE_MIXED_TRAINING_HORIZON_SECONDS,
+        "training_min_window_seconds": WEEKLY_VALUE_TRAINING_MIN_WINDOW_SECONDS,
+        "training_max_window_seconds": WEEKLY_VALUE_TRAINING_MAX_WINDOW_SECONDS,
+        "training_min_quota_delta_pct_points": WEEKLY_VALUE_TRAINING_MIN_QUOTA_DELTA_POINTS,
+        "training_max_snapshot_gap_seconds": WEEKLY_VALUE_TRAINING_MAX_SNAPSHOT_GAP_SECONDS,
+        "carry_max_age_seconds": WEEKLY_VALUE_CARRY_MAX_AGE_SECONDS,
         "minimum_samples": WEEKLY_VALUE_MIXED_MIN_SAMPLES,
         "max_condition_number": WEEKLY_VALUE_MIXED_MAX_CONDITION,
         "max_relative_rmse": WEEKLY_VALUE_MIXED_MAX_RMSE_FRACTION,
@@ -1229,7 +1503,7 @@ def _weekly_limit_value(
     }
     series: list[dict[str, Any]] = []
     unavailable: dict[str, int] = {}
-    valid_by_segment: dict[tuple[int, str], list[float]] = {}
+    valid_by_segment: dict[tuple[int, str], list[tuple[int, float]]] = {}
     segment_number = 0
     segment_limit_id: str | None = None
     segment_deadline: int | None = None
@@ -1312,7 +1586,9 @@ def _weekly_limit_value(
                             segment_limit_id = limit_id
                             segment_deadline = start_deadline
                         segment = (segment_number, limit_id)
-                        previous = valid_by_segment.setdefault(segment, [])[-2:]
+                        history = valid_by_segment.setdefault(segment, [])
+                        previous = [value for epoch, value in history
+                                    if end_epoch - epoch <= WEEKLY_VALUE_CARRY_MAX_AGE_SECONDS][-2:]
                         values = [*previous, raw]
                         smoothed = float(median(values))
                         dispersion = (max(values) - min(values)) / smoothed if smoothed > 0 else math.inf
@@ -1324,7 +1600,7 @@ def _weekly_limit_value(
                         point["value_usd"] = round(smoothed, 8)
                         point["quality"] = quality
                         point["dispersion_pct"] = round(dispersion * 100, 3) if math.isfinite(dispersion) else None
-                        valid_by_segment[segment].append(raw)
+                        history.append((end_epoch, raw))
         if reason is not None:
             point["reason"] = reason
             unavailable[reason] = unavailable.get(reason, 0) + 1
