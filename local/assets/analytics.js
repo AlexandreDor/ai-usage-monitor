@@ -676,15 +676,12 @@ function renderWeeklyLimitValue(data = {}) {
     label: entry.label,
     data: entry.valid.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.value_usd) })),
     borderColor: entry.color, backgroundColor: entry.color,
-    fill: false, borderWidth: entry.key === 'aggregate' ? 3 : 2, pointRadius: 3, tension: 0.2, spanGaps: false,
+    fill: false, borderWidth: entry.key === 'aggregate' ? 3 : 2, tension: 0.2, spanGaps: false,
     pointBackgroundColor: entry.valid.map(point => point.carried ? 'transparent' : entry.color),
     pointBorderColor: entry.color,
     pointBorderWidth: entry.valid.map(point => point.carried ? 2 : 1),
     pointRadius: entry.valid.map(point => point.carried ? 4 : 3),
     pointStyle: entry.valid.map(point => point.quality === 'high_uncertainty' ? 'crossRot' : point.carried ? 'circle' : point.inferred ? 'star' : point.quality === 'volatile' ? 'triangle' : point.quality === 'low_confidence' ? 'rectRot' : 'circle'),
-    uncertaintyBounds: entry.valid.map(point => ({
-      lower: finiteNumber(point.value_lower_usd), upper: finiteNumber(point.value_upper_usd),
-    })),
     segment: { borderDash: context => {
       const left = entry.valid[context.p0DataIndex];
       const right = entry.valid[context.p1DataIndex];

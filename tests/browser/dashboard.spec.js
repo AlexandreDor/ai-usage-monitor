@@ -1244,7 +1244,7 @@ test('shows uncertain model values and sensitivity ranges including unbounded ca
   await expect(terra).toContainText('$35.00–unbounded');
   await expect(terra.locator('.value-carried')).toContainText('High uncertainty');
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.slice(0, 2)
-    .map(d => [d.pointStyle[0], d.uncertaintyBounds[0].upper]))).toEqual([['crossRot', 150], ['crossRot', null]]);
+    .map(d => d.pointStyle[0]))).toEqual(['crossRot', 'crossRot']);
   await expect(page.locator('#weekly-limit-value-quality')).toContainText('not statistical confidence intervals');
   expect(errors).toEqual([]);
 });

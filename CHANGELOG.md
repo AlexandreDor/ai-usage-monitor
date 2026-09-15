@@ -50,9 +50,6 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Changed
 
-- Show unstable but identifiable positive model estimates with high-uncertainty
-  markers and sensitivity ranges, including explicit unbounded upper ranges.
-
 - Harden the owner-scoped alert journal and state, recovery/retries/hooks, and
   expiration of stale alerts.
 - Keep archive and anomaly records consistent.
