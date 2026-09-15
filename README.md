@@ -90,10 +90,9 @@ The local Analytics page provides:
   greater than 10,000, positive coefficients, relative RMSE no greater than
   25%. Coefficients whose worst-case movement under an assumed one-point
   quota-delta perturbation exceeds 50% are displayed as high uncertainty,
-  with cross markers and sensitivity bars rather than hidden. Value bounds
+  with cross markers and sensitivity ranges in the table. Value bounds
   invert the coefficient bounds; an upper bound crossing zero is explicitly
-  unbounded. Bars extending beyond the chart use arrows; exact bounds are
-  available in the table. These sensitivity ranges are not 95% confidence
+  unbounded. Exact bounds are available in the table. These sensitivity ranges are not 95% confidence
   intervals. The held-out target
   must also match the fitted shared quota drop within the greater of one
   percentage point or 25% of its observed drop. Failed checks keep the

@@ -590,58 +590,6 @@ const weeklyValueModelColors = new Map([
   ['gpt-5.6-sol', '#fbbf24'],
   ['gpt-6-astra', '#fb7185'],
 ]);
-const weeklyValueUncertaintyPlugin = {
-  id: 'weeklyValueUncertainty',
-  afterDatasetsDraw(chart) {
-    const { ctx, chartArea } = chart;
-    if (!ctx || !chartArea) return;
-    chart.data.datasets.forEach((dataset, datasetIndex) => {
-      if (typeof chart.isDatasetVisible === 'function' && !chart.isDatasetVisible(datasetIndex)) return;
-      const bounds = Array.isArray(dataset.uncertaintyBounds) ? dataset.uncertaintyBounds : [];
-      if (!bounds.length) return;
-      const meta = chart.getDatasetMeta(datasetIndex);
-      const scale = chart.scales?.y;
-      if (!meta || !scale) return;
-      ctx.save();
-      ctx.strokeStyle = dataset.borderColor;
-      ctx.globalAlpha = 0.45;
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([3, 3]);
-      bounds.forEach((bound, index) => {
-        const element = meta.data?.[index];
-        if (!element || !bound || bound.lower === null) return;
-        const x = element.x;
-        const rawLowerY = scale.getPixelForValue(bound.lower);
-        const rawUpperY = bound.upper === null ? -Infinity : scale.getPixelForValue(bound.upper);
-        const lowerOffscale = rawLowerY > chartArea.bottom;
-        const upperOffscale = rawUpperY < chartArea.top;
-        const lowerY = lowerOffscale ? chartArea.bottom - 3 : Math.max(chartArea.top, rawLowerY);
-        const upperY = upperOffscale ? chartArea.top + 3 : Math.min(chartArea.bottom, rawUpperY);
-        ctx.beginPath();
-        ctx.moveTo(x, lowerY);
-        ctx.lineTo(x, upperY);
-        if (lowerOffscale) {
-          ctx.moveTo(x - 4, chartArea.bottom - 8);
-          ctx.lineTo(x, chartArea.bottom - 3);
-          ctx.lineTo(x + 4, chartArea.bottom - 8);
-        } else {
-          ctx.moveTo(x - 4, lowerY);
-          ctx.lineTo(x + 4, lowerY);
-        }
-        if (upperOffscale) {
-          ctx.moveTo(x - 4, chartArea.top + 8);
-          ctx.lineTo(x, chartArea.top + 3);
-          ctx.lineTo(x + 4, chartArea.top + 8);
-        } else {
-          ctx.moveTo(x - 4, upperY);
-          ctx.lineTo(x + 4, upperY);
-        }
-        ctx.stroke();
-      });
-      ctx.restore();
-    });
-  },
-};
 function weeklyValueModelKey(model) {
   return String(model || '').trim().toLowerCase();
 }
@@ -759,7 +707,7 @@ function renderWeeklyLimitValue(data = {}) {
   options.scales.y.ticks.callback = value => formatUsd(value);
   options.plugins.legend.display = false;
   weeklyLimitValueChart = new Chart(byId('weekly-limit-value-chart').getContext('2d'), {
-    type: 'line', data: { datasets: weeklyLimitValueDatasets }, options, plugins: [weeklyValueUncertaintyPlugin],
+    type: 'line', data: { datasets: weeklyLimitValueDatasets }, options,
   });
 }
 
