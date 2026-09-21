@@ -53,8 +53,9 @@ The local Analytics page provides:
   outside this quick selection;
 - quota, token, and API-equivalent cost charts;
 - implicit weekly-limit value estimates from all locally collected
-  API-equivalent token-event costs (Codex, OpenCode, and Hermes) in a rolling
-  twelve-hour window, shown at one point per fixed six-hour UTC bucket. The
+  API-equivalent token-event costs (Codex, OpenCode, and Hermes). Aggregate
+  values use a rolling twelve-hour window and points use fixed six-hour UTC
+  buckets. The
   latest snapshot in the current bucket is retained so the current estimate
   remains visible. The estimator converts the observed quota drop from
   percentage points to a fraction (for example, 2 % → 0.02), then uses
@@ -70,11 +71,42 @@ The local Analytics page provides:
   Sol and GPT-6 Astra on one chart by default, with distinct colors and
   independent toggles. The aggregate curve is hidden by default and can be
   enabled with its toggle. Models without valid estimates are marked explicitly.
-  The data table identifies each series, including provider identity. These use the same twelve-hour windows,
-  pricing, smoothing and quality checks, but only windows containing that model
-  alone among locally collected events. Mixed-model windows are unavailable:
-  the archive records a shared quota, so its consumption cannot be attributed
-  to individual models. Uncollected usage can still bias these estimates.
+  Events are priced using their recorded provider, then costs with the same
+  normalized model name are summed into one model curve. The data includes the
+  contributing providers as provenance. All
+  series use the same pricing and validity checks.
+  Exclusive-model windows retain the short median smoothing described above.
+  A mixed-model window uses the fitted inverse coefficient directly, without
+  an additional smoothing pass, and can receive a low-confidence inferred value
+  from adaptive, non-overlapping 15-minute-to-12-hour observations with at least
+  a two-point quota drop. Observations may come from completed weekly cycles,
+  are bounded to 28 days independently of the selected display range, and never
+  cross a reset, a limit transition, or a snapshot gap over 90 minutes. Mixed
+  target intervals use the shortest recent interval with the same measurable
+  signal. The no-intercept fit accounts for every priced model
+  identity in those windows, including non-GPT usage, and estimates only GPT
+  identities present in the target window. It requires at least
+  `max(6, 2 × predictors + 2)` samples, full rank, a scaled condition number no
+  greater than 10,000, positive coefficients, relative RMSE no greater than
+  25%. Coefficients whose worst-case movement under an assumed one-point
+  quota-delta perturbation exceeds 50% are displayed as high uncertainty,
+  with cross markers and sensitivity ranges in the table. Value bounds
+  invert the coefficient bounds; an upper bound crossing zero is explicitly
+  unbounded. Exact bounds are available in the table. These sensitivity ranges are not 95% confidence
+  intervals. The held-out target
+  must also match the fitted shared quota drop within the greater of one
+  percentage point or 25% of its observed drop. Failed checks keep the
+  point unavailable with a reason. These diagnostics are conservative fit
+  checks, not confidence intervals: the archive records only a shared quota,
+  so model coefficients and values are inferred. Uncollected usage can still
+  bias these estimates.
+  After a direct or inferred per-model value is accepted, it may be carried for
+  up to seven days through ordinary unavailable points and weekly resets. A
+  carried point retains the original source date, age, and method and is shown
+  with a hollow marker and dashed line (cross markers for high uncertainty).
+  Carried estimates preserve their source sensitivity bounds and high uncertainty. Limit changes, contradictory quota
+  movement, malformed observations, missing prices, and stale current data
+  clear the carry instead of extending it.
   The aggregate remains available, independently of token breakdown filters.
 - weekly reset rows include `Estimated cycle cost ($)` for the complete
   observable all-source cycle and `Extrapolated 100% value ($)` when quota

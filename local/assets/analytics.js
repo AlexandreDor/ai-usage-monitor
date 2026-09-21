@@ -483,6 +483,14 @@ function weeklyValueReason(value) {
   const keys = {
     ambiguous_limit: 'weeklyValueReasonAmbiguousLimit',
     mixed_models: 'weeklyValueReasonMixedModels',
+    mixed_model_insufficient_samples: 'weeklyValueReasonMixedInsufficient',
+    mixed_model_fixed_mix: 'weeklyValueReasonMixedFixedMix',
+    mixed_model_ill_conditioned: 'weeklyValueReasonMixedIllConditioned',
+    mixed_model_poor_fit: 'weeklyValueReasonMixedPoorFit',
+    mixed_model_non_positive_coefficients: 'weeklyValueReasonMixedNonPositive',
+    mixed_model_unstable_coefficients: 'weeklyValueReasonMixedUnstable',
+    mixed_model_target_absent: 'weeklyValueReasonMixedTargetAbsent',
+    mixed_model_target_mismatch: 'weeklyValueReasonMixedTargetMismatch',
     deadline_transition: 'weeklyValueReasonDeadlineTransition',
     incomplete_cycle: 'weeklyValueReasonIncompleteCycle',
     insufficient_quota_delta: 'weeklyValueReasonInsufficientDelta',
@@ -510,21 +518,64 @@ function weeklyValueReason(value) {
 function weeklyValuePointValid(point) {
   return point && finiteNumber(point.value_usd) !== null && point.quality && point.quality !== 'unavailable';
 }
+function weeklyValueSensitivity(point) {
+  if (point?.uncertainty_method !== 'assumed_1_point_quota_error_sensitivity') return null;
+  const lower = finiteNumber(point.value_lower_usd);
+  const upper = finiteNumber(point.value_upper_usd);
+  if (lower === null) return null;
+  return upper === null
+    ? t('weeklyValueSensitivityUnbounded', { lower: formatUsd(lower) })
+    : t('weeklyValueSensitivityBounded', { lower: formatUsd(lower), upper: formatUsd(upper) });
+}
 function renderWeeklyLimitValueTable(points) {
   const body = byId('weekly-limit-value-data-body');
   clearRows(body);
   for (const point of points) {
     const row = document.createElement('tr');
     cell(row, formatDate(point.at));
-    cell(row, point.estimateLabel || t('weeklyValueAllModels'));
+    const estimate = cell(row, point.estimateLabel || t('weeklyValueAllModels'));
+    if (Array.isArray(point.estimateProviders) && point.estimateProviders.length) {
+      estimate.title = point.estimateProviders.join(', ');
+    }
     const observed = cell(row, formatUsd(point.observed_cost_usd), point.observed_cost_usd === null ? 'value-unavailable' : '');
     const consumed = finiteNumber(point.quota_consumed_pct_points);
     cell(row, consumed === null ? 'N/A' : formatPercent(consumed));
     cell(row, formatUsd(point.raw_value_usd), point.raw_value_usd === null ? 'value-unavailable' : '');
     cell(row, formatUsd(point.value_usd), point.value_usd === null ? 'value-unavailable' : '');
+    const sensitivity = weeklyValueSensitivity(point);
+    const sensitivityCell = cell(row, sensitivity || EMPTY_VALUE, sensitivity ? 'value-sensitivity' : '');
+    if (sensitivity && finiteNumber(point.coefficient_fraction_per_usd) !== null) {
+      const error = finiteNumber(point.coefficient_error_bound_fraction_per_usd);
+      sensitivityCell.title = t('weeklyValueSensitivityTitle', {
+        coefficient: point.coefficient_fraction_per_usd,
+        error: error === null ? t('weeklyValueUnbounded') : error,
+      });
+    }
     const quality = cell(row, weeklyValueQuality(point.quality), `quality-${point.quality || 'unavailable'}`);
     if (point.dispersion_pct !== undefined && point.dispersion_pct !== null) quality.title = `${formatPercent(point.dispersion_pct)} ${t('weeklyValueDispersion')}`;
-    const reason = cell(row, point.reason ? weeklyValueReason(point.reason) : t('weeklyValueAvailable'));
+    let reasonText = point.carried
+      ? t('weeklyValueCarried', { date: formatDate(point.source_at), quality: weeklyValueQuality(point.quality) })
+      : point.inferred ? t('weeklyValueInferred')
+      : point.mixed_model_reason ? weeklyValueReason(point.mixed_model_reason)
+        : point.reason ? weeklyValueReason(point.reason) : t('weeklyValueAvailable');
+    if (!point.carried && point.mixed_model_reason === 'mixed_model_insufficient_samples'
+      && Number.isFinite(point.mixed_model_sample_count) && Number.isFinite(point.mixed_model_minimum_samples)) {
+      reasonText = t('weeklyValueMixedSampleCounts', {
+        samples: point.mixed_model_sample_count, minimum: point.mixed_model_minimum_samples,
+      });
+    }
+    const reason = cell(row, reasonText, point.carried ? 'value-carried' : point.inferred ? 'value-inferred' : '');
+    if (point.carried) {
+      reason.title = t('weeklyValueCarriedTitle', {
+        date: formatDate(point.source_at), age: formatDuration(point.source_age_seconds),
+        method: point.source_method === 'mixed_model_regression' ? t('weeklyValueCarriedInferred') : t('weeklyValueCarriedDirect'),
+        reason: weeklyValueReason(point.carried_from_reason),
+      });
+      reason.setAttribute('aria-label', reasonText);
+    } else if (point.inferred) {
+      reason.title = t('weeklyValueInferredTitle', { samples: point.training_sample_count ?? '?' });
+      reason.setAttribute('aria-label', reasonText);
+    }
     if (point.reason) reason.className = 'value-unavailable';
     body?.appendChild(row);
   }
@@ -532,41 +583,55 @@ function renderWeeklyLimitValueTable(points) {
 let weeklyValueData = {};
 const weeklyValueSelection = new Map();
 const weeklyValueDefaults = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-astra'];
-const weeklyValueColors = ['#38bdf8', '#a78bfa', '#34d399', '#fbbf24', '#fb7185'];
+const weeklyValueColors = ['#38bdf8', '#a78bfa', '#34d399', '#fbbf24', '#fb7185', '#60a5fa', '#f97316'];
+const weeklyValueModelColors = new Map([
+  ['gpt-5.6-luna', '#a78bfa'],
+  ['gpt-5.6-terra', '#34d399'],
+  ['gpt-5.6-sol', '#fbbf24'],
+  ['gpt-6-astra', '#fb7185'],
+]);
+function weeklyValueModelKey(model) {
+  return String(model || '').trim().toLowerCase();
+}
 function renderWeeklyLimitValue(data = {}) {
   weeklyValueData = data;
   const selector = byId('weekly-limit-value-models');
   const models = Array.isArray(data.by_model) ? data.by_model : [];
   const entries = [{ key: 'aggregate', label: t('weeklyValueAllModels'), color: weeklyValueColors[0], data }];
-  const modelNames = [...weeklyValueDefaults, ...new Set(models.map(item => item.model)
-    .filter(model => !weeklyValueDefaults.includes(model)))];
-  for (const model of modelNames) {
-    const estimates = models.filter(item => item.model === model);
-    // A shared quota window can be valid for only one provider/model pair.
-    // Join those points in one model curve without adding or averaging values.
-    const byTime = new Map();
-    for (const estimate of estimates) {
-      for (const point of Array.isArray(estimate.series) ? estimate.series : []) {
-        const previous = byTime.get(point.at);
-        if (!previous || weeklyValuePointValid(point)
-          || (!weeklyValuePointValid(previous) && previous.reason === 'mixed_models')) {
-          byTime.set(point.at, { ...point, provider: estimate.provider });
-        }
-      }
-    }
-    const series = [...byTime.values()].sort((left, right) => timestampMs(left.at) - timestampMs(right.at));
-    const reasons = {};
-    for (const point of series) if (point.reason) reasons[point.reason] = (reasons[point.reason] || 0) + 1;
-    const index = weeklyValueDefaults.indexOf(model);
-    entries.push({ key: model, label: model, model,
-      color: index >= 0 ? weeklyValueColors[index + 1] : '#94a3b8',
-      data: { series, unavailable_reasons: reasons } });
+  const estimatesByModel = new Map();
+  for (const estimate of models) {
+    const modelKey = weeklyValueModelKey(estimate.model);
+    if (modelKey && !estimatesByModel.has(modelKey)) estimatesByModel.set(modelKey, estimate);
+  }
+  const modelNames = [...weeklyValueDefaults, ...[...estimatesByModel.keys()]
+    .filter(model => !weeklyValueDefaults.includes(model))];
+  const colorsForEntry = index => weeklyValueColors[index % weeklyValueColors.length];
+  for (const [index, model] of modelNames.entries()) {
+    const estimate = estimatesByModel.get(model) || { model, providers: [], series: [], unavailable_reasons: {} };
+    const providers = Array.isArray(estimate.providers)
+      ? estimate.providers.filter(provider => typeof provider === 'string' && provider)
+      : estimate.provider ? [estimate.provider] : [];
+    const series = (Array.isArray(estimate.series) ? estimate.series : [])
+      .map(point => ({ ...point, estimateProviders: providers }))
+      .sort((left, right) => timestampMs(left.at) - timestampMs(right.at));
+    const reasons = estimate.unavailable_reasons || {};
+    entries.push({ key: model, label: estimate.model || model, model, providers,
+      color: weeklyValueModelColors.get(model) || colorsForEntry(index + 5),
+      data: { ...estimate, series, unavailable_reasons: reasons } });
   }
   const selected = [];
   clearRows(selector);
   for (const entry of entries) {
     if (!weeklyValueSelection.has(entry.key)) {
-      weeklyValueSelection.set(entry.key, weeklyValueDefaults.includes(entry.model));
+      let inherited;
+      if (entry.model) {
+        const suffix = `/${entry.model}`;
+        const variants = [...weeklyValueSelection.entries()]
+          .filter(([key]) => key.endsWith(suffix)).map(([, active]) => active);
+        if (variants.length) inherited = variants.some(Boolean);
+      }
+      weeklyValueSelection.set(entry.key,
+        inherited === undefined ? weeklyValueDefaults.includes(entry.model) : inherited);
     }
     const active = weeklyValueSelection.get(entry.key);
     const points = Array.isArray(entry.data.series) ? entry.data.series : [];
@@ -575,6 +640,7 @@ function renderWeeklyLimitValue(data = {}) {
     button.type = 'button';
     button.dataset.weeklyModel = entry.key;
     button.setAttribute('aria-pressed', String(active));
+    if (entry.providers?.length) button.title = entry.providers.join(', ');
     button.style.setProperty('--series-color', entry.color);
     const swatch = document.createElement('span');
     swatch.className = 'weekly-value-swatch';
@@ -592,7 +658,7 @@ function renderWeeklyLimitValue(data = {}) {
     selector.appendChild(button);
     if (active) selected.push({ ...entry, points, valid });
   }
-  const points = selected.flatMap(entry => entry.points.map(point => ({ ...point, estimateLabel: point.provider ? `${entry.label} (${point.provider})` : entry.label })))
+  const points = selected.flatMap(entry => entry.points.map(point => ({ ...point, estimateLabel: entry.label })))
     .sort((left, right) => timestampMs(left.at) - timestampMs(right.at));
   const valid = points.filter(weeklyValuePointValid);
   byId('weekly-limit-value-empty').hidden = valid.length > 0;
@@ -610,9 +676,17 @@ function renderWeeklyLimitValue(data = {}) {
     label: entry.label,
     data: entry.valid.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.value_usd) })),
     borderColor: entry.color, backgroundColor: entry.color,
-    fill: false, borderWidth: entry.key === 'aggregate' ? 3 : 2, pointRadius: 3, tension: 0.2, spanGaps: false,
-    pointBackgroundColor: entry.color,
-    pointStyle: entry.valid.map(point => point.quality === 'volatile' ? 'triangle' : point.quality === 'low_confidence' ? 'rectRot' : 'circle'),
+    fill: false, borderWidth: entry.key === 'aggregate' ? 3 : 2, tension: 0.2, spanGaps: false,
+    pointBackgroundColor: entry.valid.map(point => point.carried ? 'transparent' : entry.color),
+    pointBorderColor: entry.color,
+    pointBorderWidth: entry.valid.map(point => point.carried ? 2 : 1),
+    pointRadius: entry.valid.map(point => point.carried ? 4 : 3),
+    pointStyle: entry.valid.map(point => point.quality === 'high_uncertainty' ? 'crossRot' : point.carried ? 'circle' : point.inferred ? 'star' : point.quality === 'volatile' ? 'triangle' : point.quality === 'low_confidence' ? 'rectRot' : 'circle'),
+    segment: { borderDash: context => {
+      const left = entry.valid[context.p0DataIndex];
+      const right = entry.valid[context.p1DataIndex];
+      return left?.carried || right?.carried ? [6, 4] : undefined;
+    } },
     valueKind: 'usd',
   }));
   if (typeof Chart !== 'function' || !valid.length) {

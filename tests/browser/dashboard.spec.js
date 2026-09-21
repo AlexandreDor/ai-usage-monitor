@@ -556,7 +556,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#tokens-chart-card')).toBeHidden();
   await expect(page.locator('#weekly-limit-value-card')).toBeVisible();
   await expect(page.locator('#weekly-limit-value-window')).toContainText('one point / 6 h');
-  await expect(page.locator('#weekly-limit-value-summary')).toContainText('1 valid twelve-hour estimate');
+  await expect(page.locator('#weekly-limit-value-summary')).toContainText('1 displayed estimate');
   await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(1);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].data[0].y)).toBe(75);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].valueKind)).toBe('usd');
@@ -1128,9 +1128,8 @@ test('shows four GPT curves by default and lets users enable the aggregate', asy
   const value = analyticsPayload.weekly_limit_value;
   const names = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-astra'];
   const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: names.map((model, index) => ({
-    ...value, provider: 'openai', model, series: [{ ...value.series[0], value_usd: 100 + index * 25, raw_value_usd: 100 + index * 25 }],
+    ...value, providers: model === 'gpt-5.6-sol' ? ['auto', 'openai', 'openai-codex'] : ['openai'], model, series: [{ ...value.series[0], value_usd: 100 + index * 25, raw_value_usd: 100 + index * 25 }],
   })) } };
-  payload.weekly_limit_value.by_model.push({ ...value, provider: 'openai-codex', model: 'gpt-5.6-sol', series: [{ ...value.series[0], value_usd: null, quality: 'unavailable', reason: 'mixed_models' }] });
   await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
   await page.goto('/analytics.html');
   const controls = page.locator('#weekly-limit-value-models');
@@ -1140,7 +1139,10 @@ test('shows four GPT curves by default and lets users enable the aggregate', asy
   await expect.poll(() => page.evaluate(() => new Set(weeklyLimitValueChart.data.datasets.map(item => item.borderColor)).size)).toBe(4);
   await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(4);
   await expect(page.locator('#weekly-limit-value-data-body')).toContainText('gpt-6-astra');
-  const sol = controls.getByRole('button', { name: /gpt-5.6-sol/ });
+  await expect(controls.getByRole('button', { name: 'gpt-5.6-sol', exact: true })).toBeVisible();
+  const sol = controls.getByRole('button', { name: 'gpt-5.6-sol', exact: true });
+  await expect(sol).toHaveAttribute('title', 'auto, openai, openai-codex');
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.map(item => item.borderColor))).toEqual(['#a78bfa', '#34d399', '#fbbf24', '#fb7185']);
   await sol.click();
   await expect(sol).toHaveAttribute('aria-pressed', 'false');
   await expect(sol).toBeFocused();
@@ -1150,7 +1152,9 @@ test('shows four GPT curves by default and lets users enable the aggregate', asy
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(4);
   await page.setViewportSize({ width: 390, height: 844 });
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  for (const model of names) await controls.getByRole('button', { name: model, exact: true }).click();
+  for (let index = 0; index < 4; index += 1) {
+    await controls.locator('button[aria-pressed="true"]').first().click();
+  }
   await expect(page.locator('#weekly-limit-value-empty')).toBeVisible();
   await controls.getByRole('button', { name: /All models/ }).click();
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].data[0].y)).toBe(75);
@@ -1159,7 +1163,7 @@ test('shows four GPT curves by default and lets users enable the aggregate', asy
 test('keeps missing GPT estimates visible without inventing curve points', async ({ page }) => {
   const value = analyticsPayload.weekly_limit_value;
   const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: [
-    { ...value, provider: 'openai', model: 'gpt-5.6-terra', series: [{ ...value.series[0], value_usd: null, raw_value_usd: null, quality: 'unavailable', reason: 'mixed_models' }], unavailable_reasons: { mixed_models: 1 } },
+    { ...value, provider: 'openai', model: 'gpt-5.6-terra', series: [{ ...value.series[0], value_usd: null, raw_value_usd: null, quality: 'unavailable', reason: 'mixed_models', mixed_model_reason: 'mixed_model_insufficient_samples', mixed_model_sample_count: 2, mixed_model_minimum_samples: 8 }], unavailable_reasons: { mixed_models: 1 } },
   ] } };
   await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
   await page.goto('/analytics.html');
@@ -1168,5 +1172,79 @@ test('keeps missing GPT estimates visible without inventing curve points', async
   await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(4);
   await expect(controls.getByText('No estimate', { exact: true })).toHaveCount(4);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueDatasets.every(item => item.data.length === 0))).toBe(true);
-  await expect(page.locator('#weekly-limit-value-data-body')).toContainText('shared quota cannot be attributed');
+  await expect(page.locator('#weekly-limit-value-data-body')).toContainText('2 prior non-overlapping windows available; 8 required');
+});
+
+test('labels mixed-window inference as shared-quota and low confidence', async ({ page }) => {
+  const value = analyticsPayload.weekly_limit_value;
+  const inferred = {
+    ...value.series[0], value_usd: 125, raw_value_usd: 125,
+    quality: 'low_confidence', reason: null, inferred: true,
+    attribution: 'mixed_model_regression', training_sample_count: 8,
+  };
+  const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: [
+    { ...value, provider: 'openai', model: 'gpt-5.6-sol', series: [inferred], unavailable_reasons: {} },
+  ] } };
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+  await page.goto('/analytics.html');
+  const row = page.locator('#weekly-limit-value-data-body tr').filter({ hasText: 'gpt-5.6-sol' });
+  await expect(row).toContainText('Low confidence');
+  await expect(row).toContainText('Inferred from shared quota');
+  await expect(row.locator('.value-inferred')).toHaveAttribute('title', /8 prior non-overlapping windows/);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets
+    .find(item => item.label === 'gpt-5.6-sol').pointStyle[0])).toBe('star');
+});
+
+test('distinguishes carried weekly values from newly calculated points', async ({ page }) => {
+  const value = analyticsPayload.weekly_limit_value;
+  const direct = { ...value.series[0], at: '2026-08-03T18:00:00Z', value_usd: 125, raw_value_usd: 125 };
+  const carried = {
+    ...direct, at: '2026-08-04T00:00:00Z', raw_value_usd: null,
+    quality: 'low_confidence', reason: null, carried: true,
+    carried_from_reason: 'reset_in_window', source_at: direct.at,
+    mixed_model_reason: 'mixed_model_insufficient_samples', mixed_model_sample_count: 2, mixed_model_minimum_samples: 8,
+    source_age_seconds: 21600, source_method: 'exclusive_model_window', source_quality: 'good',
+  };
+  const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: [
+    { ...value, provider: 'openai', model: 'gpt-5.6-sol', series: [direct, carried], unavailable_reasons: {} },
+  ] } };
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+  await page.goto('/analytics.html');
+  const row = page.locator('#weekly-limit-value-data-body tr').filter({ hasText: 'Carried from' });
+  await expect(row).toContainText('Low confidence');
+  await expect(row.locator('.value-carried')).toHaveAttribute('title', /Direct exclusive-window estimate.*6h old.*reset/i);
+  await expect.poll(() => page.evaluate(() => {
+    const dataset = weeklyLimitValueChart.data.datasets.find(item => item.label === 'gpt-5.6-sol');
+    return [dataset.pointStyle[1], dataset.pointBackgroundColor[1], dataset.segment.borderDash({ p0DataIndex: 0, p1DataIndex: 1 })];
+  })).toEqual(['circle', 'transparent', [6, 4]]);
+});
+
+test('shows uncertain model values and sensitivity ranges including unbounded carry', async ({ page }) => {
+  const value = analyticsPayload.weekly_limit_value;
+  const uncertain = {
+    ...value.series[0], value_usd: 60, raw_value_usd: 60, inferred: true,
+    quality: 'high_uncertainty', reason: null, value_lower_usd: 35, value_upper_usd: 150,
+    uncertainty_method: 'assumed_1_point_quota_error_sensitivity',
+    coefficient_fraction_per_usd: 1 / 60, coefficient_error_bound_fraction_per_usd: 0.01,
+  };
+  const carried = { ...uncertain, value_upper_usd: null, carried: true, source_at: uncertain.at,
+    source_age_seconds: 3600, source_quality: 'high_uncertainty', source_method: 'mixed_model_regression',
+    carried_from_reason: 'mixed_model_target_absent' };
+  const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: [
+    { model: 'gpt-5.6-luna', providers: ['openai'], series: [uncertain], unavailable_reasons: {} },
+    { model: 'gpt-5.6-terra', providers: ['openai'], series: [carried], unavailable_reasons: {} },
+  ] } };
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+  await page.goto('/analytics.html');
+  const table = page.locator('#weekly-limit-value-data-body');
+  await expect(table.locator('tr').filter({ hasText: 'gpt-5.6-luna' })).toContainText('$35.00–$150.00');
+  const terra = table.locator('tr').filter({ hasText: 'gpt-5.6-terra' });
+  await expect(terra).toContainText('$35.00–unbounded');
+  await expect(terra.locator('.value-carried')).toContainText('High uncertainty');
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.slice(0, 2)
+    .map(d => d.pointStyle[0]))).toEqual(['crossRot', 'crossRot']);
+  await expect(page.locator('#weekly-limit-value-quality')).toContainText('not statistical confidence intervals');
+  expect(errors).toEqual([]);
 });

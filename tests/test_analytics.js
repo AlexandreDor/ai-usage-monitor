@@ -76,7 +76,7 @@ evaluate(`weeklyValueSelection.set('aggregate', true); renderWeeklyLimitValue({
 })`);
 if (element('weekly-limit-value-empty').hidden !== true) fail('valid weekly value series still showed the empty state');
 if (element('weekly-limit-value-data-body').children.length !== 2) fail('weekly value table did not include qualified rows');
-if (!element('weekly-limit-value-summary').textContent.includes('twelve-hour estimate')) fail('weekly value summary did not use the twelve-hour window');
+if (!element('weekly-limit-value-summary').textContent.includes('displayed estimate')) fail('weekly value summary did not describe mixed estimate types');
 if (evaluate('weeklyLimitValueDatasets[0].data[0].y') !== 75) fail('weekly value chart lost the USD value');
 if (evaluate('formatUsd(75)') !== '$75.00') fail('weekly value formatting did not remain USD');
 if (evaluate("weeklyLimitValueDatasets[0].valueKind") !== 'usd') fail('weekly value chart did not declare USD formatting');
