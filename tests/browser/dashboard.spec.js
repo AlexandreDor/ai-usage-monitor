@@ -443,7 +443,7 @@ const analyticsPayload = {
   filters: { sources: [], models: [], reset_type: 'all' },
   available: {
     sources: ['codex', 'opencode'],
-    models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra', 'gpt-5.5', 'gpt-5.4', 'unknown-model'],
+    models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6-astra', 'gpt-5.5', 'gpt-5.4', 'unknown-model'],
   },
   freshness: { limits_last_sample_at: '2026-08-04T09:45:00Z', collectors: { codex: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, opencode: { status: 'ok', last_success_at: '2026-08-04T09:45:00Z' }, hermes: { status: 'disabled', last_success_at: null } } },
   limits: { samples: 2, forecast_samples: 2, series: [{ at: '2026-08-03T00:00:00Z', five_h_pct: 80, weekly_pct: 60, ideal_weekly_pct: 65.5, forecast_chance_24h_pct: 60, forecast_chance_6h_pct: 20, forecast_generated_at: '2026-08-02T23:55:00Z', forecast_samples: 1 }, { at: '2026-08-04T00:00:00Z', five_h_pct: 55, weekly_pct: 52, ideal_weekly_pct: 51.2, forecast_chance_24h_pct: 70, forecast_chance_6h_pct: 30, forecast_generated_at: '2026-08-03T23:55:00Z', forecast_samples: 1 }] },
@@ -543,7 +543,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#estimated-cost')).toHaveText('€9.68');
   await expect(page.locator('#allocation-total-cost')).toHaveText('€9.68');
   await expect(page.locator('#estimated-cost')).toHaveAttribute('title', 'Converted from USD using fixed rate: 1 USD = €0.86');
-  await expect.poll(() => analyticsQueries[0]?.get('models')).toBe('gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-6-astra');
+  await expect.poll(() => analyticsQueries[0]?.get('models')).toBe('gpt-5.6-luna,gpt-5.6-terra,gpt-5.6-sol,gpt-6-luna,gpt-6-sol,gpt-6-astra');
   await expect(page.locator('#weekly-reset-count')).toHaveText('2');
   await expect(page.locator('#weekly-reset-impact')).toHaveText('1 random · 1 end of week');
   await expect(page.locator('#random-reset-count')).toHaveText('1');
@@ -588,12 +588,15 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   });
   expect(warningPosition).toEqual({ afterDataHealth: true, beforeFooter: true, marginTop: '18px' });
   await expect(page.locator('#source-filter input, #model-filter input')).toHaveCount(0);
-  await expect(page.locator('#model-filter [data-filter-value]')).toHaveCount(7);
+  await expect(page.locator('#model-filter [data-filter-value]')).toHaveCount(9);
+  for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
+    await expect(page.locator(`#model-filter [data-filter-value="${model}"]`)).toHaveAttribute('aria-pressed', 'true');
+  }
   for (const model of ['gpt-5.5', 'gpt-5.4', 'unknown-model']) {
     await expect(page.locator(`#model-filter [data-filter-value="${model}"]`)).toHaveAttribute('aria-pressed', 'false');
   }
   await page.getByRole('button', { name: 'GPT', exact: true }).click();
-  await expect.poll(() => analyticsQueries.at(-1)?.get('models')).toBe('gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-6-astra');
+  await expect.poll(() => analyticsQueries.at(-1)?.get('models')).toBe('gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-6-luna,gpt-6-sol,gpt-6-astra');
   await page.locator('#source-filter [data-filter-value="codex"]').click();
   await expect.poll(() => analyticsQueries.at(-1)?.get('sources')).toBe('opencode,hermes');
   await expect(page.locator('.page-nav')).toHaveCount(0);
@@ -667,7 +670,7 @@ test('falls back once to all models when GPT is unavailable', async ({ page }) =
   await page.goto('/analytics.html');
 
   await expect.poll(() => queries.length).toBe(2);
-  expect(queries[0].get('models')).toBe('gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-6-astra');
+  expect(queries[0].get('models')).toBe('gpt-5.6-luna,gpt-5.6-terra,gpt-5.6-sol,gpt-6-luna,gpt-6-sol,gpt-6-astra');
   expect(queries[1].get('models')).toBe('legacy-model,unknown-model');
   await expect(page.locator('#analytics-error')).toContainText('No supported GPT model is available');
   await page.waitForTimeout(100);
@@ -1124,9 +1127,9 @@ test('switches locale and currency and persists the preference across pages', as
 
 
 
-test('shows four GPT curves by default and lets users enable the aggregate', async ({ page }) => {
+test('shows six GPT curves by default and lets users enable the aggregate', async ({ page }) => {
   const value = analyticsPayload.weekly_limit_value;
-  const names = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-astra'];
+  const names = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6-astra'];
   const payload = { ...analyticsPayload, weekly_limit_value: { ...value, by_model: names.map((model, index) => ({
     ...value, providers: model === 'gpt-5.6-sol' ? ['auto', 'openai', 'openai-codex'] : ['openai'], model, series: [{ ...value.series[0], value_usd: 100 + index * 25, raw_value_usd: 100 + index * 25 }],
   })) } };
@@ -1134,25 +1137,25 @@ test('shows four GPT curves by default and lets users enable the aggregate', asy
   await page.goto('/analytics.html');
   const controls = page.locator('#weekly-limit-value-models');
   await expect(controls.getByRole('button', { name: /All models/ })).toHaveAttribute('aria-pressed', 'false');
-  await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(4);
-  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.map(item => item.data[0].y))).toEqual([100, 125, 150, 175]);
-  await expect.poll(() => page.evaluate(() => new Set(weeklyLimitValueChart.data.datasets.map(item => item.borderColor)).size)).toBe(4);
-  await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(4);
+  await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(6);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.map(item => item.data[0].y))).toEqual([100, 125, 150, 175, 200, 225]);
+  await expect.poll(() => page.evaluate(() => new Set(weeklyLimitValueChart.data.datasets.map(item => item.borderColor)).size)).toBe(6);
+  await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(6);
   await expect(page.locator('#weekly-limit-value-data-body')).toContainText('gpt-6-astra');
   await expect(controls.getByRole('button', { name: 'gpt-5.6-sol', exact: true })).toBeVisible();
   const sol = controls.getByRole('button', { name: 'gpt-5.6-sol', exact: true });
   await expect(sol).toHaveAttribute('title', 'auto, openai, openai-codex');
-  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.map(item => item.borderColor))).toEqual(['#a78bfa', '#34d399', '#fbbf24', '#fb7185']);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.map(item => item.borderColor))).toEqual(['#a78bfa', '#34d399', '#fbbf24', '#60a5fa', '#f97316', '#fb7185']);
   await sol.click();
   await expect(sol).toHaveAttribute('aria-pressed', 'false');
   await expect(sol).toBeFocused();
-  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(3);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(5);
   await sol.press('Space');
   await expect(sol).toHaveAttribute('aria-pressed', 'true');
-  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(4);
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.length)).toBe(6);
   await page.setViewportSize({ width: 390, height: 844 });
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  for (let index = 0; index < 4; index += 1) {
+  for (let index = 0; index < 6; index += 1) {
     await controls.locator('button[aria-pressed="true"]').first().click();
   }
   await expect(page.locator('#weekly-limit-value-empty')).toBeVisible();
@@ -1169,8 +1172,8 @@ test('keeps missing GPT estimates visible without inventing curve points', async
   await page.goto('/analytics.html');
   const controls = page.locator('#weekly-limit-value-models');
   await expect(controls.getByRole('button', { name: /All models/ })).toHaveAttribute('aria-pressed', 'false');
-  await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(4);
-  await expect(controls.getByText('No estimate', { exact: true })).toHaveCount(4);
+  await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(6);
+  await expect(controls.getByText('No estimate', { exact: true })).toHaveCount(6);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueDatasets.every(item => item.data.length === 0))).toBe(true);
   await expect(page.locator('#weekly-limit-value-data-body')).toContainText('2 prior non-overlapping windows available; 8 required');
 });
