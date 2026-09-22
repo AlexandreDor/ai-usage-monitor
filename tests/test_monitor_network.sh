@@ -116,6 +116,99 @@ consumed_next_deadline=$((consumed_new_deadline + 5 * 60 * 60))
 check_thresholds 100 100 later unknown "$consumed_next_deadline" '' "$((consumed_new_deadline + 1))" group-a >/dev/null
 assert_eq 3 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
   "next scheduled reset was not delivered exactly once"
+
+# Registration is part of the observed-cycle journal transaction. If that
+# write fails, the immutable consumed-reset intent stays in state and a later,
+# further-consumed sample must register and deliver the original event once.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-consumed-register-retry"
+register_retry_start=2000001060
+register_retry_old=$((register_retry_start + 2 * 60 * 60))
+register_retry_observed=$((register_retry_start + 300))
+register_retry_new=$((register_retry_observed + 5 * 60 * 60))
+check_thresholds 26 100 later unknown "$register_retry_old" '' \
+  "$register_retry_start" group-a >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_original /')"
+expire_observed_owner_cycle() { return 1; }
+if check_thresholds 87 100 later unknown "$register_retry_new" '' \
+  "$register_retry_observed" group-a >/dev/null 2>&1; then
+  fail "consumed reset journal failure was accepted"
+fi
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "failed consumed reset registration emitted HTTP"
+assert_eq "$register_retry_observed" \
+  "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "failed consumed reset registration lost its durable intent"
+eval "$(declare -f expire_observed_owner_cycle_original | sed '1s/^expire_observed_owner_cycle_original /expire_observed_owner_cycle /')"
+check_thresholds 10 100 later unknown "$register_retry_new" '' \
+  "$((register_retry_observed + 1))" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "consumed reset registration retry was not delivered exactly once"
+assert_eq 0 "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "successful consumed reset registration retained its intent"
+assert_eq "$register_retry_new" \
+  "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "consumed reset retry did not arm the real next deadline"
+python3 - "$ALERT_DELIVERIES_FILE" "$register_retry_observed" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and "Reset detected" in item["message"]]
+assert len(resets) == 1, items
+assert resets[0]["event_data"]["reset_epoch"] == int(sys.argv[2]), resets[0]
+assert "Remaining: 87%" in resets[0]["message"], resets[0]
+PYEOF
+
+# A crash after the atomic journal write but before final state persistence is
+# also recoverable. Replaying the durable intent must reuse the same reset row,
+# then deliver it once without manufacturing a duplicate occurrence.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-consumed-crash-retry"
+crash_retry_start=2000001070
+crash_retry_old=$((crash_retry_start + 2 * 60 * 60))
+crash_retry_observed=$((crash_retry_start + 300))
+crash_retry_new=$((crash_retry_observed + 5 * 60 * 60))
+check_thresholds 26 100 later unknown "$crash_retry_old" '' \
+  "$crash_retry_start" group-a >/dev/null
+# Stop after the journal transaction and an intermediate detector-state write,
+# before the final new-cycle transition is persisted.
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f reconcile_alert_deliveries | sed '1s/^reconcile_alert_deliveries /reconcile_alert_deliveries_original /')"
+(
+  reconcile_alert_deliveries() {
+    persist_alert_state
+    exit 99
+  }
+  check_thresholds 87 100 later unknown "$crash_retry_new" '' \
+    "$crash_retry_observed" group-a >/dev/null
+) >/dev/null 2>&1 || true
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "consumed reset crash attempted delivery before recovery"
+assert_eq "$crash_retry_observed" \
+  "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "consumed reset crash lost its durable intent"
+eval "$(declare -f reconcile_alert_deliveries_original | sed '1s/^reconcile_alert_deliveries_original /reconcile_alert_deliveries /')"
+check_thresholds 80 100 later unknown "$crash_retry_new" '' \
+  "$((crash_retry_observed + 1))" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "consumed reset crash recovery was not delivered exactly once"
+assert_eq 0 "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "consumed reset crash recovery retained its durable intent"
+assert_eq "$crash_retry_new" \
+  "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "consumed reset crash recovery did not arm the real next deadline"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and "Reset detected" in item["message"]]
+assert len(resets) == 1, items
+PYEOF
 ALERT_THRESHOLDS=75
 TELEGRAM_BOT_TOKEN='123:token'
 TELEGRAM_CHAT_ID=-456

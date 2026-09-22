@@ -30,6 +30,7 @@ from anomalies import (
     RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT,
     RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS,
     process_snapshot,
+    reset_observation_gap_acceptable,
 )
 from history import (
     SQLITE_INTEGER_MAX,
@@ -409,14 +410,9 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
     scheduled_5h_cycles = set()
     scheduled_weekly_cycles = set()
     for previous, current in zip(rows, rows[1:]):
-        gap = current[0] - previous[0]
-        intervals = [
-            value for value in (previous[5], current[5])
-            if isinstance(value, (int, float)) and value > 0
-        ]
-        expected_interval = int(max(intervals, default=900))
         # A deadline crossing alone is not enough evidence across a long gap.
-        if gap <= 0 or gap > max(3_600, expected_interval * 2):
+        if not reset_observation_gap_acceptable(
+                previous[0], current[0], previous[5], current[5]):
             continue
         # Legacy snapshots may have no limit owner at all.  They remain useful
         # archive rows, but comparing two ownerless snapshots would fabricate
@@ -516,6 +512,9 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             and previous[6] == current[6]
             and isinstance(previous_pct, (int, float))
             and isinstance(previous_deadline, int)
+            and reset_observation_gap_acceptable(
+                previous[0], current[0], previous[5], current[5]
+            )
             and not scheduled_crossing
             and current_deadline
                 >= previous_deadline + OBSERVED_FIVE_HOUR_RESET_MIN_DEADLINE_ADVANCE_SECONDS

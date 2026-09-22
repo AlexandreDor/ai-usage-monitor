@@ -120,6 +120,17 @@ next_consumed_deadline=$((new_consumed_deadline + 5 * 60 * 60))
 check_thresholds 100 100 later unknown "$next_consumed_deadline" '' "$((new_consumed_deadline + 1))" group-a
 assert_alert_count 3
 
+# The same refill evidence is insufficient after a gap beyond the shared
+# observation bound. Keep the old cycle armed and do not announce a reset.
+reset_case
+long_gap_old_deadline=$((now + 5 * 60 * 60))
+long_gap_new_deadline=$((long_gap_old_deadline + 30 * 60))
+check_thresholds 26 100 later unknown "$long_gap_old_deadline" '' "$now" group-a
+check_thresholds 87 100 later unknown "$long_gap_new_deadline" '' "$((now + 2 * 60 * 60))" group-a
+assert_alert_count 0
+assert_eq "$long_gap_old_deadline" "$(state_value five_h_armed_reset_at)" \
+  "long-gap refill displaced the live detector's old cycle"
+
 # Reconstructing a missing delivery journal from the observed-reset sample
 # must not manufacture a deliverable 5h network reset or its old threshold occurrence.
 reset_case

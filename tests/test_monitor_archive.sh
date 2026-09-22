@@ -438,6 +438,29 @@ print(len(rows))
 PYEOF
 )" "consumed 5h refill was not derived as an observed reset"
 
+# Archive reconstruction uses the same observation-gap bound as the live and
+# anomaly detectors. A long interruption cannot turn two stale snapshots into
+# direct evidence of one observed rollover.
+rm -f "$ARCHIVE_FILE"
+five_consumed_long_before=$((BASE - 2 * 3600))
+five_consumed_long_previous_deadline=$((BASE + 2 * 3600))
+five_consumed_long_current_deadline=$((BASE + 5 * 3600))
+printf '{"five_h_pct":26,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_consumed_long_previous_deadline" "$(iso_at "$five_consumed_long_before")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":87,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_consumed_long_current_deadline" "$(iso_at "$BASE")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute(
+        "SELECT COUNT(*) FROM reset_events WHERE window = '5h'"
+    ).fetchone()[0])
+PYEOF
+)" "long-gap consumed refill was reconstructed as an observed reset"
+
 # Once the old deadline has actually crossed, the same partial refill remains
 # a scheduled reset rather than being reclassified as an early observation.
 rm -f "$ARCHIVE_FILE"

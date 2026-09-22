@@ -37,6 +37,8 @@ RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS = 30 * 60
 OBSERVED_FIVE_HOUR_RESET_MIN_CHANGE_PCT = 20.0
 OBSERVED_FIVE_HOUR_RESET_FULL_REFILL_PCT = 98.0
 OBSERVED_FIVE_HOUR_RESET_MIN_DEADLINE_ADVANCE_SECONDS = 30 * 60
+RESET_OBSERVATION_DEFAULT_INTERVAL_SECONDS = 15 * 60
+RESET_OBSERVATION_MIN_GAP_LIMIT_SECONDS = 60 * 60
 WINDOWS = (("5h", "five_h_pct", "five_h_reset_at"),
            ("weekly", "weekly_pct", "weekly_reset_at"))
 ANOMALY_TYPES = (
@@ -66,6 +68,38 @@ def _epoch(value: Any) -> int | None:
     return value if value > 0 else None
 
 
+def _sample_interval(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        value = int(value)
+    except (OverflowError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def reset_observation_gap_acceptable(
+        previous_epoch: int, current_epoch: int,
+        previous_interval: int | None = None,
+        current_interval: int | None = None) -> bool:
+    """Return whether adjacent reset observations are close enough to compare."""
+    gap = current_epoch - previous_epoch
+    intervals = [
+        value for value in (
+            _sample_interval(previous_interval),
+            _sample_interval(current_interval),
+        )
+        if value is not None
+    ]
+    expected_interval = max(
+        intervals, default=RESET_OBSERVATION_DEFAULT_INTERVAL_SECONDS,
+    )
+    return 0 < gap <= max(
+        RESET_OBSERVATION_MIN_GAP_LIMIT_SECONDS,
+        expected_interval * 2,
+    )
+
+
 def _limit_id(value: Any) -> str:
     if isinstance(value, str) and value and all(ord(char) >= 32 for char in value):
         return canonicalize_limit_id(value) or "__unknown__"
@@ -75,6 +109,7 @@ def _limit_id(value: Any) -> str:
 def _state_default() -> dict[str, Any]:
     return {
         "last_epoch": 0,
+        "last_sample_interval_seconds": RESET_OBSERVATION_DEFAULT_INTERVAL_SECONDS,
         "last_pct": None,
         "last_reset_at": None,
         "last_available_reset_at": None,
@@ -111,7 +146,8 @@ def _load_state(connection: sqlite3.Connection, limit_id: str, window: str,
     pct_column = "five_h_pct" if window == "5h" else "weekly_pct"
     reset_column = "five_h_reset_at" if window == "5h" else "weekly_reset_at"
     row = connection.execute(
-        f"""SELECT scraped_at_epoch, {pct_column}, {reset_column}
+        f"""SELECT scraped_at_epoch, {pct_column}, {reset_column},
+                   sample_interval_seconds
               FROM snapshots
              WHERE scraped_at_epoch < ? AND limit_id IS ?
              ORDER BY scraped_at_epoch DESC LIMIT 1""",
@@ -123,6 +159,10 @@ def _load_state(connection: sqlite3.Connection, limit_id: str, window: str,
             "last_epoch": int(row[0]), "last_pct": _number(row[1]),
             "last_reset_at": _epoch(row[2]),
             "last_available_reset_at": _epoch(row[2]),
+            "last_sample_interval_seconds": (
+                _sample_interval(row[3])
+                or RESET_OBSERVATION_DEFAULT_INTERVAL_SECONDS
+            ),
         })
         if state["last_reset_at"] is not None:
             state["reset_history"] = [[int(row[0]), state["last_reset_at"]]]
@@ -242,9 +282,13 @@ def _record_reset_history(state: dict[str, Any], epoch: int,
 
 def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str,
                    pct: Any, reset_at: Any, epoch: int,
-                   force_baseline: bool) -> None:
+                   sample_interval: Any, force_baseline: bool) -> None:
     current_pct = _number(pct)
     current_reset = _epoch(reset_at)
+    current_interval = (
+        _sample_interval(sample_interval)
+        or RESET_OBSERVATION_DEFAULT_INTERVAL_SECONDS
+    )
     if current_pct is None:
         return
     state, state_exists = _load_state(connection, limit_id, window, epoch)
@@ -254,6 +298,7 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     if (force_baseline and not state_exists) or _number(state.get("last_pct")) is None:
         state.update({
             "last_epoch": epoch, "last_pct": current_pct,
+            "last_sample_interval_seconds": current_interval,
             "last_reset_at": current_reset,
             "last_available_reset_at": current_reset,
             "missing_streak": 0,
@@ -271,6 +316,10 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     if previous_epoch is None or epoch <= previous_epoch:
         return
     previous_pct = float(state["last_pct"])
+    previous_interval = (
+        _sample_interval(state.get("last_sample_interval_seconds"))
+        or RESET_OBSERVATION_DEFAULT_INTERVAL_SECONDS
+    )
     previous_reset = _epoch(state.get("last_reset_at"))
     if previous_reset is None:
         previous_reset = _epoch(state.get("last_available_reset_at"))
@@ -278,8 +327,14 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     recognized_weekly = window == "weekly" and _weekly_reset(
         previous_pct, current_pct, previous_reset, current_reset
     )
-    recognized_five_hour = window == "5h" and _observed_five_hour_reset(
-        previous_pct, current_pct, previous_reset, current_reset
+    recognized_five_hour = (
+        window == "5h"
+        and reset_observation_gap_acceptable(
+            previous_epoch, epoch, previous_interval, current_interval,
+        )
+        and _observed_five_hour_reset(
+            previous_pct, current_pct, previous_reset, current_reset,
+        )
     )
     reset_in_past = current_reset is not None and current_reset <= epoch
 
@@ -396,6 +451,7 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     # after two genuinely stable samples.
     _record_reset_history(state, epoch, current_reset)
     state["last_epoch"] = epoch
+    state["last_sample_interval_seconds"] = current_interval
     state["last_pct"] = current_pct
     state["last_reset_at"] = current_reset
     if current_reset is not None:
@@ -425,7 +481,9 @@ def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any]) -
         _detect_window(
             connection, limit_id=limit_id, window=window,
             pct=snapshot.get(pct_key), reset_at=snapshot.get(reset_key),
-            epoch=epoch, force_baseline=force_baseline,
+            epoch=epoch,
+            sample_interval=snapshot.get("sample_interval_seconds"),
+            force_baseline=force_baseline,
         )
 
 
