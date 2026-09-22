@@ -876,7 +876,8 @@ def interrupt_pending_owner(document: dict[str, Any], limit_id: str, now: int) -
 
 
 def interrupt_pending_other_owners(document: dict[str, Any], current_limit_id: str,
-                                   now: int) -> int:
+                                   now: int,
+                                   preserve_cycle: str | None = None) -> int:
     """Terminalize pending detector events owned by any other limit group.
 
     The comparison and all terminal transitions happen against one loaded
@@ -892,12 +893,17 @@ def interrupt_pending_other_owners(document: dict[str, Any], current_limit_id: s
     canonical_current_limit_id = canonicalize_limit_id(current_limit_id)
     if canonical_current_limit_id is None:
         raise JournalError("current owner interruption limit ID is invalid")
+    if preserve_cycle is not None and (
+            not isinstance(preserve_cycle, str) or not preserve_cycle):
+        raise JournalError("preserved interruption cycle is invalid")
 
     interrupted = 0
     for item in document["alerts"]:
         if (item["kind"] not in {"threshold", "reset"}
                 or item["status"] != "pending"
-                or item["event_data"].get("limit_id") == canonical_current_limit_id):
+                or item["event_data"].get("limit_id") == canonical_current_limit_id
+                or (preserve_cycle is not None
+                    and _same_cycle(item["cycle_key"], preserve_cycle))):
             continue
         _terminate(item, "owner_interrupted", now, "owner_interrupted")
         interrupted += 1
@@ -1309,7 +1315,7 @@ def command(args: argparse.Namespace) -> None:
     elif args.action in {"interrupt-other-owners", "interrupt-pending-other-owners"}:
         migrated = migrate_document(document, args.now)
         interrupted = interrupt_pending_other_owners(
-            migrated, args.current_limit_id, args.now,
+            migrated, args.current_limit_id, args.now, args.preserve_cycle,
         )
         if migrated is not document or interrupted:
             atomic_write(path, migrated)
@@ -1460,6 +1466,7 @@ def parser() -> argparse.ArgumentParser:
     )
     interrupt_other_parser.add_argument("journal")
     interrupt_other_parser.add_argument("current_limit_id")
+    interrupt_other_parser.add_argument("--preserve-cycle")
     interrupt_other_parser.add_argument("--now", type=int, required=True)
     local_reset_parser = sub.add_parser(
         "suppress-local-reset", aliases=["tombstone-local-reset"],

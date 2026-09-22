@@ -903,6 +903,27 @@ class AlertJournalTests(unittest.TestCase):
         self.assertEqual(0, alerts.interrupt_pending_other_owners(self.document, "default", 301))
         self.assertEqual(0, alerts.interrupt_pending_owner(self.document, "default", 301))
 
+    def test_interrupt_other_owners_preserves_explicit_recovery_cycle(self):
+        preserved_request = reset_request(cycle="limit:other|reset:200")
+        preserved_request["event_data"]["limit_id"] = "other"
+        preserved = alerts.register(self.document, preserved_request)
+        interrupted_request = request(
+            "50", channels=["discord"], cycle="limit:stale|reset:100",
+        )
+        interrupted_request["event_data"].update({
+            "limit_id": "stale", "reset_epoch": 100,
+        })
+        interrupted = alerts.register(self.document, interrupted_request)
+
+        self.assertEqual(1, alerts.interrupt_pending_other_owners(
+            self.document, "default", 300, preserved["cycle_key"],
+        ))
+
+        self.assertEqual("pending", preserved["status"])
+        self.assertEqual("failed", interrupted["status"])
+        self.assertEqual("owner_interrupted", interrupted["terminal_reason"])
+        alerts.validate_document(self.document, allow_legacy=False)
+
     def test_interrupt_owner_cli_migrates_legacy_journal_before_writing(self):
         item = alerts.register(self.document, request("50", channels=["discord"]))
         raw_limit_id = "legacy-owner"

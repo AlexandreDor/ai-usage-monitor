@@ -1216,9 +1216,14 @@ interrupt_pending_owner() {
 }
 
 interrupt_pending_other_owners() {
-  local current_limit_id="$1" now="$2"
-  python3 "$ALERTS_PY" interrupt-other-owners "$ALERT_DELIVERIES_FILE" \
-    "$current_limit_id" --now "$now"
+  local current_limit_id="$1" now="$2" preserve_cycle="${3:-}"
+  if [[ -n "$preserve_cycle" ]]; then
+    python3 "$ALERTS_PY" interrupt-other-owners "$ALERT_DELIVERIES_FILE" \
+      "$current_limit_id" --preserve-cycle "$preserve_cycle" --now "$now"
+  else
+    python3 "$ALERTS_PY" interrupt-other-owners "$ALERT_DELIVERIES_FILE" \
+      "$current_limit_id" --now "$now"
+  fi
 }
 
 suppress_local_reset_cycle() {
@@ -2872,6 +2877,7 @@ check_thresholds() {
   local consumed_observed_5h_cycle_key="" consumed_observed_5h_request_json='{}'
   local consumed_observed_5h_owner="" consumed_observed_5h_remaining_pct=""
   local consumed_observed_5h_next_reset_at=0
+  local foreign_consumed_5h_intent=0 foreign_consumed_5h_preserve_cycle=""
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 script_hook_error=0 initialize_script_baseline=0
   local weekly_network_request=0 script_actions_started=""
   local observed_weekly_reset=0 five_h_observation_valid=0 weekly_observation_valid=0
@@ -3075,6 +3081,8 @@ check_thresholds() {
     consumed_observed_5h_next_reset_at="$pending_consumed_5h_next_reset_at"
     if [[ "$consumed_observed_5h_owner" == "$limit_id" ]]; then
       consumed_observed_5h_reset=1
+    else
+      foreign_consumed_5h_intent=1
     fi
   fi
 
@@ -3104,6 +3112,18 @@ check_thresholds() {
       consumed_observed_5h_reset=0
     else
       observed_5h_reset_candidate=1
+    fi
+  fi
+  if (( observed_5h_reset_candidate == 1 )); then
+    # A durable consumed-reset intent is single-owner. If another owner proves
+    # its own refill while that intent is still pending, defer the new sample
+    # without advancing its baseline. The foreign intent is replayed below and
+    # the current owner can prove the same reset again on its next fresh poll.
+    if (( consumed_observed_5h_reset == 1 && foreign_consumed_5h_intent == 1 )); then
+      observed_5h_reset_candidate=0
+      consumed_observed_5h_reset=0
+      process_5h_sample=0
+      five_h_observation_valid=0
     fi
   fi
   if (( observed_5h_reset_candidate == 1 )); then
@@ -3329,6 +3349,28 @@ check_thresholds() {
     }
   fi
 
+  # A pending consumed reset belongs to its recorded owner, even after the
+  # active limit group changes. Replay that immutable request with the recorded
+  # owner before the current group's interruption pass. Keep the state intent
+  # until the journal occurrence becomes terminal so a crash or transport retry
+  # can continue preserving it from cross-owner interruption.
+  if (( foreign_consumed_5h_intent == 1 )); then
+    if ! expire_observed_owner_cycle 5h "$pending_consumed_5h_reset_limit_id" \
+      "$scraped_at_epoch" "$pending_consumed_5h_superseded_reset_at" \
+      "$consumed_observed_5h_cycle_key" "$consumed_observed_5h_request_json"; then
+      ALERT_PROCESSING_ERROR="foreign observed 5h reset recovery failed"
+      return 1
+    fi
+    foreign_consumed_5h_preserve_cycle="$consumed_observed_5h_cycle_key"
+    if [[ -z "$foreign_consumed_5h_preserve_cycle" ]]; then
+      pending_consumed_5h_reset_at=0
+      pending_consumed_5h_reset_limit_id=""
+      pending_consumed_5h_remaining_pct=""
+      pending_consumed_5h_next_reset_at=0
+      pending_consumed_5h_superseded_reset_at=0
+    fi
+  fi
+
   # Close an observed 5-hour cycle immediately after the journal is known to
   # exist, before interruption reconciliation or any detector work can
   # persist.  A restored arm is authoritative when it is explicitly owned by
@@ -3530,6 +3572,7 @@ check_thresholds() {
   # other than this current sample's owner before any detector mutation or due
   # delivery; this is one atomic journal operation and is safe to repeat.
   if ! interrupt_pending_other_owners "$limit_id" "$scraped_at_epoch" \
+    "$foreign_consumed_5h_preserve_cycle" \
     || ! reconcile_alert_deliveries "$scraped_at_epoch" "$limit_id" 1; then
     ALERT_PROCESSING_ERROR="alert owner interruption failed"
     return 1
@@ -4342,6 +4385,17 @@ PYEOF
       if ! reconcile_alert_deliveries "$scraped_at_epoch" "$limit_id" "$discard_other_group_terminal"; then
         NETWORK_DELIVERY_ERROR=1
         ALERT_PROCESSING_ERROR="alert reconciliation failed"
+      elif [[ -n "$foreign_consumed_5h_preserve_cycle" ]] \
+        && ! journal_has_pending_alert reset 5h reset \
+          "$foreign_consumed_5h_preserve_cycle"; then
+        # Registration/delivery is now durable in the journal. Clearing only
+        # after reconciliation prevents a crash from exposing the pending
+        # foreign occurrence to the next owner-interruption pass.
+        pending_consumed_5h_reset_at=0
+        pending_consumed_5h_reset_limit_id=""
+        pending_consumed_5h_remaining_pct=""
+        pending_consumed_5h_next_reset_at=0
+        pending_consumed_5h_superseded_reset_at=0
       fi
     fi
   fi

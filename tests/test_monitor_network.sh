@@ -209,6 +209,96 @@ resets = [item for item in items if item["kind"] == "reset"
           and "Reset detected" in item["message"]]
 assert len(resets) == 1, items
 PYEOF
+
+# A consumed-reset intent survives an owner switch. Replay it with its recorded
+# owner before establishing B's baseline, then allow B to publish its own
+# consumed reset without reusing A's preserve cycle.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-cross-owner"
+cross_owner_start=2000001080
+cross_owner_a_old=$((cross_owner_start + 2 * 60 * 60))
+cross_owner_a_observed=$((cross_owner_start + 300))
+cross_owner_a_new=$((cross_owner_a_observed + 5 * 60 * 60))
+check_thresholds 26 100 later unknown "$cross_owner_a_old" '' \
+  "$cross_owner_start" group-a >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_original /')"
+expire_observed_owner_cycle() { return 1; }
+if check_thresholds 87 100 later unknown "$cross_owner_a_new" '' \
+  "$cross_owner_a_observed" group-a >/dev/null 2>&1; then
+  fail "cross-owner setup accepted failed consumed reset registration"
+fi
+eval "$(declare -f expire_observed_owner_cycle_original | sed '1s/^expire_observed_owner_cycle_original /expire_observed_owner_cycle /')"
+cross_owner_b_start=$((cross_owner_a_observed + 1))
+cross_owner_b_old=$((cross_owner_b_start + 2 * 60 * 60))
+check_thresholds 30 100 later unknown "$cross_owner_b_old" '' \
+  "$cross_owner_b_start" group-b >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "foreign consumed reset intent was not replayed exactly once"
+assert_eq 0 "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "foreign consumed reset intent remained orphaned after delivery"
+cross_owner_b_observed=$((cross_owner_b_start + 300))
+cross_owner_b_new=$((cross_owner_b_observed + 5 * 60 * 60))
+check_thresholds 85 100 later unknown "$cross_owner_b_new" '' \
+  "$cross_owner_b_observed" group-b >/dev/null
+assert_eq 2 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "second owner could not publish its consumed reset"
+assert_eq 0 "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "second owner's consumed reset intent was not cleared"
+assert_eq "$cross_owner_b_new" \
+  "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "second owner's real deadline was not armed"
+python3 - "$ALERT_DELIVERIES_FILE" \
+  "$(canonicalize_alert_limit_id group-a)" "$(canonicalize_alert_limit_id group-b)" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and "Reset detected" in item["message"]]
+assert len(resets) == 2, items
+assert {item["event_data"]["limit_id"] for item in resets} == {sys.argv[2], sys.argv[3]}, resets
+assert all(item["status"] == "delivered" for item in resets), resets
+PYEOF
+
+# Returning to A without another refill must neither replay nor duplicate the
+# already recovered immutable occurrence.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-cross-owner-return"
+cross_return_start=2000001090
+cross_return_a_old=$((cross_return_start + 2 * 60 * 60))
+cross_return_a_observed=$((cross_return_start + 300))
+cross_return_a_new=$((cross_return_a_observed + 5 * 60 * 60))
+check_thresholds 26 100 later unknown "$cross_return_a_old" '' \
+  "$cross_return_start" group-a >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_original /')"
+expire_observed_owner_cycle() { return 1; }
+if check_thresholds 87 100 later unknown "$cross_return_a_new" '' \
+  "$cross_return_a_observed" group-a >/dev/null 2>&1; then
+  fail "cross-owner return setup accepted failed consumed reset registration"
+fi
+eval "$(declare -f expire_observed_owner_cycle_original | sed '1s/^expire_observed_owner_cycle_original /expire_observed_owner_cycle /')"
+cross_return_b_at=$((cross_return_a_observed + 1))
+cross_return_b_deadline=$((cross_return_b_at + 2 * 60 * 60))
+check_thresholds 40 100 later unknown "$cross_return_b_deadline" '' \
+  "$cross_return_b_at" group-b >/dev/null
+check_thresholds 80 100 later unknown "$cross_return_a_new" '' \
+  "$((cross_return_b_at + 1))" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "returning to the recovered owner duplicated its consumed reset"
+assert_eq 0 "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "returning to the recovered owner restored an orphan intent"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and "Reset detected" in item["message"]]
+assert len(resets) == 1, items
+assert resets[0]["status"] == "delivered", resets
+PYEOF
 ALERT_THRESHOLDS=75
 TELEGRAM_BOT_TOKEN='123:token'
 TELEGRAM_CHAT_ID=-456
