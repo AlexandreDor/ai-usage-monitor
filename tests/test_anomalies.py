@@ -71,7 +71,7 @@ class AnomalyDetectorTests(unittest.TestCase):
     def test_full_five_hour_observed_reset_is_not_a_reset_shift(self):
         previous_deadline = 10_000
         self.observe(snapshot(100, five=100, five_reset=previous_deadline))
-        self.observe(snapshot(200, five=100, five_reset=previous_deadline + 900))
+        self.observe(snapshot(200, five=100, five_reset=previous_deadline + 1_800))
         self.assertEqual([], self.rows("5h"))
 
     def test_weekly_quota_increase_is_reported_independently(self):

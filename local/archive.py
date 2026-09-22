@@ -23,6 +23,9 @@ from storage import (
     wal_sidecar_paths,
 )
 from anomalies import (
+    OBSERVED_FIVE_HOUR_RESET_FULL_REFILL_PCT,
+    OBSERVED_FIVE_HOUR_RESET_MIN_CHANGE_PCT,
+    OBSERVED_FIVE_HOUR_RESET_MIN_DEADLINE_ADVANCE_SECONDS,
     RANDOM_WEEKLY_RESET_FULL_REFILL_PCT,
     RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT,
     RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS,
@@ -435,18 +438,18 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             current_reset_at = current[reset_index]
             if (
                 previous[0] < reset_at <= current[0]
-                # A complete 100% -> 100% 5-hour pair with a strictly later
-                # deadline is the explicit no-consumption reset signal. Keep it
-                # in the observed pass below so archive consumers get the same
-                # local-only identity as the live detector, even when the old
-                # deadline was crossed between samples. Preserve scheduled
-                # crossing behavior when the deadline did not advance.
+                # A materially advanced full-to-full 5-hour cycle is handled
+                # by the observed pass below. A partially consumed refill
+                # keeps scheduled-crossing priority when the old deadline was
+                # actually crossed; before that deadline, the observed pass
+                # below still recognizes it as an early refill.
                 and not (
                     window == "5h"
+                    and isinstance(current_reset_at, int)
+                    and current_reset_at
+                        >= reset_at + OBSERVED_FIVE_HOUR_RESET_MIN_DEADLINE_ADVANCE_SECONDS
                     and previous[pct_index] == 100
                     and current[pct_index] == 100
-                    and isinstance(current_reset_at, int)
-                    and current_reset_at > reset_at
                 )
                 and (
                     window != "weekly"
@@ -476,11 +479,11 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
                 else:
                     scheduled_5h_cycles.add((reset_at, previous[6]))
 
-    # A 5-hour reset can be observed even when the quota remains full. Compare
-    # only complete observations from one limit group and anchor the event to
-    # the first sample carrying the advanced deadline. A scheduled crossing
-    # already identified above owns that transition, preventing two markers
-    # for the same reset.
+    # A 5-hour reset can be observed after immediate consumption, or while the
+    # quota remains full. Compare only complete observations from one limit
+    # group and anchor the event to the first sample carrying the materially
+    # advanced deadline. A scheduled crossing already identified above owns
+    # that transition, preventing two markers for the same reset.
     previous_five = None
     for current in rows:
         current_pct, current_deadline = current[1], current[2]
@@ -505,6 +508,7 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
 
         previous = previous_five
         previous_pct, previous_deadline = previous[1], previous[2]
+        refill_change = current_pct - previous_pct
         scheduled_crossing = (previous_deadline, previous[6]) in scheduled_5h_cycles
         if (
             previous[6] is not None
@@ -513,9 +517,18 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             and isinstance(previous_pct, (int, float))
             and isinstance(previous_deadline, int)
             and not scheduled_crossing
-            and previous_pct == 100
-            and current_pct == 100
-            and current_deadline > previous_deadline
+            and current_deadline
+                >= previous_deadline + OBSERVED_FIVE_HOUR_RESET_MIN_DEADLINE_ADVANCE_SECONDS
+            and (
+                (previous_pct == 100 and current_pct == 100)
+                or (
+                    refill_change > 0
+                    and (
+                        refill_change >= OBSERVED_FIVE_HOUR_RESET_MIN_CHANGE_PCT
+                        or current_pct >= OBSERVED_FIVE_HOUR_RESET_FULL_REFILL_PCT
+                    )
+                )
+            )
         ):
             connection.execute(
                 """

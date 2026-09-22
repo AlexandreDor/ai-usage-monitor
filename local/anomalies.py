@@ -30,6 +30,13 @@ RESET_MISSING_CONFIRMATIONS = 2
 RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT = 20.0
 RANDOM_WEEKLY_RESET_FULL_REFILL_PCT = 98.0
 RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS = 30 * 60
+# The 5-hour API can expose a freshly started cycle only after some of its
+# quota has already been consumed.  Use the same conservative refill evidence
+# as the weekly detector so a real 26% -> 87% rollover is not reported as an
+# anomaly merely because no poll observed the transient 100% value.
+OBSERVED_FIVE_HOUR_RESET_MIN_CHANGE_PCT = 20.0
+OBSERVED_FIVE_HOUR_RESET_FULL_REFILL_PCT = 98.0
+OBSERVED_FIVE_HOUR_RESET_MIN_DEADLINE_ADVANCE_SECONDS = 30 * 60
 WINDOWS = (("5h", "five_h_pct", "five_h_reset_at"),
            ("weekly", "weekly_pct", "weekly_reset_at"))
 ANOMALY_TYPES = (
@@ -152,13 +159,32 @@ def _weekly_reset(previous_pct: float, current_pct: float,
 def _observed_five_hour_reset(previous_pct: float, current_pct: float,
                               previous_reset: int | None,
                               current_reset: int | None) -> bool:
-    """Recognize a full 5-hour cycle whose quota stayed at 100%."""
+    """Recognize a materially advanced 5-hour cycle.
+
+    A full-to-full transition remains useful evidence, but small reset-time
+    estimate drift must not manufacture another cycle.  A partially consumed
+    refill is accepted when it has the same evidence threshold as a random
+    weekly refill.
+    """
     if previous_reset is None or current_reset is None:
         return False
+    deadline_advanced = (
+        current_reset
+        >= previous_reset + OBSERVED_FIVE_HOUR_RESET_MIN_DEADLINE_ADVANCE_SECONDS
+    )
+    change = current_pct - previous_pct
     return (
-        previous_pct == 100
-        and current_pct == 100
-        and current_reset > previous_reset
+        deadline_advanced
+        and (
+            (previous_pct == 100 and current_pct == 100)
+            or (
+                change > 0
+                and (
+                    change >= OBSERVED_FIVE_HOUR_RESET_MIN_CHANGE_PCT
+                    or current_pct >= OBSERVED_FIVE_HOUR_RESET_FULL_REFILL_PCT
+                )
+            )
+        )
     )
 
 

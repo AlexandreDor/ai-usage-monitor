@@ -57,7 +57,7 @@ export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
 DISCORD_WEBHOOK='https://discord.com/api/webhooks/123/token'
 TELEGRAM_BOT_TOKEN='' TELEGRAM_CHAT_ID=''
 old_five_deadline=$((2000000100 + 300))
-new_five_deadline=$((old_five_deadline + 900))
+new_five_deadline=$((old_five_deadline + 30 * 60))
 check_thresholds 100 100 later unknown "$old_five_deadline" '' 2000000100 group-a >/dev/null
 python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
 import pathlib
@@ -75,6 +75,47 @@ items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
 print(sum(item["kind"] == "reset" and item["status"] == "pending" for item in items))
 PYEOF
 )" "observed 5h reset was queued in the network journal"
+
+# A materially refilled 5-hour cycle was already started by user activity.
+# Announce it once, keep its real next deadline armed after acknowledgement,
+# and do not let the superseded deadline emit another reset.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-consumed"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERT_THRESHOLDS=0
+consumed_start=2000001050
+consumed_old_deadline=$((consumed_start + 2 * 60 * 60))
+consumed_observed_at=$((consumed_start + 300))
+consumed_new_deadline=$((consumed_observed_at + 5 * 60 * 60))
+check_thresholds 26 100 later unknown "$consumed_old_deadline" '' "$consumed_start" group-a >/dev/null
+check_thresholds 87 100 later unknown "$consumed_new_deadline" '' "$consumed_observed_at" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "consumed observed reset was not delivered once"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and "Reset detected" in item["message"]]
+assert len(resets) == 1, items
+assert resets[0]["status"] == "delivered", resets[0]
+PYEOF
+assert_eq "$consumed_new_deadline" \
+  "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "observed reset acknowledgement cleared the new cycle"
+assert_eq 87 "$(awk -F= '$1 == "prev_5h_pct" {print $2}' "$STATE_FILE")" \
+  "consumed observed reset reset its threshold baseline to 100"
+check_thresholds 0 100 later unknown "$consumed_new_deadline" '' "$((consumed_start + 900))" group-a >/dev/null
+assert_eq 2 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "consumed cycle did not emit exactly one low-balance alert"
+check_thresholds 0 100 later unknown "$consumed_new_deadline" '' "$((consumed_old_deadline + 1))" group-a >/dev/null
+assert_eq 2 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "superseded deadline emitted a stale reset"
+consumed_next_deadline=$((consumed_new_deadline + 5 * 60 * 60))
+check_thresholds 100 100 later unknown "$consumed_next_deadline" '' "$((consumed_new_deadline + 1))" group-a >/dev/null
+assert_eq 3 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "next scheduled reset was not delivered exactly once"
 ALERT_THRESHOLDS=75
 TELEGRAM_BOT_TOKEN='123:token'
 TELEGRAM_CHAT_ID=-456
@@ -89,7 +130,7 @@ ALERTS_ENABLED=0
 ALERT_THRESHOLDS=75
 armed_observation_at=2000001100
 armed_old_deadline=$((armed_observation_at + 3600))
-armed_new_deadline=$((armed_old_deadline + 900))
+armed_new_deadline=$((armed_old_deadline + 30 * 60))
 check_thresholds 100 100 later unknown "$armed_old_deadline" '' "$armed_observation_at" group-a >/dev/null
 armed_limit_id="$(canonicalize_alert_limit_id group-a)"
 python3 - "$STATE_FILE" "$armed_old_deadline" "$armed_limit_id" <<'PYEOF'
@@ -143,7 +184,7 @@ ALERTS_ENABLED=1
 ALERT_THRESHOLDS=50
 restored_now=2000002050
 restored_old_deadline=$((restored_now + 3600))
-restored_new_deadline=$((restored_old_deadline + 900))
+restored_new_deadline=$((restored_old_deadline + 30 * 60))
 restored_limit_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -208,7 +249,7 @@ chmod 700 "$due_missing_hook"
 export DUE_MISSING_HOOK_LOG="$due_missing_hook_log"
 due_missing_now=2000015000
 due_missing_old=$((due_missing_now - 60))
-due_missing_new=$((due_missing_old + 900))
+due_missing_new=$((due_missing_old + 30 * 60))
 due_missing_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -256,7 +297,7 @@ rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-due-observed-existing-journal"
 due_existing_now=2000016000
 due_existing_old=$((due_existing_now - 60))
-due_existing_new=$((due_existing_old + 900))
+due_existing_new=$((due_existing_old + 30 * 60))
 due_existing_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -326,7 +367,7 @@ rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-due-observed-expiry-retry"
 retry_now=2000017000
 retry_old=$((retry_now - 60))
-retry_new=$((retry_old + 900))
+retry_new=$((retry_old + 30 * 60))
 retry_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -455,7 +496,7 @@ chmod 700 "$restart_hook"
 export RESTART_HOOK_LOG="$restart_hook_log"
 restart_now=2000002500
 restart_old_deadline=$((restart_now + 1800))
-restart_new_deadline=$((restart_old_deadline + 900))
+restart_new_deadline=$((restart_old_deadline + 30 * 60))
 restart_limit_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -540,7 +581,7 @@ chmod 700 "$wal_hook"
 export WAL_HOOK_LOG="$wal_hook_log"
 wal_now=2000007000
 wal_old_deadline=$((wal_now + 1800))
-wal_new_deadline=$((wal_old_deadline + 900))
+wal_new_deadline=$((wal_old_deadline + 30 * 60))
 wal_limit_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -627,7 +668,7 @@ export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-reconcile-failure"
 export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
 reconcile_fail_now=2000009000
 reconcile_fail_old=$((reconcile_fail_now + 1800))
-reconcile_fail_new=$((reconcile_fail_old + 900))
+reconcile_fail_new=$((reconcile_fail_old + 30 * 60))
 reconcile_fail_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -675,7 +716,7 @@ export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-stale-arm-crash"
 export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
 stale_arm_crash_now=2000011000
 stale_arm_crash_old=$((stale_arm_crash_now + 1800))
-stale_arm_crash_new=$((stale_arm_crash_old + 900))
+stale_arm_crash_new=$((stale_arm_crash_old + 30 * 60))
 stale_arm_crash_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -750,7 +791,7 @@ run_restored_incoherent_arm_case() {
   local case_now=2000005000
   local case_old_deadline=$((case_now + 1800))
   local case_arm_deadline=$((case_now + 3600))
-  local case_new_deadline=$((case_old_deadline + 900))
+  local case_new_deadline=$((case_old_deadline + 30 * 60))
   local case_limit_id case_cycle
   rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
   export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-${case_name}"
@@ -1010,7 +1051,7 @@ ALERTS_ENABLED=1
 ALERT_THRESHOLDS=50
 retry_observation_at=2000002100
 retry_old_deadline=$((retry_observation_at + 3600))
-retry_new_deadline=$((retry_old_deadline + 900))
+retry_new_deadline=$((retry_old_deadline + 30 * 60))
 check_thresholds 100 100 later unknown "$retry_old_deadline" '' "$retry_observation_at" group-a >/dev/null
 retry_limit_id="$(canonicalize_alert_limit_id group-a)"
 python3 - "$STATE_FILE" "$retry_old_deadline" "$retry_limit_id" <<'PYEOF'
@@ -1071,7 +1112,7 @@ ALERTS_ENABLED=1
 ALERT_THRESHOLDS=50
 no_arm_retry_now=2000002700
 no_arm_retry_old=$((no_arm_retry_now + 1800))
-no_arm_retry_new=$((no_arm_retry_old + 900))
+no_arm_retry_new=$((no_arm_retry_old + 30 * 60))
 no_arm_retry_id="$(canonicalize_alert_limit_id group-a)"
 check_thresholds 100 100 later unknown "$no_arm_retry_old" '' \
   "$no_arm_retry_now" group-a >/dev/null
@@ -1355,7 +1396,7 @@ ALERTS_ENABLED=1
 ALERT_THRESHOLDS=50
 live_now=2000004000
 live_old_reset=$((live_now + 3600))
-live_new_reset=$((live_old_reset + 900))
+live_new_reset=$((live_old_reset + 30 * 60))
 check_thresholds 100 100 later later "$live_old_reset" "$live_old_reset" "$live_now" group-a >/dev/null
 check_thresholds 80 80 unknown unknown '' '' "$((live_now + 1))" group-b >/dev/null
 check_thresholds 100 100 later later "$live_new_reset" "$live_new_reset" "$((live_now + 2))" group-a >/dev/null
@@ -2038,7 +2079,7 @@ chmod 700 "${no_arm_hook}"
 export NO_ARM_HOOK_LOG="${no_arm_hook_log}"
 no_arm_hook_now=2000002300
 no_arm_hook_old=$((no_arm_hook_now + 1800))
-no_arm_hook_new=$((no_arm_hook_old + 900))
+no_arm_hook_new=$((no_arm_hook_old + 30 * 60))
 check_thresholds 100 100 later unknown "${no_arm_hook_old}" '' \
   "${no_arm_hook_now}" group-a >/dev/null
 printf '{"schema_version":2,"limit_id_contract_version":1,"legacy_migration":{"source_state_version":5,"completed_at":%s},"alerts":[]}\n' \

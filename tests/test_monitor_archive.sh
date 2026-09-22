@@ -383,7 +383,7 @@ PYEOF
 rm -f "$ARCHIVE_FILE"
 five_observed_before=$((BASE - 900))
 five_observed_previous_deadline=$((BASE + 4 * 3600))
-five_observed_current_deadline=$((five_observed_previous_deadline + 900))
+five_observed_current_deadline=$((five_observed_previous_deadline + 30 * 60))
 printf '{"five_h_pct":100,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
   "$five_observed_previous_deadline" "$(iso_at "$five_observed_before")" \
   | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
@@ -413,13 +413,81 @@ with sqlite3.connect(sys.argv[1]) as connection:
 PYEOF
 )" "observed 5h reset reconstruction created duplicates"
 
+# Immediate use can hide the transient 100% value. A substantial refill with
+# a materially advanced deadline is still one observed 5-hour reset.
+rm -f "$ARCHIVE_FILE"
+five_consumed_before=$((BASE - 900))
+five_consumed_previous_deadline=$((BASE + 2 * 3600))
+five_consumed_current_deadline=$((BASE + 5 * 3600))
+printf '{"five_h_pct":26,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_consumed_previous_deadline" "$(iso_at "$five_consumed_before")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":87,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_consumed_current_deadline" "$(iso_at "$BASE")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '1' "$(python3 - "$ARCHIVE_FILE" "$BASE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    rows = connection.execute(
+        "SELECT reset_at_epoch, before_pct, after_pct, detection_method "
+        "FROM reset_events WHERE window = '5h'"
+    ).fetchall()
+assert rows == [(int(sys.argv[2]), 26.0, 87.0, "observed_refill")], rows
+print(len(rows))
+PYEOF
+)" "consumed 5h refill was not derived as an observed reset"
+
+# Once the old deadline has actually crossed, the same partial refill remains
+# a scheduled reset rather than being reclassified as an early observation.
+rm -f "$ARCHIVE_FILE"
+five_due_before=$((BASE - 900))
+five_due_deadline=$((BASE - 60))
+five_due_next_deadline=$((BASE + 5 * 3600))
+printf '{"five_h_pct":26,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_due_deadline" "$(iso_at "$five_due_before")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":87,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_due_next_deadline" "$(iso_at "$BASE")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '1' "$(python3 - "$ARCHIVE_FILE" "$five_due_deadline" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    rows = connection.execute(
+        "SELECT reset_at_epoch, before_pct, after_pct, detection_method "
+        "FROM reset_events WHERE window = '5h'"
+    ).fetchall()
+assert rows == [(int(sys.argv[2]), 26.0, 87.0, "scheduled_crossing")], rows
+print(len(rows))
+PYEOF
+)" "due consumed 5h refill lost scheduled-reset priority"
+
+# A few seconds of deadline estimate drift is not a second cycle.
+rm -f "$ARCHIVE_FILE"
+five_drift_before=$((BASE - 900))
+five_drift_deadline=$((BASE + 4 * 3600))
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$five_drift_deadline" "$(iso_at "$five_drift_before")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":100,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$((five_drift_deadline + 9))" "$(iso_at "$BASE")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+assert_eq '0' "$(python3 - "$ARCHIVE_FILE" <<'PYEOF'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    print(connection.execute("SELECT COUNT(*) FROM reset_events WHERE window = '5h'").fetchone()[0])
+PYEOF
+)" "small 5h deadline drift fabricated a reset"
+
 # A complete 100% -> 100% pair remains an observed reset when the old
 # deadline crossed between samples.  Archive reconstruction must classify it
 # the same way as the live detector rather than creating a scheduled crossing.
 rm -f "$ARCHIVE_FILE"
 five_crossing_before=$((BASE - 1800))
 five_crossing_old_deadline=$((BASE - 900))
-five_crossing_new_deadline=$((five_crossing_old_deadline + 900))
+five_crossing_new_deadline=$((five_crossing_old_deadline + 30 * 60))
 printf '{"five_h_pct":100,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
   "$five_crossing_old_deadline" "$(iso_at "$five_crossing_before")" \
   | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
@@ -468,7 +536,7 @@ PYEOF
 rm -f "$ARCHIVE_FILE"
 partial_group_five_before=$((BASE - 1800))
 partial_group_five_first_deadline=$((BASE + 4 * 3600))
-partial_group_five_second_deadline=$((partial_group_five_first_deadline + 900))
+partial_group_five_second_deadline=$((partial_group_five_first_deadline + 30 * 60))
 printf '{"five_h_pct":100,"five_h_reset_at":%s,"limit_id":"group-a","scraped_at":"%s"}\n' \
   "$partial_group_five_first_deadline" "$(iso_at "$partial_group_five_before")" \
   | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
