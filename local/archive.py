@@ -484,6 +484,30 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
     for current in rows:
         current_pct, current_deadline = current[1], current[2]
         if not isinstance(current_pct, (int, float)) or not isinstance(current_deadline, int):
+            # A same-owner partial poll may be the first sample after the
+            # scheduled deadline. Keep that cycle even though its quota value
+            # is unknown; a later complete refill cannot create another event.
+            if (
+                previous_five is not None
+                and previous_five[6] is not None
+                and current[6] == previous_five[6]
+                and isinstance(previous_five[2], int)
+                and previous_five[0] < previous_five[2] <= current[0]
+                and reset_observation_gap_acceptable(
+                    previous_five[0], current[0], previous_five[5], current[5]
+                )
+            ):
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO reset_events (
+                        window, reset_at_epoch, observed_at_epoch,
+                        before_pct, after_pct, detection_method
+                    ) VALUES ('5h', ?, ?, ?, ?, 'scheduled_crossing')
+                    """,
+                    (previous_five[2], current[0], previous_five[1],
+                     current_pct if isinstance(current_pct, (int, float)) else None),
+                )
+                scheduled_5h_cycles.add((previous_five[2], previous_five[6]))
             # A partial observation from another (or unknown) group breaks the
             # retained complete baseline.  Keeping A across A -> B(partial) ->
             # A would compare non-adjacent groups and fabricate an observed

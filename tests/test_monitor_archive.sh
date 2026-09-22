@@ -438,6 +438,34 @@ print(len(rows))
 PYEOF
 )" "consumed 5h refill was not derived as an observed reset"
 
+# The scheduled deadline may first be observed in a partial sample. The later
+# complete 26 -> 87 refill then belongs to that one scheduled cycle.
+rm -f "$ARCHIVE_FILE"
+partial_five_before=$((BASE - 300))
+partial_five_deadline=$((BASE - 100))
+partial_five_sample=$((BASE - 99))
+partial_five_new=$((BASE + 5 * 3600))
+printf '{"five_h_pct":26,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$partial_five_deadline" "$(iso_at "$partial_five_before")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"weekly_pct":100,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$(iso_at "$partial_five_sample")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+printf '{"five_h_pct":87,"five_h_reset_at":%s,"scraped_at":"%s","limit_id":"test"}\n' \
+  "$partial_five_new" "$(iso_at "$BASE")" \
+  | python3 "$ARCHIVE_SCRIPT" --database "$ARCHIVE_FILE" --history "$HISTORY_FILE" --retention-days 365
+python3 - "$ARCHIVE_FILE" "$partial_five_deadline" "$partial_five_sample" <<'PYEOF'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    rows = connection.execute(
+        "SELECT reset_at_epoch, observed_at_epoch, detection_method "
+        "FROM reset_events WHERE window = '5h'"
+    ).fetchall()
+assert rows == [(int(sys.argv[2]), int(sys.argv[3]), "scheduled_crossing")], rows
+PYEOF
+
 # Archive reconstruction uses the same observation-gap bound as the live and
 # anomaly detectors. A long interruption cannot turn two stale snapshots into
 # direct evidence of one observed rollover.

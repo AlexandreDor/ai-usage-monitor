@@ -3095,10 +3095,21 @@ check_thresholds() {
       "$last_five_h_sample_interval_seconds" "$sample_interval_seconds"; then
     five_h_gap_within_archive_bound=0
   fi
+  # Pre-upgrade state has no timestamp for its complete 5h baseline. Keep the
+  # historical full-to-full signal, but require a dated baseline before
+  # inferring the newly supported partially consumed refill.
   if (( five_h_observation_valid == 1 && five_h_gap_within_archive_bound == 1 )) \
+    && { (( last_five_h_sampled_at_epoch > 0 )) \
+         || [[ "$observed_5h_pct" == 100 && "$five_h_pct" == 100 ]]; } \
     && [[ -n "$observed_5h_limit_id" && "$limit_id" == "$observed_5h_limit_id" ]] \
     && is_observed_5h_reset "$observed_5h_pct" "$five_h_pct" \
-      "$observed_5h_reset_at" "$five_h_reset_at"; then
+      "$observed_5h_reset_at" "$five_h_reset_at" \
+    && [[ "$last_notified_5h_reset_at" != "$observed_5h_reset_at" ]] \
+    && ! { (( script_5h_reset_attempted_at == observed_5h_reset_at \
+               && observed_5h_reset_at > 0 )) \
+           && journal_has_network_reset_occurrence 5h \
+             "limit:${limit_id}|reset:${observed_5h_reset_at}" \
+             "$limit_id" "$observed_5h_reset_at"; }; then
     if is_consumed_observed_5h_reset "$observed_5h_pct" "$five_h_pct" \
       "$observed_5h_reset_at" "$five_h_reset_at"; then
       consumed_observed_5h_reset=1
@@ -3114,17 +3125,14 @@ check_thresholds() {
       observed_5h_reset_candidate=1
     fi
   fi
-  if (( observed_5h_reset_candidate == 1 )); then
-    # A durable consumed-reset intent is single-owner. If another owner proves
-    # its own refill while that intent is still pending, defer the new sample
-    # without advancing its baseline. The foreign intent is replayed below and
-    # the current owner can prove the same reset again on its next fresh poll.
-    if (( consumed_observed_5h_reset == 1 && foreign_consumed_5h_intent == 1 )); then
-      observed_5h_reset_candidate=0
-      consumed_observed_5h_reset=0
-      process_5h_sample=0
-      five_h_observation_valid=0
-    fi
+  # A foreign durable intent owns the one preserve-cycle slot. Defer either
+  # kind of observed refill from the current owner until that intent finishes;
+  # retain the prior complete baseline so the next poll can classify it.
+  if (( observed_5h_reset_candidate == 1 && foreign_consumed_5h_intent == 1 )); then
+    observed_5h_reset_candidate=0
+    consumed_observed_5h_reset=0
+    process_5h_sample=0
+    five_h_observation_valid=0
   fi
   if (( observed_5h_reset_candidate == 1 )); then
     if (( consumed_observed_5h_reset == 1 \
@@ -4069,14 +4077,8 @@ check_thresholds() {
       five_h_armed_reset_at=0
       five_h_armed_limit_id=""
     fi
-    # Clear the write-ahead intent only after the detector has fully rotated.
-    # Any state write before this point must retain enough data to replay both
-    # the immutable journal registration and the new-cycle transition.
-    pending_consumed_5h_reset_at=0
-    pending_consumed_5h_reset_limit_id=""
-    pending_consumed_5h_remaining_pct=""
-    pending_consumed_5h_next_reset_at=0
-    pending_consumed_5h_superseded_reset_at=0
+    # The detector has rotated, but the write-ahead intent still protects a
+    # pending network delivery if a different owner arrives before its retry.
     observed_5h_reset=0
   fi
 
@@ -4385,12 +4387,12 @@ PYEOF
       if ! reconcile_alert_deliveries "$scraped_at_epoch" "$limit_id" "$discard_other_group_terminal"; then
         NETWORK_DELIVERY_ERROR=1
         ALERT_PROCESSING_ERROR="alert reconciliation failed"
-      elif [[ -n "$foreign_consumed_5h_preserve_cycle" ]] \
+      elif (( pending_consumed_5h_reset_at > 0 )) \
         && ! journal_has_pending_alert reset 5h reset \
-          "$foreign_consumed_5h_preserve_cycle"; then
-        # Registration/delivery is now durable in the journal. Clearing only
-        # after reconciliation prevents a crash from exposing the pending
-        # foreign occurrence to the next owner-interruption pass.
+          "limit:${pending_consumed_5h_reset_limit_id}|reset:${pending_consumed_5h_reset_at}"; then
+        # Keep the intent across owner changes and transport retries. The
+        # journal has now made the occurrence terminal, so it no longer needs
+        # protection from the next owner-interruption pass.
         pending_consumed_5h_reset_at=0
         pending_consumed_5h_reset_limit_id=""
         pending_consumed_5h_remaining_pct=""

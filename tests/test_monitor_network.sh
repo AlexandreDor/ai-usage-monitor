@@ -299,6 +299,131 @@ resets = [item for item in items if item["kind"] == "reset"
 assert len(resets) == 1, items
 assert resets[0]["status"] == "delivered", resets
 PYEOF
+
+# A transport failure leaves A's registered occurrence pending after detector
+# rotation. Switching to B must preserve A until its retry succeeds.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-consumed-transport-owner-switch"
+transport_start=2000001100
+transport_a_old=$((transport_start + 7200))
+transport_a_observed=$((transport_start + 300))
+transport_a_new=$((transport_a_observed + 18000))
+export FAKE_CURL_DISCORD_STATUS=503
+check_thresholds 26 100 later unknown "$transport_a_old" '' "$transport_start" group-a >/dev/null
+if check_thresholds 87 100 later unknown "$transport_a_new" '' \
+  "$transport_a_observed" group-a >/dev/null 2>&1; then
+  fail "transport failure was accepted for consumed reset"
+fi
+assert_eq "$transport_a_observed" \
+  "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "transport failure lost A's recovery intent"
+transport_b_at=$((transport_a_observed + 1))
+transport_b_old=$((transport_b_at + 7200))
+if check_thresholds 100 100 later unknown "$transport_b_old" '' \
+  "$transport_b_at" group-b >/dev/null 2>&1; then
+  fail "pending foreign delivery failure was accepted"
+fi
+assert_eq "$transport_a_observed" \
+  "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "owner switch discarded A's pending delivery intent"
+
+# B's full-to-full refill must also wait behind A's intent. Its complete
+# baseline stays unchanged, and the next poll can classify B after A finishes.
+transport_b_refill=$((transport_b_at + 300))
+transport_b_new=$((transport_b_old + 1800))
+if check_thresholds 100 100 later unknown "$transport_b_new" '' \
+  "$transport_b_refill" group-b >/dev/null 2>&1; then
+  fail "pending foreign delivery failure was accepted during B refill"
+fi
+assert_eq "$transport_b_old" \
+  "$(awk -F= '$1 == "observed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "deferred full-to-full refill advanced B's baseline"
+export FAKE_CURL_DISCORD_STATUS=204
+check_thresholds 100 100 later unknown "$transport_b_new" '' \
+  "$((transport_b_refill + 1))" group-b >/dev/null
+assert_eq 0 "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "successful A retry retained its intent"
+check_thresholds 100 100 later unknown "$transport_b_new" '' \
+  "$((transport_b_refill + 2))" group-b >/dev/null
+python3 - "$ALERT_DELIVERIES_FILE" "$(canonicalize_alert_limit_id group-a)" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and "Reset detected" in item["message"]]
+assert len(resets) == 1, items
+assert resets[0]["event_data"]["limit_id"] == sys.argv[2], resets
+assert resets[0]["status"] == "delivered", resets
+PYEOF
+
+# A pre-upgrade state has no timestamp for its stored complete 5h baseline.
+# Its first post-upgrade sample cannot establish a recent refill pair.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-consumed-undated-baseline"
+legacy_sample=2000001200
+legacy_old=$((legacy_sample + 7200))
+legacy_new=$((legacy_old + 1800))
+legacy_owner="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' 'state_version=5' 'limit_id_contract_version=1' \
+  'observed_5h_pct=26' "observed_5h_reset_at=${legacy_old}" \
+  "observed_5h_limit_id=${legacy_owner}" \
+  "five_h_armed_reset_at=${legacy_old}" "five_h_armed_limit_id=${legacy_owner}" \
+  > "$STATE_FILE"
+check_thresholds 87 100 later unknown "$legacy_new" '' "$legacy_sample" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "undated legacy baseline caused a false observed reset"
+assert_eq "$legacy_sample" \
+  "$(awk -F= '$1 == "last_five_h_sampled_at_epoch" {print $2}' "$STATE_FILE")" \
+  "first post-upgrade sample did not establish a dated baseline"
+
+# A partial sample after the old deadline reports the scheduled reset. The
+# next complete 26 -> 87 comparison must not emit an observed duplicate.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-consumed-after-partial-scheduled"
+partial_start=2000001300
+partial_old=$((partial_start + 300))
+partial_at=$((partial_old + 1))
+partial_full=$((partial_at + 1))
+partial_new=$((partial_full + 18000))
+check_thresholds 26 100 later unknown "$partial_old" '' "$partial_start" group-a >/dev/null
+check_thresholds '' 100 unknown unknown '' '' "$partial_at" group-a >/dev/null
+check_thresholds 87 100 later unknown "$partial_new" '' "$partial_full" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "partial scheduled crossing emitted a duplicate observed reset"
+python3 - "$ALERT_DELIVERIES_FILE" "$partial_old" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and item["window"] == "5h" and item["status"] == "delivered"]
+assert len(resets) == 1, items
+assert resets[0]["event_data"]["reset_epoch"] == int(sys.argv[2]), resets
+PYEOF
+
+# The same classification must hold while the scheduled network occurrence is
+# pending a retry; its successful delivery may happen on the later full poll.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-consumed-after-partial-pending"
+export FAKE_CURL_DISCORD_STATUS=503
+check_thresholds 26 100 later unknown "$partial_old" '' "$partial_start" group-a >/dev/null
+if check_thresholds '' 100 unknown unknown '' '' "$partial_at" group-a >/dev/null 2>&1; then
+  fail "scheduled partial delivery failure was accepted"
+fi
+export FAKE_CURL_DISCORD_STATUS=204
+check_thresholds 87 100 later unknown "$partial_new" '' "$partial_full" group-a >/dev/null
+python3 - "$ALERT_DELIVERIES_FILE" "$partial_old" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset" and item["window"] == "5h"]
+assert len(resets) == 1, items
+assert resets[0]["event_data"]["reset_epoch"] == int(sys.argv[2]), resets
+assert resets[0]["status"] == "delivered", resets
+PYEOF
+export FAKE_CURL_DISCORD_STATUS=204
 ALERT_THRESHOLDS=75
 TELEGRAM_BOT_TOKEN='123:token'
 TELEGRAM_CHAT_ID=-456
