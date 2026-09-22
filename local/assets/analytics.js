@@ -6,7 +6,7 @@ const BREAKDOWN_PAGE_SIZE = 50;
 const PARIS_ZONE = 'Europe/Paris';
 const EMPTY_VALUE = '-';
 const PRICE_WARNING_PATTERN = /^No catalog price; assumed zero: (.+)$/u;
-const GPT_MODELS = Object.freeze(['gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-6-astra']);
+const GPT_MODELS = Object.freeze(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6-astra']);
 const state = {
   range: '30d',
   sources: ['codex', 'opencode', 'hermes'],
@@ -582,12 +582,14 @@ function renderWeeklyLimitValueTable(points) {
 }
 let weeklyValueData = {};
 const weeklyValueSelection = new Map();
-const weeklyValueDefaults = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-astra'];
-const weeklyValueColors = ['#38bdf8', '#a78bfa', '#34d399', '#fbbf24', '#fb7185', '#60a5fa', '#f97316'];
+const weeklyValueDefaults = GPT_MODELS;
+const weeklyValueColors = ['#38bdf8', '#a78bfa', '#34d399', '#fbbf24', '#fb7185', '#60a5fa', '#f97316', '#e879f9', '#2dd4bf'];
 const weeklyValueModelColors = new Map([
   ['gpt-5.6-luna', '#a78bfa'],
   ['gpt-5.6-terra', '#34d399'],
   ['gpt-5.6-sol', '#fbbf24'],
+  ['gpt-6-luna', '#60a5fa'],
+  ['gpt-6-sol', '#f97316'],
   ['gpt-6-astra', '#fb7185'],
 ]);
 function weeklyValueModelKey(model) {
