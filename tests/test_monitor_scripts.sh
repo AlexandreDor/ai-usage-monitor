@@ -131,7 +131,7 @@ ALERT_SCRIPT_1="$HOOK_ONE"
 ALERT_SCRIPT_1_EVENTS='5h:reset'
 validate_config
 old_five_deadline=$((now + 300))
-new_five_deadline=$((old_five_deadline + 15 * 60))
+new_five_deadline=$((old_five_deadline + 30 * 60))
 check_thresholds 100 100 later later "$old_five_deadline" '' "$now" group-a
 check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 900))" group-a
 check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 1800))" group-a
@@ -139,6 +139,28 @@ assert_eq 1 "$(wc -l < "$HOOK_LOG")" "observed 5h reset script was replayed"
 assert_contains "$(head -n 1 "$HOOK_LOG")" '|5h|reset|1|' "observed 5h reset event contract"
 assert_contains "$(head -n 1 "$HOOK_LOG")" "|eof|present|100|$((now + 900))|later|$((now + 900))|" "observed reset hook context"
 assert_contains "$(head -n 1 "$HOOK_LOG")" "|$((now + 900))|" "observed reset was not anchored to its observation"
+
+# A materially refilled cycle that was already consumed is an external
+# observed reset. It notifies and rotates detector state without running the
+# reset hook; the next genuinely scheduled reset remains hook-eligible.
+reset_case
+ALERT_SCRIPT_1="$HOOK_ONE"
+ALERT_SCRIPT_1_EVENTS='5h:reset'
+validate_config
+consumed_old_deadline=$((now + 2 * 60 * 60))
+consumed_observed_at=$((now + 300))
+consumed_new_deadline=$((consumed_observed_at + 5 * 60 * 60))
+check_thresholds 26 100 later unknown "$consumed_old_deadline" '' "$now" group-a
+check_thresholds 87 100 later unknown "$consumed_new_deadline" '' "$consumed_observed_at" group-a
+[[ ! -e "$HOOK_LOG" ]] || fail "consumed observed reset executed its reset hook"
+assert_eq "$consumed_new_deadline" "$(state_value five_h_armed_reset_at)" \
+  "consumed observed reset did not keep its real deadline armed"
+assert_eq 87 "$(state_value script_prev_5h_pct)" \
+  "consumed observed reset did not preserve the hook baseline"
+consumed_next_deadline=$((consumed_new_deadline + 5 * 60 * 60))
+check_thresholds 100 100 later unknown "$consumed_next_deadline" '' "$((consumed_new_deadline + 1))" group-a
+assert_eq 1 "$(wc -l < "$HOOK_LOG")" \
+  "scheduled reset after consumed observation did not execute its hook"
 
 # A crash after the durable pending intent but before run_alert_script must
 # leave the action non-terminal. The restart retries the same local-only reset
@@ -150,7 +172,7 @@ ALERT_SCRIPT_1="$HOOK_ONE"
 ALERT_SCRIPT_1_EVENTS='5h:reset'
 validate_config
 crash_old_five_deadline=$((now + 300))
-crash_new_five_deadline=$((crash_old_five_deadline + 900))
+crash_new_five_deadline=$((crash_old_five_deadline + 30 * 60))
 check_thresholds 100 100 later later "$crash_old_five_deadline" '' "$now" group-a
 (
   # shellcheck disable=SC2317,SC2329
@@ -240,7 +262,7 @@ ALERT_SCRIPT_1="$HOOK_ONE"
 ALERT_SCRIPT_1_EVENTS='5h:reset'
 validate_config
 retry_old_five_deadline=$((now + 3600))
-retry_new_five_deadline=$((retry_old_five_deadline + 900))
+retry_new_five_deadline=$((retry_old_five_deadline + 30 * 60))
 check_thresholds 100 100 later unknown "$retry_old_five_deadline" '' "$now" group-a
 # Inject failure at the atomic observed-reset transaction actually used by
 # monitor.sh.  The old invalidate_pending_thresholds_for_owner hook is no
@@ -922,7 +944,7 @@ ALERT_SCRIPT_1="$HOOK_ONE"
 ALERT_SCRIPT_1_EVENTS='5h:reset'
 validate_config
 old_five_deadline=$((now + 300))
-new_five_deadline=$((old_five_deadline + 900))
+new_five_deadline=$((old_five_deadline + 30 * 60))
 check_thresholds 100 100 later unknown "$old_five_deadline" '' "$now" group-a
 check_thresholds 100 100 later unknown "$new_five_deadline" '' "$((now + 900))" group-a
 [[ ! -e "$HOOK_LOG" ]] || fail "disabled observed 5h reset executed its hook"

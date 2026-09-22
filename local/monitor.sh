@@ -54,6 +54,9 @@ INVALID_ALERT_SCRIPT_CONFIG=0
 RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT=20
 RANDOM_WEEKLY_RESET_FULL_REFILL_PCT=98
 RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS=$((30 * 60))
+OBSERVED_FIVE_HOUR_RESET_MIN_CHANGE_PCT=20
+OBSERVED_FIVE_HOUR_RESET_FULL_REFILL_PCT=98
+OBSERVED_FIVE_HOUR_RESET_MIN_DEADLINE_ADVANCE_SECONDS=$((30 * 60))
 
 usage() {
   cat <<EOF
@@ -826,9 +829,14 @@ configured_alert_channels_json() {
 
 network_reset_request_json() {
   local window="$1" limit_id="$2" reset_epoch="$3" created_at="$4"
+  local supplied_message="${5:-}"
   local channels message
   channels="$(configured_alert_channels_json)" || return 1
-  message="$(format_alert_message reset "$window")" || return 1
+  if [[ -n "$supplied_message" ]]; then
+    message="$supplied_message"
+  else
+    message="$(format_alert_message reset "$window")" || return 1
+  fi
   ALERT_REGISTER_MESSAGE="$message" python3 - "$window" "$limit_id" \
     "$reset_epoch" "$created_at" "$channels" <<'PYEOF'
 import json
@@ -1208,9 +1216,14 @@ interrupt_pending_owner() {
 }
 
 interrupt_pending_other_owners() {
-  local current_limit_id="$1" now="$2"
-  python3 "$ALERTS_PY" interrupt-other-owners "$ALERT_DELIVERIES_FILE" \
-    "$current_limit_id" --now "$now"
+  local current_limit_id="$1" now="$2" preserve_cycle="${3:-}"
+  if [[ -n "$preserve_cycle" ]]; then
+    python3 "$ALERTS_PY" interrupt-other-owners "$ALERT_DELIVERIES_FILE" \
+      "$current_limit_id" --preserve-cycle "$preserve_cycle" --now "$now"
+  else
+    python3 "$ALERTS_PY" interrupt-other-owners "$ALERT_DELIVERIES_FILE" \
+      "$current_limit_id" --now "$now"
+  fi
 }
 
 suppress_local_reset_cycle() {
@@ -1306,8 +1319,10 @@ PYEOF
 
 is_reset_observation_gap_acceptable() {
   local previous_at="$1" current_at="$2" previous_interval="$3" current_interval="$4"
-  python3 - "$previous_at" "$current_at" "$previous_interval" "$current_interval" <<'PYEOF'
+  PYTHONPATH="$(dirname "$ANOMALIES_PY")${PYTHONPATH:+:${PYTHONPATH}}" \
+    python3 - "$previous_at" "$current_at" "$previous_interval" "$current_interval" <<'PYEOF'
 import sys
+from anomalies import reset_observation_gap_acceptable
 
 try:
     previous_at, current_at, previous_interval, current_interval = map(int, sys.argv[1:])
@@ -1318,38 +1333,83 @@ except (TypeError, ValueError):
 # prior timestamp exists, use the same conservative bound as archive.py.
 if previous_at <= 0:
     raise SystemExit(0)
-gap = current_at - previous_at
-intervals = [value for value in (previous_interval, current_interval) if value > 0]
-expected_interval = max(intervals, default=900)
-raise SystemExit(0 if 0 < gap <= max(3_600, expected_interval * 2) else 1)
+raise SystemExit(0 if reset_observation_gap_acceptable(
+    previous_at, current_at, previous_interval, current_interval
+) else 1)
 PYEOF
 }
 
-# A 5-hour reset can be observed even when the quota was never consumed.  In
-# that case the only positive evidence is two complete observations at 100%
-# with the same limit group and a strictly later reset deadline.  The first
-# observation carrying the new deadline is used as the event anchor because
-# the exact reset instant is not observable.
+# A 5-hour cycle may already be partly consumed before the first post-reset
+# poll.  Accept either a full-to-full transition or a substantial refill, but
+# require a material deadline advance in both cases so a few seconds of API
+# estimate drift cannot manufacture another reset.
 is_observed_5h_reset() {
   local previous_pct="$1"
   local current_pct="$2"
   local previous_reset_at="$3"
   local current_reset_at="$4"
 
-  python3 - "$previous_pct" "$current_pct" "$previous_reset_at" "$current_reset_at" <<'PYEOF'
+  python3 - "$previous_pct" "$current_pct" "$previous_reset_at" "$current_reset_at" \
+    "$OBSERVED_FIVE_HOUR_RESET_MIN_CHANGE_PCT" \
+    "$OBSERVED_FIVE_HOUR_RESET_FULL_REFILL_PCT" \
+    "$OBSERVED_FIVE_HOUR_RESET_MIN_DEADLINE_ADVANCE_SECONDS" <<'PYEOF'
 import sys
 
 try:
     previous_pct, current_pct = map(float, sys.argv[1:3])
     previous_reset_at, current_reset_at = map(int, sys.argv[3:5])
+    minimum_change, full_refill = map(float, sys.argv[5:7])
+    minimum_deadline_advance = int(sys.argv[7])
 except (TypeError, ValueError):
     raise SystemExit(1)
 
+refill_change = current_pct - previous_pct
 detected = (
-    previous_pct == 100
-    and current_pct == 100
+    current_reset_at >= previous_reset_at + minimum_deadline_advance
     and previous_reset_at > 0
-    and current_reset_at > previous_reset_at
+    and (
+        (previous_pct == 100 and current_pct == 100)
+        or (
+            refill_change > 0
+            and (refill_change >= minimum_change or current_pct >= full_refill)
+        )
+    )
+)
+raise SystemExit(0 if detected else 1)
+PYEOF
+}
+
+# A consumed observed reset means user activity has already started the new
+# 5-hour cycle.  It is a different operational event from the historical
+# full-to-full signal: notify it, rotate detector state to the new deadline,
+# and never spend more quota by running a reset hook for it.
+is_consumed_observed_5h_reset() {
+  local previous_pct="$1"
+  local current_pct="$2"
+  local previous_reset_at="$3"
+  local current_reset_at="$4"
+
+  python3 - "$previous_pct" "$current_pct" "$previous_reset_at" "$current_reset_at" \
+    "$OBSERVED_FIVE_HOUR_RESET_MIN_CHANGE_PCT" \
+    "$OBSERVED_FIVE_HOUR_RESET_FULL_REFILL_PCT" \
+    "$OBSERVED_FIVE_HOUR_RESET_MIN_DEADLINE_ADVANCE_SECONDS" <<'PYEOF'
+import sys
+
+try:
+    previous_pct, current_pct = map(float, sys.argv[1:3])
+    previous_reset_at, current_reset_at = map(int, sys.argv[3:5])
+    minimum_change, full_refill = map(float, sys.argv[5:7])
+    minimum_deadline_advance = int(sys.argv[7])
+except (TypeError, ValueError):
+    raise SystemExit(1)
+
+change = current_pct - previous_pct
+detected = (
+    previous_reset_at > 0
+    and current_reset_at >= previous_reset_at + minimum_deadline_advance
+    and change > 0
+    and (change >= minimum_change or current_pct >= full_refill)
+    and not (previous_pct == 100 and current_pct == 100)
 )
 raise SystemExit(0 if detected else 1)
 PYEOF
@@ -1724,6 +1784,16 @@ clear_weekly_reset_script_actions() {
   suppressed_script_weekly_reset_actions=""
 }
 
+suppress_consumed_observed_5h_reset_scripts() {
+  local rule_position action_id
+  for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_IDS[@]}; rule_position++ )); do
+    [[ "${ALERT_SCRIPT_RULE_EVENTS[$rule_position]}" == "5h:reset" ]] || continue
+    action_id="${ALERT_SCRIPT_RULE_IDS[$rule_position]}"
+    csv_contains "$suppressed_script_5h_reset_actions" "$action_id" \
+      || suppressed_script_5h_reset_actions="${suppressed_script_5h_reset_actions:+${suppressed_script_5h_reset_actions},}${action_id}"
+  done
+}
+
 has_unfinished_reset_script_actions() {
   local window="$1" rule_position action_id event completed_name suppressed_name
   for (( rule_position = 0; rule_position < ${#ALERT_SCRIPT_RULE_IDS[@]}; rule_position++ )); do
@@ -1800,7 +1870,8 @@ if marker is not None:
         raise SystemExit("invalid alert state limit ID contract marker")
     for key in ("observed_5h_limit_id", "observed_weekly_limit_id",
                 "five_h_armed_limit_id", "weekly_armed_limit_id",
-                "pending_observed_weekly_reset_limit_id"):
+                "pending_observed_weekly_reset_limit_id",
+                "pending_consumed_5h_reset_limit_id"):
         value = values.get(key, "")
         if value and not re.fullmatch(r"limit-[0-9a-f]{64}", value):
             raise SystemExit(f"marked alert state contains a raw {key}")
@@ -1816,7 +1887,8 @@ def opaque(value):
 
 for key in ("observed_5h_limit_id", "observed_weekly_limit_id",
             "five_h_armed_limit_id", "weekly_armed_limit_id",
-            "pending_observed_weekly_reset_limit_id"):
+            "pending_observed_weekly_reset_limit_id",
+            "pending_consumed_5h_reset_limit_id"):
     if key in values:
         values[key] = opaque(values[key])
 
@@ -1829,7 +1901,8 @@ for line in lines:
         continue
     if key in {"observed_5h_limit_id", "observed_weekly_limit_id",
                "five_h_armed_limit_id", "weekly_armed_limit_id",
-               "pending_observed_weekly_reset_limit_id"}:
+               "pending_observed_weekly_reset_limit_id",
+               "pending_consumed_5h_reset_limit_id"}:
         value = values[key]
     output.append(f"{key}={value}")
 encoded = ("\n".join(output) + "\n").encode("utf-8")
@@ -2000,6 +2073,8 @@ persist_alert_state() {
     "observed_weekly_pct=${observed_weekly_pct}" \
     "observed_weekly_reset_at=${observed_weekly_reset_at}" \
     "observed_weekly_limit_id=${observed_weekly_limit_id}" \
+    "last_five_h_sampled_at_epoch=${last_five_h_sampled_at_epoch}" \
+    "last_five_h_sample_interval_seconds=${last_five_h_sample_interval_seconds}" \
     "last_sampled_at_epoch=${last_sampled_at_epoch}" \
     "last_sample_interval_seconds=${last_sample_interval_seconds}" \
     "five_h_armed_reset_at=${five_h_armed_reset_at}" \
@@ -2012,6 +2087,11 @@ persist_alert_state() {
     "local_observed_weekly_reset_at=${local_observed_weekly_reset_at}" \
     "pending_observed_weekly_reset_at=${pending_observed_weekly_reset_at}" \
     "pending_observed_weekly_reset_limit_id=${pending_observed_weekly_reset_limit_id}" \
+    "pending_consumed_5h_reset_at=${pending_consumed_5h_reset_at}" \
+    "pending_consumed_5h_reset_limit_id=${pending_consumed_5h_reset_limit_id}" \
+    "pending_consumed_5h_remaining_pct=${pending_consumed_5h_remaining_pct}" \
+    "pending_consumed_5h_next_reset_at=${pending_consumed_5h_next_reset_at}" \
+    "pending_consumed_5h_superseded_reset_at=${pending_consumed_5h_superseded_reset_at}" \
     "notified_5h_thresholds=${notified_5h_thresholds}" \
     "notified_weekly_thresholds=${notified_weekly_thresholds}" \
     "pending_5h_threshold=${pending_5h_threshold}" \
@@ -2745,6 +2825,8 @@ check_thresholds() {
   local observed_weekly_pct=""
   local observed_weekly_reset_at=0
   local observed_weekly_limit_id=""
+  local last_five_h_sampled_at_epoch=0
+  local last_five_h_sample_interval_seconds=900
   local last_sampled_at_epoch=0
   local last_sample_interval_seconds=900
   local five_h_armed_reset_at=0
@@ -2757,6 +2839,11 @@ check_thresholds() {
   local local_observed_weekly_reset_at=0
   local pending_observed_weekly_reset_at=0
   local pending_observed_weekly_reset_limit_id=""
+  local pending_consumed_5h_reset_at=0
+  local pending_consumed_5h_reset_limit_id=""
+  local pending_consumed_5h_remaining_pct=""
+  local pending_consumed_5h_next_reset_at=0
+  local pending_consumed_5h_superseded_reset_at=0
   local notified_5h_thresholds=""
   local notified_weekly_thresholds=""
   local pending_5h_threshold=""
@@ -2787,18 +2874,23 @@ check_thresholds() {
   local thresholds state_key state_value pace t critical status=0 reset_age rule_position script_threshold
   local original_pending cycle_key covered_json registration_status disabled_notified transaction_epoch
   local weekly_cycle_key weekly_request_json
+  local consumed_observed_5h_cycle_key="" consumed_observed_5h_request_json='{}'
+  local consumed_observed_5h_owner="" consumed_observed_5h_remaining_pct=""
+  local consumed_observed_5h_next_reset_at=0
+  local foreign_consumed_5h_intent=0 foreign_consumed_5h_preserve_cycle=""
   local due_5h_reset_at=0 due_weekly_reset_at=0 script_state_error=0 script_hook_error=0 initialize_script_baseline=0
   local weekly_network_request=0 script_actions_started=""
   local observed_weekly_reset=0 five_h_observation_valid=0 weekly_observation_valid=0
   local process_5h_sample=1 process_weekly_sample=1 state_loaded=0
   local initialize_5h_baseline=0 observed_5h_reset=0 observed_5h_reset_candidate=0
+  local consumed_observed_5h_reset=0 consumed_observed_5h_event_at=0
   local observed_5h_scheduled_due=0
   local observed_5h_superseded_reset_at=0 observed_5h_local_tombstone=0
   local observed_5h_reset_recovery=0 observed_5h_atomic_done=0
   local observed_5h_initial_no_arm=0
   local observed_weekly_reset_recovery=0 weekly_intent_succeeded=1
   local observed_weekly_scheduled_due=0 weekly_atomic_done=0
-  local weekly_gap_within_archive_bound=1
+  local five_h_gap_within_archive_bound=1 weekly_gap_within_archive_bound=1
   local interrupted_5h_owner="" interrupted_5h_reset_at=0
   local interrupted_weekly_owner="" interrupted_weekly_reset_at=0
   local previous_local_observed_weekly_reset_at=0
@@ -2825,22 +2917,22 @@ check_thresholds() {
           [[ "$state_value" =~ ^[0-9]+$ ]] || { ALERT_PROCESSING_ERROR="invalid alert state version"; return 1; }
           state_version="$state_value"
           ;;
-        prev_5h_pct|prev_weekly_pct|observed_5h_pct|observed_weekly_pct|script_prev_5h_pct|script_prev_weekly_pct)
+        prev_5h_pct|prev_weekly_pct|observed_5h_pct|observed_weekly_pct|script_prev_5h_pct|script_prev_weekly_pct|pending_consumed_5h_remaining_pct)
           if [[ "$state_value" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
           fi
           ;;
-        observed_5h_reset_at|observed_weekly_reset_at|five_h_armed_reset_at|weekly_armed_reset_at|last_notified_5h_reset_at|last_notified_weekly_reset_at|local_observed_5h_reset_at|local_observed_weekly_reset_at|pending_observed_weekly_reset_at)
+        observed_5h_reset_at|observed_weekly_reset_at|five_h_armed_reset_at|weekly_armed_reset_at|last_notified_5h_reset_at|last_notified_weekly_reset_at|local_observed_5h_reset_at|local_observed_weekly_reset_at|pending_observed_weekly_reset_at|pending_consumed_5h_reset_at|pending_consumed_5h_next_reset_at|pending_consumed_5h_superseded_reset_at)
           if [[ "$state_value" =~ ^[0-9]+$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
           fi
           ;;
-        last_sampled_at_epoch)
+        last_five_h_sampled_at_epoch|last_sampled_at_epoch)
           if [[ "$state_value" =~ ^(0|[1-9][0-9]{0,11})$ ]]; then
             printf -v "$state_key" '%s' "$state_value"
           fi
           ;;
-        last_sample_interval_seconds)
+        last_five_h_sample_interval_seconds|last_sample_interval_seconds)
           if [[ "$state_value" =~ ^[1-9][0-9]{0,4}$ ]] \
             && (( state_value <= 86400 )); then
             printf -v "$state_key" '%s' "$state_value"
@@ -2855,7 +2947,7 @@ check_thresholds() {
         alerts_disabled_since)
           [[ "$state_value" =~ ^[0-9]+$ ]] && alerts_disabled_since="$state_value"
           ;;
-        observed_5h_limit_id|observed_weekly_limit_id|five_h_armed_limit_id|weekly_armed_limit_id|pending_observed_weekly_reset_limit_id)
+        observed_5h_limit_id|observed_weekly_limit_id|five_h_armed_limit_id|weekly_armed_limit_id|pending_observed_weekly_reset_limit_id|pending_consumed_5h_reset_limit_id)
           printf -v "$state_key" '%s' "$state_value"
           ;;
         script_tracking_initialized)
@@ -2972,19 +3064,99 @@ check_thresholds() {
     clear_weekly_script_actions
   fi
 
+  # A consumed-reset network intent owns an immutable observation identity and
+  # enough event data to rebuild its journal request after a crash or write
+  # failure. Keep it independent from the current sample: a retry may be
+  # partial, further consumed, or belong to a different active limit group.
+  if (( pending_consumed_5h_reset_at > 0 )); then
+    if [[ -z "$pending_consumed_5h_reset_limit_id" \
+          || -z "$pending_consumed_5h_remaining_pct" ]] \
+      || (( pending_consumed_5h_next_reset_at <= 0 )); then
+      ALERT_PROCESSING_ERROR="invalid consumed 5h reset intent"
+      return 1
+    fi
+    consumed_observed_5h_event_at="$pending_consumed_5h_reset_at"
+    consumed_observed_5h_owner="$pending_consumed_5h_reset_limit_id"
+    consumed_observed_5h_remaining_pct="$pending_consumed_5h_remaining_pct"
+    consumed_observed_5h_next_reset_at="$pending_consumed_5h_next_reset_at"
+    if [[ "$consumed_observed_5h_owner" == "$limit_id" ]]; then
+      consumed_observed_5h_reset=1
+    else
+      foreign_consumed_5h_intent=1
+    fi
+  fi
+
   # Detect this candidate before a missing delivery journal is reconstructed.
   # Otherwise migration can turn the very sample that proves a local observed
   # reset into a stale network reset (and threshold) occurrence.
-  if (( five_h_observation_valid == 1 )) \
+  if (( last_five_h_sampled_at_epoch > 0 )) \
+    && ! is_reset_observation_gap_acceptable \
+      "$last_five_h_sampled_at_epoch" "$scraped_at_epoch" \
+      "$last_five_h_sample_interval_seconds" "$sample_interval_seconds"; then
+    five_h_gap_within_archive_bound=0
+  fi
+  # Pre-upgrade state has no timestamp for its complete 5h baseline. Keep the
+  # historical full-to-full signal, but require a dated baseline before
+  # inferring the newly supported partially consumed refill.
+  if (( five_h_observation_valid == 1 && five_h_gap_within_archive_bound == 1 )) \
+    && { (( last_five_h_sampled_at_epoch > 0 )) \
+         || [[ "$observed_5h_pct" == 100 && "$five_h_pct" == 100 ]]; } \
     && [[ -n "$observed_5h_limit_id" && "$limit_id" == "$observed_5h_limit_id" ]] \
     && is_observed_5h_reset "$observed_5h_pct" "$five_h_pct" \
+      "$observed_5h_reset_at" "$five_h_reset_at" \
+    && [[ "$last_notified_5h_reset_at" != "$observed_5h_reset_at" ]] \
+    && ! { (( script_5h_reset_attempted_at == observed_5h_reset_at \
+               && observed_5h_reset_at > 0 )) \
+           && journal_has_network_reset_occurrence 5h \
+             "limit:${limit_id}|reset:${observed_5h_reset_at}" \
+             "$limit_id" "$observed_5h_reset_at"; }; then
+    if is_consumed_observed_5h_reset "$observed_5h_pct" "$five_h_pct" \
       "$observed_5h_reset_at" "$five_h_reset_at"; then
-    observed_5h_reset_candidate=1
+      consumed_observed_5h_reset=1
+    fi
+    # Once the armed deadline is due, a partially consumed refill belongs to
+    # the scheduled reset path.  Before that deadline, the advanced cycle is
+    # positive evidence that the old arm has already been superseded.
+    if (( consumed_observed_5h_reset == 1 && five_h_armed_reset_at > 0 \
+          && scraped_at_epoch >= five_h_armed_reset_at )) \
+      && [[ "$five_h_armed_limit_id" == "$limit_id" ]]; then
+      consumed_observed_5h_reset=0
+    else
+      observed_5h_reset_candidate=1
+    fi
+  fi
+  # A foreign durable intent owns the one preserve-cycle slot. Defer either
+  # kind of observed refill from the current owner until that intent finishes;
+  # retain the prior complete baseline so the next poll can classify it.
+  if (( observed_5h_reset_candidate == 1 && foreign_consumed_5h_intent == 1 )); then
+    observed_5h_reset_candidate=0
+    consumed_observed_5h_reset=0
+    process_5h_sample=0
+    five_h_observation_valid=0
+  fi
+  if (( observed_5h_reset_candidate == 1 )); then
+    if (( consumed_observed_5h_reset == 1 \
+          && pending_consumed_5h_reset_at == 0 )); then
+      consumed_observed_5h_event_at="$scraped_at_epoch"
+      consumed_observed_5h_owner="$limit_id"
+      consumed_observed_5h_remaining_pct="$five_h_pct"
+      consumed_observed_5h_next_reset_at="$five_h_reset_at"
+      pending_consumed_5h_reset_at="$consumed_observed_5h_event_at"
+      pending_consumed_5h_reset_limit_id="$limit_id"
+      pending_consumed_5h_remaining_pct="$five_h_pct"
+      pending_consumed_5h_next_reset_at="$five_h_reset_at"
+      if (( five_h_armed_reset_at > 0 )) \
+        && [[ "$five_h_armed_limit_id" == "$limit_id" ]]; then
+        pending_consumed_5h_superseded_reset_at="$five_h_armed_reset_at"
+      else
+        pending_consumed_5h_superseded_reset_at="$observed_5h_reset_at"
+      fi
+    fi
     if (( five_h_armed_reset_at > 0 )) \
      && [[ "$five_h_armed_limit_id" == "$limit_id" ]]; then
       # A full-to-full deadline advance is local evidence even when the
-      # previously armed deadline has just become due.  Both complete samples
-      # are full, so a network reset would contradict the 5h reset contract.
+      # previously armed deadline has just become due. A consumed refill only
+      # enters this branch before the arm is due.
       if (( scraped_at_epoch >= five_h_armed_reset_at )) \
         && [[ "$local_observed_5h_reset_at" != "$five_h_armed_reset_at" ]]; then
         observed_5h_reset=1
@@ -3167,6 +3339,46 @@ check_thresholds() {
     return 1
   fi
 
+  # Rebuild the immutable notification request from the durable state intent.
+  # The request is passed to alerts.py together with old-cycle expiration so
+  # either both changes reach disk or neither does.
+  if (( pending_consumed_5h_reset_at > 0 )) \
+    && [[ "${ALERTS_ENABLED:-1}" == 1 ]] \
+    && [[ "$(configured_alert_channels_json)" != "[]" ]]; then
+    consumed_observed_5h_cycle_key="limit:${pending_consumed_5h_reset_limit_id}|reset:${pending_consumed_5h_reset_at}"
+    consumed_observed_5h_request_json="$(network_reset_request_json 5h \
+      "$pending_consumed_5h_reset_limit_id" "$pending_consumed_5h_reset_at" \
+      "$pending_consumed_5h_reset_at" \
+      "$(printf '⏱️ Codex · 5h quota · Reset detected\nRemaining: %s%%\nNext reset: %s' \
+        "$pending_consumed_5h_remaining_pct" \
+        "$(format_paris_timestamp "$pending_consumed_5h_next_reset_at")")")" || {
+      ALERT_PROCESSING_ERROR="observed 5h reset request construction failed"
+      return 1
+    }
+  fi
+
+  # A pending consumed reset belongs to its recorded owner, even after the
+  # active limit group changes. Replay that immutable request with the recorded
+  # owner before the current group's interruption pass. Keep the state intent
+  # until the journal occurrence becomes terminal so a crash or transport retry
+  # can continue preserving it from cross-owner interruption.
+  if (( foreign_consumed_5h_intent == 1 )); then
+    if ! expire_observed_owner_cycle 5h "$pending_consumed_5h_reset_limit_id" \
+      "$scraped_at_epoch" "$pending_consumed_5h_superseded_reset_at" \
+      "$consumed_observed_5h_cycle_key" "$consumed_observed_5h_request_json"; then
+      ALERT_PROCESSING_ERROR="foreign observed 5h reset recovery failed"
+      return 1
+    fi
+    foreign_consumed_5h_preserve_cycle="$consumed_observed_5h_cycle_key"
+    if [[ -z "$foreign_consumed_5h_preserve_cycle" ]]; then
+      pending_consumed_5h_reset_at=0
+      pending_consumed_5h_reset_limit_id=""
+      pending_consumed_5h_remaining_pct=""
+      pending_consumed_5h_next_reset_at=0
+      pending_consumed_5h_superseded_reset_at=0
+    fi
+  fi
+
   # Close an observed 5-hour cycle immediately after the journal is known to
   # exist, before interruption reconciliation or any detector work can
   # persist.  A restored arm is authoritative when it is explicitly owned by
@@ -3177,7 +3389,8 @@ check_thresholds() {
   # reset.
   if (( observed_5h_reset_candidate == 1 )); then
     if ! expire_observed_owner_cycle 5h "$limit_id" "$scraped_at_epoch" \
-      "$transaction_epoch"; then
+      "$transaction_epoch" "$consumed_observed_5h_cycle_key" \
+      "$consumed_observed_5h_request_json"; then
       ALERT_PROCESSING_ERROR="local reset threshold transaction failed"
       return 1
     fi
@@ -3264,7 +3477,8 @@ check_thresholds() {
   # occurrence when no trustworthy arm exists.
   if (( observed_5h_reset_candidate == 1 || observed_5h_reset_recovery == 1 )); then
     if ! expire_observed_owner_cycle 5h "$limit_id" "$scraped_at_epoch" \
-      "${observed_5h_superseded_reset_at:-0}"; then
+      "${observed_5h_superseded_reset_at:-0}" \
+      "$consumed_observed_5h_cycle_key" "$consumed_observed_5h_request_json"; then
       # The two durable stores are independent.  If the journal write failed,
       # leave a state recovery intent behind so a later changed sample retries
       # before delivery; if this complementary write also fails, fail closed
@@ -3289,6 +3503,12 @@ check_thresholds() {
     # marker until its local hook opportunity is reconciled.
     if (( five_h_armed_reset_at == 0 )); then
       local_observed_5h_reset_at=0
+    fi
+  fi
+  if (( observed_5h_atomic_done == 1 )) \
+    && [[ -n "$consumed_observed_5h_cycle_key" ]]; then
+    if [[ "$consumed_observed_5h_owner" == "$limit_id" ]]; then
+      observed_5h_reset=1
     fi
   fi
 
@@ -3360,6 +3580,7 @@ check_thresholds() {
   # other than this current sample's owner before any detector mutation or due
   # delivery; this is one atomic journal operation and is safe to repeat.
   if ! interrupt_pending_other_owners "$limit_id" "$scraped_at_epoch" \
+    "$foreign_consumed_5h_preserve_cycle" \
     || ! reconcile_alert_deliveries "$scraped_at_epoch" "$limit_id" 1; then
     ALERT_PROCESSING_ERROR="alert owner interruption failed"
     return 1
@@ -3681,14 +3902,18 @@ check_thresholds() {
     notified_weekly_thresholds=""
   fi
 
-  # A complete 100% -> 100% observation with a later deadline is an observed
-  # 5-hour reset. The candidate was classified before journal reconstruction,
-  # including when an existing arm is already due, so all full-to-full resets
-  # stay local and silent on the network.
+  # A materially advanced 5-hour observation is a reset even when immediate
+  # use hid the transient 100% value. The candidate was classified before
+  # journal reconstruction, including when an existing full-to-full arm is
+  # already due.
   if (( initialize_5h_baseline == 0 && five_h_observation_valid == 1 )) \
     && [[ "$limit_id" == "$observed_5h_limit_id" ]] \
+    && (( five_h_gap_within_archive_bound == 1 )) \
     && is_observed_5h_reset "$observed_5h_pct" "$five_h_pct" \
       "$observed_5h_reset_at" "$five_h_reset_at" \
+    && ! ( (( consumed_observed_5h_reset == 1 && five_h_armed_reset_at > 0 \
+             && scraped_at_epoch >= five_h_armed_reset_at )) \
+           && [[ "$five_h_armed_limit_id" == "$limit_id" ]] ) \
     && ! ( (( five_h_armed_reset_at > 0 && scraped_at_epoch >= five_h_armed_reset_at \
              && observed_5h_local_tombstone == 0 )) \
            && [[ "$five_h_armed_limit_id" == "$limit_id" ]] ); then
@@ -3811,6 +4036,52 @@ check_thresholds() {
   fi
 
     fi
+
+  # User activity has already started this observed cycle. Publish one reset
+  # occurrence anchored to the observation, suppress reset hooks for that
+  # occurrence, and rotate immediately to the real next deadline. Keep this
+  # outside the old arm's due branch: recovery may happen before that stale
+  # deadline after an earlier journal failure or process interruption.
+  if (( consumed_observed_5h_reset == 1 && observed_5h_reset == 1 \
+        && consumed_observed_5h_event_at > 0 )) \
+    && [[ "$consumed_observed_5h_owner" == "$limit_id" ]]; then
+    if [[ -z "$consumed_observed_5h_cycle_key" ]]; then
+      cycle_key="limit:${limit_id}|reset:${consumed_observed_5h_event_at}"
+      registration_status=0
+      register_network_alert reset 5h reset "$cycle_key" \
+        "$(printf '⏱️ Codex · 5h quota · Reset detected\nRemaining: %s%%\nNext reset: %s' \
+          "$consumed_observed_5h_remaining_pct" \
+          "$(format_paris_timestamp "$consumed_observed_5h_next_reset_at")")" \
+        "{\"limit_id\":\"${limit_id}\",\"reset_epoch\":${consumed_observed_5h_event_at}}" \
+        "$consumed_observed_5h_event_at" \
+        "$((consumed_observed_5h_event_at + 5 * 60 * 60))" false \
+        "$cycle_key" || registration_status=$?
+      if (( registration_status != 0 && registration_status != 2 )); then
+        ALERT_PROCESSING_ERROR="observed 5h reset journal registration failed"
+        return 1
+      fi
+    fi
+    suppress_consumed_observed_5h_reset_scripts
+    local_observed_5h_reset_at=0
+    notified_5h_thresholds=""
+    pending_5h_threshold=""
+    prev_5h_pct="$consumed_observed_5h_remaining_pct"
+    script_prev_5h_pct="$consumed_observed_5h_remaining_pct"
+    clear_5h_script_actions
+    if percentage_below_full "$consumed_observed_5h_remaining_pct" \
+      && (( consumed_observed_5h_next_reset_at > scraped_at_epoch \
+            && consumed_observed_5h_next_reset_at <= scraped_at_epoch + 6 * 60 * 60 )); then
+      five_h_armed_reset_at="$consumed_observed_5h_next_reset_at"
+      five_h_armed_limit_id="$limit_id"
+    else
+      five_h_armed_reset_at=0
+      five_h_armed_limit_id=""
+    fi
+    # The detector has rotated, but the write-ahead intent still protects a
+    # pending network delivery if a different owner arrives before its retry.
+    observed_5h_reset=0
+  fi
+
   if (( weekly_armed_reset_at > 0 && scraped_at_epoch >= weekly_armed_reset_at )) \
     && [[ "$weekly_armed_limit_id" == "$limit_id" ]]; then
     cycle_key="limit:${limit_id}|reset:${weekly_armed_reset_at}"
@@ -3897,8 +4168,9 @@ check_thresholds() {
   fi
 
     fi
-  # Ignore shifting reset estimates while a cycle is armed. Once it has reset,
-  # arm the next plausible deadline only after some quota has been consumed.
+  # Ignore small reset-estimate shifts while a cycle is armed. Material
+  # advances are handled above as observed resets; once a cycle is otherwise
+  # retired, arm the next plausible deadline after some quota is consumed.
   if (( five_h_armed_reset_at == 0 )) \
     && [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ && "$five_h_reset_at" =~ ^[0-9]+$ ]] \
     && percentage_below_full "$five_h_pct" \
@@ -4115,6 +4387,17 @@ PYEOF
       if ! reconcile_alert_deliveries "$scraped_at_epoch" "$limit_id" "$discard_other_group_terminal"; then
         NETWORK_DELIVERY_ERROR=1
         ALERT_PROCESSING_ERROR="alert reconciliation failed"
+      elif (( pending_consumed_5h_reset_at > 0 )) \
+        && ! journal_has_pending_alert reset 5h reset \
+          "limit:${pending_consumed_5h_reset_limit_id}|reset:${pending_consumed_5h_reset_at}"; then
+        # Keep the intent across owner changes and transport retries. The
+        # journal has now made the occurrence terminal, so it no longer needs
+        # protection from the next owner-interruption pass.
+        pending_consumed_5h_reset_at=0
+        pending_consumed_5h_reset_limit_id=""
+        pending_consumed_5h_remaining_pct=""
+        pending_consumed_5h_next_reset_at=0
+        pending_consumed_5h_superseded_reset_at=0
       fi
     fi
   fi
@@ -4280,10 +4563,14 @@ PYEOF
     # entries.  Subsequent cycles return to normal expire-before-deliver order.
     alerts_disabled_since=0
   fi
-  # Keep the previous complete weekly observation timestamp and cadence beside
+  # Keep the previous complete observation timestamps and cadence beside
   # detector state. This is the live equivalent of archive.py's adjacent
   # complete-snapshot gap check: a partial observation must not hide an old
   # complete baseline and make a sparse full-to-full pair look recent.
+  if (( five_h_observation_valid == 1 )); then
+    last_five_h_sampled_at_epoch="$scraped_at_epoch"
+    last_five_h_sample_interval_seconds="$sample_interval_seconds"
+  fi
   if (( weekly_observation_valid == 1 )); then
     last_sampled_at_epoch="$scraped_at_epoch"
     last_sample_interval_seconds="$sample_interval_seconds"

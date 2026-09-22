@@ -20,11 +20,11 @@ import alerts  # noqa: E402
 
 
 def snapshot(epoch, *, five=50, weekly=50, five_reset=10_000,
-             weekly_reset=10_000, limit="group-a"):
+             weekly_reset=10_000, limit="group-a", sample_interval=900):
     return {
         "scraped_at_epoch": epoch, "five_h_pct": five, "weekly_pct": weekly,
         "five_h_reset_at": five_reset, "weekly_reset_at": weekly_reset,
-        "limit_id": limit,
+        "limit_id": limit, "sample_interval_seconds": sample_interval,
     }
 
 
@@ -71,8 +71,26 @@ class AnomalyDetectorTests(unittest.TestCase):
     def test_full_five_hour_observed_reset_is_not_a_reset_shift(self):
         previous_deadline = 10_000
         self.observe(snapshot(100, five=100, five_reset=previous_deadline))
-        self.observe(snapshot(200, five=100, five_reset=previous_deadline + 900))
+        self.observe(snapshot(200, five=100, five_reset=previous_deadline + 1_800))
         self.assertEqual([], self.rows("5h"))
+
+    def test_consumed_five_hour_reset_is_recognized_within_gap_limit(self):
+        previous_deadline = 10_000
+        self.observe(snapshot(100, five=26, five_reset=previous_deadline))
+        self.observe(snapshot(
+            1_000, five=87, five_reset=previous_deadline + 1_800,
+        ))
+        self.assertEqual([], self.rows("5h"))
+
+    def test_consumed_five_hour_reset_is_not_recognized_after_long_gap(self):
+        previous_deadline = 10_000
+        self.observe(snapshot(100, five=26, five_reset=previous_deadline))
+        self.observe(snapshot(
+            3_701, five=87, five_reset=previous_deadline + 1_800,
+        ))
+        self.assertEqual([
+            ("quota_increase", "5h", 26.0, 87.0),
+        ], self.rows("5h"))
 
     def test_weekly_quota_increase_is_reported_independently(self):
         self.observe(snapshot(100, five=50, weekly=40, weekly_reset=10_000))

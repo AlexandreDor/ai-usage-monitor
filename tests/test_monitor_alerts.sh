@@ -76,7 +76,7 @@ assert_alert_count 0
 # new deadline and is acknowledged locally without a deliverable network occurrence.
 reset_case
 old_five_deadline=$((now + 300))
-new_five_deadline=$((old_five_deadline + 15 * 60))
+new_five_deadline=$((old_five_deadline + 30 * 60))
 check_thresholds 100 100 later later "$old_five_deadline" '' "$now" group-a
 check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 900))" group-a
 assert_alert_count 0
@@ -92,6 +92,44 @@ check_thresholds 100 100 later later "$new_five_deadline" '' "$((now + 1800))" g
 assert_alert_count 0
 check_thresholds 100 100 later later "$((new_five_deadline - 60))" '' "$((now + 2700))" group-a
 assert_alert_count 0
+
+# A 5-hour refill can be substantially consumed before the first post-reset
+# poll. The deadline advance closes the old arm, emits one observed-reset
+# notice, and uses the observed 87% as the new threshold baseline. The stale
+# old deadline must not later manufacture another reset or replay the 0% alert.
+reset_case
+old_consumed_deadline=$((now + 2 * 60 * 60))
+observed_consumed_at=$((now + 300))
+new_consumed_deadline=$((observed_consumed_at + 5 * 60 * 60))
+check_thresholds 26 100 later unknown "$old_consumed_deadline" '' "$now" group-a
+check_thresholds 87 100 later unknown "$new_consumed_deadline" '' "$observed_consumed_at" group-a
+assert_alert_count 1
+assert_contains "$(<"$ALERT_LOG")" "Reset detected" \
+  "consumed observed reset was not announced"
+assert_eq "$new_consumed_deadline" "$(state_value five_h_armed_reset_at)" \
+  "consumed observed reset did not arm its new deadline"
+assert_eq 87 "$(state_value prev_5h_pct)" \
+  "consumed observed reset did not preserve its observed baseline"
+check_thresholds 0 100 later unknown "$new_consumed_deadline" '' "$((now + 900))" group-a
+assert_alert_count 2
+check_thresholds 0 100 later unknown "$new_consumed_deadline" '' "$((old_consumed_deadline + 1))" group-a
+assert_alert_count 2
+assert_eq "$new_consumed_deadline" "$(state_value five_h_armed_reset_at)" \
+  "stale deadline displaced the consumed observed cycle"
+next_consumed_deadline=$((new_consumed_deadline + 5 * 60 * 60))
+check_thresholds 100 100 later unknown "$next_consumed_deadline" '' "$((new_consumed_deadline + 1))" group-a
+assert_alert_count 3
+
+# The same refill evidence is insufficient after a gap beyond the shared
+# observation bound. Keep the old cycle armed and do not announce a reset.
+reset_case
+long_gap_old_deadline=$((now + 5 * 60 * 60))
+long_gap_new_deadline=$((long_gap_old_deadline + 30 * 60))
+check_thresholds 26 100 later unknown "$long_gap_old_deadline" '' "$now" group-a
+check_thresholds 87 100 later unknown "$long_gap_new_deadline" '' "$((now + 2 * 60 * 60))" group-a
+assert_alert_count 0
+assert_eq "$long_gap_old_deadline" "$(state_value five_h_armed_reset_at)" \
+  "long-gap refill displaced the live detector's old cycle"
 
 # Reconstructing a missing delivery journal from the observed-reset sample
 # must not manufacture a deliverable 5h network reset or its old threshold occurrence.

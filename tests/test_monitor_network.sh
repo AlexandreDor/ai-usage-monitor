@@ -57,7 +57,7 @@ export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
 DISCORD_WEBHOOK='https://discord.com/api/webhooks/123/token'
 TELEGRAM_BOT_TOKEN='' TELEGRAM_CHAT_ID=''
 old_five_deadline=$((2000000100 + 300))
-new_five_deadline=$((old_five_deadline + 900))
+new_five_deadline=$((old_five_deadline + 30 * 60))
 check_thresholds 100 100 later unknown "$old_five_deadline" '' 2000000100 group-a >/dev/null
 python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
 import pathlib
@@ -75,6 +75,355 @@ items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
 print(sum(item["kind"] == "reset" and item["status"] == "pending" for item in items))
 PYEOF
 )" "observed 5h reset was queued in the network journal"
+
+# A materially refilled 5-hour cycle was already started by user activity.
+# Announce it once, keep its real next deadline armed after acknowledgement,
+# and do not let the superseded deadline emit another reset.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-consumed"
+export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
+ALERT_THRESHOLDS=0
+consumed_start=2000001050
+consumed_old_deadline=$((consumed_start + 2 * 60 * 60))
+consumed_observed_at=$((consumed_start + 300))
+consumed_new_deadline=$((consumed_observed_at + 5 * 60 * 60))
+check_thresholds 26 100 later unknown "$consumed_old_deadline" '' "$consumed_start" group-a >/dev/null
+check_thresholds 87 100 later unknown "$consumed_new_deadline" '' "$consumed_observed_at" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "consumed observed reset was not delivered once"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and "Reset detected" in item["message"]]
+assert len(resets) == 1, items
+assert resets[0]["status"] == "delivered", resets[0]
+PYEOF
+assert_eq "$consumed_new_deadline" \
+  "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "observed reset acknowledgement cleared the new cycle"
+assert_eq 87 "$(awk -F= '$1 == "prev_5h_pct" {print $2}' "$STATE_FILE")" \
+  "consumed observed reset reset its threshold baseline to 100"
+check_thresholds 0 100 later unknown "$consumed_new_deadline" '' "$((consumed_start + 900))" group-a >/dev/null
+assert_eq 2 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "consumed cycle did not emit exactly one low-balance alert"
+check_thresholds 0 100 later unknown "$consumed_new_deadline" '' "$((consumed_old_deadline + 1))" group-a >/dev/null
+assert_eq 2 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "superseded deadline emitted a stale reset"
+consumed_next_deadline=$((consumed_new_deadline + 5 * 60 * 60))
+check_thresholds 100 100 later unknown "$consumed_next_deadline" '' "$((consumed_new_deadline + 1))" group-a >/dev/null
+assert_eq 3 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "next scheduled reset was not delivered exactly once"
+
+# Registration is part of the observed-cycle journal transaction. If that
+# write fails, the immutable consumed-reset intent stays in state and a later,
+# further-consumed sample must register and deliver the original event once.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-consumed-register-retry"
+register_retry_start=2000001060
+register_retry_old=$((register_retry_start + 2 * 60 * 60))
+register_retry_observed=$((register_retry_start + 300))
+register_retry_new=$((register_retry_observed + 5 * 60 * 60))
+check_thresholds 26 100 later unknown "$register_retry_old" '' \
+  "$register_retry_start" group-a >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_original /')"
+expire_observed_owner_cycle() { return 1; }
+if check_thresholds 87 100 later unknown "$register_retry_new" '' \
+  "$register_retry_observed" group-a >/dev/null 2>&1; then
+  fail "consumed reset journal failure was accepted"
+fi
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "failed consumed reset registration emitted HTTP"
+assert_eq "$register_retry_observed" \
+  "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "failed consumed reset registration lost its durable intent"
+eval "$(declare -f expire_observed_owner_cycle_original | sed '1s/^expire_observed_owner_cycle_original /expire_observed_owner_cycle /')"
+check_thresholds 10 100 later unknown "$register_retry_new" '' \
+  "$((register_retry_observed + 1))" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "consumed reset registration retry was not delivered exactly once"
+assert_eq 0 "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "successful consumed reset registration retained its intent"
+assert_eq "$register_retry_new" \
+  "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "consumed reset retry did not arm the real next deadline"
+python3 - "$ALERT_DELIVERIES_FILE" "$register_retry_observed" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and "Reset detected" in item["message"]]
+assert len(resets) == 1, items
+assert resets[0]["event_data"]["reset_epoch"] == int(sys.argv[2]), resets[0]
+assert "Remaining: 87%" in resets[0]["message"], resets[0]
+PYEOF
+
+# A crash after the atomic journal write but before final state persistence is
+# also recoverable. Replaying the durable intent must reuse the same reset row,
+# then deliver it once without manufacturing a duplicate occurrence.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-consumed-crash-retry"
+crash_retry_start=2000001070
+crash_retry_old=$((crash_retry_start + 2 * 60 * 60))
+crash_retry_observed=$((crash_retry_start + 300))
+crash_retry_new=$((crash_retry_observed + 5 * 60 * 60))
+check_thresholds 26 100 later unknown "$crash_retry_old" '' \
+  "$crash_retry_start" group-a >/dev/null
+# Stop after the journal transaction and an intermediate detector-state write,
+# before the final new-cycle transition is persisted.
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f reconcile_alert_deliveries | sed '1s/^reconcile_alert_deliveries /reconcile_alert_deliveries_original /')"
+(
+  reconcile_alert_deliveries() {
+    persist_alert_state
+    exit 99
+  }
+  check_thresholds 87 100 later unknown "$crash_retry_new" '' \
+    "$crash_retry_observed" group-a >/dev/null
+) >/dev/null 2>&1 || true
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "consumed reset crash attempted delivery before recovery"
+assert_eq "$crash_retry_observed" \
+  "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "consumed reset crash lost its durable intent"
+eval "$(declare -f reconcile_alert_deliveries_original | sed '1s/^reconcile_alert_deliveries_original /reconcile_alert_deliveries /')"
+check_thresholds 80 100 later unknown "$crash_retry_new" '' \
+  "$((crash_retry_observed + 1))" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "consumed reset crash recovery was not delivered exactly once"
+assert_eq 0 "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "consumed reset crash recovery retained its durable intent"
+assert_eq "$crash_retry_new" \
+  "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "consumed reset crash recovery did not arm the real next deadline"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and "Reset detected" in item["message"]]
+assert len(resets) == 1, items
+PYEOF
+
+# A consumed-reset intent survives an owner switch. Replay it with its recorded
+# owner before establishing B's baseline, then allow B to publish its own
+# consumed reset without reusing A's preserve cycle.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-cross-owner"
+cross_owner_start=2000001080
+cross_owner_a_old=$((cross_owner_start + 2 * 60 * 60))
+cross_owner_a_observed=$((cross_owner_start + 300))
+cross_owner_a_new=$((cross_owner_a_observed + 5 * 60 * 60))
+check_thresholds 26 100 later unknown "$cross_owner_a_old" '' \
+  "$cross_owner_start" group-a >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_original /')"
+expire_observed_owner_cycle() { return 1; }
+if check_thresholds 87 100 later unknown "$cross_owner_a_new" '' \
+  "$cross_owner_a_observed" group-a >/dev/null 2>&1; then
+  fail "cross-owner setup accepted failed consumed reset registration"
+fi
+eval "$(declare -f expire_observed_owner_cycle_original | sed '1s/^expire_observed_owner_cycle_original /expire_observed_owner_cycle /')"
+cross_owner_b_start=$((cross_owner_a_observed + 1))
+cross_owner_b_old=$((cross_owner_b_start + 2 * 60 * 60))
+check_thresholds 30 100 later unknown "$cross_owner_b_old" '' \
+  "$cross_owner_b_start" group-b >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "foreign consumed reset intent was not replayed exactly once"
+assert_eq 0 "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "foreign consumed reset intent remained orphaned after delivery"
+cross_owner_b_observed=$((cross_owner_b_start + 300))
+cross_owner_b_new=$((cross_owner_b_observed + 5 * 60 * 60))
+check_thresholds 85 100 later unknown "$cross_owner_b_new" '' \
+  "$cross_owner_b_observed" group-b >/dev/null
+assert_eq 2 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "second owner could not publish its consumed reset"
+assert_eq 0 "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "second owner's consumed reset intent was not cleared"
+assert_eq "$cross_owner_b_new" \
+  "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
+  "second owner's real deadline was not armed"
+python3 - "$ALERT_DELIVERIES_FILE" \
+  "$(canonicalize_alert_limit_id group-a)" "$(canonicalize_alert_limit_id group-b)" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and "Reset detected" in item["message"]]
+assert len(resets) == 2, items
+assert {item["event_data"]["limit_id"] for item in resets} == {sys.argv[2], sys.argv[3]}, resets
+assert all(item["status"] == "delivered" for item in resets), resets
+PYEOF
+
+# Returning to A without another refill must neither replay nor duplicate the
+# already recovered immutable occurrence.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-cross-owner-return"
+cross_return_start=2000001090
+cross_return_a_old=$((cross_return_start + 2 * 60 * 60))
+cross_return_a_observed=$((cross_return_start + 300))
+cross_return_a_new=$((cross_return_a_observed + 5 * 60 * 60))
+check_thresholds 26 100 later unknown "$cross_return_a_old" '' \
+  "$cross_return_start" group-a >/dev/null
+# shellcheck disable=SC2317,SC2329,SC2001
+eval "$(declare -f expire_observed_owner_cycle | sed '1s/^expire_observed_owner_cycle /expire_observed_owner_cycle_original /')"
+expire_observed_owner_cycle() { return 1; }
+if check_thresholds 87 100 later unknown "$cross_return_a_new" '' \
+  "$cross_return_a_observed" group-a >/dev/null 2>&1; then
+  fail "cross-owner return setup accepted failed consumed reset registration"
+fi
+eval "$(declare -f expire_observed_owner_cycle_original | sed '1s/^expire_observed_owner_cycle_original /expire_observed_owner_cycle /')"
+cross_return_b_at=$((cross_return_a_observed + 1))
+cross_return_b_deadline=$((cross_return_b_at + 2 * 60 * 60))
+check_thresholds 40 100 later unknown "$cross_return_b_deadline" '' \
+  "$cross_return_b_at" group-b >/dev/null
+check_thresholds 80 100 later unknown "$cross_return_a_new" '' \
+  "$((cross_return_b_at + 1))" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "returning to the recovered owner duplicated its consumed reset"
+assert_eq 0 "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "returning to the recovered owner restored an orphan intent"
+python3 - "$ALERT_DELIVERIES_FILE" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and "Reset detected" in item["message"]]
+assert len(resets) == 1, items
+assert resets[0]["status"] == "delivered", resets
+PYEOF
+
+# A transport failure leaves A's registered occurrence pending after detector
+# rotation. Switching to B must preserve A until its retry succeeds.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-consumed-transport-owner-switch"
+transport_start=2000001100
+transport_a_old=$((transport_start + 7200))
+transport_a_observed=$((transport_start + 300))
+transport_a_new=$((transport_a_observed + 18000))
+export FAKE_CURL_DISCORD_STATUS=503
+check_thresholds 26 100 later unknown "$transport_a_old" '' "$transport_start" group-a >/dev/null
+if check_thresholds 87 100 later unknown "$transport_a_new" '' \
+  "$transport_a_observed" group-a >/dev/null 2>&1; then
+  fail "transport failure was accepted for consumed reset"
+fi
+assert_eq "$transport_a_observed" \
+  "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "transport failure lost A's recovery intent"
+transport_b_at=$((transport_a_observed + 1))
+transport_b_old=$((transport_b_at + 7200))
+if check_thresholds 100 100 later unknown "$transport_b_old" '' \
+  "$transport_b_at" group-b >/dev/null 2>&1; then
+  fail "pending foreign delivery failure was accepted"
+fi
+assert_eq "$transport_a_observed" \
+  "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "owner switch discarded A's pending delivery intent"
+
+# B's full-to-full refill must also wait behind A's intent. Its complete
+# baseline stays unchanged, and the next poll can classify B after A finishes.
+transport_b_refill=$((transport_b_at + 300))
+transport_b_new=$((transport_b_old + 1800))
+if check_thresholds 100 100 later unknown "$transport_b_new" '' \
+  "$transport_b_refill" group-b >/dev/null 2>&1; then
+  fail "pending foreign delivery failure was accepted during B refill"
+fi
+assert_eq "$transport_b_old" \
+  "$(awk -F= '$1 == "observed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "deferred full-to-full refill advanced B's baseline"
+export FAKE_CURL_DISCORD_STATUS=204
+check_thresholds 100 100 later unknown "$transport_b_new" '' \
+  "$((transport_b_refill + 1))" group-b >/dev/null
+assert_eq 0 "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
+  "successful A retry retained its intent"
+check_thresholds 100 100 later unknown "$transport_b_new" '' \
+  "$((transport_b_refill + 2))" group-b >/dev/null
+python3 - "$ALERT_DELIVERIES_FILE" "$(canonicalize_alert_limit_id group-a)" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and "Reset detected" in item["message"]]
+assert len(resets) == 1, items
+assert resets[0]["event_data"]["limit_id"] == sys.argv[2], resets
+assert resets[0]["status"] == "delivered", resets
+PYEOF
+
+# A pre-upgrade state has no timestamp for its stored complete 5h baseline.
+# Its first post-upgrade sample cannot establish a recent refill pair.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-consumed-undated-baseline"
+legacy_sample=2000001200
+legacy_old=$((legacy_sample + 7200))
+legacy_new=$((legacy_old + 1800))
+legacy_owner="$(canonicalize_alert_limit_id group-a)"
+printf '%s\n' 'state_version=5' 'limit_id_contract_version=1' \
+  'observed_5h_pct=26' "observed_5h_reset_at=${legacy_old}" \
+  "observed_5h_limit_id=${legacy_owner}" \
+  "five_h_armed_reset_at=${legacy_old}" "five_h_armed_limit_id=${legacy_owner}" \
+  > "$STATE_FILE"
+check_thresholds 87 100 later unknown "$legacy_new" '' "$legacy_sample" group-a >/dev/null
+assert_eq 0 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "undated legacy baseline caused a false observed reset"
+assert_eq "$legacy_sample" \
+  "$(awk -F= '$1 == "last_five_h_sampled_at_epoch" {print $2}' "$STATE_FILE")" \
+  "first post-upgrade sample did not establish a dated baseline"
+
+# A partial sample after the old deadline reports the scheduled reset. The
+# next complete 26 -> 87 comparison must not emit an observed duplicate.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-consumed-after-partial-scheduled"
+partial_start=2000001300
+partial_old=$((partial_start + 300))
+partial_at=$((partial_old + 1))
+partial_full=$((partial_at + 1))
+partial_new=$((partial_full + 18000))
+check_thresholds 26 100 later unknown "$partial_old" '' "$partial_start" group-a >/dev/null
+check_thresholds '' 100 unknown unknown '' '' "$partial_at" group-a >/dev/null
+check_thresholds 87 100 later unknown "$partial_new" '' "$partial_full" group-a >/dev/null
+assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
+  "partial scheduled crossing emitted a duplicate observed reset"
+python3 - "$ALERT_DELIVERIES_FILE" "$partial_old" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset"
+          and item["window"] == "5h" and item["status"] == "delivered"]
+assert len(resets) == 1, items
+assert resets[0]["event_data"]["reset_epoch"] == int(sys.argv[2]), resets
+PYEOF
+
+# The same classification must hold while the scheduled network occurrence is
+# pending a retry; its successful delivery may happen on the later full poll.
+rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
+export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-consumed-after-partial-pending"
+export FAKE_CURL_DISCORD_STATUS=503
+check_thresholds 26 100 later unknown "$partial_old" '' "$partial_start" group-a >/dev/null
+if check_thresholds '' 100 unknown unknown '' '' "$partial_at" group-a >/dev/null 2>&1; then
+  fail "scheduled partial delivery failure was accepted"
+fi
+export FAKE_CURL_DISCORD_STATUS=204
+check_thresholds 87 100 later unknown "$partial_new" '' "$partial_full" group-a >/dev/null
+python3 - "$ALERT_DELIVERIES_FILE" "$partial_old" <<'PYEOF'
+import json
+import sys
+
+items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
+resets = [item for item in items if item["kind"] == "reset" and item["window"] == "5h"]
+assert len(resets) == 1, items
+assert resets[0]["event_data"]["reset_epoch"] == int(sys.argv[2]), resets
+assert resets[0]["status"] == "delivered", resets
+PYEOF
+export FAKE_CURL_DISCORD_STATUS=204
 ALERT_THRESHOLDS=75
 TELEGRAM_BOT_TOKEN='123:token'
 TELEGRAM_CHAT_ID=-456
@@ -89,7 +438,7 @@ ALERTS_ENABLED=0
 ALERT_THRESHOLDS=75
 armed_observation_at=2000001100
 armed_old_deadline=$((armed_observation_at + 3600))
-armed_new_deadline=$((armed_old_deadline + 900))
+armed_new_deadline=$((armed_old_deadline + 30 * 60))
 check_thresholds 100 100 later unknown "$armed_old_deadline" '' "$armed_observation_at" group-a >/dev/null
 armed_limit_id="$(canonicalize_alert_limit_id group-a)"
 python3 - "$STATE_FILE" "$armed_old_deadline" "$armed_limit_id" <<'PYEOF'
@@ -143,7 +492,7 @@ ALERTS_ENABLED=1
 ALERT_THRESHOLDS=50
 restored_now=2000002050
 restored_old_deadline=$((restored_now + 3600))
-restored_new_deadline=$((restored_old_deadline + 900))
+restored_new_deadline=$((restored_old_deadline + 30 * 60))
 restored_limit_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -208,7 +557,7 @@ chmod 700 "$due_missing_hook"
 export DUE_MISSING_HOOK_LOG="$due_missing_hook_log"
 due_missing_now=2000015000
 due_missing_old=$((due_missing_now - 60))
-due_missing_new=$((due_missing_old + 900))
+due_missing_new=$((due_missing_old + 30 * 60))
 due_missing_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -256,7 +605,7 @@ rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-due-observed-existing-journal"
 due_existing_now=2000016000
 due_existing_old=$((due_existing_now - 60))
-due_existing_new=$((due_existing_old + 900))
+due_existing_new=$((due_existing_old + 30 * 60))
 due_existing_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -326,7 +675,7 @@ rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-due-observed-expiry-retry"
 retry_now=2000017000
 retry_old=$((retry_now - 60))
-retry_new=$((retry_old + 900))
+retry_new=$((retry_old + 30 * 60))
 retry_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -455,7 +804,7 @@ chmod 700 "$restart_hook"
 export RESTART_HOOK_LOG="$restart_hook_log"
 restart_now=2000002500
 restart_old_deadline=$((restart_now + 1800))
-restart_new_deadline=$((restart_old_deadline + 900))
+restart_new_deadline=$((restart_old_deadline + 30 * 60))
 restart_limit_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -540,7 +889,7 @@ chmod 700 "$wal_hook"
 export WAL_HOOK_LOG="$wal_hook_log"
 wal_now=2000007000
 wal_old_deadline=$((wal_now + 1800))
-wal_new_deadline=$((wal_old_deadline + 900))
+wal_new_deadline=$((wal_old_deadline + 30 * 60))
 wal_limit_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -627,7 +976,7 @@ export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-reconcile-failure"
 export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
 reconcile_fail_now=2000009000
 reconcile_fail_old=$((reconcile_fail_now + 1800))
-reconcile_fail_new=$((reconcile_fail_old + 900))
+reconcile_fail_new=$((reconcile_fail_old + 30 * 60))
 reconcile_fail_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -675,7 +1024,7 @@ export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-stale-arm-crash"
 export FAKE_CURL_DISCORD_STATUS=204 FAKE_CURL_DISCORD_EXIT=0
 stale_arm_crash_now=2000011000
 stale_arm_crash_old=$((stale_arm_crash_now + 1800))
-stale_arm_crash_new=$((stale_arm_crash_old + 900))
+stale_arm_crash_new=$((stale_arm_crash_old + 30 * 60))
 stale_arm_crash_id="$(canonicalize_alert_limit_id group-a)"
 printf '%s\n' \
   'state_version=5' 'limit_id_contract_version=1' \
@@ -750,7 +1099,7 @@ run_restored_incoherent_arm_case() {
   local case_now=2000005000
   local case_old_deadline=$((case_now + 1800))
   local case_arm_deadline=$((case_now + 3600))
-  local case_new_deadline=$((case_old_deadline + 900))
+  local case_new_deadline=$((case_old_deadline + 30 * 60))
   local case_limit_id case_cycle
   rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
   export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-${case_name}"
@@ -1010,7 +1359,7 @@ ALERTS_ENABLED=1
 ALERT_THRESHOLDS=50
 retry_observation_at=2000002100
 retry_old_deadline=$((retry_observation_at + 3600))
-retry_new_deadline=$((retry_old_deadline + 900))
+retry_new_deadline=$((retry_old_deadline + 30 * 60))
 check_thresholds 100 100 later unknown "$retry_old_deadline" '' "$retry_observation_at" group-a >/dev/null
 retry_limit_id="$(canonicalize_alert_limit_id group-a)"
 python3 - "$STATE_FILE" "$retry_old_deadline" "$retry_limit_id" <<'PYEOF'
@@ -1071,7 +1420,7 @@ ALERTS_ENABLED=1
 ALERT_THRESHOLDS=50
 no_arm_retry_now=2000002700
 no_arm_retry_old=$((no_arm_retry_now + 1800))
-no_arm_retry_new=$((no_arm_retry_old + 900))
+no_arm_retry_new=$((no_arm_retry_old + 30 * 60))
 no_arm_retry_id="$(canonicalize_alert_limit_id group-a)"
 check_thresholds 100 100 later unknown "$no_arm_retry_old" '' \
   "$no_arm_retry_now" group-a >/dev/null
@@ -1355,7 +1704,7 @@ ALERTS_ENABLED=1
 ALERT_THRESHOLDS=50
 live_now=2000004000
 live_old_reset=$((live_now + 3600))
-live_new_reset=$((live_old_reset + 900))
+live_new_reset=$((live_old_reset + 30 * 60))
 check_thresholds 100 100 later later "$live_old_reset" "$live_old_reset" "$live_now" group-a >/dev/null
 check_thresholds 80 80 unknown unknown '' '' "$((live_now + 1))" group-b >/dev/null
 check_thresholds 100 100 later later "$live_new_reset" "$live_new_reset" "$((live_now + 2))" group-a >/dev/null
@@ -2038,7 +2387,7 @@ chmod 700 "${no_arm_hook}"
 export NO_ARM_HOOK_LOG="${no_arm_hook_log}"
 no_arm_hook_now=2000002300
 no_arm_hook_old=$((no_arm_hook_now + 1800))
-no_arm_hook_new=$((no_arm_hook_old + 900))
+no_arm_hook_new=$((no_arm_hook_old + 30 * 60))
 check_thresholds 100 100 later unknown "${no_arm_hook_old}" '' \
   "${no_arm_hook_now}" group-a >/dev/null
 printf '{"schema_version":2,"limit_id_contract_version":1,"legacy_migration":{"source_state_version":5,"completed_at":%s},"alerts":[]}\n' \
