@@ -273,7 +273,7 @@ payload = build_payload(
     now=sol_boundary + 86400,
 )
 assert payload["pricing"] == {
-    "currency": "USD", "as_of": "2026-09-08", "valuation_mode": "effective_catalog"
+    "currency": "USD", "as_of": "2026-09-22", "valuation_mode": "effective_catalog"
 }
 assert payload["tokens"]["summary"]["estimated_cost_usd"] == 126.745, payload["tokens"]["summary"]
 breakdown = {(row["provider"], row["model"]): row["estimated_cost_usd"] for row in payload["tokens"]["breakdown"]}

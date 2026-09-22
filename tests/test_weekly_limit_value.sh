@@ -176,6 +176,15 @@ assert _event_cost({"provider": "openai", "model": "priced", "input_tokens": -1,
                                              "cache_write_per_million": 1, "output_per_million": 1}}) == (None, "invalid_event")
 
 pricing = price_index(load_pricing(root / "local/pricing.json"))
+for model, expected in (("gpt-6-sol", 14.7), ("gpt-6-luna", 0.735)):
+    for provider in ("openai", "openai-codex", "auto"):
+        cost, reason = _event_cost(
+            {"provider": provider, "model": model,
+             "input_tokens": 1000000, "cache_read_tokens": 1000000,
+             "cache_write_tokens": 1000000, "output_tokens": 1000000},
+            pricing,
+        )
+        assert (cost, reason) == (expected, None), (provider, model, cost, reason)
 pricing_boundary = 1787270400
 for occurred_at, expected in ((pricing_boundary - 1, 5.0), (pricing_boundary, 4.0)):
     cost, reason = _event_cost(
