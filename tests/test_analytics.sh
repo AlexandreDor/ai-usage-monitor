@@ -273,7 +273,7 @@ payload = build_payload(
     now=sol_boundary + 86400,
 )
 assert payload["pricing"] == {
-    "currency": "USD", "as_of": "2026-09-22", "valuation_mode": "effective_catalog"
+    "currency": "USD", "as_of": "2026-10-01", "valuation_mode": "effective_catalog"
 }
 assert payload["tokens"]["summary"]["estimated_cost_usd"] == 126.745, payload["tokens"]["summary"]
 breakdown = {(row["provider"], row["model"]): row["estimated_cost_usd"] for row in payload["tokens"]["breakdown"]}
@@ -305,6 +305,9 @@ expected_periods = {
     "gpt-5.6-luna": [
         ("1970-01-01T00:00:00Z", 1.0, 0.1, 1.25, 6.0),
         ("2026-07-30T00:00:00Z", 0.2, 0.02, 0.25, 1.2),
+    ],
+    "gpt-6.1-sol": [
+        ("1970-01-01T00:00:00Z", 2.0, 0.1, 2.5, 10.0),
     ],
 }
 for model, expected in expected_periods.items():

@@ -49,8 +49,8 @@ The local Analytics page provides:
 - uncached input, cache read, cache write, output, reasoning, and total token
   counters;
 - filtering by application and model, with GPT-5.6 Sol, Terra, and Luna plus
-  GPT-6 Astra selected by default when available; older GPT models remain
-  outside this quick selection;
+  GPT-6 Luna, Sol, Astra, and GPT-6.1 Sol selected by default when available;
+  older GPT models remain outside this quick selection;
 - quota, token, and API-equivalent cost charts;
 - implicit weekly-limit value estimates from all locally collected
   API-equivalent token-event costs (Codex, OpenCode, and Hermes). Aggregate
@@ -67,9 +67,9 @@ The local Analytics page provides:
   increases or sub-0.5-point drops, stale/incomplete observations, missing
   positive prices, invalid counters, and zero cost are shown as unavailable
   with a reason rather than silently extrapolated;
-- the weekly-limit value controls compare GPT-5.6 Luna, Terra,
-  Sol and GPT-6 Astra on one chart by default, with distinct colors and
-  independent toggles. The aggregate curve is hidden by default and can be
+- the weekly-limit value controls compare GPT-5.6 Luna, Terra, Sol,
+  GPT-6 Luna, Sol, Astra, and GPT-6.1 Sol on one chart by default, with distinct
+  colors and independent toggles. The aggregate curve is hidden by default and can be
   enabled with its toggle. Models without valid estimates are marked explicitly.
   Events are priced using their recorded provider, then costs with the same
   normalized model name are summed into one model curve. The data includes the
@@ -619,8 +619,11 @@ estimated cost. The default Standard short-context rates are sourced from the
 [OpenAI API pricing page](https://developers.openai.com/api/docs/pricing) and
 its [API changelog](https://developers.openai.com/api/docs/changelog). GPT-6
 Astra's current base rates are documented on its
-[model page](https://developers.openai.com/api/docs/models/gpt-6-astra); the
-catalog excludes its long-context and alternate billing tiers.
+[model page](https://developers.openai.com/api/docs/models/gpt-6-astra).
+GPT-6.1 Sol's reference rates are $2 input, $0.10 cached input, $2.50 cache
+write, and $10 output per million tokens, as documented on its
+[model page](https://developers.openai.com/api/docs/models/gpt-6.1-sol).
+The catalog excludes long-context and alternate billing tiers.
 
 Example with Codex and OpenCode only:
 
