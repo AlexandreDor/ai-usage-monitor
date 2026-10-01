@@ -6,7 +6,7 @@ const BREAKDOWN_PAGE_SIZE = 50;
 const PARIS_ZONE = 'Europe/Paris';
 const EMPTY_VALUE = '-';
 const PRICE_WARNING_PATTERN = /^No catalog price; assumed zero: (.+)$/u;
-const GPT_MODELS = Object.freeze(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6-astra']);
+const GPT_MODELS = Object.freeze(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-astra']);
 const state = {
   range: '30d',
   sources: ['codex', 'opencode', 'hermes'],
@@ -590,6 +590,7 @@ const weeklyValueModelColors = new Map([
   ['gpt-5.6-sol', '#fbbf24'],
   ['gpt-6-luna', '#60a5fa'],
   ['gpt-6-sol', '#f97316'],
+  ['gpt-6.1-sol', '#e879f9'],
   ['gpt-6-astra', '#fb7185'],
 ]);
 function weeklyValueModelKey(model) {
