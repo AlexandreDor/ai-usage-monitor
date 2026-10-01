@@ -6,6 +6,11 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ## [Unreleased]
 
+### Added
+
+- Select GPT-6.1 Sol by default in Analytics and the GPT quick selection,
+  with its own weekly-limit value curve and Standard API reference prices.
+
 ### Changed
 
 - Show unstable but identifiable positive model estimates with high-uncertainty

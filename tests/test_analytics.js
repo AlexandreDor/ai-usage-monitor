@@ -147,18 +147,18 @@ evaluate(`renderLimits({
 if (evaluate('limitDatasets.find(dataset => dataset.datasetKey === "reset-5h").hidden') !== false) fail('5-hour marker visibility preference was lost after an absent-marker payload');
 
 
-// Six independent selections survive refreshes and temporary missing data.
+// Seven independent selections survive refreshes and temporary missing data.
 evaluate(`weeklyValueSelection.clear(); renderWeeklyLimitValue({ by_model: [{ provider: 'openai', model: 'gpt-5.6-sol', series: [] }] });`);
-if (evaluate('weeklyLimitValueDatasets.length') !== 6) fail('six default curves were not selected');
-if (evaluate('new Set(weeklyLimitValueDatasets.map(item => item.borderColor)).size') !== 6) fail('default curves do not have distinct colors');
-if (!evaluate("weeklyValueSelection.get('gpt-6-sol') && weeklyValueSelection.get('gpt-6-luna')")) fail('new GPT-6 models were not selected');
+if (evaluate('weeklyLimitValueDatasets.length') !== 7) fail('seven default curves were not selected');
+if (evaluate('new Set(weeklyLimitValueDatasets.map(item => item.borderColor)).size') !== 7) fail('default curves do not have distinct colors');
+if (!evaluate("weeklyValueSelection.get('gpt-6-sol') && weeklyValueSelection.get('gpt-6-luna') && weeklyValueSelection.get('gpt-6.1-sol')")) fail('new GPT-6 models were not selected');
 evaluate(`weeklyValueSelection.set('gpt-5.6-sol', false);
   renderWeeklyLimitValue(weeklyValueData);`);
-if (evaluate('weeklyLimitValueDatasets.length') !== 5) fail('model toggle did not remove its dataset');
+if (evaluate('weeklyLimitValueDatasets.length') !== 6) fail('model toggle did not remove its dataset');
 evaluate('renderWeeklyLimitValue({ series: [], by_model: [] })');
-if (evaluate('weeklyLimitValueDatasets.length') !== 5) fail('model selection lost when data disappeared');
+if (evaluate('weeklyLimitValueDatasets.length') !== 6) fail('model selection lost when data disappeared');
 evaluate(`renderWeeklyLimitValue({ by_model: [{ provider: 'openai', model: 'gpt-5.6-sol', series: [] }] });`);
-if (evaluate('weeklyLimitValueDatasets.length') !== 5) fail('model selection lost when data returned');
+if (evaluate('weeklyLimitValueDatasets.length') !== 6) fail('model selection lost when data returned');
 evaluate(`for (const key of weeklyValueSelection.keys()) weeklyValueSelection.set(key, false);
   renderWeeklyLimitValue(weeklyValueData);`);
 if (evaluate('weeklyLimitValueDatasets.length') !== 0) fail('all curves cannot be deselected');

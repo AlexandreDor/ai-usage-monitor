@@ -176,7 +176,7 @@ assert _event_cost({"provider": "openai", "model": "priced", "input_tokens": -1,
                                              "cache_write_per_million": 1, "output_per_million": 1}}) == (None, "invalid_event")
 
 pricing = price_index(load_pricing(root / "local/pricing.json"))
-for model, expected in (("gpt-6-sol", 14.7), ("gpt-6-luna", 0.735)):
+for model, expected in (("gpt-6-sol", 14.7), ("gpt-6.1-sol", 14.6), ("gpt-6-luna", 0.735)):
     for provider in ("openai", "openai-codex", "auto"):
         cost, reason = _event_cost(
             {"provider": provider, "model": model,
