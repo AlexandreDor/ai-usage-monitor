@@ -2521,12 +2521,13 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
     except (CollectorError, OSError, UnicodeError, ValueError) as exc:
         raise AnalyticsUnavailableError("pricing catalog cannot be read") from exc
     try:
+        preopen_revision = SNAPSHOT_REVISIONS.observe(database)
         connection = connect_database(database, read_only=True)
     except (ArchiveCorruptionError, ArchiveSchemaError, OSError, sqlite3.DatabaseError) as exc:
         raise AnalyticsUnavailableError("analytics archive cannot be read") from exc
     connection.row_factory = sqlite3.Row
     try:
-        pinned_revision = SNAPSHOT_REVISIONS.pin(connection, database)
+        pinned_revision = SNAPSHOT_REVISIONS.pin(connection, database, expected=preopen_revision)
         cache_namespace = None
         if pinned_revision is not None:
             pricing_digest = hashlib.sha256(json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode()).hexdigest()

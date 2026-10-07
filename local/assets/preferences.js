@@ -632,6 +632,7 @@
     diagnostics: 'Monitor diagnostics', diagnosticsUnavailable: 'Diagnostics unavailable', loadingSection: 'Loading…',
     sectionFailed: 'Unable to load this section. Showing the last successful data when available.', unavailableModel: 'Unavailable in this archive',
     chartFallbackTable: 'Chart unavailable. The data table is open below.',
+    restoredModelsRejected: 'The requested model filter exceeds 50 models. Default filters are shown.',
   });
   Object.assign(translations.fr.analytics, {
     comparePrevious: 'Comparer la période précédente', comparison: 'Période précédente', comparisonUnavailable: 'Comparaison précédente indisponible',
@@ -639,6 +640,7 @@
     diagnostics: 'Diagnostic du moniteur', diagnosticsUnavailable: 'Diagnostic indisponible', loadingSection: 'Chargement…',
     sectionFailed: 'Impossible de charger cette section. Les dernières données valides sont affichées si disponibles.', unavailableModel: 'Indisponible dans cette archive',
     chartFallbackTable: 'Graphique indisponible. Le tableau de données est ouvert ci-dessous.',
+    restoredModelsRejected: 'Le filtre demandé dépasse 50 modèles. Les filtres par défaut sont affichés.',
   });
   translations.en.analytics.diagnosticLabels = {
     monitor: 'Monitor', archive: 'Archive', status: 'Status', last_cycle_at: 'Last cycle', last_success_at: 'Last success',
@@ -679,10 +681,16 @@
     }
     return formatters.get(key);
   }
-  function validTimezone(value) {
-    if (typeof value !== 'string' || value.length > 100 || !value) return false;
-    try { formatter('date', 'en', { timeZone: value }); return true; } catch (_error) { return false; }
+  function canonicalTimezone(value) {
+    if (typeof value !== 'string' || value.length > 100 || !value) return null;
+    try {
+      const name = formatter('date', 'en', { timeZone: value }).resolvedOptions().timeZone;
+      // Intl also accepts numeric offsets in newer browsers; the API uses
+      // named IANA zones, including their canonical spelling and aliases.
+      return typeof name === 'string' && !/^[+-]/.test(name) ? name : null;
+    } catch (_error) { return null; }
   }
+  function validTimezone(value) { return canonicalTimezone(value) !== null; }
   function validRate(value) { return value !== '' && Number.isFinite(Number(value)) && Number(value) > 0 && Number(value) <= 1000; }
   function validDate(value) {
     return value === '' || (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value);
@@ -709,7 +717,7 @@
       currency: Object.prototype.hasOwnProperty.call(CURRENCIES, candidate.currency)
         ? candidate.currency
         : DEFAULTS.currency,
-      timezone: validTimezone(candidate.timezone) ? candidate.timezone : DEFAULTS.timezone,
+      timezone: canonicalTimezone(candidate.timezone) || DEFAULTS.timezone,
       usdToEurRate: validRate(candidate.usdToEurRate) ? Number(candidate.usdToEurRate) : DEFAULTS.usdToEurRate,
       rateDate: validDate(candidate.rateDate) ? candidate.rateDate : DEFAULTS.rateDate,
     };

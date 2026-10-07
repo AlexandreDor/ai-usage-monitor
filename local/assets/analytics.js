@@ -14,6 +14,7 @@ const state = {
   availableModels: [],
   modelAvailabilityResolved: false,
   modelFallbackNotice: false,
+  restoredModelsRejected: false,
   resetType: 'weekly',
   resetOffset: 0,
   breakdownOffset: 0,
@@ -41,6 +42,7 @@ let diagnosticsPayload = null;
 let diagnosticsState = '';
 let currentPeriod = {};
 let refreshSequence = 0;
+let pendingBaseSequence = null;
 let filterTimer = null;
 let filtersPending = false;
 const requestControllers = new Map();
@@ -74,8 +76,9 @@ function restoreFilters() {
   const list = value => Array.isArray(value) ? value : typeof value === 'string' ? value.split(',') : [];
   const sources = list(saved.sources).filter(value => ['codex', 'opencode', 'hermes'].includes(value));
   if (sources.length) state.sources = [...new Set(sources)];
-  const models = list(saved.models).filter(value => typeof value === 'string' && value.length > 0 && value.length <= 200 && !/[\x00-\x1f,]/.test(value)).slice(0, 100);
-  if (models.length) { state.models = [...new Set(models)]; state.explicitModels = true; state.modelAvailabilityResolved = true; }
+  const models = [...new Set(list(saved.models).filter(value => typeof value === 'string' && value.length > 0 && value.length <= 200 && !/[\x00-\x1f,]/.test(value)))];
+  state.restoredModelsRejected = models.length > 50;
+  if (models.length && models.length <= 50) { state.models = models; state.explicitModels = true; state.modelAvailabilityResolved = true; }
   if (['all', '5h', 'weekly'].includes(saved.reset_type)) state.resetType = saved.reset_type;
   if (validFilterDate(saved.from_date) && validFilterDate(saved.to_date) && saved.from_date <= saved.to_date) {
     state.fromDate = saved.from_date; state.toDate = saved.to_date;
@@ -96,6 +99,7 @@ function persistFilters() {
   updateExportLink();
 }
 function queueRefresh() {
+  state.restoredModelsRejected = false;
   filtersPending = true;
   clearTimeout(filterTimer);
   ++refreshSequence;
@@ -306,7 +310,8 @@ function localizeMessage(message) {
   return message;
 }
 function renderWarnings(warnings) {
-  const values = Array.isArray(warnings) ? warnings : warnings ? [warnings] : [];
+  const values = Array.isArray(warnings) ? [...warnings] : warnings ? [warnings] : [];
+  if (state.restoredModelsRejected) values.push(t('restoredModelsRejected'));
   setMessage('analytics-warnings', values.filter(message => !isPriceWarning(message)));
   setMessage('analytics-price-warnings', values.filter(isPriceWarning));
 }
@@ -1282,7 +1287,9 @@ async function loadSection(section, generation, base, query) {
   }
 }
 async function refresh({ section = 'base', revisionRetry = false } = {}) {
-  if (filtersPending) section = 'base';
+  // A pending base owns an older query. Restart it with the latest controls
+  // before it can overwrite a newer component selection or pagination page.
+  if (filtersPending || pendingBaseSequence !== null) section = 'base';
   filtersPending = false;
   clearTimeout(filterTimer);
   if (section !== 'base' && lastPayload) {
@@ -1292,6 +1299,7 @@ async function refresh({ section = 'base', revisionRetry = false } = {}) {
     return;
   }
   const sequence = ++refreshSequence;
+  pendingBaseSequence = sequence;
   clearTimeout(refreshTimer);
   for (const controller of requestControllers.values()) controller?.abort();
   requestControllers.clear();
@@ -1304,6 +1312,7 @@ async function refresh({ section = 'base', revisionRetry = false } = {}) {
   try {
     const payload = await fetchAnalytics('base', query, controller?.signal);
     if (sequence !== refreshSequence) return;
+    pendingBaseSequence = null;
     render(payload);
     if (sequence !== refreshSequence) return;
     persistFilters();
@@ -1320,6 +1329,7 @@ async function refresh({ section = 'base', revisionRetry = false } = {}) {
     setMessage('analytics-error', lastPayload ? `${message} · ${t('showingLastData')}` : message);
   } finally {
     if (sequence === refreshSequence) {
+      pendingBaseSequence = null;
       if (loading) loading.hidden = true;
       requestControllers.delete('base');
       refreshSchedule();

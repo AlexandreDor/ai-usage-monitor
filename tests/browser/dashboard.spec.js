@@ -1556,3 +1556,106 @@ test('localizes safe diagnostic fields statuses errors and warnings when prefere
   await expect(panel).not.toContainText('SECRET');
   await expect(panel).not.toContainText('/private/path');
 });
+
+for (const action of ['reset filter', 'breakdown pagination']) {
+  test(`keeps the latest ${action} when an older base response arrives late`, async ({ page }) => {
+    let baseCount = 0;
+    let releaseOldBase;
+    const heldBase = new Promise(resolve => { releaseOldBase = resolve; });
+    const queries = [];
+    const resetsFor = filter => ({ ...analyticsPayload.resets, total: 1, offset: 0, items: [{
+      window: filter === '5h' ? '5h' : 'weekly', category: 'scheduled',
+      reset_at: analyticsPayload.period.from, observed_at: analyticsPayload.period.from,
+      before_pct: 0, after_pct: 100,
+    }] });
+    const tokensFor = offset => ({ ...analyticsPayload.tokens,
+      breakdown: [{ ...analyticsPayload.tokens.breakdown[0], model: `page-${offset}` }],
+      breakdown_pagination: { total: 100, limit: 50, offset },
+    });
+    await page.route('**/api/analytics?*', async route => {
+      const query = new URL(route.request().url()).searchParams;
+      queries.push(query);
+      const section = query.get('sections');
+      const resets = resetsFor(query.get('reset_type'));
+      const tokens = tokensFor(Number(query.get('breakdown_offset') || 0));
+      if (section === 'base') {
+        baseCount += 1;
+        if (baseCount === 2) await heldBase;
+        const base = { ...analyticsPayload, revision: 'stable', tokens, resets, pending_sections: ['weekly', 'resets'] };
+        delete base.weekly_limit_value;
+        return route.fulfill({ json: base });
+      }
+      return route.fulfill({ json: { period: analyticsPayload.period, revision: 'stable',
+        ...(section === 'resets' ? { resets } : section === 'breakdown' ? { tokens } : { weekly_limit_value: analyticsPayload.weekly_limit_value }),
+      } });
+    });
+    await page.goto('/analytics.html');
+    await expect(page.locator('#resets-body tr')).toHaveCount(1);
+    await expect(page.locator('#breakdown-body')).toContainText('page-0');
+    await page.evaluate(() => { window.heldRefresh = refresh(); });
+    await expect.poll(() => baseCount).toBe(2);
+    if (action === 'reset filter') {
+      await page.selectOption('#reset-filter', '5h');
+      await expect.poll(() => page.evaluate(() => displayedResetData?.items[0]?.window)).toBe('5h');
+    } else {
+      await page.locator('#breakdown-next').click();
+      await expect(page.locator('#breakdown-body')).toContainText('page-50');
+    }
+    releaseOldBase();
+    await page.evaluate(() => window.heldRefresh);
+    expect(baseCount).toBe(3);
+    if (action === 'reset filter') {
+      await expect(page.locator('#reset-filter')).toHaveValue('5h');
+      expect(await page.evaluate(() => displayedResetData.items[0].window)).toBe('5h');
+    } else {
+      await expect(page.locator('#breakdown-body')).toContainText('page-50');
+      expect(await page.evaluate(() => state.breakdownOffset)).toBe(50);
+    }
+    expect(queries.filter(query => query.get('sections') === 'base').at(-1).get(action === 'reset filter' ? 'reset_type' : 'breakdown_offset')).toBe(action === 'reset filter' ? '5h' : '50');
+  });
+}
+
+test('normalizes browser timezone aliases before Analytics and CSV requests', async ({ page }) => {
+  const queries = [];
+  await page.route('**/api/analytics?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    queries.push(query);
+    if (query.get('timezone') === 'PST') return route.fulfill({ status: 400, json: { error: 'invalid IANA zone' } });
+    return route.fulfill({ json: analyticsPayload });
+  });
+  await page.goto('/analytics.html');
+  await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+  await page.locator('.advanced-preferences summary').click();
+  const timezoneInput = page.locator('[data-preference-input="timezone"]');
+  await timezoneInput.fill('PST');
+  await timezoneInput.blur();
+  await expect(timezoneInput).toHaveValue('America/Los_Angeles');
+  await expect.poll(() => queries.at(-1).get('timezone')).toBe('America/Los_Angeles');
+  await expect(page.locator('#analytics-error')).toBeHidden();
+  const csv = new URL(await page.locator('#csv-download').getAttribute('href'), 'http://localhost');
+  expect(csv.searchParams.get('timezone')).toBe('America/Los_Angeles');
+  await page.reload();
+  await expect.poll(() => queries.at(-1).get('timezone')).toBe('America/Los_Angeles');
+  await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+});
+
+for (const storageMode of ['URL', 'local storage']) {
+  test(`rejects restored ${storageMode} model filters above the API limit`, async ({ page }) => {
+    const models = Array.from({ length: 51 }, (_, index) => `model-${index}`);
+    const queries = [];
+    if (storageMode === 'local storage') await page.addInitScript(models => {
+      localStorage.setItem('codex-usage-monitor.analytics-filters', JSON.stringify({ models }));
+    }, models);
+    await page.route('**/api/analytics?*', route => {
+      const query = new URL(route.request().url()).searchParams;
+      queries.push(query);
+      if ((query.get('models') || '').split(',').length > 50) return route.fulfill({ status: 400, json: { error: 'model filter is invalid' } });
+      return route.fulfill({ json: analyticsPayload });
+    });
+    await page.goto(`/analytics.html${storageMode === 'URL' ? `?models=${models.join(',')}` : ''}`);
+    await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+    expect(queries[0].get('models').split(',').length).toBeLessThanOrEqual(50);
+    await expect(page.locator('#analytics-error')).toBeHidden();
+    await expect(page.locator('#analytics-warnings')).toContainText('exceeds 50 models');
+  });
+}

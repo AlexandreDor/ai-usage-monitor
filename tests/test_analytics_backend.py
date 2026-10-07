@@ -2,8 +2,9 @@
 """Behavior and invalidation checks for selective analytics and reusable work."""
 import concurrent.futures
 from copy import deepcopy
-from contextlib import closing
+from contextlib import closing, contextmanager
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -17,6 +18,7 @@ import analytics
 import analytics_cache
 from analytics_cache import AnalyticsCache, SnapshotRevisions, archive_revision
 from storage import connect_database
+from storage import PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -45,6 +47,102 @@ class AnalyticsBackendTests(unittest.TestCase):
     def payload(self, params=None, now=None):
         return analytics.build_payload(self.db, self.pricing, params or {'range': 'all'},
                                        now=self.now if now is None else now)
+
+    @contextmanager
+    def isolated_snapshot_caches(self):
+        monitor = SnapshotRevisions()
+        with patch.object(analytics, 'SNAPSHOT_REVISIONS', monitor), \
+             patch.object(analytics, 'WEEKLY_CACHE', AnalyticsCache()), \
+             patch.object(analytics, 'REGRESSION_CACHE', AnalyticsCache()):
+            try:
+                yield monitor
+            finally:
+                for observer in monitor._observers.values():
+                    observer[1].close()
+
+    def prepare_replacement(self):
+        replacement = self.db.with_name('replacement.sqlite3')
+        with closing(sqlite3.connect(self.db)) as original, closing(sqlite3.connect(replacement)) as new:
+            original.execute('PRAGMA journal_mode=DELETE')
+            original.backup(new)
+            new.execute('UPDATE token_usage_events SET input_tokens=input_tokens*3')
+            new.commit()
+            new.execute('PRAGMA journal_mode=DELETE')
+        return replacement
+
+    def assert_replacement_is_current_and_cached(self, raced):
+        params = {'range': 'all', 'sections': 'weekly'}
+        fresh = self.payload(params)
+        self.assertNotEqual(raced['revision'], fresh['revision'])
+        self.assertEqual(fresh['weekly_limit_value']['series'][-1]['observed_cost_usd'], 4.5)
+        with patch.object(analytics, 'weekly_limit_value', side_effect=AssertionError('warm request recomputed')):
+            self.assertEqual(self.payload(params), fresh)
+
+    def test_replacement_after_open_cannot_poison_new_archive_caches(self):
+        replacement = self.prepare_replacement()
+        original_connect = analytics.connect_database
+        def opened_then_replaced(path, **kwargs):
+            connection = original_connect(path, **kwargs)
+            os.replace(replacement, self.db)
+            return connection
+        with self.isolated_snapshot_caches():
+            with patch.object(analytics, 'connect_database', side_effect=opened_then_replaced):
+                old = self.payload({'range': 'all', 'sections': 'weekly'})
+            self.assertEqual(old['weekly_limit_value']['series'][-1]['observed_cost_usd'], 1.5)
+            self.assertFalse(analytics.WEEKLY_CACHE._values)
+            self.assertFalse(analytics.REGRESSION_CACHE._values)
+            self.assert_replacement_is_current_and_cached(old)
+
+    def test_replacement_before_open_refuses_preopen_identity(self):
+        replacement = self.prepare_replacement()
+        original_connect = analytics.connect_database
+        def replaced_then_opened(path, **kwargs):
+            os.replace(replacement, self.db)
+            return original_connect(path, **kwargs)
+        with self.isolated_snapshot_caches():
+            with patch.object(analytics, 'connect_database', side_effect=replaced_then_opened):
+                raced = self.payload({'range': 'all', 'sections': 'weekly'})
+            self.assertEqual(raced['weekly_limit_value']['series'][-1]['observed_cost_usd'], 4.5)
+            self.assertFalse(analytics.WEEKLY_CACHE._values)
+            self.assertFalse(analytics.REGRESSION_CACHE._values)
+            self.assert_replacement_is_current_and_cached(raced)
+
+    def test_replacement_during_observer_open_refuses_wrong_file_identity(self):
+        replacement = self.prepare_replacement()
+        original_connect = sqlite3.connect
+        def observer_opened_then_replaced(*args, **kwargs):
+            connection = original_connect(*args, **kwargs)
+            os.replace(replacement, self.db)
+            return connection
+        with self.isolated_snapshot_caches() as monitor:
+            with patch.object(analytics_cache.sqlite3, 'connect', side_effect=observer_opened_then_replaced):
+                self.assertIsNone(monitor.observe(self.db))
+            self.assertIsNotNone(monitor.observe(self.db))
+            current = self.payload({'range': 'all', 'sections': 'weekly'})
+            self.assertEqual(current['weekly_limit_value']['series'][-1]['observed_cost_usd'], 4.5)
+
+    def test_migrated_snapshot_commit_before_pin_cannot_poison_current_archive(self):
+        with closing(sqlite3.connect(self.db)) as writer:
+            writer.execute('DELETE FROM metadata WHERE key=?', (PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY,))
+            writer.commit()
+            original_connect = analytics.connect_database
+            def migrated_then_committed(path, **kwargs):
+                connection = original_connect(path, **kwargs)
+                self.assertEqual(connection.execute('PRAGMA database_list').fetchone()[2], '')
+                writer.execute('UPDATE token_usage_events SET input_tokens=input_tokens*3')
+                writer.commit()
+                return connection
+            with self.isolated_snapshot_caches():
+                # Keep the file fingerprint unchanged to isolate the commit
+                # publication signal from filesystem-based invalidation.
+                stamp = archive_revision(self.db)
+                with patch.object(analytics_cache, 'archive_revision', return_value=stamp):
+                    with patch.object(analytics, 'connect_database', side_effect=migrated_then_committed):
+                        old = self.payload({'range': 'all', 'sections': 'weekly'})
+                    self.assertEqual(old['weekly_limit_value']['series'][-1]['observed_cost_usd'], 1.5)
+                    self.assertFalse(analytics.WEEKLY_CACHE._values)
+                    self.assertFalse(analytics.REGRESSION_CACHE._values)
+                    self.assert_replacement_is_current_and_cached(old)
 
     def test_sections_match_full_and_skip_expensive_work(self):
         full = self.payload()
@@ -127,6 +225,8 @@ class AnalyticsBackendTests(unittest.TestCase):
         monitor = SnapshotRevisions()
         self.addCleanup(lambda: [value[1].close() for value in monitor._observers.values()])
         with closing(connect_database(self.db)) as writer, writer:
+            expected = monitor.observe(self.db)
+            self.assertIsNotNone(expected)
             with closing(connect_database(self.db, read_only=True)) as reader:
                 class RacingRead:
                     def execute(inner, query):
@@ -137,7 +237,32 @@ class AnalyticsBackendTests(unittest.TestCase):
                         return result
                 stamp = archive_revision(self.db)
                 with patch.object(analytics_cache, 'archive_revision', return_value=stamp):
-                    self.assertIsNone(monitor.pin(RacingRead(), self.db))
+                    self.assertEqual(monitor.observe(self.db), expected)
+                    self.assertIsNone(monitor.pin(RacingRead(), self.db, expected=expected))
+            # Prove an unchanged observation can name a snapshot, so the
+            # racing assertion does not pass merely by disabling all caching.
+            expected = monitor.observe(self.db)
+            with closing(connect_database(self.db, read_only=True)) as reader:
+                self.assertEqual(monitor.pin(reader, self.db, expected=expected), expected)
+
+    def test_unobserved_open_connection_reads_without_cache_identity(self):
+        with self.isolated_snapshot_caches() as monitor:
+            with closing(connect_database(self.db, read_only=True)) as reader:
+                self.assertIsNone(monitor.pin(reader, self.db, expected=None))
+                self.assertTrue(reader.in_transaction)
+                self.assertEqual(reader.execute('SELECT COUNT(*) FROM snapshots').fetchone()[0], 3)
+
+    def test_evicted_preopen_observer_does_not_name_snapshot(self):
+        other = self.db.with_name('other.sqlite3')
+        with closing(connect_database(other)):
+            pass
+        monitor = SnapshotRevisions(max_archives=1)
+        self.addCleanup(lambda: [value[1].close() for value in monitor._observers.values()])
+        expected = monitor.observe(self.db)
+        self.assertIsNotNone(expected)
+        with closing(connect_database(self.db, read_only=True)) as reader:
+            self.assertIsNotNone(monitor.observe(other))
+            self.assertIsNone(monitor.pin(reader, self.db, expected=expected))
 
     def test_timezone_dst_and_previous_comparison(self):
         result = self.payload({'from_date': '2026-03-08', 'to_date': '2026-03-08',

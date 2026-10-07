@@ -84,4 +84,12 @@ if (api.formatCurrency(10) !== '€9.00' || api.convertUsd(10) !== 9) fail('cust
 if (api.timezone() !== 'UTC' || api.get().rateDate !== '2026-10-07') fail('custom timezone/rate date not saved');
 api.set({ timezone: 'Invalid/Zone', usdToEurRate: -3, rateDate: '2026-02-31' });
 if (api.timezone() !== 'Europe/Paris' || api.get().usdToEurRate !== 0.86 || api.get().rateDate !== '') fail('invalid preferences accepted');
+for (const [input, expected] of [['PST', 'America/Los_Angeles'], ['utc', 'UTC'], ['europe/paris', 'Europe/Paris'], ['Etc/GMT-2', 'Etc/GMT-2']]) {
+  api.set({ timezone: input });
+  if (api.timezone() !== expected) fail(`timezone ${input} was not normalized to its IANA name`);
+}
+const storedAlias = createContext(JSON.stringify({ timezone: 'PST' }));
+if (storedAlias.CodexPreferences.timezone() !== 'America/Los_Angeles') fail('stored alias was not normalized on load');
+api.set({ timezone: '+02:00' });
+if (api.timezone() !== 'Europe/Paris') fail('numeric UTC offset accepted as an IANA zone');
 console.log('PASS: preference tests');
