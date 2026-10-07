@@ -75,15 +75,16 @@ jobs:
           python -m unittest tests.test_migrations
           python -m unittest tests.test_codex_client
           python -m compileall -q local tests
-          systemd-analyze verify packaging/systemd/codex-usage-monitor.service packaging/systemd/codex-usage-dashboard.service
+          systemd-analyze verify packaging/systemd/codex-usage-monitor.service packaging/systemd/codex-usage-dashboard.service packaging/systemd/codex-usage-backup.service packaging/systemd/codex-usage-backup.timer
           python -m coverage run --branch --rcfile=.coveragerc -m unittest \
             tests.test_migrations tests.test_alerts tests.test_anomalies \
             tests.test_history tests.test_codex_client tests.test_config \
-            tests.test_storage_durability
+            tests.test_storage_durability tests.test_analytics_backend tests.test_analytics_export tests.test_http_features tests.test_diagnostics tests.test_backup
           python -m coverage report --rcfile=.coveragerc
           SKIP_PYTHON_TESTS=1 tests/run.sh
           npx playwright install --with-deps chromium
           npm run test:browser
+          npm run test:performance
           npm audit --audit-level=low
           shellcheck -x local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
 

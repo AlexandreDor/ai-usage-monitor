@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Codex Usage Monitor archive backup
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15m
+Persistent=true
+Unit=codex-usage-backup.service
+
+[Install]
+WantedBy=timers.target

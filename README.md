@@ -29,6 +29,9 @@ reset probabilities from the independent Codex Forecast service.
   values stay visible when collection or publication is delayed.
 - English and French interfaces.
 - EUR and USD display preferences shared across both pages.
+- Shared display timezone, user-set USD-to-EUR rate and optional rate date.
+  Defaults remain Europe/Paris and 0.86 EUR per USD; the rate is not downloaded
+  automatically and never changes the underlying USD estimates.
 - Optional global 24-hour and 6-hour reset probabilities from
   [Codex Forecast](https://codex.lunarwerx.com/).
 - No direct third-party request from the browser: the monitor fetches Forecast
@@ -129,6 +132,15 @@ The local Analytics page provides:
   conversion;
 - collector freshness, warnings, and accessible text/table alternatives for
   Analytics charts.
+- progressive loading: quota history and tokens appear before the weekly-value
+  calculations finish; each section retains its last valid data on failure;
+- previous-period token and cost comparisons using the same application/model
+  filters and an immediately preceding period of equal duration;
+- remembered filters and locally shareable URLs;
+- full CSV exports of filtered quota/token series, weekly values, allocation,
+  and reset history, independently of the currently displayed table page;
+- an optional diagnostic panel with sanitized monitor health, archive counts,
+  and the twenty most recent quota anomalies.
 
 Analytics data stays in the local SQLite archive and is not synchronized to the
 Gist. Cost values are estimates, not billing statements. Reasoning tokens are a
@@ -956,7 +968,66 @@ Advanced Analytics requires the local `serve.sh` API and the local SQLite
 archive. A Pages browser cannot provide Analytics merely by having access to
 the Gist.
 
+## Analytics loading, exports, and preferences
+
+Display settings are stored in this browser. The timezone uses an IANA name
+such as `Europe/Paris` or `UTC`; custom date ranges use midnight in the selected
+zone, including daylight-saving changes. EUR conversion is presentation only.
+The optional rate date identifies the rate you entered, not an automatically
+verified exchange rate.
+
+Analytics remembers source/model/date/reset/comparison selections locally and
+updates the URL, so reloads and local links keep the selected view. An explicitly
+selected model that is absent from the archive is not silently replaced by a
+different model. Detailed chart tables are populated when opened, then updated
+while open. If charts cannot render, the same complete tables remain available.
+
+CSV downloads keep UTC timestamps, full token counters, percentages and USD
+values without display rounding. They cover the selected filtered period, not
+only the visible page. Missing estimates remain empty with their reason/status;
+unknown-priced allocation rows keep their pricing status. Text that could be a
+spreadsheet formula is escaped. Exports above 10,000 rows or 16 MiB fail with an
+explicit request to shorten the period rather than silently truncate.
+
+The read-only API retains its existing full JSON response by default. Optional
+`sections=base|weekly|resets|breakdown` selects a component, `at` anchors the
+period endpoint to a Unix timestamp, `timezone` selects custom-date boundaries,
+and `compare=previous` adds the preceding-period summary. Every response includes
+an opaque archive/pricing `revision`; the frontend only combines components
+with matching revision and period. Freshness is evaluated at the actual request
+time, even for anchored requests. Local caches are bounded, coalesce concurrent
+identical work, and invalidate after archive/pricing changes. Cached estimates
+still become unavailable when current observations are stale.
+
+`/api/analytics.csv?dataset=limits|tokens|weekly_value|breakdown|resets` accepts the
+same period/source/model/reset filters. `/api/diagnostics` exposes only an
+allowlisted projection: health status and times, counters, fixed error labels,
+and recent anomaly types/percentages. Raw health errors, account identifiers,
+private filesystem paths and configuration are not served.
+
+Static assets use ETag revalidation, so changed releases are picked up immediately
+while unchanged files return 304. JSON, CSV, diagnostics and runtime snapshots
+remain `no-store`. Text responses negotiate gzip; downloads and charts retain
+their complete data and rendering resolution.
+
 ## Backup/Restore SQLite
+
+Create a verified backup without stopping the live WAL writer:
+
+```bash
+python3 local/backup.py --database local/runtime/usage-history.sqlite3 \
+  --destination-dir local/runtime/backups --keep 14 --status-json
+```
+
+The backup directory is private and backups are mode `600`. The tool uses the
+SQLite backup API, checks integrity and the current archive schema, publishes
+atomically, and only prunes verified owned backups matching its naming scheme.
+Concurrent runs are rejected. A failed copy leaves previous backups intact;
+unsafe, linked or unverifiable retention candidates are left untouched.
+The copy phase has a thirty-second deadline. These backups remain on this
+machine; retain a separate copy elsewhere for disaster recovery.
+
+An opt-in daily systemd timer is packaged; see [installation instructions](docs/INSTALL.md).
 
 The default archive is
 `local/runtime/usage-history.sqlite3`. It is private local state, not an
@@ -1256,7 +1327,12 @@ migration rollback.
 
 - `local/monitor.sh`: collection loop, snapshot publication, integrations, and
   alert orchestration.
-- `local/serve.sh`: allowlisted local HTTP server and read-only Analytics API.
+- `local/serve.sh` and `http_server.py`: server configuration, allowlisted local
+  HTTP routes, compression and static revalidation.
+- `local/analytics_cache.py` and `analytics_export.py`: bounded reusable
+  calculations and complete filtered CSV exports.
+- `local/diagnostics.py`, `operations.py`, and `backup.py`: sanitized diagnostics,
+  private filesystem helpers and verified archive backups.
 - `local/storage.py`, `archive.py`, and `analytics.py`: SQLite storage and query
   logic.
 - `local/token_usage.py`: Codex, OpenCode, and Hermes token collectors.
@@ -1265,9 +1341,12 @@ migration rollback.
 - `tests/run.sh`: dependency-free shell, Python, and Node test suite.
 - `npm run test:browser`: Playwright and axe-core browser tests, excluding the
   dedicated performance benchmarks.
-- `npm run test:performance`: Chromium idle-rendering budgets for the live
-  dashboard and Analytics page. Each page is sampled three times for two seconds
-  after a short warm-up; the median is checked for paint and raster work,
+- `npm run test:performance`: a synthetic 50,000-event backend loading benchmark,
+  dense-history browser loading/DOM/formatter budgets, and Chromium idle-rendering
+  budgets for the live dashboard and Analytics page. CI and release validation
+  run these benchmarks. The backend report is saved as
+  `test-results/backend-performance.json`. Idle rendering on each page is sampled
+  three times for two seconds after a short warm-up; the median is checked for paint and raster work,
   compositor draws, and renderer task time, while any infinite animation fails
   the test. A JSON summary with every sample is stored with the Playwright test
   artifacts under `test-results/`. These metrics detect continuous client

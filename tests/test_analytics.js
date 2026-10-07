@@ -19,7 +19,12 @@ class FakeElement {
     this.className = '';
     this.classList = { add: () => {}, remove: () => {}, toggle: () => {} };
   }
-  appendChild(child) { this.children.push(child); return child; }
+  appendChild(child) {
+    if (child.isFragment) { this.children.push(...child.children); child.children = []; }
+    else this.children.push(child);
+    return child;
+  }
+  replaceChildren(...children) { this.children = []; children.forEach(child => this.appendChild(child)); }
   removeChild(child) { this.children = this.children.filter(item => item !== child); }
   get firstChild() { return this.children[0] || null; }
   setAttribute(name, value) { this.attributes[name] = String(value); }
@@ -41,6 +46,7 @@ const documentObject = {
   querySelectorAll: () => [],
   getElementById: element,
   createElement: tag => new FakeElement(tag),
+  createDocumentFragment: () => Object.assign(new FakeElement(), { isFragment: true }),
   addEventListener: () => {},
 };
 function FakeChart(_context, config) {
@@ -53,7 +59,7 @@ FakeChart.Interaction = { modes: {} };
 FakeChart.register = () => {};
 
 const context = vm.createContext({
-  console, Date, Error, Intl, Map, Number, Object, Array, Set,
+  console, Date, Error, Intl, Map, Number, Object, Array, Set, URLSearchParams, AbortController,
   Chart: FakeChart,
   document: documentObject,
   addEventListener: () => {},
@@ -163,4 +169,8 @@ evaluate(`for (const key of weeklyValueSelection.keys()) weeklyValueSelection.se
   renderWeeklyLimitValue(weeklyValueData);`);
 if (evaluate('weeklyLimitValueDatasets.length') !== 0) fail('all curves cannot be deselected');
 if (!element('weekly-limit-value-chart-wrap').hidden) fail('empty selection showed a chart');
+if (evaluate('periodAnchor({ to: (Date.now() + 86400000) / 1000 })') !== null) fail('future custom period anchor was accepted');
+if (evaluate('periodAnchor({ to: 0 })') !== null) fail('zero period anchor was accepted');
+if (evaluate('periodAnchor({ to: -1 })') !== null) fail('negative period anchor was accepted');
+if (evaluate('periodAnchor({ to: 1700000000 })') !== 1700000000) fail('past period anchor was not preserved');
 console.log('PASS: analytics JavaScript tests');

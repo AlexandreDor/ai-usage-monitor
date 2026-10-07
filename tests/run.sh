@@ -10,6 +10,11 @@ if [[ "${SKIP_PYTHON_TESTS:-0}" != 1 ]]; then
   python3 "$TEST_DIR/test_codex_client.py"
   python3 "$TEST_DIR/test_config.py"
   python3 "$TEST_DIR/test_storage_durability.py"
+  python3 "$TEST_DIR/test_analytics_backend.py"
+  python3 "$TEST_DIR/test_analytics_export.py"
+  python3 "$TEST_DIR/test_http_features.py"
+  python3 "$TEST_DIR/test_diagnostics.py"
+  python3 "$TEST_DIR/test_backup.py"
 fi
 
 for test_file in "$TEST_DIR"/test_*.sh; do

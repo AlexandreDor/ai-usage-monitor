@@ -4,7 +4,7 @@
 (function initialisePreferences(root) {
   const STORAGE_KEY = 'codex-usage-monitor.preferences';
   const USD_TO_EUR_RATE = 0.86;
-  const DEFAULTS = Object.freeze({ language: 'en', currency: 'EUR' });
+  const DEFAULTS = Object.freeze({ language: 'en', currency: 'EUR', timezone: 'Europe/Paris', usdToEurRate: USD_TO_EUR_RATE, rateDate: '' });
   const LANGUAGE_LOCALES = Object.freeze({ en: 'en-GB', fr: 'fr-FR' });
   const CURRENCIES = Object.freeze({ EUR: 'EUR', USD: 'USD' });
   const translations = {
@@ -15,6 +15,7 @@
         currency: 'Currency',
         euro: '€ Euro',
         dollar: '$ US dollar',
+        advanced: 'Time and exchange rate', timezone: 'Time zone (IANA)', usdToEurRate: 'EUR per USD', rateDate: 'Rate date', invalidTimezone: 'Enter a valid IANA time zone.', invalidRate: 'Enter a positive exchange rate.', invalidDate: 'Enter a valid date.',
       },
       languages: { en: 'English', fr: 'Français' },
       currencies: { EUR: '€ EUR', USD: '$ USD' },
@@ -322,6 +323,7 @@
         currency: 'Monnaie',
         euro: '€ Euro',
         dollar: '$ Dollar américain',
+        advanced: 'Heure et taux de change', timezone: 'Fuseau horaire (IANA)', usdToEurRate: 'EUR par USD', rateDate: 'Date du taux', invalidTimezone: 'Saisissez un fuseau horaire IANA valide.', invalidRate: 'Saisissez un taux de change positif.', invalidDate: 'Saisissez une date valide.',
       },
       languages: { en: 'English', fr: 'Français' },
       currencies: { EUR: '€ EUR', USD: '$ USD' },
@@ -624,6 +626,68 @@
     },
   };
 
+  Object.assign(translations.en.analytics, {
+    comparePrevious: 'Compare previous period', comparison: 'Previous period', comparisonUnavailable: 'Previous-period comparison unavailable',
+    exportCsv: 'Export CSV', exportDataset: 'Dataset', exportDownload: 'Download CSV', exportRaw: 'USD, full token counts and UTC dates',
+    diagnostics: 'Monitor diagnostics', diagnosticsUnavailable: 'Diagnostics unavailable', loadingSection: 'Loading…',
+    sectionFailed: 'Unable to load this section. Showing the last successful data when available.', unavailableModel: 'Unavailable in this archive',
+    chartFallbackTable: 'Chart unavailable. The data table is open below.',
+  });
+  Object.assign(translations.fr.analytics, {
+    comparePrevious: 'Comparer la période précédente', comparison: 'Période précédente', comparisonUnavailable: 'Comparaison précédente indisponible',
+    exportCsv: 'Exporter CSV', exportDataset: 'Jeu de données', exportDownload: 'Télécharger CSV', exportRaw: 'USD, nombres de tokens complets et dates UTC',
+    diagnostics: 'Diagnostic du moniteur', diagnosticsUnavailable: 'Diagnostic indisponible', loadingSection: 'Chargement…',
+    sectionFailed: 'Impossible de charger cette section. Les dernières données valides sont affichées si disponibles.', unavailableModel: 'Indisponible dans cette archive',
+    chartFallbackTable: 'Graphique indisponible. Le tableau de données est ouvert ci-dessous.',
+  });
+  translations.en.analytics.diagnosticLabels = {
+    monitor: 'Monitor', archive: 'Archive', status: 'Status', last_cycle_at: 'Last cycle', last_success_at: 'Last success',
+    consecutive_failures: 'Consecutive failures', last_cycle_duration_ms: 'Cycle duration (ms)', interval_seconds: 'Interval (seconds)',
+    age_seconds: 'Age (seconds)', last_error_at: 'Last error', error_code: 'Error code', error_message: 'Error', snapshots: 'Limit samples',
+    token_events: 'Token events', resets: 'Resets', anomalies: 'Anomalies', pending_anomalies: 'Pending anomalies', last_snapshot_at: 'Last limit sample',
+  };
+  translations.fr.analytics.diagnosticLabels = {
+    monitor: 'Moniteur', archive: 'Archive', status: 'État', last_cycle_at: 'Dernier cycle', last_success_at: 'Dernière réussite',
+    consecutive_failures: 'Échecs consécutifs', last_cycle_duration_ms: 'Durée du cycle (ms)', interval_seconds: 'Intervalle (secondes)',
+    age_seconds: 'Âge (secondes)', last_error_at: 'Dernière erreur', error_code: 'Code d’erreur', error_message: 'Erreur', snapshots: 'Relevés de limite',
+    token_events: 'Événements de tokens', resets: 'Réinitialisations', anomalies: 'Anomalies', pending_anomalies: 'Anomalies en attente', last_snapshot_at: 'Dernier relevé de limite',
+  };
+  translations.en.analytics.diagnosticStatuses = { healthy: 'healthy', unhealthy: 'unhealthy', degraded: 'degraded', stale: 'stale', unavailable: 'unavailable', ok: 'healthy' };
+  translations.fr.analytics.diagnosticStatuses = { healthy: 'bon', unhealthy: 'défaillant', degraded: 'dégradé', stale: 'périmé', unavailable: 'indisponible', ok: 'bon' };
+  translations.en.analytics.diagnosticErrors = {
+    alert_state_failed: 'Alert state could not be saved.', alert_journal_failed: 'Alert journal maintenance failed.',
+    alert_cleanup_failed: 'Alert cleanup failed.', collection_failed: 'Collection or alert delivery failed.',
+  };
+  translations.fr.analytics.diagnosticErrors = {
+    alert_state_failed: 'L’état des alertes n’a pas pu être enregistré.', alert_journal_failed: 'La maintenance du journal des alertes a échoué.',
+    alert_cleanup_failed: 'Le nettoyage des alertes a échoué.', collection_failed: 'La collecte ou l’envoi des alertes a échoué.',
+  };
+  translations.en.analytics.diagnosticWarnings = { monitorUnavailable: 'Monitor health is unavailable.', monitorStale: 'Monitor health is stale.', archiveUnavailable: 'Archive is unavailable.', archiveUnsafe: 'Archive could not be read safely.', unknown: 'Diagnostics warning.' };
+  translations.fr.analytics.diagnosticWarnings = { monitorUnavailable: 'L’état du moniteur est indisponible.', monitorStale: 'L’état du moniteur est périmé.', archiveUnavailable: 'L’archive est indisponible.', archiveUnsafe: 'L’archive n’a pas pu être lue en toute sécurité.', unknown: 'Avertissement du diagnostic.' };
+  translations.en.analytics.diagnosticAnomalies = { quota_increase: 'Quota increased', reset_shift: 'Reset shifted', reset_in_past: 'Reset in the past', reset_missing: 'Reset missing', reset_oscillation: 'Reset oscillation' };
+  translations.fr.analytics.diagnosticAnomalies = { quota_increase: 'Quota en hausse', reset_shift: 'Réinitialisation décalée', reset_in_past: 'Réinitialisation dans le passé', reset_missing: 'Réinitialisation absente', reset_oscillation: 'Réinitialisation instable' };
+  Object.assign(translations.fr.preferences, {
+    advanced: 'Heure et taux de change', timezone: 'Fuseau horaire (IANA)', usdToEurRate: 'EUR par USD', rateDate: 'Date du taux',
+    invalidTimezone: 'Saisissez un fuseau horaire IANA valide.', invalidRate: 'Saisissez un taux de change positif.', invalidDate: 'Saisissez une date valide.',
+  });
+  const formatters = new Map();
+  function formatter(kind, language, options = {}) {
+    const key = JSON.stringify([kind, language, Object.entries(options).sort(([a], [b]) => a.localeCompare(b))]);
+    if (!formatters.has(key)) {
+      if (formatters.size >= 64) formatters.delete(formatters.keys().next().value);
+      formatters.set(key, kind === 'date' ? new Intl.DateTimeFormat(language, options) : new Intl.NumberFormat(language, options));
+    }
+    return formatters.get(key);
+  }
+  function validTimezone(value) {
+    if (typeof value !== 'string' || value.length > 100 || !value) return false;
+    try { formatter('date', 'en', { timeZone: value }); return true; } catch (_error) { return false; }
+  }
+  function validRate(value) { return value !== '' && Number.isFinite(Number(value)) && Number(value) > 0 && Number(value) <= 1000; }
+  function validDate(value) {
+    return value === '' || (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value);
+  }
+
   let preferences = { ...DEFAULTS };
   let initialised = false;
   const listeners = new Set();
@@ -645,6 +709,9 @@
       currency: Object.prototype.hasOwnProperty.call(CURRENCIES, candidate.currency)
         ? candidate.currency
         : DEFAULTS.currency,
+      timezone: validTimezone(candidate.timezone) ? candidate.timezone : DEFAULTS.timezone,
+      usdToEurRate: validRate(candidate.usdToEurRate) ? Number(candidate.usdToEurRate) : DEFAULTS.usdToEurRate,
+      rateDate: validDate(candidate.rateDate) ? candidate.rateDate : DEFAULTS.rateDate,
     };
   }
 
@@ -724,8 +791,8 @@
       element.textContent = translate(element.getAttribute('data-i18n'));
     }
     applyAttributeTranslations(documentRef);
-    for (const select of documentRef.querySelectorAll('[data-preference-select]')) {
-      const setting = select.getAttribute('data-preference-select');
+    for (const select of documentRef.querySelectorAll('[data-preference-select], [data-preference-input]')) {
+      const setting = select.getAttribute('data-preference-select') || select.getAttribute('data-preference-input');
       select.value = preferences[setting];
     }
     for (const button of documentRef.querySelectorAll('[data-preference-toggle]')) syncToggle(button);
@@ -737,7 +804,7 @@
 
   function set(partial) {
     const next = normalize({ ...preferences, ...(partial || {}) });
-    if (next.language === preferences.language && next.currency === preferences.currency) return;
+    if (Object.keys(DEFAULTS).every(key => next[key] === preferences[key])) return;
     preferences = next;
     persist();
     applyDocument();
@@ -747,10 +814,14 @@
   function bindControls() {
     const documentRef = root.document;
     if (!documentRef || typeof documentRef.querySelectorAll !== 'function') return;
-    for (const select of documentRef.querySelectorAll('[data-preference-select]')) {
+    for (const select of documentRef.querySelectorAll('[data-preference-select], [data-preference-input]')) {
       select.addEventListener('change', event => {
-        const setting = event.currentTarget.getAttribute('data-preference-select');
-        set({ [setting]: event.currentTarget.value });
+        const control = event.currentTarget;
+        const setting = control.getAttribute('data-preference-select') || control.getAttribute('data-preference-input');
+        const valid = setting === 'timezone' ? validTimezone(control.value) : setting === 'usdToEurRate' ? validRate(control.value) : setting === 'rateDate' ? validDate(control.value) : true;
+        control.setCustomValidity?.(valid ? '' : translate(`preferences.${setting === 'timezone' ? 'invalidTimezone' : setting === 'rateDate' ? 'invalidDate' : 'invalidRate'}`));
+        if (!valid) { control.reportValidity?.(); return; }
+        set({ [setting]: control.value });
       });
     }
     for (const button of documentRef.querySelectorAll('[data-preference-toggle]')) {
@@ -787,6 +858,10 @@
     get: () => ({ ...preferences }),
     locale,
     numberLocale,
+    timezone: () => preferences.timezone,
+    convertUsd: value => Number(value) * (preferences.currency === 'EUR' ? preferences.usdToEurRate : 1),
+    dateFormatter: options => formatter('date', locale(), { ...options, timeZone: preferences.timezone }),
+    numberFormatter: (options = {}, language = numberLocale()) => formatter('number', language, options),
     t: translate,
     set,
     subscribe(listener) {
@@ -798,9 +873,9 @@
     formatCurrency(value) {
       const usd = Number(value);
       if (!Number.isFinite(usd)) return '-';
-      const amount = preferences.currency === 'EUR' ? usd * USD_TO_EUR_RATE : usd;
+      const amount = preferences.currency === 'EUR' ? usd * preferences.usdToEurRate : usd;
       const fractionDigits = Math.abs(amount) < 1 ? 4 : 2;
-      return new Intl.NumberFormat(locale(), {
+      return formatter('number', locale(), {
         style: 'currency',
         currency: preferences.currency,
         currencyDisplay: 'narrowSymbol',
@@ -809,7 +884,7 @@
       }).format(amount);
     },
     formatRate() {
-      return new Intl.NumberFormat(numberLocale(), { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(USD_TO_EUR_RATE);
+      return formatter('number', numberLocale(), { minimumFractionDigits: 2, maximumFractionDigits: 6 }).format(preferences.usdToEurRate);
     },
   };
   root.CodexPreferences = api;

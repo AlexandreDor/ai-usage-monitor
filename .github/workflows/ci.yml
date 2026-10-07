@@ -37,7 +37,7 @@ jobs:
       - name: Check Bash syntax
         run: bash -n local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
       - name: Validate packaged systemd units
-        run: systemd-analyze verify packaging/systemd/codex-usage-monitor.service packaging/systemd/codex-usage-dashboard.service
+        run: systemd-analyze verify packaging/systemd/codex-usage-monitor.service packaging/systemd/codex-usage-dashboard.service packaging/systemd/codex-usage-backup.service packaging/systemd/codex-usage-backup.timer
       - name: Compile Python modules
         run: python -m compileall -q local tests
       - name: Verify SQLite migrations
@@ -49,7 +49,7 @@ jobs:
           python -m coverage run --branch --rcfile=.coveragerc -m unittest
           tests.test_migrations tests.test_alerts tests.test_anomalies
           tests.test_history tests.test_codex_client tests.test_config
-          tests.test_storage_durability
+          tests.test_storage_durability tests.test_analytics_backend tests.test_analytics_export tests.test_http_features tests.test_diagnostics tests.test_backup
       - name: Enforce Python coverage threshold
         run: python -m coverage report --rcfile=.coveragerc
       - name: Run shell and functional tests
@@ -58,6 +58,15 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Run browser tests
         run: npm run test:browser
+      - name: Run analytics loading and idle performance budgets
+        run: npm run test:performance
+      - name: Upload performance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: performance-results
+          path: test-results/
+          if-no-files-found: ignore
       - name: Audit npm dependencies (all vulnerability levels)
         run: npm audit --audit-level=low
       - name: Run ShellCheck

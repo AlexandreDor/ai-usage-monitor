@@ -88,7 +88,7 @@ headers="$(curl --silent --dump-header - --output /dev/null "http://127.0.0.1:${
 assert_contains "$headers" 'Content-Security-Policy:' "CSP header missing"
 assert_contains "$headers" 'X-Content-Type-Options: nosniff' "nosniff header missing"
 assert_contains "$headers" 'X-Frame-Options: DENY' "frame protection missing"
-assert_contains "$headers" 'Cache-Control: no-store' "cache header missing"
+assert_contains "$headers" 'Cache-Control: public, max-age=0, must-revalidate' "static revalidation header missing"
 
 for path in /monitor.sh /runtime/.alert_state /runtime/alert-deliveries.json /runtime/usage-history.sqlite3 '/%2e%2e%2fmonitor.sh' '/%252e%252e%252fmonitor.sh'; do
   code="$(curl --path-as-is --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:${port}${path}")"
@@ -136,7 +136,7 @@ wait "$server_pid" 2>/dev/null || true
 server_pid=""
 serve_fixture="${TEST_ROOT}/serve-fixture"
 mkdir -p "$serve_fixture"
-cp "$SERVE" "$ROOT_DIR/local/config.py" "$ROOT_DIR/local/analytics.py" "$ROOT_DIR/local/storage.py" "$ROOT_DIR/local/token_usage.py" "$serve_fixture/"
+cp "$SERVE" "$ROOT_DIR/local/config.py" "$ROOT_DIR/local/analytics.py" "$ROOT_DIR/local/storage.py" "$ROOT_DIR/local/token_usage.py" "$ROOT_DIR/local/http_server.py" "$ROOT_DIR/local/analytics_export.py" "$ROOT_DIR/local/diagnostics.py" "$ROOT_DIR/local/operations.py" "$ROOT_DIR/local/analytics_cache.py" "$serve_fixture/"
 printf "TOKEN_PRICING_FILE='%s'\nDASHBOARD_ACTIVE_INTERVAL_SECONDS=120\n" "$custom_pricing" > "${serve_fixture}/.env"
 runtime_override="${TEST_ROOT}/serve-runtime"
 mkdir -m 700 "$runtime_override"

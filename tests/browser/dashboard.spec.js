@@ -557,6 +557,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#weekly-limit-value-card')).toBeVisible();
   await expect(page.locator('#weekly-limit-value-window')).toContainText('one point / 6 h');
   await expect(page.locator('#weekly-limit-value-summary')).toContainText('1 displayed estimate');
+  await page.locator('#weekly-limit-value-card details summary').click();
   await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(1);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].data[0].y)).toBe(75);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets[0].valueKind)).toBe('usd');
@@ -741,6 +742,7 @@ test('renders detailed analytics, reset markers and cost mode by default', async
   await expect(page.locator('#reasoning-tokens')).toHaveText('50K');
   await expect(page.locator('#limits-chart-summary')).toContainText('2 reset markers');
   await expect(page.locator('#limits-chart-summary')).toContainText('2 forecast samples');
+  await page.locator('#limits-chart-card details summary').click();
   await expect(page.locator('#limits-data-body tr').first().locator('td')).toHaveCount(6);
   await expect(page.locator('#breakdown-body tr td')).toHaveCount(11);
   await expect(page.locator('#reset-pagination')).toBeVisible();
@@ -891,7 +893,7 @@ test('retries a failed breakdown page without skipping it', async ({ page }) => 
   await page.goto('/analytics.html');
 
   await page.locator('#breakdown-next').click();
-  await expect(page.locator('#analytics-error')).toContainText('temporary pagination failure');
+  await expect(page.locator('#breakdown-section-status')).toContainText('temporary pagination failure');
   await page.locator('#breakdown-next').click();
   await expect.poll(() => requestedOffsets.slice(-2)).toEqual([50, 50]);
   await expect(page.locator('#breakdown-page-label')).toHaveText('51–55 of 55');
@@ -1032,6 +1034,7 @@ test('does not render a 5-hour series when Codex returns null', async ({ page })
 
   await expect.poll(() => page.evaluate(() => typeof limitsChart !== 'undefined' && limitsChart !== null)).toBe(true);
   await expect.poll(() => page.evaluate(() => limitsChart.data.datasets.some(dataset => dataset.label === '5-hour remaining'))).toBe(false);
+  await page.locator('#limits-chart-card details summary').click();
   await expect(page.locator('#limits-data-body tr').first()).toContainText('-');
   await expect(page.locator('#resets-body tr').first()).toContainText('N/A —');
 });
@@ -1141,6 +1144,7 @@ test('shows seven GPT curves by default and lets users enable the aggregate', as
   await expect(controls.getByRole('button', { name: 'gpt-6.1-sol', exact: true })).toHaveAttribute('aria-pressed', 'true');
   await expect.poll(() => page.evaluate(() => weeklyLimitValueChart.data.datasets.map(item => item.data[0].y))).toEqual([100, 125, 150, 175, 200, 225, 250]);
   await expect.poll(() => page.evaluate(() => new Set(weeklyLimitValueChart.data.datasets.map(item => item.borderColor)).size)).toBe(7);
+  await page.locator('#weekly-limit-value-card details summary').click();
   await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(7);
   await expect(page.locator('#weekly-limit-value-data-body')).toContainText('gpt-6.1-sol');
   await expect(page.locator('#weekly-limit-value-data-body')).toContainText('gpt-6-astra');
@@ -1177,6 +1181,7 @@ test('keeps missing GPT estimates visible without inventing curve points', async
   await expect(controls.locator('button[aria-pressed="true"]')).toHaveCount(7);
   await expect(controls.getByText('No estimate', { exact: true })).toHaveCount(7);
   await expect.poll(() => page.evaluate(() => weeklyLimitValueDatasets.every(item => item.data.length === 0))).toBe(true);
+  await page.locator('#weekly-limit-value-card details summary').click();
   await expect(page.locator('#weekly-limit-value-data-body')).toContainText('2 prior non-overlapping windows available; 8 required');
 });
 
@@ -1192,6 +1197,7 @@ test('labels mixed-window inference as shared-quota and low confidence', async (
   ] } };
   await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
   await page.goto('/analytics.html');
+  await page.locator('#weekly-limit-value-card details summary').click();
   const row = page.locator('#weekly-limit-value-data-body tr').filter({ hasText: 'gpt-5.6-sol' });
   await expect(row).toContainText('Low confidence');
   await expect(row).toContainText('Inferred from shared quota');
@@ -1215,6 +1221,7 @@ test('distinguishes carried weekly values from newly calculated points', async (
   ] } };
   await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
   await page.goto('/analytics.html');
+  await page.locator('#weekly-limit-value-card details summary').click();
   const row = page.locator('#weekly-limit-value-data-body tr').filter({ hasText: 'Carried from' });
   await expect(row).toContainText('Low confidence');
   await expect(row.locator('.value-carried')).toHaveAttribute('title', /Direct exclusive-window estimate.*6h old.*reset/i);
@@ -1243,6 +1250,7 @@ test('shows uncertain model values and sensitivity ranges including unbounded ca
   page.on('pageerror', error => errors.push(error.message));
   await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
   await page.goto('/analytics.html');
+  await page.locator('#weekly-limit-value-card details summary').click();
   const table = page.locator('#weekly-limit-value-data-body');
   await expect(table.locator('tr').filter({ hasText: 'gpt-5.6-luna' })).toContainText('$35.00–$150.00');
   const terra = table.locator('tr').filter({ hasText: 'gpt-5.6-terra' });
@@ -1252,4 +1260,299 @@ test('shows uncertain model values and sensitivity ranges including unbounded ca
     .map(d => d.pointStyle[0]))).toEqual(['crossRot', 'crossRot']);
   await expect(page.locator('#weekly-limit-value-quality')).toContainText('not statistical confidence intervals');
   expect(errors).toEqual([]);
+});
+
+test('defers closed chart tables and refreshes opened tables with keyboard access', async ({ page }) => {
+  let current = analyticsPayload;
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: current }));
+  await page.goto('/analytics.html');
+  await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+  for (const id of ['limits-data-body', 'weekly-limit-value-data-body', 'tokens-data-body']) {
+    await expect(page.locator(`#${id} tr`)).toHaveCount(0);
+  }
+  const summary = page.locator('#limits-chart-card details summary');
+  await summary.focus();
+  await summary.press('Enter');
+  await expect(page.locator('#limits-data-body tr')).toHaveCount(2);
+  current = { ...analyticsPayload, limits: { ...analyticsPayload.limits, series: [{ ...analyticsPayload.limits.series[0], weekly_pct: 13 }] } };
+  await page.evaluate(() => refresh());
+  await expect(page.locator('#limits-data-body tr')).toHaveCount(1);
+  await expect(page.locator('#limits-data-body')).toContainText('13%');
+  await summary.press('Space');
+  current = analyticsPayload;
+  await page.evaluate(() => refresh());
+  await expect(page.locator('#limits-data-body tr')).toHaveCount(0);
+  await summary.press('Enter');
+  await expect(page.locator('#limits-data-body tr')).toHaveCount(2);
+});
+
+test('progressively loads compatible sections and scopes pagination to the affected section', async ({ page }) => {
+  const requests = [];
+  let releaseWeekly;
+  const weeklyReady = new Promise(resolve => { releaseWeekly = resolve; });
+  const base = { ...analyticsPayload, revision: 'fixture-1', pending_sections: ['weekly', 'resets'] };
+  delete base.weekly_limit_value;
+  await page.route('**/api/analytics?*', async route => {
+    const query = new URL(route.request().url()).searchParams;
+    requests.push(query);
+    const section = query.get('sections');
+    if (section === 'weekly') {
+      await weeklyReady;
+      return route.fulfill({ json: { period: base.period, revision: base.revision, weekly_limit_value: analyticsPayload.weekly_limit_value } });
+    }
+    if (section === 'resets') return route.fulfill({ json: { period: base.period, revision: base.revision, resets: { ...enhancedAnalyticsPayload.resets, offset: Number(query.get('reset_offset') || 0) } } });
+    if (section === 'breakdown') return route.fulfill({ json: { period: base.period, revision: base.revision, tokens: analyticsPayload.tokens } });
+    return route.fulfill({ json: base });
+  });
+  await page.goto('/analytics.html');
+  await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+  await expect(page.locator('#analytics-loading')).toBeHidden();
+  await expect(page.locator('#weekly-section-status')).toContainText('Loading');
+  await expect(page.locator('#resets-body tr')).toHaveCount(1);
+  expect(requests[0].get('sections')).toBe('base');
+  for (const query of requests.slice(1)) expect(query.get('at')).toBe(String(Date.parse(base.period.to) / 1000));
+  releaseWeekly();
+  await expect(page.locator('#weekly-section-status')).toBeHidden();
+  await expect.poll(() => page.evaluate(() => weeklyLimitValueDatasets.length)).toBe(7);
+  const before = requests.length;
+  await page.locator('#resets-next').click();
+  await expect(page.locator('#reset-page-label')).toHaveText('51–55 of 55');
+  expect(requests.slice(before).map(query => query.get('sections'))).toEqual(['resets']);
+  await page.evaluate(() => refresh({ section: 'breakdown' }));
+  expect(requests.at(-1).get('sections')).toBe('breakdown');
+});
+
+test('retries a revision mismatch once and keeps section failures visible', async ({ page }) => {
+  let bases = 0;
+  const requests = [];
+  await page.route('**/api/analytics?*', route => {
+    const section = new URL(route.request().url()).searchParams.get('sections');
+    requests.push(section);
+    if (section === 'base') {
+      bases += 1;
+      const base = { ...analyticsPayload, revision: `base-${bases}`, pending_sections: ['weekly', 'resets'] };
+      delete base.weekly_limit_value;
+      return route.fulfill({ json: base });
+    }
+    if (section === 'weekly') return route.fulfill({ json: { period: analyticsPayload.period, revision: 'changed', weekly_limit_value: analyticsPayload.weekly_limit_value } });
+    return route.fulfill({ status: 500, json: { error: 'reset calculation failed' } });
+  });
+  await page.goto('/analytics.html');
+  await expect(page.locator('#analytics-error')).toContainText('Analytics changed during loading');
+  await expect(page.locator('#resets-section-status')).toContainText('reset calculation failed');
+  await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+  expect(bases).toBe(2);
+  expect(requests.filter(section => section === 'weekly')).toHaveLength(2);
+});
+
+test('retains explicit unavailable models and validated filters through reload and local navigation', async ({ page }) => {
+  const queries = [];
+  await mockUsage(page);
+  await page.route('**/api/analytics?*', route => {
+    queries.push(new URL(route.request().url()).searchParams);
+    return route.fulfill({ json: analyticsPayload });
+  });
+  await page.goto('/analytics.html?range=7d&sources=codex&models=retired-model&reset_type=5h');
+  await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+  const unavailable = page.locator('#model-filter button').filter({ hasText: 'retired-model' });
+  await expect(unavailable).toHaveAttribute('aria-pressed', 'true');
+  await expect(unavailable).toHaveAttribute('title', 'Unavailable in this archive');
+  expect(queries[0].get('models')).toBe('retired-model');
+  await page.reload();
+  await expect(unavailable).toHaveAttribute('aria-pressed', 'true');
+  await page.getByRole('link', { name: 'Live limits' }).click();
+  await page.getByRole('link', { name: 'Advanced analytics' }).click();
+  await expect(unavailable).toHaveAttribute('aria-pressed', 'true');
+  expect(queries.at(-1).get('range')).toBe('7d');
+  expect(queries.at(-1).get('sources')).toBe('codex');
+  expect(queries.at(-1).get('reset_type')).toBe('5h');
+  await page.goto('/analytics.html?range=invalid&sources=not-real&models=&from_date=2026-02-31&to_date=2026-03-02');
+  await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+  expect(queries.at(-1).get('from_date')).toBeNull();
+  expect(queries.at(-1).get('sources')).toBe('codex,opencode,hermes');
+});
+
+test('coalesces rapid filter changes and exposes comparison and filtered CSV exports', async ({ page }) => {
+  const queries = [];
+  await page.route('**/api/analytics?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    queries.push(query);
+    return route.fulfill({ json: { ...analyticsPayload, comparison: query.get('compare') === 'previous' ? {
+      period: analyticsPayload.period, tokens: { summary: { input_tokens: 1000000, estimated_cost_usd: 10 } },
+    } : undefined } });
+  });
+  await page.goto('/analytics.html');
+  await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+  await page.evaluate(() => {
+    document.querySelector('[data-range="7d"]').click();
+    document.querySelector('[data-range="90d"]').click();
+    document.querySelector('[data-range="1y"]').click();
+  });
+  await expect.poll(() => queries.at(-1).get('range')).toBe('1y');
+  expect(queries).toHaveLength(2);
+  await page.locator('#compare-previous').check();
+  await expect(page.locator('#comparison-summary')).toContainText('+725,000');
+  await expect(page.locator('#comparison-summary')).toContainText('+€1.08');
+  await page.locator('.analytics-tools summary').click();
+  await page.locator('#csv-dataset').selectOption('breakdown');
+  const href = await page.locator('#csv-download').getAttribute('href');
+  const params = new URL(href, 'http://localhost').searchParams;
+  expect(params.get('dataset')).toBe('breakdown');
+  expect(params.get('range')).toBe('1y');
+  expect(params.get('models')).toContain('gpt-6.1-sol');
+  expect(params.has('breakdown_offset')).toBe(false);
+  const downloaded = page.waitForEvent('download');
+  await page.locator('#csv-download').click();
+  const download = await downloaded;
+  // Chromium downloads bypass page request routing; endpoint CSV content is covered by HTTP tests.
+  expect(new URL(download.url()).pathname).toBe('/api/analytics.csv');
+  expect(new URL(download.url()).searchParams.get('dataset')).toBe('breakdown');
+  const axe = await new AxeBuilder({ page }).analyze();
+  expectNoAxeViolations(axe, ['critical', 'serious']);
+});
+
+test('shares validated time-zone and dated exchange-rate preferences across pages', async ({ page }) => {
+  const queries = [];
+  await mockUsage(page);
+  await page.route('**/api/analytics?*', route => {
+    queries.push(new URL(route.request().url()).searchParams);
+    return route.fulfill({ json: analyticsPayload });
+  });
+  await page.goto('/analytics.html');
+  await expect(page.locator('#estimated-cost')).toHaveText('€9.68');
+  await page.locator('.advanced-preferences summary').click();
+  const rate = page.locator('[data-preference-input="usdToEurRate"]');
+  await rate.fill('0.9');
+  await rate.blur();
+  await expect(page.locator('#estimated-cost')).toHaveText('€10.13');
+  const date = page.locator('[data-preference-input="rateDate"]');
+  await date.fill('2026-10-07');
+  await date.blur();
+  await expect(page.locator('#pricing-note')).toContainText('2026-10-07');
+  const zone = page.locator('[data-preference-input="timezone"]');
+  await zone.fill('UTC');
+  await zone.blur();
+  await expect.poll(() => queries.at(-1).get('timezone')).toBe('UTC');
+  await zone.fill('Invalid/Zone');
+  await zone.blur();
+  await expect.poll(() => page.evaluate(() => CodexPreferences.timezone())).toBe('UTC');
+  await page.getByRole('link', { name: 'Live limits' }).click();
+  await page.locator('.advanced-preferences summary').click();
+  await expect(page.locator('[data-preference-input="timezone"]')).toHaveValue('UTC');
+  await expect(page.locator('[data-preference-input="usdToEurRate"]')).toHaveValue('0.9');
+  await expect(page.locator('[data-preference-input="rateDate"]')).toHaveValue('2026-10-07');
+});
+
+test('opens accessible data tables when Chart construction fails and limits diagnostics to safe fields', async ({ page }) => {
+  await page.route('**/assets/chart.umd.min.js', route => route.fulfill({ contentType: 'application/javascript', body: 'window.Chart = function() { throw new Error("broken chart"); };' }));
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: analyticsPayload }));
+  await page.route('**/api/diagnostics', route => route.fulfill({ json: {
+    schema_version: 1,
+    monitor: { status: 'healthy', consecutive_failures: 0, raw_error: '/secret/path token=SECRET' },
+    archive: { status: 'ok', snapshots: 42, token_events: 7 },
+    anomalies: [{ window: 'weekly', type: 'quota_increase', detected_at: '2026-10-07T00:00:00Z', before_pct: 10, after_pct: 20, path: 'SECRET' }],
+    raw: 'SECRET',
+  } }));
+  await page.goto('/analytics.html');
+  await expect(page.locator('#limits-chart-wrap')).toBeHidden();
+  await expect(page.locator('#limits-data-body tr')).toHaveCount(2);
+  await expect(page.locator('#tokens-chart-card')).toBeVisible();
+  await expect(page.locator('#tokens-data-body tr')).toHaveCount(1);
+  await expect(page.locator('#limits-chart-summary')).toContainText('data table is open');
+  await expect(page.locator('#diagnostics-body')).toContainText('42');
+  await expect(page.locator('#diagnostics-body')).not.toContainText('SECRET');
+  await expect(page.locator('#diagnostics-body')).not.toContainText('/secret/path');
+});
+
+test('loads components and exports custom dates ending today without a future anchor', async ({ page }) => {
+  const queries = [];
+  const today = new Date().toISOString().slice(0, 10);
+  const tomorrowMidnight = new Date(`${today}T00:00:00Z`);
+  tomorrowMidnight.setUTCDate(tomorrowMidnight.getUTCDate() + 1);
+  const period = { ...analyticsPayload.period, range: 'custom', from: `${today}T00:00:00Z`, to: tomorrowMidnight.toISOString() };
+  const base = { ...analyticsPayload, period, revision: 'custom-today', pending_sections: ['weekly', 'resets'] };
+  delete base.weekly_limit_value;
+  await page.route('**/api/analytics?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    queries.push(query);
+    if (query.has('at') && Number(query.get('at')) > Date.now() / 1000) return route.fulfill({ status: 400, json: { error: 'future anchors are invalid' } });
+    if (query.get('sections') === 'weekly') return route.fulfill({ json: { period, revision: base.revision, weekly_limit_value: analyticsPayload.weekly_limit_value } });
+    if (query.get('sections') === 'resets') return route.fulfill({ json: { period, revision: base.revision, resets: analyticsPayload.resets } });
+    return route.fulfill({ json: base });
+  });
+  await page.goto(`/analytics.html?range=custom&from_date=${today}&to_date=${today}`);
+  await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+  await expect(page.locator('#resets-body tr')).toHaveCount(1);
+  await expect(page.locator('#weekly-section-status')).toBeHidden();
+  await expect.poll(() => queries.map(query => query.get('sections')).sort()).toEqual(['base', 'resets', 'weekly']);
+  for (const query of queries) {
+    expect(query.has('at')).toBe(false);
+    expect(query.get('from_date')).toBe(today);
+    expect(query.get('to_date')).toBe(today);
+  }
+  const csv = new URL(await page.locator('#csv-download').getAttribute('href'), 'http://localhost');
+  expect(csv.searchParams.has('at')).toBe(false);
+  expect(csv.searchParams.get('from_date')).toBe(today);
+  expect(csv.searchParams.get('to_date')).toBe(today);
+  await expect(page.locator('#analytics-error')).toBeHidden();
+});
+
+test('localizes retained weekly and reset data while replacement components are pending', async ({ page }) => {
+  let pending = false;
+  let release;
+  const ready = new Promise(resolve => { release = resolve; });
+  await page.route('**/api/analytics?*', async route => {
+    const section = new URL(route.request().url()).searchParams.get('sections');
+    if (!pending) return route.fulfill({ json: analyticsPayload });
+    if (section === 'base') {
+      const base = { ...analyticsPayload, pending_sections: ['weekly', 'resets'] };
+      delete base.weekly_limit_value;
+      return route.fulfill({ json: base });
+    }
+    await ready;
+    return route.fulfill({ json: section === 'weekly' ? { period: analyticsPayload.period, weekly_limit_value: analyticsPayload.weekly_limit_value } : { period: analyticsPayload.period, resets: analyticsPayload.resets } });
+  });
+  await page.goto('/analytics.html');
+  await expect(page.locator('#resets-body')).toContainText('Random');
+  const aggregate = page.locator('#weekly-limit-value-models button[data-weekly-model="aggregate"]');
+  await aggregate.click();
+  await page.locator('#weekly-limit-value-card details summary').click();
+  await expect(page.locator('#weekly-limit-value-data-body tr')).toHaveCount(1);
+  pending = true;
+  await page.evaluate(() => { refresh(); });
+  await expect(page.locator('#weekly-section-status')).toContainText('Loading');
+  await expect(page.locator('#resets-section-status')).toContainText('Loading');
+  await page.locator('#language-toggle').click();
+  await expect(aggregate).toContainText('Tous les modèles');
+  await expect(page.locator('#weekly-limit-value-data-body')).toContainText('Tous les modèles');
+  await expect(page.locator('#resets-body')).toContainText('Aléatoire');
+  release();
+  await expect(page.locator('#weekly-section-status')).toBeHidden();
+  await expect(page.locator('#resets-section-status')).toBeHidden();
+});
+
+test('localizes safe diagnostic fields statuses errors and warnings when preferences change', async ({ page }) => {
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: analyticsPayload }));
+  await page.route('**/api/diagnostics', route => route.fulfill({ json: {
+    schema_version: 1,
+    monitor: { status: 'degraded', last_success_at: '2026-10-07T00:00:00Z', consecutive_failures: 3, error_code: 'collection_failed', error_message: 'Collection or alert delivery failed.', raw_error: '/private/path token=SECRET' },
+    archive: { status: 'healthy', snapshots: 42 },
+    anomalies: [{ window: 'weekly', type: 'quota_increase', detected_at: '2026-10-07T00:00:00Z', before_pct: 10, after_pct: 20 }],
+    warnings: ['Monitor health is stale.', 'Archive could not be read safely.'],
+  } }));
+  await page.goto('/analytics.html');
+  await expect(page.locator('#diagnostics-body')).toContainText('Last success');
+  await page.locator('#language-toggle').click();
+  const panel = page.locator('#diagnostics-body');
+  await expect(panel).toContainText('Moniteur · État: dégradé');
+  await expect(panel).toContainText('Dernière réussite');
+  await expect(panel).toContainText('Échecs consécutifs: 3');
+  await expect(panel).toContainText('La collecte ou l’envoi des alertes a échoué.');
+  await expect(panel).toContainText('L’état du moniteur est périmé.');
+  await expect(panel).toContainText('L’archive n’a pas pu être lue en toute sécurité.');
+  await expect(panel).toContainText('Hebdomadaire · Quota en hausse');
+  await expect(panel).not.toContainText('Last success');
+  await expect(panel).not.toContainText('Monitor health is stale.');
+  await expect(panel).not.toContainText('SECRET');
+  await expect(panel).not.toContainText('/private/path');
 });

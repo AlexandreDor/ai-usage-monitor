@@ -205,3 +205,33 @@ sudo userdel codex-monitor
 
 Review the paths before running removal commands. The state and configuration
 are not recoverable after deletion unless a separate backup exists.
+
+## Optional scheduled archive backups
+
+After installing the release and service account, install the opt-in backup
+units. The timer runs daily with a fifteen-minute random delay, catches missed
+runs, and retains fourteen verified backups in
+`/var/lib/codex-usage-monitor/backups`. It does not stop the collector:
+
+```bash
+sudo install -m 0644 /opt/codex-usage-monitor/current/packaging/systemd/codex-usage-backup.service /etc/systemd/system/
+sudo install -m 0644 /opt/codex-usage-monitor/current/packaging/systemd/codex-usage-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now codex-usage-backup.timer
+sudo systemctl list-timers codex-usage-backup.timer
+```
+
+Use a service override to change the destination or `--keep`. The destination
+must be owned by `codex-monitor`, private and writable within the service's
+`ReadWritePaths`; a different location requires extending that allowlist. The
+backup command verifies the current v4 schema and integrity before publication,
+uses mode `600`, rejects symlinks and overlapping runs, and preserves existing
+backups after a failed copy. Transfer a verified backup to separate storage if
+off-machine recovery is required. Restore using the documented
+[SQLite restore procedure](../README.md#restore-safely).
+
+To stop scheduling backups during removal:
+
+```bash
+sudo systemctl disable --now codex-usage-backup.timer
+```
