@@ -327,7 +327,10 @@ Coverage measures every Python runtime module, including `analytics.py`,
 `archive.py`, and `token_usage.py`, and fails below the combined 60%
 line-and-branch threshold. The runner discovers the Python unit tests and
 captures Python subprocesses launched by the shell functional tests through a
-private startup bootstrap. It combines their measurements and writes reports
+private startup bootstrap. On the pinned CPython runtime, measurement starts
+before the first project module executes, including CLI and inline imports;
+fixture helpers that only manipulate JSON avoid loading the coverage engine.
+It combines their measurements and writes reports
 under `coverage/`; no global Python installation is modified.
 
 CI runs on pull requests and pushes to `dev` or `main`, avoiding duplicate runs

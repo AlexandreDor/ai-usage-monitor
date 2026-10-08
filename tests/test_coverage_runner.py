@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -75,6 +76,8 @@ class CoverageRunnerTests(unittest.TestCase):
             lines = (self.root / filename).read_text().splitlines()
             entry = next(index for index, line in enumerate(lines, 1) if line.startswith('if __name__ =='))
             self.assertIn(entry + 1, measured, filename)
+            first_import = next(index for index, line in enumerate(lines, 1) if line.startswith('import '))
+            self.assertIn(first_import, measured, filename)
         self.assertTrue((self.root / "coverage/coverage.xml").is_file())
         self.assertTrue((self.root / "coverage/report.txt").is_file())
         self.assertTrue((self.root / "coverage/.coverage").is_file())
@@ -107,6 +110,37 @@ class CoverageRunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("Coverage failure", result.stdout)
         self.assert_cli_measured()
+
+    def test_inline_and_spec_imports_start_measurement_but_fixture_helpers_do_not(self):
+        import coverage
+        data_directory = self.root / 'measurements'
+        data_directory.mkdir()
+        environment = os.environ.copy()
+        environment.update(
+            COVERAGE_PROCESS_START=str(self.root / '.coveragerc'),
+            COVERAGE_RCFILE=str(self.root / '.coveragerc'),
+            COVERAGE_FILE=str(data_directory / '.coverage'),
+            PYTHONPATH=str(self.root / 'tests/coverage_bootstrap'),
+        )
+        def child(code):
+            subprocess.run([sys.executable, '-c', code], cwd=self.root / 'tests',
+                           env=environment, check=True, capture_output=True, text=True)
+        child('import json; assert json.loads("{\\\"value\\\": 1}")["value"] == 1')
+        self.assertEqual(list(data_directory.iterdir()), [])
+        child('import sys; sys.path.insert(0, "../local"); import archive')
+        child('import importlib.util; '
+              'spec = importlib.util.spec_from_file_location("fixture_operations", "../local/operations.py"); '
+              'module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)')
+        measured = {}
+        for filename in data_directory.iterdir():
+            data = coverage.CoverageData(basename=str(filename))
+            data.read()
+            for source in data.measured_files():
+                measured.setdefault(source, set()).update(data.lines(source) or [])
+        for filename in ('local/archive.py', 'local/operations.py'):
+            lines = (self.root / filename).read_text().splitlines()
+            first_import = next(index for index, line in enumerate(lines, 1) if line.startswith('import '))
+            self.assertIn(first_import, measured[filename])
 
 
 if __name__ == "__main__":
