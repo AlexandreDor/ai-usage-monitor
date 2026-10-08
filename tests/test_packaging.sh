@@ -105,7 +105,7 @@ assert_contains "$archive_listing" "codex-usage-monitor-${version}/VERSION" "arc
 assert_contains "$archive_listing" "codex-usage-monitor-${version}/packaging/systemd/codex-usage-monitor.service" "archive has monitor unit"
 assert_contains "$archive_listing" "codex-usage-monitor-${version}/packaging/systemd/codex-usage-backup.service" "archive has backup unit"
 assert_contains "$archive_listing" "codex-usage-monitor-${version}/packaging/systemd/codex-usage-backup.timer" "archive has backup timer"
-for module in http_server.py analytics_cache.py analytics_export.py diagnostics.py operations.py backup.py; do
+for module in http_server.py analytics_cache.py analytics_history_cache.py analytics_export.py diagnostics.py operations.py backup.py; do
   assert_contains "$archive_listing" "codex-usage-monitor-${version}/local/${module}" "archive has required ${module}"
 done
 assert_contains "$archive_listing" "codex-usage-monitor-${version}/docs/INSTALL.md" "archive has installation docs"

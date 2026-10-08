@@ -2,8 +2,11 @@
 """Benchmark backend loading with deterministic synthetic evidence only.
 
 Run from any directory; the default report is test-results/backend-performance.json.
-Three samples cover full requests with empty process caches, selective base
-requests, and weekly requests warmed by the final full request. Median budgets
+Three samples cover full requests with empty memory and disk caches, selective
+base requests, warm weekly requests, collection append, and fresh processes.
+The uncached append comparison skips all historical cache fingerprint work;
+restart timings measure backend execution, excluding interpreter startup.
+Median budgets
 are deliberately generous (15/3/3 seconds) to catch gross loading regressions
 without treating shared CI hardware noise as a product regression. SQLite's
 filesystem cache is not flushed. This does not benchmark production archives,
@@ -13,14 +16,17 @@ network transfer, browser rendering, or the old implementation.
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from statistics import median
 import sys
 import tempfile
 import time
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,7 +43,24 @@ CADENCE = 900
 BASE = 1_700_000_000
 SAMPLES = 3
 MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
-BUDGETS = {"full_cold": 15.0, "base": 3.0, "weekly_warm": 3.0}
+BUDGETS = {"full_cold": 15.0, "base": 3.0, "weekly_warm": 3.0,
+           "full_uncached": 15.0, "weekly_append_uncached": 3.0, "weekly_append": 3.0, "weekly_restart": 3.0}
+
+
+def reset_memory_caches():
+    analytics.WEEKLY_CACHE = AnalyticsCache(max_entries=16)
+    analytics.REGRESSION_CACHE = AnalyticsCache(max_entries=2048, max_bytes=8 * 1024 * 1024)
+
+
+@contextmanager
+def counting_prices():
+    # A lightweight counter avoids mock call-history overhead on 50,000 rows.
+    original, count = analytics._event_cost, [0]
+    def recorded(*args, **kwargs):
+        count[0] += 1
+        return original(*args, **kwargs)
+    with patch.object(analytics, '_event_cost', new=recorded):
+        yield count
 
 
 def create_fixture(database: Path, pricing: Path) -> dict:
@@ -131,14 +154,27 @@ def run() -> dict:
             def payload(section=None):
                 selected = params if section is None else {**params, "sections": section}
                 return analytics.build_payload(database, pricing, selected, now=now)
+            original_weekly = analytics.weekly_limit_value
+            def uncached_weekly(*args, **kwargs):
+                kwargs['cache_namespace'] = None
+                kwargs['historical_cache'] = None
+                return original_weekly(*args, **kwargs)
 
             durations = {name: [] for name in BUDGETS}
             for _ in range(SAMPLES):
-                # Fresh result/regression caches make every full sample cold.
-                analytics.WEEKLY_CACHE = AnalyticsCache(max_entries=16)
-                analytics.REGRESSION_CACHE = AnalyticsCache(max_entries=2048, max_bytes=8 * 1024 * 1024)
+                # Both memory and disposable disk fits must be empty for cold samples.
+                reset_memory_caches()
+                shutil.rmtree(analytics.HistoricalFitCache(database).directory, ignore_errors=True)
                 full, elapsed = measure(payload)
                 durations["full_cold"].append(elapsed)
+            for _ in range(SAMPLES):
+                reset_memory_caches()
+                with patch.object(analytics, 'HistoricalFitCache', return_value=None), \
+                     patch.object(analytics, 'weekly_limit_value', side_effect=uncached_weekly):
+                    uncached_full, elapsed = measure(payload)
+                durations['full_uncached'].append(elapsed)
+                if full != uncached_full:
+                    raise AssertionError('persistent cold full result differs from uncached computation')
             for _ in range(SAMPLES):
                 base, elapsed = measure(lambda: payload("base"))
                 durations["base"].append(elapsed)
@@ -165,13 +201,58 @@ def run() -> dict:
             if changed_weekly["revision"] == weekly["revision"] or changed_weekly["weekly_limit_value"] == weekly["weekly_limit_value"]:
                 raise AssertionError("a committed token row did not invalidate weekly result work")
             report["checks"]["committed_row_invalidates"] = True
+            report['fit_computations'] = {'append': [], 'restart': [], 'uncached': []}
+            report['pricing_computations'] = {'append': [], 'restart': [], 'uncached': []}
+            for index in range(SAMPLES):
+                with closing(connect_database(database)) as writer, writer:
+                    writer.execute('''INSERT INTO token_usage_events
+                        (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+                        VALUES (?, 'codex', 'openai', ?, 12345, ?)''',
+                        (now-2, MODELS[0], f'synthetic-append-{index}'))
+                with patch.object(analytics, '_mixed_training_fit', wraps=analytics._mixed_training_fit) as fits, \
+                     counting_prices() as prices:
+                    appended, elapsed = measure(lambda: payload('weekly'))
+                    report['fit_computations']['append'].append(fits.call_count)
+                    report['pricing_computations']['append'].append(prices[0])
+                durations['weekly_append'].append(elapsed)
+                reset_memory_caches()
+                with patch.object(analytics, 'HistoricalFitCache', return_value=None), \
+                     patch.object(analytics, 'weekly_limit_value', side_effect=uncached_weekly), \
+                     patch.object(analytics, '_mixed_training_fit', wraps=analytics._mixed_training_fit) as fits, \
+                     counting_prices() as prices:
+                    uncached, elapsed = measure(lambda: payload('weekly'))
+                    report['fit_computations']['uncached'].append(fits.call_count)
+                    report['pricing_computations']['uncached'].append(prices[0])
+                durations['weekly_append_uncached'].append(elapsed)
+                if appended != uncached:
+                    raise AssertionError('append reuse differs from exact uncached calculation')
+                worker = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                    '--worker', str(database), str(pricing), str(now)],
+                    check=True, capture_output=True, text=True)
+                restarted = json.loads(worker.stdout)
+                durations['weekly_restart'].append(restarted['elapsed'])
+                report['fit_computations']['restart'].append(restarted['fits'])
+                report['pricing_computations']['restart'].append(restarted['prices'])
+                # Observer tokens are deliberately process-specific.
+                if restarted['weekly'] != appended['weekly_limit_value']:
+                    raise AssertionError('fresh-process reuse changed weekly values')
+            report['checks']['append_and_restart_match_uncached'] = True
+            report['checks']['restart_reuses_all_fits'] = not any(report['fit_computations']['restart'])
+            report['checks']['restart_reuses_priced_events'] = not any(report['pricing_computations']['restart'])
+            report['checks']['append_reuses_historical_fits'] = all(
+                warm < cold for warm, cold in zip(report['fit_computations']['append'], report['fit_computations']['uncached']))
             report["response_bytes"] = {"full": encoded_size(full), "base": encoded_size(base), "weekly": encoded_size(weekly)}
             report["timings"] = {
                 name: {"samples_seconds": [round(value, 6) for value in values],
                        "median_seconds": round(median(values), 6), "budget_passed": median(values) < BUDGETS[name]}
                 for name, values in durations.items()
             }
-            report["passed"] = all(value["budget_passed"] for value in report["timings"].values())
+            baseline = median(durations['weekly_append_uncached'])
+            report['speedups'] = {name: round(baseline / median(durations[name]), 3)
+                                  for name in ('weekly_append', 'weekly_restart')}
+            report['cold_overhead_ratio'] = round(median(durations['full_cold']) / median(durations['full_uncached']), 3)
+            report["passed"] = (all(value["budget_passed"] for value in report["timings"].values())
+                                and all(report['checks'].values()))
         except Exception as exc:
             # Never expose fixture paths, archive payloads, or user diagnostics.
             report["error_type"] = type(exc).__name__
@@ -181,6 +262,16 @@ def run() -> dict:
 
 
 def main() -> int:
+    if len(sys.argv) == 5 and sys.argv[1] == '--worker':
+        database, pricing, now = Path(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4])
+        with patch.object(analytics, '_mixed_training_fit', wraps=analytics._mixed_training_fit) as fits, \
+             counting_prices() as prices:
+            payload, elapsed = measure(lambda: analytics.build_payload(database, pricing,
+                {'range': '30d', 'sections': 'weekly', 'at': str(now)}, now=now))
+        print(json.dumps({'elapsed': elapsed, 'fits': fits.call_count, 'prices': prices[0],
+                          'weekly': payload['weekly_limit_value']}, separators=(',', ':')))
+        close_fixture_observer(database)
+        return 0
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "test-results/backend-performance.json")
     args = parser.parse_args()

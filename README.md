@@ -312,25 +312,30 @@ From the repository root, run the same quality controls locally:
 test "$(python3 -c 'import platform; print(platform.python_version())')" = "$(tr -d '[:space:]' < .python-version)"
 test "$(node --version)" = "v$(tr -d '[:space:]' < .node-version)"
 python3 -m pip install --requirement requirements-ci.txt
-bash -n local/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
+bash -n local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
 python3 -m compileall -q local tests
-python3 -m coverage run --branch --rcfile=.coveragerc -m unittest \
-  tests.test_migrations tests.test_alerts tests.test_anomalies tests.test_history \
-  tests.test_codex_client tests.test_config tests.test_storage_durability
-python3 -m coverage report --rcfile=.coveragerc
-SKIP_PYTHON_TESTS=1 tests/run.sh
+scripts/test-coverage.sh
 npm ci
 npm audit --audit-level=low
 npx playwright install --with-deps chromium
 npm run test:browser
+npm run test:performance
 shellcheck -x local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
 ```
 
-Coverage enables branch measurement for the exercised Python modules, including
-the SQLite migration tests, and fails below the combined 60% line-and-branch
-threshold. The documented command is the same test selection used by CI;
-modules exercised only through separate subprocesses are not counted as
-in-process coverage.
+Coverage measures every Python runtime module, including `analytics.py`,
+`archive.py`, and `token_usage.py`, and fails below the combined 60%
+line-and-branch threshold. The runner discovers the Python unit tests and
+captures Python subprocesses launched by the shell functional tests through a
+private startup bootstrap. It combines their measurements and writes reports
+under `coverage/`; no global Python installation is modified.
+
+CI runs on pull requests and pushes to `dev` or `main`, avoiding duplicate runs
+for feature-branch pushes. New commits cancel older runs for the same pull
+request or branch. Static quality checks, functional tests with coverage, and
+browser/performance tests run in parallel. The existing `test` check requires
+all three jobs to succeed, including when a job fails or is skipped. Release
+validation uses the same coverage runner and retains all quality checks.
 `npm audit --audit-level=low` is also blocking: every vulnerability reported at
 low severity or above fails the CI job, while `package-lock.json` remains the
 reproducible installation source. Migration tests cover fresh archives,
@@ -999,6 +1004,18 @@ time, even for anchored requests. Local caches are bounded, coalesce concurrent
 identical work, and invalidate after archive/pricing changes. Cached estimates
 still become unavailable when current observations are stale.
 
+Mixed-model historical fits and hourly blocks of priced events use a disposable
+persistent cache in
+`.<archive filename>.analytics-cache/fits.sqlite3` beside the archive. Keys
+cover the exact target, its causal training data, pricing and estimator policy,
+so new collections reuse unaffected history and restarts retain valid fits.
+Changed or deleted historical data recompute the affected fits. The archive
+and complete chart data remain authoritative. The cache directory is private
+(`0700`), its database is `0600`, and storage is bounded to 2,048 entries,
+8 MiB of results shared by pricing and fits, and 16 MiB of SQLite pages.
+New entries are committed together at the end of the request. Unavailable, locked or corrupt
+caches fall back to ordinary calculation; deleting the cache is safe.
+
 `/api/analytics.csv?dataset=limits|tokens|weekly_value|breakdown|resets` accepts the
 same period/source/model/reset filters. `/api/diagnostics` exposes only an
 allowlisted projection: health status and times, counters, fixed error labels,
@@ -1329,8 +1346,9 @@ migration rollback.
   alert orchestration.
 - `local/serve.sh` and `http_server.py`: server configuration, allowlisted local
   HTTP routes, compression and static revalidation.
-- `local/analytics_cache.py` and `analytics_export.py`: bounded reusable
-  calculations and complete filtered CSV exports.
+- `local/analytics_cache.py`, `analytics_history_cache.py`, and
+  `analytics_export.py`: bounded reusable calculations, private persistent
+  historical fits, and complete filtered CSV exports.
 - `local/diagnostics.py`, `operations.py`, and `backup.py`: sanitized diagnostics,
   private filesystem helpers and verified archive backups.
 - `local/storage.py`, `archive.py`, and `analytics.py`: SQLite storage and query

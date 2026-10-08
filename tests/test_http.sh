@@ -136,7 +136,7 @@ wait "$server_pid" 2>/dev/null || true
 server_pid=""
 serve_fixture="${TEST_ROOT}/serve-fixture"
 mkdir -p "$serve_fixture"
-cp "$SERVE" "$ROOT_DIR/local/config.py" "$ROOT_DIR/local/analytics.py" "$ROOT_DIR/local/storage.py" "$ROOT_DIR/local/token_usage.py" "$ROOT_DIR/local/http_server.py" "$ROOT_DIR/local/analytics_export.py" "$ROOT_DIR/local/diagnostics.py" "$ROOT_DIR/local/operations.py" "$ROOT_DIR/local/analytics_cache.py" "$serve_fixture/"
+cp "$SERVE" "$ROOT_DIR/local/config.py" "$ROOT_DIR/local/analytics.py" "$ROOT_DIR/local/storage.py" "$ROOT_DIR/local/token_usage.py" "$ROOT_DIR/local/http_server.py" "$ROOT_DIR/local/analytics_export.py" "$ROOT_DIR/local/diagnostics.py" "$ROOT_DIR/local/operations.py" "$ROOT_DIR/local/analytics_cache.py" "$ROOT_DIR/local/analytics_history_cache.py" "$serve_fixture/"
 printf "TOKEN_PRICING_FILE='%s'\nDASHBOARD_ACTIVE_INTERVAL_SECONDS=120\n" "$custom_pricing" > "${serve_fixture}/.env"
 runtime_override="${TEST_ROOT}/serve-runtime"
 mkdir -m 700 "$runtime_override"

@@ -19,6 +19,7 @@ from typing import Any, Iterable, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from analytics_cache import REGRESSION_CACHE, SNAPSHOT_REVISIONS, WEEKLY_CACHE
+from analytics_history_cache import ContentRanges, FIT_CACHE_VERSION, HistoricalFitCache
 
 from storage import ArchiveCorruptionError, ArchiveSchemaError, connect_database
 from token_usage import MAX_PRICING_BOUNDARIES as MAX_CATALOG_PRICING_BOUNDARIES
@@ -395,12 +396,13 @@ class _RequestCostEvents:
         self.prices = price_index(catalog)
         self.loaded = None
 
-    def load(self, start: int, end: int, *, rows=None):
+    def load(self, start: int, end: int, *, rows=None, events=None):
         if self.loaded is not None:
             loaded_start, loaded_end, events, epochs = self.loaded
             if loaded_start <= start and end <= loaded_end:
                 return events[bisect.bisect_left(epochs, start):bisect.bisect_left(epochs, end)]
-        events = _load_cost_events(self.connection, self.prices, start, end, rows=rows)
+        events = (events if events is not None else
+                  _load_cost_events(self.connection, self.prices, start, end, rows=rows))
         epochs = [event[0] for event in events]
         # Invalid timestamps are represented by zero by the estimator. Do not
         # slice a synthetic or unsorted epoch index as if it were archive data.
@@ -1323,6 +1325,7 @@ def weekly_limit_value(
     sample_interval_seconds: int = 900,
     cache_namespace: tuple | None = None,
     cost_loader: _RequestCostEvents | None = None,
+    historical_cache: HistoricalFitCache | None = None,
 ) -> dict[str, Any]:
     """Build the aggregate and per-model weekly-value estimates.
 
@@ -1339,13 +1342,29 @@ def weekly_limit_value(
     history_start = evaluation_start - WEEKLY_VALUE_MAX_WINDOW_SECONDS - WEEKLY_VALUE_MIXED_TRAINING_HORIZON_SECONDS
     identities = connection.execute(
         """SELECT occurred_at_epoch, provider, model, input_tokens,
-                  cache_read_tokens, cache_write_tokens, output_tokens, quality
+                  cache_read_tokens, cache_write_tokens, output_tokens, quality,
+                  source, reasoning_tokens
            FROM token_usage_events
            WHERE occurred_at_epoch >= ? AND occurred_at_epoch < ?
            ORDER BY occurred_at_epoch, id""",
         (history_start, end),
     ).fetchall()
-    events = (cost_loader.load(history_start, end, rows=identities) if cost_loader is not None
+    event_content = None
+    raw_epochs = [row['occurred_at_epoch'] for row in identities]
+    if (cache_namespace is not None and all(type(epoch) is int for epoch in raw_epochs)
+            and all(left <= right for left, right in zip(raw_epochs, raw_epochs[1:]))):
+        event_content = ContentRanges(raw_epochs, (tuple(row) for row in identities))
+    events = None
+    if historical_cache is not None and event_content is not None:
+        events = []
+        historical_namespace = hashlib.sha256(repr(cache_namespace[1:]).encode()).hexdigest()
+        for block, left, right, digest in event_content.chunks:
+            def compute_events():
+                return _load_cost_events(connection, prices, history_start, end, rows=identities[left:right])
+            events.extend(historical_cache.cost_events(
+                (historical_namespace, block, right-left, digest), right-left, compute_events))
+    events = (cost_loader.load(history_start, end, rows=identities, events=events) if cost_loader is not None
+              else events if events is not None
               else _load_cost_events(connection, prices, history_start, end, rows=identities))
     display_start = evaluation_start - WEEKLY_VALUE_MAX_WINDOW_SECONDS
     models = sorted({row["model"].strip().lower() for row in identities
@@ -1399,6 +1418,18 @@ def weekly_limit_value(
             target_observations[target_row["scraped_at_epoch"]] = observation
         elif observation_reason is not None:
             target_observation_reasons[target_row["scraped_at_epoch"]] = observation_reason
+    # Snapshot identity still governs response memoization. Historical fits
+    # depend only on their causal horizon and exact target; indexing content
+    # once avoids rehashing every overlapping 28-day training slice.
+    content_ranges = None
+    if (cache_namespace is not None and target_observations
+            and all(left <= right for left, right in zip(identity_event_epochs, identity_event_epochs[1:]))):
+        sorted_resets = sorted(reset_epochs)
+        content_ranges = (
+            ContentRanges(history_epochs, (tuple(row) for row in history_rows)),
+            event_content or ContentRanges(identity_event_epochs, (tuple(row) for row in identities)),
+            ContentRanges(sorted_resets, sorted_resets),
+        )
     mixed_fit_cache: dict[int, dict[str, Any]] = {}
     interval_cost_cache: dict = {}
     mixed_rejections: dict[str, int] = {}
@@ -1462,11 +1493,24 @@ def weekly_limit_value(
                     )
                 # Every target has a complete causal training horizon in these
                 # inputs. A changing display start/end cannot change this fit.
-                fit = compute_fit() if cache_namespace is None else REGRESSION_CACHE.get_or_compute(
-                    (cache_namespace, target_epoch, target["start_epoch"],
-                     target["limit_id"], target["deadline"], target["fraction"],
-                     tuple(sorted(target["costs"].items()))), compute_fit,
-                )
+                if content_ranges is None:
+                    fit = compute_fit()
+                else:
+                    horizon = target["start_epoch"] - WEEKLY_VALUE_MIXED_TRAINING_HORIZON_SECONDS
+                    row_content, event_content, reset_content = content_ranges
+                    fit_key = (
+                        FIT_CACHE_VERSION, cache_namespace[1:],
+                        row_content.digest(horizon, target["start_epoch"], inclusive_end=True),
+                        event_content.digest(horizon, target["start_epoch"]),
+                        reset_content.digest(horizon, target["start_epoch"], inclusive_end=True),
+                        target_epoch, target["start_epoch"], target["limit_id"],
+                        target["deadline"], target["fraction"],
+                        tuple(sorted(target["costs"].items())), tuple(sorted(target["identities"])),
+                    )
+                    def reusable_fit():
+                        return (compute_fit() if historical_cache is None else
+                                historical_cache.get_or_compute(fit_key, compute_fit))
+                    fit = REGRESSION_CACHE.get_or_compute(fit_key, reusable_fit)
                 mixed_fit_cache[target_epoch] = fit
             if fit.get("ok"):
                 inferred = _mixed_point_from_fit(point, target, identity, fit)
@@ -2623,12 +2667,17 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
                 }
         if section in ("full", "weekly"):
             def compute_weekly():
-                return weekly_limit_value(
-                    connection, catalog, start, end, now=current,
-                    sample_interval_seconds=freshness["sample_interval_seconds"],
-                    cache_namespace=cache_namespace,
-                    cost_loader=cost_loader,
-                )
+                historical = HistoricalFitCache(database) if cache_namespace is not None else None
+                try:
+                    return weekly_limit_value(
+                        connection, catalog, start, end, now=current,
+                        sample_interval_seconds=freshness["sample_interval_seconds"],
+                        cache_namespace=cache_namespace,
+                        cost_loader=cost_loader, historical_cache=historical,
+                    )
+                finally:
+                    if historical is not None:
+                        historical.close()
             # Exact interval endpoints preserve membership. The only wall-clock
             # dependency of weekly estimates is the latest-sample stale state.
             result["weekly_limit_value"] = compute_weekly() if cache_namespace is None else WEEKLY_CACHE.get_or_compute(
