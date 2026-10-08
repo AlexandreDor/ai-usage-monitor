@@ -160,6 +160,37 @@ class AnalyticsBackendTests(unittest.TestCase):
             self.assertEqual(partial['revision'], full['revision'])
             self.assertNotIn('limits', partial)
 
+    def test_reset_cycle_outside_weekly_horizon_matches_cold_and_warm_full(self):
+        end = self.base
+        early = end - 50 * 86400
+        with closing(connect_database(self.db)) as connection, connection:
+            connection.execute('DELETE FROM snapshots')
+            connection.execute('DELETE FROM token_usage_events')
+            for at, deadline, remaining in (
+                (early - 60, early, 20), (early + 60, end, 100),
+                (end - 60, end, 20), (end + 60, end + 604800, 100),
+            ):
+                connection.execute('INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                                   (at, analytics.iso_utc(at), 80, None, None, remaining,
+                                    None, deadline, 900, 192, 'limit-a'))
+            for at in (early, end):
+                connection.execute('INSERT INTO reset_events VALUES (?, ?, ?, ?, ?, ?)',
+                                   ('weekly', at, at + 60, 20, 100, 'scheduled_crossing'))
+            for index, at in enumerate((early + 86400, end - 3600)):
+                connection.execute('''INSERT INTO token_usage_events
+                    (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+                    VALUES (?, 'codex', 'openai', 'gpt-5.6-sol', 1000000, ?)''',
+                                   (at, str(index)))
+        with self.isolated_snapshot_caches():
+            def selected(section):
+                return self.payload({'range': '24h', 'sections': section}, now=end + 120)
+            cold = selected('full')
+            resets = selected('resets')
+            warm = selected('full')
+        self.assertEqual(cold['resets'], resets['resets'])
+        self.assertEqual(warm['resets'], resets['resets'])
+        self.assertEqual(cold['resets']['items'][0]['estimated_cycle_cost_usd'], 10.0)
+
     def test_anchor_freezes_membership_and_freshness_tracks_actual_time(self):
         params = {'range': '24h', 'sections': 'weekly', 'at': str(self.now)}
         fresh = self.payload(params)

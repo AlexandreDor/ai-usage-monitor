@@ -37,7 +37,7 @@ fi
 
 # Generate evidence even when a test fails, and preserve the test's exit status.
 report_status=0
-if coverage_command combine "$data_dir"; then
+if coverage_command combine --quiet "$data_dir"; then
   cp -- "$COVERAGE_FILE" coverage/.coverage
   coverage_command report >coverage/report.txt 2>&1 || report_status=$?
   cat coverage/report.txt

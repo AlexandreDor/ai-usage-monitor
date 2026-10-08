@@ -398,9 +398,9 @@ class _RequestCostEvents:
 
     def load(self, start: int, end: int, *, rows=None, events=None):
         if self.loaded is not None:
-            loaded_start, loaded_end, events, epochs = self.loaded
+            loaded_start, loaded_end, loaded_events, epochs = self.loaded
             if loaded_start <= start and end <= loaded_end:
-                return events[bisect.bisect_left(epochs, start):bisect.bisect_left(epochs, end)]
+                return loaded_events[bisect.bisect_left(epochs, start):bisect.bisect_left(epochs, end)]
         events = (events if events is not None else
                   _load_cost_events(self.connection, self.prices, start, end, rows=rows))
         epochs = [event[0] for event in events]
