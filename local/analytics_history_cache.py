@@ -186,7 +186,13 @@ class HistoricalFitCache:
                     value = json.loads(row[0])
                     if (validator or self._valid_fit)(value):
                         return value
-            except (sqlite3.Error, ValueError, TypeError, UnicodeError, OverflowError, RecursionError):
+            except sqlite3.Error:
+                # A lock acquired after opening must not add one busy timeout
+                # for each remaining hourly block in this request.
+                self.disabled = True
+                self.close()
+                connection = None
+            except (ValueError, TypeError, UnicodeError, OverflowError, RecursionError):
                 pass
         value = compute()
         if connection is not None:
