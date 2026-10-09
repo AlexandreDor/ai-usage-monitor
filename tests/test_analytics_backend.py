@@ -283,6 +283,36 @@ class AnalyticsBackendTests(unittest.TestCase):
                 self.assertTrue(reader.in_transaction)
                 self.assertEqual(reader.execute('SELECT COUNT(*) FROM snapshots').fetchone()[0], 3)
 
+    def test_failed_observer_reopens_without_reusing_old_cache_identity(self):
+        with self.isolated_snapshot_caches() as monitor:
+            original = self.payload({'range': 'all', 'sections': 'weekly'})
+            name = str(self.db.resolve())
+            identity, reader, nonce = monitor._observers[name]
+
+            class BrokenObserver:
+                def execute(self, query):
+                    raise sqlite3.OperationalError('disk I/O error')
+
+                def close(self):
+                    reader.close()
+
+            monitor._observers[name] = (identity, BrokenObserver(), nonce)
+            recovered = self.payload({'range': 'all', 'sections': 'weekly'})
+            self.assertNotEqual(original['revision'], recovered['revision'])
+            self.assertEqual(original['weekly_limit_value'], recovered['weekly_limit_value'])
+            with patch.object(analytics, 'weekly_limit_value', side_effect=AssertionError('warm request recomputed')):
+                self.assertEqual(self.payload({'range': 'all', 'sections': 'weekly'}), recovered)
+
+    def test_persistent_observer_failure_leaves_fresh_archive_read_available(self):
+        with self.isolated_snapshot_caches() as monitor:
+            original = self.payload()
+            with patch.object(monitor, '_read_observation_locked', side_effect=sqlite3.OperationalError('disk I/O error')) as observe:
+                recovered = self.payload()
+                self.assertEqual(observe.call_count, 6)  # Two bounded attempts at each observation.
+            for field in ('tokens', 'limits', 'weekly_limit_value', 'resets'):
+                self.assertEqual(original[field], recovered[field])
+            self.assertFalse(monitor._observers)
+
     def test_evicted_preopen_observer_does_not_name_snapshot(self):
         other = self.db.with_name('other.sqlite3')
         with closing(connect_database(other)):

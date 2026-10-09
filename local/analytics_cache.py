@@ -47,7 +47,27 @@ class SnapshotRevisions:
         self._observers = OrderedDict()
         self._lock = Lock()
 
+    def _discard_locked(self, name: str) -> None:
+        observer = self._observers.pop(name, None)
+        if observer is not None:
+            try:
+                observer[1].close()
+            except sqlite3.Error:
+                pass
+
     def _observe_locked(self, database: Path) -> tuple | None:
+        # A checkpoint/restore can leave an otherwise healthy archive with an
+        # observer attached to obsolete WAL handles. This optional cache must
+        # not make the request's fresh read connection unavailable. Reopen once
+        # with a new identity; persistent failures simply disable memoization.
+        for _attempt in range(2):
+            try:
+                return self._read_observation_locked(database)
+            except sqlite3.Error:
+                self._discard_locked(str(database.resolve()))
+        return None
+
+    def _read_observation_locked(self, database: Path) -> tuple | None:
         before = archive_revision(database)
         name = before[0]
         identity = before[1][:2] if before[1] is not None else None

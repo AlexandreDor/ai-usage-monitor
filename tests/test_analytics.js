@@ -169,7 +169,10 @@ evaluate(`for (const key of weeklyValueSelection.keys()) weeklyValueSelection.se
   renderWeeklyLimitValue(weeklyValueData);`);
 if (evaluate('weeklyLimitValueDatasets.length') !== 0) fail('all curves cannot be deselected');
 if (!element('weekly-limit-value-chart-wrap').hidden) fail('empty selection showed a chart');
-if (evaluate('periodAnchor({ to: (Date.now() + 86400000) / 1000 })') !== null) fail('future custom period anchor was accepted');
+if (evaluate('periodAnchor({ range: "custom", to: (Date.now() + 86400000) / 1000 })') !== null) fail('future custom period anchor was accepted');
+if (evaluate('periodAnchor({ range: "custom", to: 1700000000 })') !== null) fail('custom dates unnecessarily acquired an anchor');
+if (evaluate('periodAnchor({ range: "all", to: 1700000000 })') !== 1700000000) fail('all-history server anchor was lost');
+if (evaluate('periodAnchor({ range: "30d", to: 1900000000 })') !== 1900000000) fail('server anchor ahead of browser clock was rejected');
 if (evaluate('periodAnchor({ to: 0 })') !== null) fail('zero period anchor was accepted');
 if (evaluate('periodAnchor({ to: -1 })') !== null) fail('negative period anchor was accepted');
 if (evaluate('periodAnchor({ to: 1700000000 })') !== 1700000000) fail('past period anchor was not preserved');

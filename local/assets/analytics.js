@@ -150,13 +150,14 @@ function formatShortDate(value) {
   const timestamp = timestampMs(value);
   return timestamp === null ? EMPTY_VALUE : shortDateFormatter().format(new Date(timestamp));
 }
-// Custom dates can end at a future local midnight. Their explicit date
-// boundaries are stable; only past/current period ends are valid API anchors.
+// The server's ordinary period end is authoritative even if the browser clock
+// is behind. Custom dates already have explicit boundaries and need no anchor.
 function periodAnchor(period) {
+  if (period?.range === 'custom') return null;
   const milliseconds = timestampMs(period?.to);
   if (milliseconds === null) return null;
   const seconds = Math.floor(milliseconds / 1000);
-  return seconds > 0 && seconds <= Math.floor(Date.now() / 1000) ? seconds : null;
+  return seconds > 0 ? seconds : null;
 }
 function timestampMs(value) {
   if (typeof value === 'number' && Number.isFinite(value)) return value > 1e12 ? value : value * 1000;
@@ -1286,7 +1287,7 @@ async function loadSection(section, generation, base, query) {
     if (requestControllers.get(section) === controller) requestControllers.delete(section);
   }
 }
-async function refresh({ section = 'base', revisionRetry = false } = {}) {
+async function refresh({ section = 'base', revisionRetry = false, coherent = false } = {}) {
   // A pending base owns an older query. Restart it with the latest controls
   // before it can overwrite a newer component selection or pagination page.
   if (filtersPending || pendingBaseSequence !== null) section = 'base';
@@ -1310,7 +1311,7 @@ async function refresh({ section = 'base', revisionRetry = false } = {}) {
   if (loading) loading.hidden = false;
   const query = queryString();
   try {
-    const payload = await fetchAnalytics('base', query, controller?.signal);
+    const payload = await fetchAnalytics(coherent ? 'full' : 'base', query, controller?.signal);
     if (sequence !== refreshSequence) return;
     pendingBaseSequence = null;
     render(payload);
@@ -1322,9 +1323,13 @@ async function refresh({ section = 'base', revisionRetry = false } = {}) {
     await Promise.all(pending.filter(name => ['weekly', 'resets'].includes(name)).map(name => loadSection(name, sequence, payload, query)));
   } catch (error) {
     if (sequence !== refreshSequence || error?.name === 'AbortError') return;
-    if (error.revisionMismatch && !revisionRetry) { await refresh({ revisionRetry: true }); return; }
+    if (error.revisionMismatch) {
+      // Two changing snapshots must never be mixed. A single full response
+      // pins every section to one database snapshot without an unbounded retry.
+      await refresh(revisionRetry ? { coherent: true } : { revisionRetry: true }); return;
+    }
     const message = error instanceof Error ? error.message : t('unableToLoadAnalytics');
-    const localOnly = !lastPayload || error?.status === 503 || /not available|cannot be read|local mode/i.test(message);
+    const localOnly = error?.status === 404 || /local mode/i.test(message);
     setMessage('analytics-local-only', localOnly ? t('localOnly') : '');
     setMessage('analytics-error', lastPayload ? `${message} · ${t('showingLastData')}` : message);
   } finally {

@@ -1070,9 +1070,20 @@ test('keeps the last valid analytics payload after an API failure', async ({ pag
   await expect(page.locator('#total-tokens')).toHaveText('1.73M');
   await page.evaluate(() => refresh());
   await expect(page.locator('#total-tokens')).toHaveText('1.73M');
-  await expect(page.locator('#analytics-local-only')).toBeVisible();
+  await expect(page.locator('#analytics-local-only')).toBeHidden();
   await expect(page.locator('#analytics-error')).toContainText('last successful data');
 });
+
+for (const status of [404, 503]) {
+  test(`distinguishes missing analytics API from an archive failure (${status})`, async ({ page }) => {
+    await page.route('**/api/analytics?*', route => route.fulfill({ status,
+      json: { error: status === 503 ? 'analytics archive cannot be read' : 'HTTP 404' } }));
+    await page.goto('/analytics.html');
+    await expect(page.locator('#analytics-error')).toBeVisible();
+    if (status === 404) await expect(page.locator('#analytics-local-only')).toBeVisible();
+    else await expect(page.locator('#analytics-local-only')).toBeHidden();
+  });
+}
 
 test('provides a non-chart fallback and supports custom dates', async ({ page }) => {
   const queries = [];
@@ -1322,7 +1333,7 @@ test('progressively loads compatible sections and scopes pagination to the affec
   expect(requests.at(-1).get('sections')).toBe('breakdown');
 });
 
-test('retries a revision mismatch once and keeps section failures visible', async ({ page }) => {
+test('falls back to one coherent response after repeated revision mismatches', async ({ page }) => {
   let bases = 0;
   const requests = [];
   await page.route('**/api/analytics?*', route => {
@@ -1335,14 +1346,59 @@ test('retries a revision mismatch once and keeps section failures visible', asyn
       return route.fulfill({ json: base });
     }
     if (section === 'weekly') return route.fulfill({ json: { period: analyticsPayload.period, revision: 'changed', weekly_limit_value: analyticsPayload.weekly_limit_value } });
+    if (section === 'full') return route.fulfill({ json: { ...analyticsPayload, resets: enhancedAnalyticsPayload.resets } });
     return route.fulfill({ status: 500, json: { error: 'reset calculation failed' } });
   });
   await page.goto('/analytics.html');
-  await expect(page.locator('#analytics-error')).toContainText('Analytics changed during loading');
-  await expect(page.locator('#resets-section-status')).toContainText('reset calculation failed');
+  await expect.poll(() => requests.filter(section => section === 'full').length).toBe(1);
+  await expect(page.locator('#analytics-error')).toBeHidden();
+  await expect(page.locator('#resets-section-status')).toBeHidden();
   await expect(page.locator('#total-tokens')).toHaveText('1.73M');
   expect(bases).toBe(2);
   expect(requests.filter(section => section === 'weekly')).toHaveLength(2);
+});
+
+test('anchors all-history sections to server time when the browser clock is behind', async ({ page }) => {
+  const serverNow = new Date('2026-10-09T02:30:00Z');
+  await page.clock.install({ time: new Date(serverNow.getTime() - 3600000) });
+  const queries = [];
+  const period = { ...analyticsPayload.period, range: 'all', to: serverNow.toISOString() };
+  const base = { ...analyticsPayload, period, revision: 'clock-skew', pending_sections: ['weekly', 'resets'] };
+  delete base.weekly_limit_value;
+  await page.route('**/api/analytics?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    queries.push(query);
+    if (query.get('sections') === 'base') return route.fulfill({ json: base });
+    const anchored = query.get('at') === String(serverNow.getTime() / 1000);
+    const componentPeriod = anchored ? period : { ...period, to: new Date(serverNow.getTime() + 1000).toISOString() };
+    return route.fulfill({ json: { period: componentPeriod, revision: base.revision,
+      weekly_limit_value: analyticsPayload.weekly_limit_value, resets: enhancedAnalyticsPayload.resets } });
+  });
+  await page.goto('/analytics.html?range=all');
+  await expect.poll(() => queries.length).toBe(3);
+  await expect(page.locator('#weekly-section-status')).toBeHidden();
+  await expect(page.locator('#resets-section-status')).toBeHidden();
+  await expect(page.locator('#analytics-error')).toBeHidden();
+  for (const query of queries.slice(1)) expect(query.get('at')).toBe(String(serverNow.getTime() / 1000));
+});
+
+test('keeps a failed coherent fallback bounded and visible', async ({ page }) => {
+  const requests = [];
+  await page.route('**/api/analytics?*', route => {
+    const section = new URL(route.request().url()).searchParams.get('sections');
+    requests.push(section);
+    if (section === 'full') return route.fulfill({ status: 503, json: { error: 'analytics archive cannot be read' } });
+    if (section === 'base') {
+      const base = { ...analyticsPayload, revision: 'base', pending_sections: ['weekly'] };
+      delete base.weekly_limit_value;
+      return route.fulfill({ json: base });
+    }
+    return route.fulfill({ json: { period: analyticsPayload.period, revision: 'changed' } });
+  });
+  await page.goto('/analytics.html');
+  await expect(page.locator('#analytics-error')).toContainText('analytics archive cannot be read');
+  await expect(page.locator('#analytics-local-only')).toBeHidden();
+  expect(requests).toEqual(['base', 'weekly', 'base', 'weekly', 'full']);
 });
 
 test('retains explicit unavailable models and validated filters through reload and local navigation', async ({ page }) => {
