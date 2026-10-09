@@ -42,58 +42,65 @@
 
   <main class="analytics-shell">
     <section class="filter-panel" data-i18n-aria-label="analytics.filtersAria" aria-label="Analytics filters">
-      <div class="range-group" id="range-group" data-i18n-aria-label="analytics.dateRange" aria-label="Date range">
-        <button type="button" data-range="24h">24h</button>
-        <button type="button" data-range="7d">7d</button>
-        <button type="button" data-range="30d" class="active">30d</button>
-        <button type="button" data-range="90d">90d</button>
-        <button type="button" data-range="1y">1y</button>
-        <button type="button" data-range="all" data-i18n="analytics.all">All</button>
-        <button type="button" data-range="custom" data-i18n="analytics.custom">Custom</button>
-      </div>
       <div class="filter-fields">
-        <fieldset class="multi-filter">
+        <fieldset class="multi-filter filter-section period-filter">
+          <legend data-i18n="analytics.dateRange">Date range</legend>
+          <div class="filter-section-content">
+            <div class="range-group" id="range-group">
+              <button type="button" class="filter-option" data-range="24h" aria-pressed="false">24h</button>
+              <button type="button" class="filter-option" data-range="7d" aria-pressed="false">7d</button>
+              <button type="button" class="filter-option active" data-range="30d" aria-pressed="true">30d</button>
+              <button type="button" class="filter-option" data-range="90d" aria-pressed="false">90d</button>
+              <button type="button" class="filter-option" data-range="1y" aria-pressed="false">1y</button>
+              <button type="button" class="filter-option" data-range="all" aria-pressed="false" data-i18n="analytics.all">All</button>
+              <button type="button" class="filter-option" data-range="custom" aria-pressed="false" data-i18n="analytics.custom">Custom</button>
+            </div>
+            <div class="custom-dates" id="custom-dates" hidden>
+              <label><span data-i18n="analytics.from">From</span> <input id="from-date" type="date"></label>
+              <label><span data-i18n="analytics.to">To</span> <input id="to-date" type="date"></label>
+              <button type="button" id="apply-dates" data-i18n="analytics.apply">Apply</button>
+            </div>
+          </div>
+        </fieldset>
+        <fieldset class="multi-filter filter-section application-filter">
           <legend data-i18n="analytics.applications">Applications</legend>
-          <div class="filter-options" id="source-filter">
+          <div class="filter-section-content filter-options" id="source-filter">
             <button type="button" class="filter-option" data-filter-value="codex" aria-pressed="true">Codex</button>
             <button type="button" class="filter-option" data-filter-value="opencode" aria-pressed="true">OpenCode</button>
             <button type="button" class="filter-option" data-filter-value="hermes" aria-pressed="true">Hermes</button>
           </div>
         </fieldset>
-        <fieldset class="multi-filter model-filter">
+        <fieldset class="multi-filter filter-section model-filter">
           <legend data-i18n="analytics.models">Models</legend>
-          <div class="model-heading">
+          <div class="filter-section-content">
+            <div class="model-selection-row">
+              <div id="model-selection-tray" class="model-selection-tray" data-i18n-aria-label="analytics.selectedModels" aria-label="Selected models"></div>
+              <div class="model-heading-controls"><p id="model-selection-summary" class="model-selection-summary" role="status" aria-live="polite"></p><button type="button" id="toggle-model-explorer" aria-expanded="false" aria-controls="model-explorer" data-i18n="analytics.showModels">Explore models</button></div>
+            </div>
             <p class="model-scope" data-i18n="analytics.modelScope">Filter token usage and cost. Weekly value curves have their own selection.</p>
-            <div class="model-heading-controls"><p id="model-selection-summary" class="model-selection-summary" role="status" aria-live="polite"></p><button type="button" id="toggle-model-explorer" aria-expanded="false" aria-controls="model-explorer" data-i18n="analytics.showModels">Explore models</button></div>
-          </div>
-          <div id="model-selection-tray" class="model-selection-tray" data-i18n-aria-label="analytics.selectedModels" aria-label="Selected models"></div>
-          <div id="model-explorer" hidden>
-            <div class="model-toolbar">
-              <label class="model-search"><span class="sr-only" data-i18n="analytics.searchModels">Search models</span><input id="model-search" type="search" autocomplete="off" spellcheck="false" data-i18n-placeholder="analytics.searchModelsPlaceholder" placeholder="Search by model name…" aria-controls="model-filter"></label>
-              <div class="filter-actions">
-                <button type="button" id="select-gpt" data-i18n="analytics.selectGpt">GPT</button>
-                <button type="button" id="select-all-models" data-i18n="analytics.allModels">All models</button>
+            <div id="model-explorer" hidden>
+              <div class="model-toolbar">
+                <label class="model-search"><span class="sr-only" data-i18n="analytics.searchModels">Search models</span><input id="model-search" type="search" autocomplete="off" spellcheck="false" data-i18n-placeholder="analytics.searchModelsPlaceholder" placeholder="Search by model name…" aria-controls="model-filter"></label>
+                <div class="filter-actions">
+                  <button type="button" id="select-gpt" data-i18n="analytics.selectGpt">GPT</button>
+                  <button type="button" id="select-all-models" data-i18n="analytics.allModels">All models</button>
+                </div>
               </div>
-            </div>
-            <div class="model-browse-bar">
-              <div class="model-families" id="model-families" data-i18n-aria-label="analytics.modelFamilies" aria-label="Model families">
-                <button type="button" data-model-family="all" aria-pressed="true" data-i18n="analytics.all">All</button>
-                <button type="button" data-model-family="current" aria-pressed="false" data-i18n="analytics.currentGpt">Current GPT</button>
-                <button type="button" data-model-family="older" aria-pressed="false" data-i18n="analytics.olderGpt">Other GPT</button>
-                <button type="button" data-model-family="other" aria-pressed="false" data-i18n="analytics.otherModels">Other models</button>
+              <div class="model-browse-bar">
+                <div class="model-families" id="model-families" data-i18n-aria-label="analytics.modelFamilies" aria-label="Model families">
+                  <button type="button" data-model-family="all" aria-pressed="true" data-i18n="analytics.all">All</button>
+                  <button type="button" data-model-family="current" aria-pressed="false" data-i18n="analytics.currentGpt">Current GPT</button>
+                  <button type="button" data-model-family="older" aria-pressed="false" data-i18n="analytics.olderGpt">Other GPT</button>
+                  <button type="button" data-model-family="other" aria-pressed="false" data-i18n="analytics.otherModels">Other models</button>
+                </div>
+                <div class="model-results-bar"><span id="model-results-count" role="status" aria-live="polite"></span><button type="button" id="select-visible-models" data-i18n="analytics.addVisibleModels">Add visible</button><button type="button" id="clear-model-selection" data-i18n="analytics.clearModelSelection">Clear selection</button></div>
               </div>
-              <div class="model-results-bar"><span id="model-results-count" role="status" aria-live="polite"></span><button type="button" id="select-visible-models" data-i18n="analytics.addVisibleModels">Add visible</button><button type="button" id="clear-model-selection" data-i18n="analytics.clearModelSelection">Clear selection</button></div>
+              <div class="filter-options model-catalog" id="model-filter"></div>
+              <p id="model-search-empty" class="model-empty" hidden></p>
             </div>
-            <div class="filter-options model-catalog" id="model-filter"></div>
-            <p id="model-search-empty" class="model-empty" hidden></p>
+            <div class="model-apply-bar" id="model-apply-bar" hidden><p id="model-draft-status" role="status" aria-live="polite"></p><div><button type="button" id="reset-model-selection" data-i18n="analytics.cancelModelChanges">Cancel changes</button><button type="button" id="apply-model-selection" data-i18n="analytics.applyModelSelection">Apply selection</button></div></div>
           </div>
-          <div class="model-apply-bar" id="model-apply-bar" hidden><p id="model-draft-status" role="status" aria-live="polite"></p><div><button type="button" id="reset-model-selection" data-i18n="analytics.cancelModelChanges">Cancel changes</button><button type="button" id="apply-model-selection" data-i18n="analytics.applyModelSelection">Apply selection</button></div></div>
         </fieldset>
-        <div class="custom-dates" id="custom-dates" hidden>
-          <label><span data-i18n="analytics.from">From</span> <input id="from-date" type="date"></label>
-          <label><span data-i18n="analytics.to">To</span> <input id="to-date" type="date"></label>
-          <button type="button" id="apply-dates" data-i18n="analytics.apply">Apply</button>
-        </div>
       </div>
     </section>
 

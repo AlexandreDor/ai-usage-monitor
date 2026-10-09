@@ -1038,6 +1038,7 @@ function renderModelSelection() {
     if (!button) {
       button = document.createElement('button');
       button.type = 'button';
+      button.className = 'filter-option selected-model';
       button.dataset.removeModel = model;
       button.textContent = `${model} ×`;
       tray.appendChild(button);
@@ -1171,7 +1172,10 @@ async function refresh({ restoreBreakdownOffsetOnError = false } = {}) {
 
 for (const button of document.querySelectorAll('[data-range]')) {
   button.addEventListener('click', () => {
-    document.querySelectorAll('[data-range]').forEach(item => item.classList.toggle('active', item === button));
+    document.querySelectorAll('[data-range]').forEach(item => {
+      item.classList.toggle('active', item === button);
+      item.setAttribute('aria-pressed', String(item === button));
+    });
     state.range = button.dataset.range;
     state.resetOffset = 0;
     state.breakdownOffset = 0;

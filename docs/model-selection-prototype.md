@@ -1,6 +1,8 @@
 # Model selection prototype
 
 This first sketch turns the Analytics model filter into a visual workspace.
+Date range, application and model filters share aligned labels, button sizing
+and blue selection states; custom dates stay beside the date-range controls.
 The explorer starts collapsed, with the selection summary and selected chips
 visible. Expanding it shows compact cards without internal scrolling: both the
 catalog and selected chips grow naturally with their content. Apply/Cancel
