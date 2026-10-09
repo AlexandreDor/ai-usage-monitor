@@ -8,6 +8,12 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Added
 
+- Prototype a compact Analytics model explorer with searchable model cards, family
+  filters, selected-model chips and explicit Apply/Cancel for batch changes.
+  The explorer starts collapsed and expands without internal scrolling.
+  Date range, application and model filters share a unified row layout and
+  selection styling.
+  English and French controls support keyboard navigation and mobile layouts.
 - Select GPT-6.1 Sol by default in Analytics and the GPT quick selection,
   with its own weekly-limit value curve and Standard API reference prices.
 

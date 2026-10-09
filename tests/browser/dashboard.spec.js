@@ -595,8 +595,12 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   for (const model of ['gpt-5.5', 'gpt-5.4', 'unknown-model']) {
     await expect(page.locator(`#model-filter [data-filter-value="${model}"]`)).toHaveAttribute('aria-pressed', 'false');
   }
+  await expect(page.locator('#model-explorer')).toBeHidden();
+  await expect(page.locator('#toggle-model-explorer')).toHaveAttribute('aria-expanded', 'false');
+  await page.locator('#toggle-model-explorer').click();
   await page.getByRole('button', { name: 'GPT', exact: true }).click();
-  await expect.poll(() => analyticsQueries.at(-1)?.get('models')).toBe('gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-6-luna,gpt-6-sol,gpt-6.1-sol,gpt-6-astra');
+  await expect(page.locator('#apply-model-selection')).toBeDisabled();
+  expect(analyticsQueries).toHaveLength(1);
   await page.locator('#source-filter [data-filter-value="codex"]').click();
   await expect.poll(() => analyticsQueries.at(-1)?.get('sources')).toBe('opencode,hermes');
   await expect(page.locator('.page-nav')).toHaveCount(0);
@@ -647,6 +651,135 @@ test('renders advanced analytics and remains local', async ({ page }) => {
 
   const results = await new AxeBuilder({ page }).analyze();
   expect(results.violations.filter(violation => violation.impact === 'critical')).toEqual([]);
+});
+
+test('stages model changes across searches and applies them with one request', async ({ page }) => {
+  const queries = [];
+  await page.route('**/api/analytics?*', route => {
+    queries.push(new URL(route.request().url()).searchParams);
+    return route.fulfill({ json: analyticsPayload });
+  });
+  await page.goto('/analytics.html');
+  await expect(page.locator('#model-selection-summary')).toHaveText('7 of 10 selected');
+  await expect(page.locator('#model-apply-bar')).toBeHidden();
+  await expect(page.locator('#model-explorer')).toBeHidden();
+  await page.locator('#toggle-model-explorer').click();
+  await expect(page.locator('#model-search')).toBeFocused();
+  await page.locator('#model-search').fill('  GPT-5.  ');
+  await expect(page.locator('#model-filter [data-filter-value]:visible')).toHaveCount(5);
+  await page.locator('[data-model-family="older"]').click();
+  await expect(page.locator('#model-filter [data-filter-value]:visible')).toHaveCount(2);
+  await page.locator('#select-visible-models').click();
+  await expect(page.locator('#model-selection-summary')).toHaveText('9 of 10 selected');
+  await page.locator('#model-search').fill('no-such-model');
+  await expect(page.locator('#model-search-empty')).toContainText('No matching models');
+  await expect(page.locator('#select-visible-models')).toBeDisabled();
+  await expect(page.locator('#model-selection-tray [data-remove-model]')).toHaveCount(9);
+  await page.locator('#model-selection-tray [data-remove-model="gpt-6-sol"]').click();
+  await expect(page.locator('#model-draft-status')).toHaveText('3 changes ready to apply.');
+  expect(queries).toHaveLength(1);
+  await page.locator('#apply-model-selection').click();
+  await expect.poll(() => queries.length).toBe(2);
+  expect(queries[1].get('models').split(',')).toEqual(analyticsPayload.available.models.filter(model => !['gpt-6-sol', 'unknown-model'].includes(model)));
+  expect(queries[1].get('breakdown_offset')).toBe('0');
+  await expect(page.locator('#apply-model-selection')).toBeDisabled();
+  await expect(page.locator('#model-search')).toHaveValue('no-such-model');
+  await expect(page.locator('#model-apply-bar')).toBeHidden();
+  await expect(page.locator('#toggle-model-explorer')).toBeFocused();
+  await expect(page.locator('[data-model-family="older"]')).toHaveAttribute('aria-pressed', 'true');
+});
+
+test('keeps a model draft through refresh, translation and collapse and cancels explicitly', async ({ page }) => {
+  const queries = [];
+  await page.route('**/api/analytics?*', route => {
+    queries.push(new URL(route.request().url()).searchParams);
+    return route.fulfill({ json: analyticsPayload });
+  });
+  await page.goto('/analytics.html');
+  await expect(page.locator('#model-selection-summary')).toHaveText('7 of 10 selected');
+  await page.locator('#toggle-model-explorer').click();
+  await page.locator('#clear-model-selection').click();
+  await expect(page.locator('#apply-model-selection')).toBeDisabled();
+  await expect(page.locator('#model-draft-status')).toContainText('Select at least one');
+  await page.locator('[data-range="7d"]').click();
+  await expect.poll(() => queries.length).toBe(2);
+  expect(queries[1].get('models').split(',')).toHaveLength(7);
+  await expect(page.locator('#model-explorer')).toBeVisible();
+  await expect(page.locator('#model-selection-summary')).toHaveText('0 of 10 selected');
+  await page.locator('#language-toggle').click();
+  await expect(page.locator('#model-search')).toHaveAttribute('placeholder', 'Rechercher par nom de modèle…');
+  await expect(page.locator('#model-draft-status')).toContainText('Sélectionnez au moins un modèle');
+  await page.locator('#model-filter [data-filter-value="gpt-6.1-sol"]').focus();
+  await page.keyboard.press('Space');
+  await expect(page.locator('#model-filter [data-filter-value="gpt-6.1-sol"]')).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#model-explorer')).toBeHidden();
+  await expect(page.locator('#toggle-model-explorer')).toBeFocused();
+  await expect(page.locator('#apply-model-selection')).toBeVisible();
+  await expect(page.locator('#apply-model-selection')).toBeEnabled();
+  await page.locator('#model-selection-tray button').click();
+  await expect(page.locator('#toggle-model-explorer')).toBeFocused();
+  await expect(page.locator('#apply-model-selection')).toBeDisabled();
+  await page.locator('#reset-model-selection').click();
+  await expect(page.locator('#model-selection-summary')).toHaveText('7 sélectionnés sur 10');
+  await expect(page.locator('#model-apply-bar')).toBeHidden();
+  await expect(page.locator('#toggle-model-explorer')).toBeFocused();
+  await page.locator('#toggle-model-explorer').click();
+  await expect(page.locator('#model-search')).toBeFocused();
+  await page.locator('#select-all-models').click();
+  await page.locator('#toggle-model-explorer').click();
+  await page.locator('#apply-model-selection').click();
+  await expect.poll(() => queries.length).toBe(3);
+  expect(queries[2].get('models').split(',')).toHaveLength(10);
+  const results = await new AxeBuilder({ page }).include('.model-filter').analyze();
+  expectNoAxeViolations(results, ['serious', 'critical']);
+});
+
+test('makes the model explorer usable on mobile and with an empty archive', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  let models = [];
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: {
+    ...analyticsPayload, available: { ...analyticsPayload.available, models },
+  } }));
+  await page.goto('/analytics.html');
+  await expect(page.locator('#model-explorer')).toBeHidden();
+  await page.locator('#toggle-model-explorer').click();
+  await expect(page.locator('#model-search-empty')).toContainText('Models will appear here');
+  await expect(page.locator('#model-selection-summary')).toHaveText('0 of 0 selected');
+  await expect(page.locator('#model-selection-tray button')).toHaveCount(0);
+  await expect(page.locator('#select-gpt')).toBeDisabled();
+  await expect(page.locator('#select-all-models')).toBeDisabled();
+  models = [...analyticsPayload.available.models, 'a-very-long-local-model-identifier-that-should-wrap-rather-than-break-the-layout:latest'];
+  await page.locator('[data-range="7d"]').click();
+  await expect(page.locator('#model-selection-summary')).toHaveText('7 of 11 selected');
+  await page.locator('#select-all-models').click();
+  for (const id of ['model-filter', 'model-selection-tray']) {
+    const layout = await page.locator(`#${id}`).evaluate(element => ({
+      maxHeight: getComputedStyle(element).maxHeight,
+      overflowY: getComputedStyle(element).overflowY,
+      scrollHeight: element.scrollHeight,
+      clientHeight: element.clientHeight,
+    }));
+    expect(layout.maxHeight).toBe('none');
+    expect(layout.overflowY).toBe('visible');
+    expect(layout.scrollHeight).toBeLessThanOrEqual(layout.clientHeight);
+  }
+  await page.locator('#reset-model-selection').click();
+  await page.locator('[data-model-family="other"]').click();
+  await page.locator('#model-search').fill('very-long');
+  await page.locator('#select-visible-models').click();
+  await expect(page.locator('#model-selection-tray [data-remove-model]')).toHaveCount(8);
+  const layout = await page.locator('.model-filter').evaluate(element => ({
+    left: element.getBoundingClientRect().left,
+    right: element.getBoundingClientRect().right,
+    viewport: innerWidth,
+    overflow: element.scrollWidth > element.clientWidth,
+  }));
+  expect(layout.left).toBeGreaterThanOrEqual(0);
+  expect(layout.right).toBeLessThanOrEqual(layout.viewport);
+  expect(layout.overflow).toBe(false);
+  const results = await new AxeBuilder({ page }).include('.model-filter').analyze();
+  expectNoAxeViolations(results, ['serious', 'critical']);
 });
 
 test('hides analytics warning containers when the API returns no warnings', async ({ page }) => {
