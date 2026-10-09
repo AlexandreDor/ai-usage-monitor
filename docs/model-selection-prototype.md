@@ -1,8 +1,9 @@
 # Model selection prototype
 
 This first sketch turns the Analytics model filter into a visual workspace.
-The expanded explorer is deliberately prominent so the interaction can be
-evaluated before settling on a final design.
+The explorer stays expanded by default, with compact cards and a bounded
+scrolling catalog. Selected chips also have a bounded area, and Apply/Cancel
+controls appear only when changes are pending.
 
 ![French model explorer with two pending changes](model-selection-prototype.png)
 
@@ -23,6 +24,6 @@ curve controls retain their independent selection. The draft survives data
 refreshes and language changes within the page; selections are not saved across
 page reloads. All controls are available in English and French.
 
-Design choices still open for iteration include the default expanded state,
-the height of the catalog, and whether named or persistent selections would be
-useful. No model capability, performance, or pricing claims are added to cards.
+Design choices still open for iteration include whether named or persistent
+selections would be useful. No model capability, performance, or pricing claims
+are added to cards.

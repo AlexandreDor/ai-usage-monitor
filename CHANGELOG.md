@@ -8,7 +8,7 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Added
 
-- Prototype an Analytics model explorer with searchable model cards, family
+- Prototype a compact Analytics model explorer with searchable model cards, family
   filters, selected-model chips and explicit Apply/Cancel for batch changes.
   English and French controls support keyboard navigation and mobile layouts.
 - Select GPT-6.1 Sol by default in Analytics and the GPT quick selection,

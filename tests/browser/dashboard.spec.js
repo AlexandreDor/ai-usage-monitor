@@ -658,6 +658,7 @@ test('stages model changes across searches and applies them with one request', a
   });
   await page.goto('/analytics.html');
   await expect(page.locator('#model-selection-summary')).toHaveText('7 of 10 selected');
+  await expect(page.locator('#model-apply-bar')).toBeHidden();
   await page.locator('#model-search').fill('  GPT-5.  ');
   await expect(page.locator('#model-filter [data-filter-value]:visible')).toHaveCount(5);
   await page.locator('[data-model-family="older"]').click();
@@ -677,6 +678,8 @@ test('stages model changes across searches and applies them with one request', a
   expect(queries[1].get('breakdown_offset')).toBe('0');
   await expect(page.locator('#apply-model-selection')).toBeDisabled();
   await expect(page.locator('#model-search')).toHaveValue('no-such-model');
+  await expect(page.locator('#model-apply-bar')).toBeHidden();
+  await expect(page.locator('#toggle-model-explorer')).toBeFocused();
   await expect(page.locator('[data-model-family="older"]')).toHaveAttribute('aria-pressed', 'true');
 });
 
@@ -711,6 +714,8 @@ test('keeps a model draft through refresh, translation and collapse and cancels 
   await expect(page.locator('#apply-model-selection')).toBeDisabled();
   await page.locator('#reset-model-selection').click();
   await expect(page.locator('#model-selection-summary')).toHaveText('7 sélectionnés sur 10');
+  await expect(page.locator('#model-apply-bar')).toBeHidden();
+  await expect(page.locator('#toggle-model-explorer')).toBeFocused();
   await page.locator('#toggle-model-explorer').click();
   await expect(page.locator('#model-search')).toBeFocused();
   await page.locator('#select-all-models').click();

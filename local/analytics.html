@@ -63,30 +63,31 @@
         <fieldset class="multi-filter model-filter">
           <legend data-i18n="analytics.models">Models</legend>
           <div class="model-heading">
-            <div><span class="section-kicker" data-i18n="analytics.modelWorkspace">Your model selection</span><h2 data-i18n="analytics.modelTitle">Choose your lens.</h2><p data-i18n="analytics.modelScope">Filter token usage and cost. Weekly value curves have their own selection.</p></div>
-            <button type="button" id="toggle-model-explorer" aria-expanded="true" aria-controls="model-explorer" data-i18n="analytics.hideModels">Collapse</button>
+            <p class="model-scope" data-i18n="analytics.modelScope">Filter token usage and cost. Weekly value curves have their own selection.</p>
+            <div class="model-heading-controls"><p id="model-selection-summary" class="model-selection-summary" role="status" aria-live="polite"></p><button type="button" id="toggle-model-explorer" aria-expanded="true" aria-controls="model-explorer" data-i18n="analytics.hideModels">Collapse</button></div>
           </div>
-          <p id="model-selection-summary" class="model-selection-summary" role="status" aria-live="polite"></p>
           <div id="model-selection-tray" class="model-selection-tray" data-i18n-aria-label="analytics.selectedModels" aria-label="Selected models"></div>
           <div id="model-explorer">
             <div class="model-toolbar">
-              <label class="model-search"><span data-i18n="analytics.searchModels">Search models</span><input id="model-search" type="search" autocomplete="off" spellcheck="false" data-i18n-placeholder="analytics.searchModelsPlaceholder" placeholder="Search by model name…" aria-controls="model-filter"></label>
+              <label class="model-search"><span class="sr-only" data-i18n="analytics.searchModels">Search models</span><input id="model-search" type="search" autocomplete="off" spellcheck="false" data-i18n-placeholder="analytics.searchModelsPlaceholder" placeholder="Search by model name…" aria-controls="model-filter"></label>
               <div class="filter-actions">
                 <button type="button" id="select-gpt" data-i18n="analytics.selectGpt">GPT</button>
                 <button type="button" id="select-all-models" data-i18n="analytics.allModels">All models</button>
               </div>
             </div>
-            <div class="model-families" id="model-families" data-i18n-aria-label="analytics.modelFamilies" aria-label="Model families">
-              <button type="button" data-model-family="all" aria-pressed="true" data-i18n="analytics.all">All</button>
-              <button type="button" data-model-family="current" aria-pressed="false" data-i18n="analytics.currentGpt">Current GPT</button>
-              <button type="button" data-model-family="older" aria-pressed="false" data-i18n="analytics.olderGpt">Other GPT</button>
-              <button type="button" data-model-family="other" aria-pressed="false" data-i18n="analytics.otherModels">Other models</button>
+            <div class="model-browse-bar">
+              <div class="model-families" id="model-families" data-i18n-aria-label="analytics.modelFamilies" aria-label="Model families">
+                <button type="button" data-model-family="all" aria-pressed="true" data-i18n="analytics.all">All</button>
+                <button type="button" data-model-family="current" aria-pressed="false" data-i18n="analytics.currentGpt">Current GPT</button>
+                <button type="button" data-model-family="older" aria-pressed="false" data-i18n="analytics.olderGpt">Other GPT</button>
+                <button type="button" data-model-family="other" aria-pressed="false" data-i18n="analytics.otherModels">Other models</button>
+              </div>
+              <div class="model-results-bar"><span id="model-results-count" role="status" aria-live="polite"></span><button type="button" id="select-visible-models" data-i18n="analytics.addVisibleModels">Add visible</button><button type="button" id="clear-model-selection" data-i18n="analytics.clearModelSelection">Clear selection</button></div>
             </div>
-            <div class="model-results-bar"><span id="model-results-count" role="status" aria-live="polite"></span><button type="button" id="select-visible-models" data-i18n="analytics.addVisibleModels">Add visible</button><button type="button" id="clear-model-selection" data-i18n="analytics.clearModelSelection">Clear selection</button></div>
             <div class="filter-options model-catalog" id="model-filter"></div>
             <p id="model-search-empty" class="model-empty" hidden></p>
           </div>
-          <div class="model-apply-bar"><p id="model-draft-status" role="status" aria-live="polite"></p><div><button type="button" id="reset-model-selection" data-i18n="analytics.cancelModelChanges">Cancel changes</button><button type="button" id="apply-model-selection" data-i18n="analytics.applyModelSelection">Apply selection</button></div></div>
+          <div class="model-apply-bar" id="model-apply-bar" hidden><p id="model-draft-status" role="status" aria-live="polite"></p><div><button type="button" id="reset-model-selection" data-i18n="analytics.cancelModelChanges">Cancel changes</button><button type="button" id="apply-model-selection" data-i18n="analytics.applyModelSelection">Apply selection</button></div></div>
         </fieldset>
         <div class="custom-dates" id="custom-dates" hidden>
           <label><span data-i18n="analytics.from">From</span> <input id="from-date" type="date"></label>

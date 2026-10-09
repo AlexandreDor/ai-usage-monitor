@@ -1017,6 +1017,7 @@ function renderModelSelection() {
   empty.hidden = visible.size > 0;
   empty.textContent = t(state.availableModels.length ? 'modelNoResults' : 'modelNoAvailable');
   const changes = modelDraftChanges();
+  byId('model-apply-bar').hidden = !changes;
   byId('model-draft-status').textContent = t(!draft.length ? 'modelDraftEmpty' : changes ? 'modelDraftPending' : 'modelDraftSaved', { count: changes });
   byId('apply-model-selection').disabled = !draft.length || !changes;
   byId('reset-model-selection').disabled = !changes;
@@ -1216,6 +1217,7 @@ byId('clear-model-selection').addEventListener('click', () => setModelDraft([]))
 byId('reset-model-selection').addEventListener('click', () => {
   modelDraft = null;
   renderModelSelection();
+  byId('toggle-model-explorer').focus();
 });
 byId('apply-model-selection').addEventListener('click', () => {
   if (!modelDraft?.length || !modelDraftChanges()) return;
@@ -1225,6 +1227,7 @@ byId('apply-model-selection').addEventListener('click', () => {
   state.resetOffset = 0;
   state.breakdownOffset = 0;
   renderModelSelection();
+  byId('toggle-model-explorer').focus();
   refresh();
 });
 byId('model-search').addEventListener('input', event => {
