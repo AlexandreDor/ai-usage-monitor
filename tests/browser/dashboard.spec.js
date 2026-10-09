@@ -595,6 +595,9 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   for (const model of ['gpt-5.5', 'gpt-5.4', 'unknown-model']) {
     await expect(page.locator(`#model-filter [data-filter-value="${model}"]`)).toHaveAttribute('aria-pressed', 'false');
   }
+  await expect(page.locator('#model-explorer')).toBeHidden();
+  await expect(page.locator('#toggle-model-explorer')).toHaveAttribute('aria-expanded', 'false');
+  await page.locator('#toggle-model-explorer').click();
   await page.getByRole('button', { name: 'GPT', exact: true }).click();
   await expect(page.locator('#apply-model-selection')).toBeDisabled();
   expect(analyticsQueries).toHaveLength(1);
@@ -659,6 +662,9 @@ test('stages model changes across searches and applies them with one request', a
   await page.goto('/analytics.html');
   await expect(page.locator('#model-selection-summary')).toHaveText('7 of 10 selected');
   await expect(page.locator('#model-apply-bar')).toBeHidden();
+  await expect(page.locator('#model-explorer')).toBeHidden();
+  await page.locator('#toggle-model-explorer').click();
+  await expect(page.locator('#model-search')).toBeFocused();
   await page.locator('#model-search').fill('  GPT-5.  ');
   await expect(page.locator('#model-filter [data-filter-value]:visible')).toHaveCount(5);
   await page.locator('[data-model-family="older"]').click();
@@ -691,12 +697,14 @@ test('keeps a model draft through refresh, translation and collapse and cancels 
   });
   await page.goto('/analytics.html');
   await expect(page.locator('#model-selection-summary')).toHaveText('7 of 10 selected');
+  await page.locator('#toggle-model-explorer').click();
   await page.locator('#clear-model-selection').click();
   await expect(page.locator('#apply-model-selection')).toBeDisabled();
   await expect(page.locator('#model-draft-status')).toContainText('Select at least one');
   await page.locator('[data-range="7d"]').click();
   await expect.poll(() => queries.length).toBe(2);
   expect(queries[1].get('models').split(',')).toHaveLength(7);
+  await expect(page.locator('#model-explorer')).toBeVisible();
   await expect(page.locator('#model-selection-summary')).toHaveText('0 of 10 selected');
   await page.locator('#language-toggle').click();
   await expect(page.locator('#model-search')).toHaveAttribute('placeholder', 'Rechercher par nom de modèle…');
@@ -734,6 +742,8 @@ test('makes the model explorer usable on mobile and with an empty archive', asyn
     ...analyticsPayload, available: { ...analyticsPayload.available, models },
   } }));
   await page.goto('/analytics.html');
+  await expect(page.locator('#model-explorer')).toBeHidden();
+  await page.locator('#toggle-model-explorer').click();
   await expect(page.locator('#model-search-empty')).toContainText('Models will appear here');
   await expect(page.locator('#model-selection-summary')).toHaveText('0 of 0 selected');
   await expect(page.locator('#model-selection-tray button')).toHaveCount(0);
@@ -742,6 +752,19 @@ test('makes the model explorer usable on mobile and with an empty archive', asyn
   models = [...analyticsPayload.available.models, 'a-very-long-local-model-identifier-that-should-wrap-rather-than-break-the-layout:latest'];
   await page.locator('[data-range="7d"]').click();
   await expect(page.locator('#model-selection-summary')).toHaveText('7 of 11 selected');
+  await page.locator('#select-all-models').click();
+  for (const id of ['model-filter', 'model-selection-tray']) {
+    const layout = await page.locator(`#${id}`).evaluate(element => ({
+      maxHeight: getComputedStyle(element).maxHeight,
+      overflowY: getComputedStyle(element).overflowY,
+      scrollHeight: element.scrollHeight,
+      clientHeight: element.clientHeight,
+    }));
+    expect(layout.maxHeight).toBe('none');
+    expect(layout.overflowY).toBe('visible');
+    expect(layout.scrollHeight).toBeLessThanOrEqual(layout.clientHeight);
+  }
+  await page.locator('#reset-model-selection').click();
   await page.locator('[data-model-family="other"]').click();
   await page.locator('#model-search').fill('very-long');
   await page.locator('#select-visible-models').click();

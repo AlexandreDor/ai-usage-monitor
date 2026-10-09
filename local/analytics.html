@@ -64,10 +64,10 @@
           <legend data-i18n="analytics.models">Models</legend>
           <div class="model-heading">
             <p class="model-scope" data-i18n="analytics.modelScope">Filter token usage and cost. Weekly value curves have their own selection.</p>
-            <div class="model-heading-controls"><p id="model-selection-summary" class="model-selection-summary" role="status" aria-live="polite"></p><button type="button" id="toggle-model-explorer" aria-expanded="true" aria-controls="model-explorer" data-i18n="analytics.hideModels">Collapse</button></div>
+            <div class="model-heading-controls"><p id="model-selection-summary" class="model-selection-summary" role="status" aria-live="polite"></p><button type="button" id="toggle-model-explorer" aria-expanded="false" aria-controls="model-explorer" data-i18n="analytics.showModels">Explore models</button></div>
           </div>
           <div id="model-selection-tray" class="model-selection-tray" data-i18n-aria-label="analytics.selectedModels" aria-label="Selected models"></div>
-          <div id="model-explorer">
+          <div id="model-explorer" hidden>
             <div class="model-toolbar">
               <label class="model-search"><span class="sr-only" data-i18n="analytics.searchModels">Search models</span><input id="model-search" type="search" autocomplete="off" spellcheck="false" data-i18n-placeholder="analytics.searchModelsPlaceholder" placeholder="Search by model name…" aria-controls="model-filter"></label>
               <div class="filter-actions">

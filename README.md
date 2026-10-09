@@ -51,11 +51,12 @@ The local Analytics page provides:
 - filtering by application and model, with GPT-5.6 Sol, Terra, and Luna plus
   GPT-6 Luna, Sol, Astra, and GPT-6.1 Sol selected by default when available;
   older GPT models remain outside this quick selection;
-- a model explorer with name search, family filters, selected-model chips and
-  batch selection. Changes are staged until **Apply selection**; **Cancel
+- a model explorer, collapsed by default, with name search, family filters,
+  selected-model chips and batch selection. Changes are staged until **Apply selection**; **Cancel
   changes** restores the active filter. Search and family filters only narrow
   the catalog, and **Add visible** adds matching models without dropping hidden
-  selections. Collapsing the explorer retains the draft and its apply controls;
+  selections. Expanded models wrap without internal scrolling. Collapsing the
+  explorer retains the draft and its apply controls;
 - quota, token, and API-equivalent cost charts;
 - implicit weekly-limit value estimates from all locally collected
   API-equivalent token-event costs (Codex, OpenCode, and Hermes). Aggregate

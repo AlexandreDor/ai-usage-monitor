@@ -1,14 +1,18 @@
 # Model selection prototype
 
 This first sketch turns the Analytics model filter into a visual workspace.
-The explorer stays expanded by default, with compact cards and a bounded
-scrolling catalog. Selected chips also have a bounded area, and Apply/Cancel
+The explorer starts collapsed, with the selection summary and selected chips
+visible. Expanding it shows compact cards without internal scrolling: both the
+catalog and selected chips grow naturally with their content. Apply/Cancel
 controls appear only when changes are pending.
 
-![French model explorer with two pending changes](model-selection-prototype.png)
+![French model explorer collapsed by default](model-selection-prototype.png)
 
-The preview uses synthetic data from the browser-test fixture. It shows one
-model removed and another added, with both changes still awaiting application.
+![Expanded model explorer with two pending changes](model-selection-expanded.png)
+
+The previews use synthetic data from the browser-test fixture. The expanded
+view shows one model removed and another added, with both changes still
+awaiting application.
 
 - Search model names and narrow the catalog to current GPT, other GPT, or other
   models. Current GPT means the existing `GPT_MODELS` quick-selection list.
