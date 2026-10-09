@@ -32,13 +32,16 @@ Ces évolutions viendront après la stabilisation des fonctions existantes :
 
 - support de plusieurs comptes Codex ;
 - notifications Slack, ntfy ou e-mail ;
-- exposition contrôlée des données déjà maintenues dans `runtime/health.json`,
-  puis export Prometheus distinct ;
+- export Prometheus distinct à partir des diagnostics locaux ;
 - rollups quotidiens persistants pour les historiques longs ;
-- fuseau horaire configurable ;
 - transformation des fixtures anonymisées existantes en mode simulation
   documenté pour développer sans compte Codex, sans notification ni Gist par
   défaut.
+
+Les performances de chargement, diagnostics, exports CSV, comparaisons de
+périodes, filtres mémorisés, fuseau et taux EUR configurables, et sauvegardes
+planifiées sont implémentés. Les agrégats persistants restent différés : le cache
+borné réutilise les calculs sans réduire les événements bruts ni la précision.
 
 La langue et la devise configurables ainsi que les commandes `--check`,
 `--once`, `--loop`, `--status-json`, `--fail-fast`, `--bind` et `--port` ont été
@@ -46,9 +49,8 @@ retirées de cette liste car elles sont déjà implémentées.
 
 ## Ordre d'exécution recommandé
 
-1. Ajouter la détection des données périmées au dashboard principal.
-2. Détecter les anomalies de quota.
-3. Ajouter les évolutions P3 selon les besoins utilisateurs.
+1. Suivre les budgets de chargement et la stabilité sur les archives réelles.
+2. Ajouter les évolutions P3 selon les besoins utilisateurs.
 
 ## Définition globale de terminé
 
@@ -62,9 +64,6 @@ Une amélioration est considérée comme terminée lorsque :
 - aucun secret, chemin local ou identifiant de compte n'est ajouté aux données
   exposées.
 
-Le programme restant est terminé lorsque :
-
-- le dashboard principal détecte et annonce les données périmées ;
-- les mouvements de quota anormaux sont détectés sans confondre les resets
-  légitimes ;
-- les tests shell, Python, HTTP et navigateur passent en CI ;
+Les données périmées et les anomalies de quota sont déjà détectées et testées.
+Les tests shell, Python, HTTP, navigateur et performance restent des conditions
+de validation pour chaque nouvelle évolution.

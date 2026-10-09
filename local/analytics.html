@@ -38,6 +38,15 @@
         </button>
       </div>
     </div>
+
+    <details class="advanced-preferences">
+      <summary data-i18n="preferences.advanced">Time and exchange rate</summary>
+      <div class="advanced-preference-fields">
+        <label><span data-i18n="preferences.timezone">Time zone (IANA)</span><input data-preference-input="timezone" type="text" value="Europe/Paris" maxlength="100" autocomplete="off"></label>
+        <label><span data-i18n="preferences.usdToEurRate">EUR per USD</span><input data-preference-input="usdToEurRate" type="number" min="0.000001" max="1000" step="any" value="0.86"></label>
+        <label><span data-i18n="preferences.rateDate">Rate date</span><input data-preference-input="rateDate" type="date"></label>
+      </div>
+    </details>
   </header>
 
   <main class="analytics-shell">
@@ -109,6 +118,14 @@
     <div id="analytics-error" class="analytics-message error-message" role="alert" aria-live="assertive" hidden></div>
     <div id="analytics-warnings" class="analytics-message warning-message" role="status" aria-live="polite" hidden></div>
 
+    <details class="analytics-tools">
+      <summary data-i18n="analytics.exportCsv">Export CSV</summary>
+      <label><span data-i18n="analytics.exportDataset">Dataset</span><select id="csv-dataset"><option value="limits" data-i18n="analytics.codexLimits">Codex limits</option><option value="tokens" data-i18n="analytics.billableTokens">Billable tokens</option><option value="weekly_value" data-i18n="analytics.weeklyLimitValueTitle">Weekly limit value</option><option value="breakdown" data-i18n="analytics.byApplicationModel">By application and model</option><option value="resets" data-i18n="analytics.resetHistory">Reset history</option></select></label>
+      <a id="csv-download" download data-i18n="analytics.exportDownload">Download CSV</a>
+      <small data-i18n="analytics.exportRaw">USD, full token counts and UTC dates</small>
+    </details>
+    <label class="comparison-toggle"><input id="compare-previous" type="checkbox"><span data-i18n="analytics.comparePrevious">Compare previous period</span></label>
+    <p id="comparison-summary" class="chart-summary" role="status" hidden></p>
     <section class="metric-grid" data-i18n-aria-label="analytics.metricSummaryAria" aria-label="Period summary">
       <article class="metric-card metric-card-detail">
         <span class="metric-label" data-i18n="analytics.uncachedInput">Uncached input</span>
@@ -172,7 +189,7 @@
             <span class="sample-count" id="limit-samples">-</span>
           </div>
         </div>
-        <div class="chart-wrap" id="limits-chart-wrap"><canvas id="limits-chart" class="time-slice-chart" role="img" aria-describedby="limits-chart-summary limits-data-table-caption"></canvas></div>
+        <div class="chart-wrap" id="limits-chart-wrap"><canvas data-i18n-aria-label="analytics.longTermAvailability" aria-label="Long-term availability" id="limits-chart" class="time-slice-chart" role="img" aria-describedby="limits-chart-summary limits-data-table-caption"></canvas></div>
         <p class="empty-state" id="limits-empty" data-i18n="analytics.noLimitSamples" hidden>No limit samples in this period.</p>
         <p class="chart-summary" id="limits-chart-summary" role="status" aria-live="polite"></p>
         <details class="chart-data-details">
@@ -193,6 +210,7 @@
             <span class="sample-count" id="weekly-limit-value-window" data-i18n="analytics.weeklyLimitValueWindow">Rolling window · 12 h · one point / 6 h · USD</span>
           </div>
         </div>
+        <p id="weekly-section-status" class="chart-summary" role="status" hidden></p>
         <fieldset class="weekly-value-selector">
           <legend data-i18n="analytics.weeklyValueModel">Curves to display</legend>
           <div id="weekly-limit-value-models" class="weekly-value-models"></div>
@@ -200,7 +218,7 @@
         <p class="chart-description" data-i18n="analytics.weeklyValueModelDescription">Per-model values come from exclusive windows when available. Mixed usage may use a fit trained on adaptive non-overlapping intervals from the last 28 days. High-uncertainty estimates remain visible with cross markers and sensitivity ranges in the table. The last accepted value may be carried for up to 7 days across ordinary gaps and weekly resets.</p>
         <p class="chart-description" data-i18n="analytics.weeklyLimitValueDescription">Aggregate values use a rolling twelve-hour window. Per-model mixed-usage values can use shorter measurable intervals and are inferred from the shared quota, not model-level quota observations. Hollow dashed points carry an earlier accepted estimate.</p>
         <p class="quality-legend" id="weekly-limit-value-quality" data-i18n="analytics.weeklyLimitValueQualityLegend">Quality: good · low confidence · high uncertainty · volatile. Sensitivity ranges assume a one-point error in each quota observation; they are not statistical confidence intervals. The table gives the sensitivity ranges.</p>
-        <div class="chart-wrap" id="weekly-limit-value-chart-wrap"><canvas id="weekly-limit-value-chart" class="time-slice-chart" role="img" aria-describedby="weekly-limit-value-summary weekly-limit-value-table-caption"></canvas></div>
+        <div class="chart-wrap" id="weekly-limit-value-chart-wrap"><canvas data-i18n-aria-label="analytics.weeklyLimitValueTitle" aria-label="Implicit weekly limit value" id="weekly-limit-value-chart" class="time-slice-chart" role="img" aria-describedby="weekly-limit-value-summary weekly-limit-value-table-caption"></canvas></div>
         <p class="empty-state" id="weekly-limit-value-empty" data-i18n="analytics.noWeeklyLimitValue" hidden>No comparable weekly limit value is available in this period.</p>
         <p class="chart-summary" id="weekly-limit-value-summary" role="status" aria-live="polite"></p>
         <details class="chart-data-details">
@@ -218,7 +236,7 @@
             <span class="sample-count" id="event-count">-</span>
           </div>
         </div>
-        <div class="chart-wrap" id="tokens-chart-wrap"><canvas id="tokens-chart" class="time-slice-chart" role="img" aria-describedby="tokens-chart-summary tokens-data-table-caption"></canvas></div>
+        <div class="chart-wrap" id="tokens-chart-wrap"><canvas data-i18n-aria-label="analytics.tokensOverTime" aria-label="Tokens over time" id="tokens-chart" class="time-slice-chart" role="img" aria-describedby="tokens-chart-summary tokens-data-table-caption"></canvas></div>
         <p class="empty-state" id="tokens-empty" data-i18n="analytics.noTokenEvents" hidden>No token events in this period.</p>
         <p class="chart-summary" id="tokens-chart-summary" role="status" aria-live="polite"></p>
         <details class="chart-data-details">
@@ -234,6 +252,7 @@
           <div><span class="section-kicker" data-i18n="analytics.costAllocation">Cost allocation</span><h2 data-i18n="analytics.byApplicationModel">By application and model</h2></div>
           <div class="allocation-total"><span data-i18n="analytics.totalEstimatedCost">Total estimated cost</span><strong id="allocation-total-cost">-</strong></div>
         </div>
+        <p id="breakdown-section-status" class="chart-summary" role="status" hidden></p>
         <div class="table-scroll">
           <table>
             <caption class="sr-only" data-i18n="analytics.breakdownCaption">Token and cost breakdown by application, provider and model</caption>
@@ -256,6 +275,7 @@
             <select id="reset-filter"><option value="all" data-i18n="analytics.all">All</option><option value="5h" data-i18n="analytics.fiveHour">5-hour</option><option value="weekly" selected data-i18n="analytics.weekly">Weekly</option></select>
           </label>
         </div>
+        <p id="resets-section-status" class="chart-summary" role="status" hidden></p>
         <div class="table-scroll">
           <table class="reset-table">
             <caption class="sr-only" data-i18n="analytics.resetCaption">Detected limit resets</caption>
@@ -278,6 +298,7 @@
         </div>
         <div class="collector-grid" id="collector-grid"></div>
         <p class="baseline-note" id="baseline-note" hidden></p>
+        <details class="diagnostics-panel"><summary data-i18n="analytics.diagnostics">Monitor diagnostics</summary><p id="diagnostics-status" role="status" hidden></p><pre id="diagnostics-body"></pre></details>
       </section>
 
     </section>

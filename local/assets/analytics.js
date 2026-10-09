@@ -14,6 +14,7 @@ const state = {
   availableModels: [],
   modelAvailabilityResolved: false,
   modelFallbackNotice: false,
+  restoredModelsRejected: false,
   resetType: 'weekly',
   resetOffset: 0,
   breakdownOffset: 0,
@@ -22,6 +23,8 @@ const state = {
   toDate: '',
   tokenOverlay: true,
   tokenMetric: 'cost',
+  comparePrevious: false,
+  explicitModels: false,
 };
 let limitsChart = null;
 let weeklyLimitValueChart = null;
@@ -34,11 +37,81 @@ let limitDatasets = [];
 let weeklyLimitValueDatasets = [];
 let tokenDatasets = [];
 let lastPayload = null;
+let displayedResetData = null;
+let diagnosticsPayload = null;
+let diagnosticsState = '';
 let currentPeriod = {};
 let refreshSequence = 0;
 let modelDraft = null;
 let modelSearch = '';
 let modelFamily = 'all';
+let pendingBaseSequence = null;
+let filterTimer = null;
+let filtersPending = false;
+const requestControllers = new Map();
+const sectionSequences = new Map();
+const deferredTables = new Map();
+const localFormatters = new Map();
+const FILTER_STORAGE_KEY = 'codex-usage-monitor.analytics-filters';
+function cachedFormatter(kind, language, options) {
+  const key = JSON.stringify([kind, language, options]);
+  if (!localFormatters.has(key)) {
+    if (localFormatters.size >= 64) localFormatters.delete(localFormatters.keys().next().value);
+    localFormatters.set(key, kind === 'date' ? new Intl.DateTimeFormat(language, options) : new Intl.NumberFormat(language, options));
+  }
+  return localFormatters.get(key);
+}
+function timezone() { return typeof CodexPreferences === 'object' ? CodexPreferences.timezone() : PARIS_ZONE; }
+function validFilterDate(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
+}
+function restoreFilters() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(FILTER_STORAGE_KEY) || '{}') || {}; if (typeof saved !== 'object' || Array.isArray(saved)) saved = {}; } catch (_error) { /* Storage is optional. */ }
+  if (typeof location === 'object' && typeof URLSearchParams === 'function') {
+    const query = new URLSearchParams(location.search);
+    if (!query.has('range') && query.has('from_date') && query.has('to_date')) saved.range = 'custom';
+    for (const key of ['range', 'sources', 'models', 'from_date', 'to_date', 'reset_type', 'compare']) {
+      if (query.has(key)) saved[key] = query.get(key);
+    }
+  }
+  if (['24h', '7d', '30d', '90d', '1y', 'all', 'custom'].includes(saved.range)) state.range = saved.range;
+  const list = value => Array.isArray(value) ? value : typeof value === 'string' ? value.split(',') : [];
+  const sources = list(saved.sources).filter(value => ['codex', 'opencode', 'hermes'].includes(value));
+  if (sources.length) state.sources = [...new Set(sources)];
+  const models = [...new Set(list(saved.models).filter(value => typeof value === 'string' && value.length > 0 && value.length <= 200 && !/[\x00-\x1f,]/.test(value)))];
+  state.restoredModelsRejected = models.length > 50;
+  if (models.length && models.length <= 50) { state.models = models; state.explicitModels = true; state.modelAvailabilityResolved = true; }
+  if (['all', '5h', 'weekly'].includes(saved.reset_type)) state.resetType = saved.reset_type;
+  if (validFilterDate(saved.from_date) && validFilterDate(saved.to_date) && saved.from_date <= saved.to_date) {
+    state.fromDate = saved.from_date; state.toDate = saved.to_date;
+    if (!saved.range || saved.range === 'custom') state.range = 'custom';
+  } else if (state.range === 'custom') state.range = '30d';
+  state.comparePrevious = saved.compare === 'previous';
+}
+function persistFilters() {
+  const saved = { range: state.range, sources: state.sources, reset_type: state.resetType, compare: state.comparePrevious ? 'previous' : '' };
+  if (state.explicitModels) saved.models = state.models;
+  if (state.range === 'custom') { saved.from_date = state.fromDate; saved.to_date = state.toDate; }
+  try { localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(saved)); } catch (_error) { /* Storage is optional. */ }
+  if (typeof history === 'object' && typeof location === 'object') {
+    const query = new URLSearchParams(queryString());
+    for (const key of ['reset_offset', 'reset_limit', 'breakdown_offset', 'timezone']) query.delete(key);
+    try { history.replaceState(null, '', `${location.pathname}?${query}${location.hash}`); } catch (_error) { /* Embedded pages may reject URL updates. */ }
+  }
+  updateExportLink();
+}
+function queueRefresh() {
+  state.restoredModelsRejected = false;
+  filtersPending = true;
+  clearTimeout(filterTimer);
+  ++refreshSequence;
+  for (const controller of requestControllers.values()) controller?.abort();
+  requestControllers.clear();
+  persistFilters();
+  filterTimer = setTimeout(() => refresh(), 120);
+}
+restoreFilters();
 // Keep legend choices across payloads that temporarily omit a dataset (for
 // example, an all-null 5-hour series or a period without reset markers).
 // Entries are only updated for datasets currently exposed by the chart.
@@ -59,16 +132,16 @@ function t(key, values = {}) {
 }
 function locale() { return typeof CodexPreferences === 'object' ? CodexPreferences.locale() : 'en-GB'; }
 function dateFormatter() {
-  return new Intl.DateTimeFormat(locale(), {
-    timeZone: PARIS_ZONE, day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  return typeof CodexPreferences === 'object' ? CodexPreferences.dateFormatter({ day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) : cachedFormatter('date', locale(), {
+    timeZone: timezone(), day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
   });
 }
 function shortDateFormatter() {
-  return new Intl.DateTimeFormat(locale(), { timeZone: PARIS_ZONE, day: '2-digit', month: 'short', year: 'numeric' });
+  return typeof CodexPreferences === 'object' ? CodexPreferences.dateFormatter({ day: '2-digit', month: 'short', year: 'numeric' }) : cachedFormatter('date', locale(), { timeZone: timezone(), day: '2-digit', month: 'short', year: 'numeric' });
 }
 function numberFormatter(options = {}) {
   const numberLocale = typeof CodexPreferences === 'object' ? CodexPreferences.numberLocale() : 'en';
-  return new Intl.NumberFormat(numberLocale, options);
+  return typeof CodexPreferences === 'object' ? CodexPreferences.numberFormatter(options) : cachedFormatter('number', numberLocale, options);
 }
 function formatTokens(value) { return numberFormatter({ notation: 'compact', maximumFractionDigits: 2 }).format(safeNumber(value)); }
 function formatFullTokens(value) { return numberFormatter().format(safeNumber(value)); }
@@ -79,6 +152,15 @@ function formatDate(value) {
 function formatShortDate(value) {
   const timestamp = timestampMs(value);
   return timestamp === null ? EMPTY_VALUE : shortDateFormatter().format(new Date(timestamp));
+}
+// The server's ordinary period end is authoritative even if the browser clock
+// is behind. Custom dates already have explicit boundaries and need no anchor.
+function periodAnchor(period) {
+  if (period?.range === 'custom') return null;
+  const milliseconds = timestampMs(period?.to);
+  if (milliseconds === null) return null;
+  const seconds = Math.floor(milliseconds / 1000);
+  return seconds > 0 ? seconds : null;
 }
 function timestampMs(value) {
   if (typeof value === 'number' && Number.isFinite(value)) return value > 1e12 ? value : value * 1000;
@@ -94,7 +176,7 @@ function formatCost(value) {
 function formatUsd(value) {
   const number = finiteNumber(value);
   if (number === null || number < 0) return 'N/A';
-  return new Intl.NumberFormat(
+  return cachedFormatter('number',
     typeof CodexPreferences === 'object' ? CodexPreferences.numberLocale() : 'en',
     { style: 'currency', currency: 'USD', maximumFractionDigits: number < 1 ? 4 : 2 },
   ).format(number);
@@ -143,7 +225,60 @@ function formatDuration(seconds) {
 
 function clearRows(body) {
   if (!body) return;
-  while (body.firstChild) body.removeChild(body.firstChild);
+  if (typeof body.replaceChildren === 'function') body.replaceChildren();
+  else while (body.firstChild) body.removeChild(body.firstChild);
+}
+function replaceRows(body, fragment) {
+  if (!body) return;
+  if (typeof body.replaceChildren === 'function') body.replaceChildren(fragment);
+  else { clearRows(body); while (fragment.firstChild) body.appendChild(fragment.removeChild(fragment.firstChild)); }
+}
+function deferTable(id, populate) {
+  const body = byId(id);
+  const details = body?.closest('details');
+  const previous = deferredTables.get(id);
+  const entry = { details, populate, dirty: true };
+  deferredTables.set(id, entry);
+  if (details && !previous) details.addEventListener('toggle', () => {
+    const current = deferredTables.get(id);
+    if (details.open && current?.dirty) { current.populate(); current.dirty = false; }
+  });
+  if (!details || details.open || typeof Chart !== 'function') {
+    if (details && typeof Chart !== 'function') details.open = true;
+    populate(); entry.dirty = false;
+  } else clearRows(body);
+}
+function showChartFallback(id) {
+  const entry = deferredTables.get(id);
+  if (entry) {
+    if (entry.details) entry.details.open = true;
+    if (entry.dirty) { entry.populate(); entry.dirty = false; }
+  }
+}
+function renderChartSection(name, data) {
+  const sections = {
+    limits: [renderLimits, 'limits-data-body', 'limits-chart-wrap', 'limits-chart-summary'],
+    weekly: [renderWeeklyLimitValue, 'weekly-limit-value-data-body', 'weekly-limit-value-chart-wrap', 'weekly-limit-value-summary'],
+    tokens: [renderTokens, 'tokens-data-body', 'tokens-chart-wrap', 'tokens-chart-summary'],
+  };
+  const [draw, table, wrap, summary] = sections[name];
+  try {
+    draw(data);
+    if (typeof Chart !== 'function') {
+      showChartFallback(table);
+      byId(summary).textContent += ` · ${t('chartFallbackTable')}`;
+    }
+  } catch (_error) {
+    byId(wrap).hidden = true;
+    if (name === 'tokens') byId('tokens-chart-card').hidden = false;
+    showChartFallback(table);
+    byId(summary).textContent += ` · ${t('chartFallbackTable')}`;
+    const instance = name === 'limits' ? limitsChart : name === 'weekly' ? weeklyLimitValueChart : tokensChart;
+    try { instance?.destroy(); } catch (_ignored) { /* Broken charts may reject cleanup. */ }
+    if (name === 'limits') limitsChart = null;
+    else if (name === 'weekly') weeklyLimitValueChart = null;
+    else tokensChart = null;
+  }
 }
 function cell(row, value, className = '') {
   const element = document.createElement('td');
@@ -179,7 +314,8 @@ function localizeMessage(message) {
   return message;
 }
 function renderWarnings(warnings) {
-  const values = Array.isArray(warnings) ? warnings : warnings ? [warnings] : [];
+  const values = Array.isArray(warnings) ? [...warnings] : warnings ? [warnings] : [];
+  if (state.restoredModelsRejected) values.push(t('restoredModelsRejected'));
   setMessage('analytics-warnings', values.filter(message => !isPriceWarning(message)));
   setMessage('analytics-price-warnings', values.filter(isPriceWarning));
 }
@@ -199,6 +335,8 @@ function queryString() {
   } else {
     query.set('range', state.range);
   }
+  query.set('timezone', timezone());
+  if (state.comparePrevious) query.set('compare', 'previous');
   return query.toString();
 }
 
@@ -282,7 +420,7 @@ function updateTokenMetricToggle() {
 }
 function updateTokenOverlay() {
   const available = limitPoints.length > 0 && tokenPoints.length > 0;
-  const active = state.tokenOverlay && available;
+  const active = state.tokenOverlay && available && Boolean(limitsChart);
   const toggle = byId('toggle-token-overlay');
   if (toggle) {
     toggle.disabled = !available;
@@ -375,7 +513,7 @@ function markerDataset(markers, window) {
 }
 function renderLimitTable(points) {
   const body = byId('limits-data-body');
-  clearRows(body);
+  const fragment = document.createDocumentFragment();
   for (const point of points) {
     const row = document.createElement('tr');
     cell(row, formatDate(point.at));
@@ -384,8 +522,9 @@ function renderLimitTable(points) {
     cell(row, formatPercent(point.ideal_weekly_pct));
     cell(row, formatPercent(point.forecast_chance_24h_pct));
     cell(row, formatPercent(point.forecast_chance_6h_pct));
-    body?.appendChild(row);
+    fragment.appendChild(row);
   }
+  replaceRows(body, fragment);
 }
 function renderLimits(data = {}) {
   const visibility = rememberChartDatasetVisibility(limitsChart);
@@ -399,7 +538,7 @@ function renderLimits(data = {}) {
   byId('limit-samples').textContent = t('samples', { value: formatFullTokens(sampleCount) });
   byId('limits-empty').hidden = limitPoints.length > 0;
   byId('limits-chart-wrap').hidden = limitPoints.length === 0 || typeof Chart !== 'function';
-  renderLimitTable(limitPoints);
+  deferTable('limits-data-body', () => renderLimitTable(limitPoints));
   const first = limitPoints[0];
   const last = limitPoints[limitPoints.length - 1];
   byId('limits-chart-summary').textContent = limitPoints.length
@@ -532,7 +671,7 @@ function weeklyValueSensitivity(point) {
 }
 function renderWeeklyLimitValueTable(points) {
   const body = byId('weekly-limit-value-data-body');
-  clearRows(body);
+  const fragment = document.createDocumentFragment();
   for (const point of points) {
     const row = document.createElement('tr');
     cell(row, formatDate(point.at));
@@ -580,8 +719,9 @@ function renderWeeklyLimitValueTable(points) {
       reason.setAttribute('aria-label', reasonText);
     }
     if (point.reason) reason.className = 'value-unavailable';
-    body?.appendChild(row);
+    fragment.appendChild(row);
   }
+  replaceRows(body, fragment);
 }
 let weeklyValueData = {};
 const weeklyValueSelection = new Map();
@@ -677,7 +817,7 @@ function renderWeeklyLimitValue(data = {}) {
   byId('weekly-limit-value-summary').textContent = valid.length
     ? `${t('weeklyLimitValueSummary', { valid: valid.length, unavailable, from: formatDate(valid[0].at), to: formatDate(valid[valid.length - 1].at) })}${currentNotice}`
     : `${t('noWeeklyLimitValue')}${currentNotice}`;
-  renderWeeklyLimitValueTable(points);
+  deferTable('weekly-limit-value-data-body', () => renderWeeklyLimitValueTable(points));
   weeklyLimitValueDatasets = selected.map(entry => ({
     label: entry.label,
     data: entry.valid.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.value_usd) })),
@@ -740,7 +880,7 @@ function tokenDatasetValue(point) {
 }
 function renderTokenTable(tokens) {
   const body = byId('tokens-data-body');
-  clearRows(body);
+  const fragment = document.createDocumentFragment();
   const groups = groupedSourceSeries(tokens);
   if (!groups.size) groups.set('all', tokenPoints);
   for (const [source, points] of groups) {
@@ -751,9 +891,10 @@ function renderTokenTable(tokens) {
       cell(row, formatFullTokens(pointTotal(point)));
       const cost = cell(row, '');
       setCost(cost, pointCost(point));
-      body?.appendChild(row);
+      fragment.appendChild(row);
     }
   }
+  replaceRows(body, fragment);
 }
 function datasetsForTokens(tokens) {
   const groups = groupedSourceSeries(tokens);
@@ -790,7 +931,7 @@ function renderTokens(data = {}) {
   byId('tokens-chart-summary').textContent = tokenPoints.length
     ? t('tokenChartSummary', { events: formatFullTokens(summary.events), applications: formatFullTokens(new Set(tokenSourcePoints.map(point => point.source || point.application)).size || 1) })
     : t('noTokenEvents');
-  renderTokenTable(data);
+  deferTable('tokens-data-body', () => renderTokenTable(data));
   tokenDatasets = datasetsForTokens(data);
   updateTokenMetricToggle();
   if (typeof Chart !== 'function' || !tokenPoints.length) {
@@ -815,7 +956,7 @@ function renderTokens(data = {}) {
 
 function renderBreakdown(items, paginationData) {
   const body = byId('breakdown-body');
-  clearRows(body);
+  const fragment = document.createDocumentFragment();
   const values = Array.isArray(items) ? items : [];
   byId('breakdown-empty').hidden = values.length > 0;
   for (const item of values) {
@@ -833,8 +974,9 @@ function renderBreakdown(items, paginationData) {
     setCost(cost, item.estimated_cost_usd);
     if (item.pricing_status === 'assumed-zero') cost.title = t('pricingUnknownTitle');
     cell(row, item.pricing_status || EMPTY_VALUE, item.pricing_status === 'assumed-zero' ? 'pricing-unknown' : '');
-    body.appendChild(row);
+    fragment.appendChild(row);
   }
+  replaceRows(body, fragment);
   const pagination = byId('breakdown-pagination');
   if (!paginationData || typeof paginationData !== 'object') {
     pagination.hidden = true;
@@ -854,8 +996,9 @@ function renderBreakdown(items, paginationData) {
 }
 
 function renderResets(data = {}) {
+  displayedResetData = data;
   const body = byId('resets-body');
-  clearRows(body);
+  const fragment = document.createDocumentFragment();
   const items = Array.isArray(data.items) ? data.items : [];
   byId('resets-empty').hidden = items.length > 0;
   for (const item of items) {
@@ -887,8 +1030,9 @@ function renderResets(data = {}) {
         ? 'N/A'
         : `${t('forecast24h')}: ${formatPercent(forecast24h)} · ${t('forecast6h')}: ${formatPercent(forecast6h)}`,
     );
-    body.appendChild(row);
+    fragment.appendChild(row);
   }
+  replaceRows(body, fragment);
   const pagination = byId('reset-pagination');
   const total = safeNumber(data.total);
   const limit = Math.max(1, safeNumber(data.limit) || RESET_PAGE_SIZE);
@@ -992,8 +1136,12 @@ function addFilterOption(container, value) {
 function modelFamilyFor(model) {
   return GPT_MODELS.includes(model) ? 'current' : /^gpt-/i.test(model) ? 'older' : 'other';
 }
+function catalogModels() {
+  const selected = state.explicitModels || state.modelAvailabilityResolved ? state.models : [];
+  return [...new Set([...state.availableModels, ...selected, ...(modelDraft || [])])];
+}
 function visibleModels() {
-  return state.availableModels.filter(model =>
+  return catalogModels().filter(model =>
     (modelFamily === 'all' || modelFamilyFor(model) === modelFamily)
     && model.toLowerCase().includes(modelSearch.trim().toLowerCase()));
 }
@@ -1003,15 +1151,18 @@ function modelDraftChanges() {
   return [...new Set([...applied, ...draft])].filter(model => applied.has(model) !== draft.has(model)).length;
 }
 function renderModelSelection() {
-  const draft = (modelDraft || state.models).filter(model => state.availableModels.includes(model));
+  const catalog = catalogModels();
+  const draft = (modelDraft || state.models).filter(model => catalog.includes(model));
   const visible = new Set(visibleModels());
   const familyKeys = { current: 'currentGpt', older: 'olderGpt', other: 'otherModels' };
   setPressedValues(byId('model-filter'), draft);
   for (const button of byId('model-filter').querySelectorAll('[data-filter-value]')) {
     button.hidden = !visible.has(button.dataset.filterValue);
-    button.querySelector('[data-family-label]').textContent = t(familyKeys[modelFamilyFor(button.dataset.filterValue)]);
+    const available = state.availableModels.includes(button.dataset.filterValue);
+    button.querySelector('[data-family-label]').textContent = t(available ? familyKeys[modelFamilyFor(button.dataset.filterValue)] : 'unavailableModel');
+    button.title = available ? '' : t('unavailableModel');
   }
-  byId('model-selection-summary').textContent = t('modelSelectionCount', { selected: draft.length, total: state.availableModels.length });
+  byId('model-selection-summary').textContent = t('modelSelectionCount', { selected: draft.length, total: catalog.length });
   byId('model-results-count').textContent = t('modelResultsCount', { count: visible.size });
   const empty = byId('model-search-empty');
   empty.hidden = visible.size > 0;
@@ -1044,32 +1195,38 @@ function renderModelSelection() {
       tray.appendChild(button);
     }
     button.setAttribute('aria-label', t('removeModel', { model }));
+    button.title = state.availableModels.includes(model) ? '' : t('unavailableModel');
   }
 }
 function updateModelOptions(models) {
   const normalized = Array.isArray(models) ? [...new Set(models.filter(model => typeof model === 'string' && model.length))] : [];
   const container = byId('model-filter');
-  const changed = normalized.join('\0') !== state.availableModels.join('\0');
   state.availableModels = normalized;
   let shouldRefresh = false;
   if (!state.modelAvailabilityResolved && normalized.length) {
     const availableGpt = normalized.filter(model => GPT_MODELS.includes(model));
-    if (availableGpt.length) {
-      state.models = availableGpt;
-    } else {
-      state.models = [...normalized];
-      state.modelFallbackNotice = true;
-      shouldRefresh = normalized.length > 0;
+    if (availableGpt.length) state.models = availableGpt;
+    else {
+      state.models = [...normalized]; state.modelFallbackNotice = true; shouldRefresh = true;
     }
     state.modelAvailabilityResolved = true;
   }
-  if (changed) {
-    state.models = state.models.filter(model => normalized.includes(model));
-    if (!state.models.length && !state.modelFallbackNotice) state.models = [...normalized];
-    if (modelDraft !== null) modelDraft = modelDraft.filter(model => normalized.includes(model));
-    clearRows(container);
-    for (const model of normalized) addFilterOption(container, model);
-  } else setPressedValues(container, state.models);
+  const options = catalogModels();
+  const signature = JSON.stringify([normalized, options]);
+  if (container.dataset.options === signature) {
+    renderModelSelection();
+    return shouldRefresh;
+  }
+  container.dataset.options = signature;
+  clearRows(container);
+  for (const model of options) {
+    addFilterOption(container, model);
+    if (!normalized.includes(model)) {
+      const button = container.lastElementChild || container.children[container.children.length - 1];
+      button.title = t('unavailableModel');
+      button.classList.add('model-unavailable');
+    }
+  }
   renderModelSelection();
   return shouldRefresh;
 }
@@ -1097,8 +1254,9 @@ function render(payload) {
   setCost(byId('allocation-total-cost'), summary.estimated_cost_usd);
   const pricing = payload.pricing || {};
   const currency = typeof CodexPreferences === 'object' ? CodexPreferences.get().currency : 'USD';
+  const rateDate = typeof CodexPreferences === 'object' ? CodexPreferences.get().rateDate : '';
   byId('pricing-note').textContent = currency === 'EUR'
-    ? t('catalogConverted', { date: pricing.as_of || EMPTY_VALUE, rate: CodexPreferences.formatRate() })
+    ? t('catalogConverted', { date: pricing.as_of || EMPTY_VALUE, rate: CodexPreferences.formatRate() }) + (rateDate ? ` · ${rateDate}` : '')
     : t('catalog', { date: pricing.as_of || EMPTY_VALUE, currency: pricing.currency || 'USD' });
   const weeklySummary = payload.resets?.weekly_summary || { random: {}, end_of_week: {} };
   const random = weeklySummary.random || {};
@@ -1118,17 +1276,19 @@ function render(payload) {
   byId('end-week-reset-impact').textContent = t('ofUnusedQuotaExpired', { value: formatPercent(endOfWeek.unused_pct_points) });
   const period = payload.period || {};
   currentPeriod = period;
-  renderLimits(payload.limits || {});
-  renderWeeklyLimitValue(payload.weekly_limit_value || {});
-  renderTokens(payload.tokens || {});
+  renderChartSection('limits', payload.limits || {});
+  if (payload.weekly_limit_value) renderChartSection('weekly', payload.weekly_limit_value);
+  renderChartSection('tokens', payload.tokens || {});
   renderBreakdown(payload.tokens?.breakdown || [], payload.tokens?.breakdown_pagination);
-  renderResets(payload.resets || {});
+  if (!payload.pending_sections?.includes('resets')) renderResets(payload.resets || {});
+  renderComparison(payload.comparison);
+  updateExportLink();
   renderFreshness(payload.freshness || {}, period);
   const refreshForModelFallback = updateModelOptions(payload.available?.models || []);
   renderWarnings(payload.warnings || []);
   setMessage('analytics-error', state.modelFallbackNotice ? t('gptModelsUnavailable') : '');
   setMessage('analytics-local-only', '');
-  if (refreshForModelFallback) setTimeout(refresh, 0);
+  if (refreshForModelFallback) queueRefresh();
 }
 
 function refreshSchedule(payload = lastPayload) {
@@ -1139,34 +1299,221 @@ function refreshSchedule(payload = lastPayload) {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(refresh, Math.max(1000, nextUpdate - now));
 }
-async function refresh({ restoreBreakdownOffsetOnError = false } = {}) {
+function setSectionStatus(section, status, message = '') {
+  const element = byId(`${section}-section-status`);
+  if (!element) return;
+  element.hidden = !status;
+  element.textContent = status === 'loading' ? t('loadingSection') : message || t('sectionFailed');
+  const card = byId(section === 'weekly' ? 'weekly-limit-value-card' : section === 'resets' ? 'reset-history-card' : 'allocation-card');
+  card?.setAttribute('aria-busy', String(status === 'loading'));
+}
+function compatiblePayload(base, component) {
+  if (base.revision !== undefined && component.revision !== base.revision) return false;
+  for (const key of ['from', 'to']) {
+    if (base.period?.[key] !== undefined && component.period?.[key] !== base.period[key]) return false;
+  }
+  return true;
+}
+async function fetchAnalytics(section, query, signal) {
+  const params = new URLSearchParams(query);
+  params.set('sections', section);
+  const response = await fetch(`/api/analytics?${params}`, { headers: { Accept: 'application/json' }, signal });
+  let payload;
+  try { payload = await response.json(); } catch (_error) { payload = {}; }
+  if (!response.ok) {
+    const error = new Error(payload.error || `HTTP ${response.status}`); error.status = response.status; throw error;
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error(t('unableToLoadAnalytics'));
+  return payload;
+}
+async function loadSection(section, generation, base, query) {
+  const sequence = (sectionSequences.get(section) || 0) + 1;
+  sectionSequences.set(section, sequence);
+  requestControllers.get(section)?.abort();
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  requestControllers.set(section, controller);
+  const params = new URLSearchParams(query);
+  const anchor = periodAnchor(base.period);
+  if (anchor !== null) params.set('at', String(anchor));
+  setSectionStatus(section, 'loading');
+  try {
+    const component = await fetchAnalytics(section, params.toString(), controller?.signal);
+    if (generation !== refreshSequence || sequence !== sectionSequences.get(section)) return;
+    if (!compatiblePayload(base, component)) { const error = new Error('Analytics changed during loading'); error.revisionMismatch = true; throw error; }
+    // Component responses own only their section. Legacy responses may include the full payload.
+    if (section === 'weekly') {
+      if (!component.weekly_limit_value) throw new Error(t('sectionFailed'));
+      lastPayload = { ...lastPayload, weekly_limit_value: component.weekly_limit_value };
+      renderChartSection('weekly', component.weekly_limit_value);
+    } else if (section === 'resets') {
+      if (!component.resets) throw new Error(t('sectionFailed'));
+      lastPayload = { ...lastPayload, resets: component.resets };
+      renderResets(component.resets);
+    } else {
+      if (!component.tokens) throw new Error(t('sectionFailed'));
+      lastPayload = { ...lastPayload, tokens: { ...lastPayload.tokens, breakdown: component.tokens.breakdown, breakdown_pagination: component.tokens.breakdown_pagination } };
+      renderBreakdown(component.tokens.breakdown, component.tokens.breakdown_pagination);
+    }
+    lastPayload.pending_sections = (lastPayload.pending_sections || []).filter(value => value !== section);
+    lastPayload.warnings = [...new Set([...(lastPayload.warnings || []), ...(component.warnings || [])])];
+    renderWarnings(lastPayload.warnings);
+    setSectionStatus(section, '');
+  } catch (error) {
+    if (generation !== refreshSequence || sequence !== sectionSequences.get(section) || error?.name === 'AbortError') return;
+    if (section === 'breakdown') state.breakdownOffset = safeNumber(lastPayload?.tokens?.breakdown_pagination?.offset);
+    if (section === 'resets') state.resetOffset = safeNumber(lastPayload?.resets?.offset);
+    setSectionStatus(section, 'error', `${error.message} · ${t('sectionFailed')}`);
+    if (error.revisionMismatch) throw error;
+  } finally {
+    if (requestControllers.get(section) === controller) requestControllers.delete(section);
+  }
+}
+async function refresh({ section = 'base', revisionRetry = false, coherent = false } = {}) {
+  // A pending base owns an older query. Restart it with the latest controls
+  // before it can overwrite a newer component selection or pagination page.
+  if (filtersPending || pendingBaseSequence !== null) section = 'base';
+  filtersPending = false;
+  clearTimeout(filterTimer);
+  if (section !== 'base' && lastPayload) {
+    try { await loadSection(section, refreshSequence, lastPayload, queryString()); }
+    catch (error) { if (error.revisionMismatch) await refresh({ revisionRetry: true }); }
+    updateExportLink();
+    return;
+  }
   const sequence = ++refreshSequence;
-  const displayedBreakdownOffset = safeNumber(lastPayload?.tokens?.breakdown_pagination?.offset);
+  pendingBaseSequence = sequence;
   clearTimeout(refreshTimer);
+  for (const controller of requestControllers.values()) controller?.abort();
+  requestControllers.clear();
+  const coherentPending = coherent
+    ? ['weekly', 'resets'].filter(name => lastPayload?.pending_sections?.includes(name)) : [];
+  for (const name of ['weekly', 'resets', 'breakdown']) {
+    setSectionStatus(name, coherentPending.includes(name) ? 'loading' : '');
+  }
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  requestControllers.set('base', controller);
   const loading = byId('analytics-loading');
   if (loading) loading.hidden = false;
+  const query = queryString();
   try {
-    const response = await fetch(`/api/analytics?${queryString()}`, { headers: { Accept: 'application/json' } });
-    let payload;
-    try { payload = await response.json(); } catch (_error) { payload = {}; }
-    if (!response.ok) {
-      const error = new Error(payload.error || `HTTP ${response.status}`);
-      error.status = response.status;
-      throw error;
-    }
+    const payload = await fetchAnalytics(coherent ? 'full' : 'base', query, controller?.signal);
     if (sequence !== refreshSequence) return;
+    pendingBaseSequence = null;
     render(payload);
-  } catch (error) {
     if (sequence !== refreshSequence) return;
-    if (restoreBreakdownOffsetOnError) state.breakdownOffset = displayedBreakdownOffset;
+    for (const name of coherentPending) setSectionStatus(name, '');
+    persistFilters();
+    if (loading) loading.hidden = true;
+    refreshDiagnostics(sequence);
+    const pending = payload.pending_sections || [!payload.weekly_limit_value ? 'weekly' : null].filter(Boolean);
+    await Promise.all(pending.filter(name => ['weekly', 'resets'].includes(name)).map(name => loadSection(name, sequence, payload, query)));
+  } catch (error) {
+    if (sequence !== refreshSequence || error?.name === 'AbortError') return;
+    if (error.revisionMismatch) {
+      // Two changing snapshots must never be mixed. A single full response
+      // pins every section to one database snapshot without an unbounded retry.
+      await refresh(revisionRetry ? { coherent: true } : { revisionRetry: true }); return;
+    }
     const message = error instanceof Error ? error.message : t('unableToLoadAnalytics');
-    const localOnly = !lastPayload || error?.status === 503 || /not available|cannot be read|local mode/i.test(message);
+    for (const name of coherentPending) setSectionStatus(name, 'error', `${message} · ${t('showingLastData')}`);
+    const localOnly = error?.status === 404 || /local mode/i.test(message);
     setMessage('analytics-local-only', localOnly ? t('localOnly') : '');
     setMessage('analytics-error', lastPayload ? `${message} · ${t('showingLastData')}` : message);
   } finally {
-    if (sequence !== refreshSequence) return;
-    if (loading) loading.hidden = true;
-    refreshSchedule();
+    if (sequence === refreshSequence) {
+      pendingBaseSequence = null;
+      if (loading) loading.hidden = true;
+      requestControllers.delete('base');
+      refreshSchedule();
+    }
+  }
+}
+function renderComparison(comparison) {
+  const panel = byId('comparison-summary');
+  if (!panel) return;
+  panel.hidden = !state.comparePrevious;
+  if (!state.comparePrevious) return;
+  if (!comparison?.tokens?.summary) { panel.textContent = t('comparisonUnavailable'); return; }
+  const previous = comparison.tokens.summary;
+  const current = lastPayload?.tokens?.summary || {};
+  const delta = totalBillable(current) - totalBillable(previous);
+  const costDelta = safeNumber(current.estimated_cost_usd) - safeNumber(previous.estimated_cost_usd);
+  const signedTokens = `${delta >= 0 ? '+' : '−'}${formatFullTokens(Math.abs(delta))}`;
+  const signedCost = `${costDelta >= 0 ? '+' : '−'}${formatCost(Math.abs(costDelta))}`;
+  panel.textContent = `${t('comparison')}: ${formatDate(comparison.period?.from)} – ${formatDate(comparison.period?.to)} · ${t('billableTokens')}: ${formatFullTokens(totalBillable(previous))} (${signedTokens}) · ${t('apiCost')}: ${formatCost(previous.estimated_cost_usd)} (${signedCost})` + (Array.isArray(comparison.warnings) && comparison.warnings.length ? ` · ${comparison.warnings.map(localizeMessage).join(' · ')}` : '');
+}
+function updateExportLink() {
+  const link = byId('csv-download');
+  const select = byId('csv-dataset');
+  if (!link || !select) return;
+  const query = new URLSearchParams(queryString());
+  query.set('dataset', select.value || 'limits');
+  const anchor = periodAnchor(lastPayload?.period);
+  if (anchor !== null && !filtersPending) query.set('at', String(anchor));
+  query.delete('reset_offset'); query.delete('breakdown_offset');
+  link.href = `/api/analytics.csv?${query}`;
+}
+function renderDiagnostics(data) {
+  const body = byId('diagnostics-body');
+  if (!body) return;
+  const lines = [];
+  const statuses = ['healthy', 'unhealthy', 'degraded', 'stale', 'unavailable', 'ok'];
+  const errors = ['alert_state_failed', 'alert_journal_failed', 'alert_cleanup_failed', 'collection_failed'];
+  // Allowlisted fields only; never dump diagnostic objects or arbitrary errors.
+  for (const [name, source, keys] of [
+    ['monitor', data.monitor, ['status', 'last_cycle_at', 'last_success_at', 'consecutive_failures', 'last_cycle_duration_ms', 'interval_seconds', 'age_seconds', 'last_error_at', 'error_code', 'error_message']],
+    ['archive', data.archive, ['status', 'snapshots', 'token_events', 'resets', 'anomalies', 'pending_anomalies', 'last_snapshot_at']],
+  ]) {
+    for (const key of keys) {
+      const value = source?.[key];
+      if (typeof value !== 'string' && typeof value !== 'number') continue;
+      let text;
+      if (key.endsWith('_at')) text = formatDate(value);
+      else if (key === 'status') text = t(`diagnosticStatuses.${statuses.includes(value) ? value : 'unavailable'}`);
+      else if (key === 'error_code' || key === 'error_message') {
+        const code = errors.includes(source.error_code) ? source.error_code : 'collection_failed';
+        text = key === 'error_code' ? code : t(`diagnosticErrors.${code}`);
+      } else {
+        if (typeof value !== 'number') continue;
+        text = numberFormatter().format(value);
+      }
+      lines.push(`${t(`diagnosticLabels.${name}`)} · ${t(`diagnosticLabels.${key}`)}: ${text}`);
+    }
+  }
+  const anomalyTypes = ['quota_increase', 'reset_shift', 'reset_in_past', 'reset_missing', 'reset_oscillation'];
+  for (const item of (Array.isArray(data.anomalies) ? data.anomalies.slice(0, 20) : [])) {
+    const window = item.window === '5h' ? t('fiveHour') : item.window === 'weekly' ? t('weekly') : EMPTY_VALUE;
+    const type = anomalyTypes.includes(item.type) ? t(`diagnosticAnomalies.${item.type}`) : EMPTY_VALUE;
+    lines.push(`${window} · ${type} · ${formatDate(item.detected_at)} · ${formatPercent(item.before_pct)} → ${formatPercent(item.after_pct)}`);
+  }
+  const warnings = { 'Monitor health is unavailable.': 'monitorUnavailable', 'Monitor health is stale.': 'monitorStale', 'Archive is unavailable.': 'archiveUnavailable', 'Archive could not be read safely.': 'archiveUnsafe' };
+  for (const warning of (Array.isArray(data.warnings) ? data.warnings.slice(0, 10) : [])) {
+    if (typeof warning === 'string') {
+      const key = Object.prototype.hasOwnProperty.call(warnings, warning) ? warnings[warning] : 'unknown';
+      lines.push(t(`diagnosticWarnings.${key}`));
+    }
+  }
+  body.textContent = lines.join('\n');
+}
+function renderDiagnosticsStatus() {
+  setMessage('diagnostics-status', diagnosticsState === 'loading' ? t('loadingSection') : diagnosticsState === 'error' ? t('diagnosticsUnavailable') : '');
+}
+async function refreshDiagnostics(generation) {
+  if (!byId('diagnostics-body')) return;
+  diagnosticsState = 'loading';
+  renderDiagnosticsStatus();
+  try {
+    const response = await fetch('/api/diagnostics', { headers: { Accept: 'application/json' } });
+    if (!response.ok) throw new Error('unavailable');
+    const data = await response.json();
+    if (generation !== refreshSequence) return;
+    if (data.schema_version !== 1) throw new Error('unsupported');
+    diagnosticsPayload = data;
+    renderDiagnostics(data);
+    diagnosticsState = '';
+    renderDiagnosticsStatus();
+  } catch (_error) {
+    if (generation === refreshSequence) { diagnosticsState = 'error'; renderDiagnosticsStatus(); }
   }
 }
 
@@ -1180,7 +1527,7 @@ for (const button of document.querySelectorAll('[data-range]')) {
     state.resetOffset = 0;
     state.breakdownOffset = 0;
     byId('custom-dates').hidden = state.range !== 'custom';
-    if (state.range !== 'custom') refresh();
+    if (state.range !== 'custom') queueRefresh();
   });
 }
 byId('source-filter').addEventListener('click', event => {
@@ -1194,10 +1541,10 @@ byId('source-filter').addEventListener('click', event => {
   }
   state.resetOffset = 0;
   state.breakdownOffset = 0;
-  refresh();
+  queueRefresh();
 });
 function setModelDraft(models) {
-  modelDraft = state.availableModels.filter(model => models.includes(model));
+  modelDraft = catalogModels().filter(model => models.includes(model));
   renderModelSelection();
 }
 byId('model-filter').addEventListener('click', event => {
@@ -1225,6 +1572,7 @@ byId('reset-model-selection').addEventListener('click', () => {
 });
 byId('apply-model-selection').addEventListener('click', () => {
   if (!modelDraft?.length || !modelDraftChanges()) return;
+  state.explicitModels = true;
   state.models = [...modelDraft];
   modelDraft = null;
   state.modelFallbackNotice = false;
@@ -1232,7 +1580,7 @@ byId('apply-model-selection').addEventListener('click', () => {
   state.breakdownOffset = 0;
   renderModelSelection();
   byId('toggle-model-explorer').focus();
-  refresh();
+  queueRefresh();
 });
 byId('model-search').addEventListener('input', event => {
   modelSearch = event.target.value;
@@ -1273,29 +1621,29 @@ byId('weekly-limit-value-models').addEventListener('click', event => {
   if (!button) return;
   const key = button.dataset.weeklyModel;
   weeklyValueSelection.set(key, !weeklyValueSelection.get(key));
-  renderWeeklyLimitValue(weeklyValueData);
+  renderChartSection('weekly', weeklyValueData);
   // Rebuilding translated controls must not lose keyboard focus.
   for (const control of byId('weekly-limit-value-models').querySelectorAll('button')) {
     if (control.dataset.weeklyModel === key) control.focus();
   }
 });
-byId('reset-filter').addEventListener('change', event => { state.resetType = event.target.value; state.resetOffset = 0; refresh(); });
+byId('reset-filter').addEventListener('change', event => { state.resetType = event.target.value; state.resetOffset = 0; persistFilters(); refresh({ section: 'resets' }); });
 byId('apply-dates').addEventListener('click', () => {
   state.fromDate = byId('from-date').value; state.toDate = byId('to-date').value; state.resetOffset = 0; state.breakdownOffset = 0;
-  if (!state.fromDate || !state.toDate) { setMessage('analytics-error', t('chooseBothDates')); return; }
-  refresh();
+  if (!validFilterDate(state.fromDate) || !validFilterDate(state.toDate) || state.fromDate > state.toDate) { setMessage('analytics-error', t('chooseBothDates')); return; }
+  queueRefresh();
 });
-byId('resets-previous').addEventListener('click', () => { state.resetOffset = Math.max(0, state.resetOffset - RESET_PAGE_SIZE); refresh(); });
-byId('resets-next').addEventListener('click', () => { state.resetOffset += RESET_PAGE_SIZE; refresh(); });
+byId('resets-previous').addEventListener('click', () => { state.resetOffset = Math.max(0, state.resetOffset - RESET_PAGE_SIZE); refresh({ section: 'resets' }); });
+byId('resets-next').addEventListener('click', () => { state.resetOffset += RESET_PAGE_SIZE; refresh({ section: 'resets' }); });
 byId('breakdown-previous').addEventListener('click', event => {
   if (event.currentTarget.getAttribute('aria-disabled') === 'true') return;
   state.breakdownOffset = Math.max(0, state.breakdownOffset - state.breakdownLimit);
-  refresh({ restoreBreakdownOffsetOnError: true });
+  refresh({ section: 'breakdown' });
 });
 byId('breakdown-next').addEventListener('click', event => {
   if (event.currentTarget.getAttribute('aria-disabled') === 'true') return;
   state.breakdownOffset += state.breakdownLimit;
-  refresh({ restoreBreakdownOffsetOnError: true });
+  refresh({ section: 'breakdown' });
 });
 byId('toggle-token-overlay').addEventListener('click', () => {
   if (!limitPoints.length || !tokenPoints.length) return;
@@ -1304,13 +1652,38 @@ byId('toggle-token-overlay').addEventListener('click', () => {
 });
 byId('token-metric-toggle').addEventListener('click', () => {
   state.tokenMetric = state.tokenMetric === 'tokens' ? 'cost' : 'tokens';
-  if (lastPayload) renderTokens(lastPayload.tokens || {});
+  if (lastPayload) renderChartSection('tokens', lastPayload.tokens || {});
 });
 
 function refreshLocalizedAnalytics() {
   if (!lastPayload) return;
-  try { render(lastPayload); } catch (error) { setMessage('analytics-error', error instanceof Error ? error.message : t('unableToLoadAnalytics')); }
+  try {
+    render(lastPayload);
+    // Retained sections remain independent of the new base revision while
+    // their replacements are pending, but must still follow display preferences.
+    if (!lastPayload.weekly_limit_value && Object.keys(weeklyValueData).length) renderChartSection('weekly', weeklyValueData);
+    if (lastPayload.pending_sections?.includes('resets') && displayedResetData) renderResets(displayedResetData);
+    if (diagnosticsPayload) renderDiagnostics(diagnosticsPayload);
+    renderDiagnosticsStatus();
+  } catch (error) { setMessage('analytics-error', error instanceof Error ? error.message : t('unableToLoadAnalytics')); }
 }
 
-if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(refreshLocalizedAnalytics);
+let activeTimezone = timezone();
+if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(() => {
+  if (activeTimezone !== timezone()) { activeTimezone = timezone(); queueRefresh(); }
+  else refreshLocalizedAnalytics();
+});
+for (const button of document.querySelectorAll('[data-range]')) {
+  const active = button.dataset.range === state.range;
+  button.classList.toggle('active', active);
+  button.setAttribute('aria-pressed', String(active));
+}
+byId('custom-dates').hidden = state.range !== 'custom';
+byId('from-date').value = state.fromDate;
+byId('to-date').value = state.toDate;
+setPressedValues(byId('source-filter'), state.sources);
+byId('compare-previous').checked = state.comparePrevious;
+byId('compare-previous').addEventListener('change', event => { state.comparePrevious = event.target.checked; queueRefresh(); });
+byId('csv-dataset').addEventListener('change', updateExportLink);
+updateExportLink();
 refresh();

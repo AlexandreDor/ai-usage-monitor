@@ -416,3 +416,13 @@ td { color: #dbeafe; }
 .weekly-value-swatch { width: 10px; height: 10px; border-radius: 50%; background: var(--series-color); flex-shrink: 0; }
 .weekly-value-models button[aria-pressed="false"] .weekly-value-swatch { background: transparent; box-shadow: inset 0 0 0 1px var(--series-color); }
 .weekly-value-no-data { font-size: .65rem; color: var(--muted); font-weight: 400; }
+
+.analytics-tools { margin: .8rem 0; color: #8b949e; font-size: .85rem; }
+.analytics-tools summary, .diagnostics-panel summary { cursor: pointer; }
+.analytics-tools label { display: inline-flex; align-items: center; gap: .5rem; margin: .7rem; }
+.analytics-tools select { color: #e6edf3; background: #161b22; padding: .4rem; border: 1px solid #30363d; border-radius: 5px; }
+.analytics-tools a { color: #38bdf8; margin-right: .7rem; }
+.comparison-toggle { display: inline-flex; gap: .5rem; align-items: center; font-size: .85rem; margin-bottom: .8rem; color: #e6edf3; }
+.diagnostics-panel { margin-top: 1rem; font-size: .85rem; }
+.diagnostics-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #8b949e; }
+.model-unavailable { opacity: .7; }

@@ -27,8 +27,11 @@ awaiting application.
 
 The model filter affects token usage and API-equivalent cost. Weekly-value
 curve controls retain their independent selection. The draft survives data
-refreshes and language changes within the page; selections are not saved across
-page reloads. All controls are available in English and French.
+refreshes and language changes within the page. Applied selections are saved
+in this browser and included in locally shareable URLs; pending changes remain
+scoped to the current page. Remembered models absent from the archive stay
+visible and are labelled unavailable. All controls are available in English
+and French.
 
 Design choices still open for iteration include whether named or persistent
 selections would be useful. No model capability, performance, or pricing claims

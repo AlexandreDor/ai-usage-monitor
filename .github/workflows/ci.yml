@@ -2,22 +2,31 @@ name: CI
 
 on:
   push:
+    branches: [dev, main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  quality:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python 3.12.8
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version-file: .python-version
-      - name: Set up Node.js 22.14.0
-        uses: actions/setup-node@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .node-version
           cache: npm
@@ -28,37 +37,93 @@ jobs:
           test "$actual_python" = "$expected_python"
           expected_node="$(tr -d '[:space:]' < .node-version)"
           test "$(node --version)" = "v$expected_node"
-      - name: Install quality dependencies
-        run: python -m pip install --requirement requirements-ci.txt
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install --yes shellcheck
-      - name: Install browser test dependencies
+      - name: Install npm dependencies
         run: npm ci
       - name: Check Bash syntax
         run: bash -n local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
       - name: Validate packaged systemd units
-        run: systemd-analyze verify packaging/systemd/codex-usage-monitor.service packaging/systemd/codex-usage-dashboard.service
+        run: systemd-analyze verify packaging/systemd/codex-usage-monitor.service packaging/systemd/codex-usage-dashboard.service packaging/systemd/codex-usage-backup.service packaging/systemd/codex-usage-backup.timer
       - name: Compile Python modules
         run: python -m compileall -q local tests
-      - name: Verify SQLite migrations
-        run: python -m unittest tests.test_migrations
-      - name: Test Codex protocol client
-        run: python -m unittest tests.test_codex_client
-      - name: Run Python tests with branch coverage
-        run: >-
-          python -m coverage run --branch --rcfile=.coveragerc -m unittest
-          tests.test_migrations tests.test_alerts tests.test_anomalies
-          tests.test_history tests.test_codex_client tests.test_config
-          tests.test_storage_durability
-      - name: Enforce Python coverage threshold
-        run: python -m coverage report --rcfile=.coveragerc
-      - name: Run shell and functional tests
-        run: SKIP_PYTHON_TESTS=1 tests/run.sh
-      - name: Install Chromium
-        run: npx playwright install --with-deps chromium
-      - name: Run browser tests
-        run: npm run test:browser
       - name: Audit npm dependencies (all vulnerability levels)
         run: npm audit --audit-level=low
       - name: Run ShellCheck
         run: shellcheck -x local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
+
+  functional:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version-file: .python-version
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+      - name: Install quality dependencies
+        run: python -m pip install --requirement requirements-ci.txt
+      - name: Run unit and functional tests with branch coverage
+        run: scripts/test-coverage.sh
+      - name: Upload coverage evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-results
+          path: coverage/
+          if-no-files-found: ignore
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version-file: .python-version
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - name: Install browser test dependencies
+        run: npm ci
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run browser tests
+        run: npm run test:browser
+      - name: Run analytics loading and idle performance budgets
+        run: npm run test:performance
+      - name: Upload performance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: performance-results
+          path: test-results/
+          if-no-files-found: ignore
+
+  # Preserve the existing required check while making every parallel job mandatory.
+  test:
+    if: always()
+    needs: [quality, functional, browser]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every check to succeed
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          FUNCTIONAL_RESULT: ${{ needs.functional.result }}
+          BROWSER_RESULT: ${{ needs.browser.result }}
+        run: |
+          test "$QUALITY_RESULT" = success
+          test "$FUNCTIONAL_RESULT" = success
+          test "$BROWSER_RESULT" = success
