@@ -36,6 +36,9 @@ let tokenDatasets = [];
 let lastPayload = null;
 let currentPeriod = {};
 let refreshSequence = 0;
+let modelDraft = null;
+let modelSearch = '';
+let modelFamily = 'all';
 // Keep legend choices across payloads that temporarily omit a dataset (for
 // example, an all-null 5-hour series or a period without reset markers).
 // Entries are only updated for datasets currently exposed by the chart.
@@ -971,11 +974,78 @@ function addFilterOption(container, value) {
   button.className = 'filter-option';
   button.dataset.filterValue = value;
   button.setAttribute('aria-pressed', String(state.models.includes(value)));
-  button.textContent = value;
+  const marker = document.createElement('span');
+  marker.className = 'model-check';
+  marker.setAttribute('aria-hidden', 'true');
+  marker.textContent = '✓';
+  const name = document.createElement('span');
+  name.className = 'model-name';
+  name.textContent = value;
+  const family = document.createElement('span');
+  family.className = 'model-family-label';
+  family.dataset.familyLabel = modelFamilyFor(value);
+  button.appendChild(marker);
+  button.appendChild(name);
+  button.appendChild(family);
   container.appendChild(button);
 }
+function modelFamilyFor(model) {
+  return GPT_MODELS.includes(model) ? 'current' : /^gpt-/i.test(model) ? 'older' : 'other';
+}
+function visibleModels() {
+  return state.availableModels.filter(model =>
+    (modelFamily === 'all' || modelFamilyFor(model) === modelFamily)
+    && model.toLowerCase().includes(modelSearch.trim().toLowerCase()));
+}
+function modelDraftChanges() {
+  const applied = new Set(state.models);
+  const draft = new Set(modelDraft || state.models);
+  return [...new Set([...applied, ...draft])].filter(model => applied.has(model) !== draft.has(model)).length;
+}
+function renderModelSelection() {
+  const draft = (modelDraft || state.models).filter(model => state.availableModels.includes(model));
+  const visible = new Set(visibleModels());
+  const familyKeys = { current: 'currentGpt', older: 'olderGpt', other: 'otherModels' };
+  setPressedValues(byId('model-filter'), draft);
+  for (const button of byId('model-filter').querySelectorAll('[data-filter-value]')) {
+    button.hidden = !visible.has(button.dataset.filterValue);
+    button.querySelector('[data-family-label]').textContent = t(familyKeys[modelFamilyFor(button.dataset.filterValue)]);
+  }
+  byId('model-selection-summary').textContent = t('modelSelectionCount', { selected: draft.length, total: state.availableModels.length });
+  byId('model-results-count').textContent = t('modelResultsCount', { count: visible.size });
+  const empty = byId('model-search-empty');
+  empty.hidden = visible.size > 0;
+  empty.textContent = t(state.availableModels.length ? 'modelNoResults' : 'modelNoAvailable');
+  const changes = modelDraftChanges();
+  byId('model-draft-status').textContent = t(!draft.length ? 'modelDraftEmpty' : changes ? 'modelDraftPending' : 'modelDraftSaved', { count: changes });
+  byId('apply-model-selection').disabled = !draft.length || !changes;
+  byId('reset-model-selection').disabled = !changes;
+  byId('clear-model-selection').disabled = !draft.length;
+  byId('select-visible-models').disabled = ![...visible].some(model => !draft.includes(model));
+  byId('select-gpt').disabled = !state.availableModels.some(model => GPT_MODELS.includes(model));
+  byId('select-all-models').disabled = !state.availableModels.length;
+  const toggle = byId('toggle-model-explorer');
+  toggle.textContent = t(toggle.getAttribute('aria-expanded') === 'true' ? 'hideModels' : 'showModels');
+  // Reuse tray controls so keyboard focus survives draft edits and translation.
+  const tray = byId('model-selection-tray');
+  const controls = new Map([...tray.querySelectorAll('[data-remove-model]')].map(button => [button.dataset.removeModel, button]));
+  for (const [model, button] of controls) {
+    if (!draft.includes(model)) tray.removeChild(button);
+  }
+  for (const model of draft) {
+    let button = controls.get(model);
+    if (!button) {
+      button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.removeModel = model;
+      button.textContent = `${model} ×`;
+      tray.appendChild(button);
+    }
+    button.setAttribute('aria-label', t('removeModel', { model }));
+  }
+}
 function updateModelOptions(models) {
-  const normalized = Array.isArray(models) ? models.filter(model => typeof model === 'string') : [];
+  const normalized = Array.isArray(models) ? [...new Set(models.filter(model => typeof model === 'string' && model.length))] : [];
   const container = byId('model-filter');
   const changed = normalized.join('\0') !== state.availableModels.join('\0');
   state.availableModels = normalized;
@@ -994,9 +1064,11 @@ function updateModelOptions(models) {
   if (changed) {
     state.models = state.models.filter(model => normalized.includes(model));
     if (!state.models.length && !state.modelFallbackNotice) state.models = [...normalized];
+    if (modelDraft !== null) modelDraft = modelDraft.filter(model => normalized.includes(model));
     clearRows(container);
     for (const model of normalized) addFilterOption(container, model);
   } else setPressedValues(container, state.models);
+  renderModelSelection();
   return shouldRefresh;
 }
 
@@ -1119,34 +1191,74 @@ byId('source-filter').addEventListener('click', event => {
   state.breakdownOffset = 0;
   refresh();
 });
+function setModelDraft(models) {
+  modelDraft = state.availableModels.filter(model => models.includes(model));
+  renderModelSelection();
+}
 byId('model-filter').addEventListener('click', event => {
   const button = event.target.closest('[data-filter-value]');
   if (!button) return;
-  button.setAttribute('aria-pressed', String(button.getAttribute('aria-pressed') !== 'true'));
-  state.models = pressedValues(byId('model-filter'));
-  if (!state.models.length) {
-    button.setAttribute('aria-pressed', 'true');
-    state.models = [button.dataset.filterValue];
+  const model = button.dataset.filterValue;
+  const draft = modelDraft || state.models;
+  setModelDraft(draft.includes(model) ? draft.filter(value => value !== model) : [...draft, model]);
+});
+byId('model-selection-tray').addEventListener('click', event => {
+  const button = event.target.closest('[data-remove-model]');
+  if (!button) return;
+  const next = button.nextElementSibling || button.previousElementSibling;
+  setModelDraft((modelDraft || state.models).filter(model => model !== button.dataset.removeModel));
+  (next || byId('toggle-model-explorer')).focus();
+});
+byId('select-all-models').addEventListener('click', () => setModelDraft(state.availableModels));
+byId('select-gpt').addEventListener('click', () => setModelDraft(state.availableModels.filter(model => GPT_MODELS.includes(model))));
+byId('select-visible-models').addEventListener('click', () => setModelDraft([...(modelDraft || state.models), ...visibleModels()]));
+byId('clear-model-selection').addEventListener('click', () => setModelDraft([]));
+byId('reset-model-selection').addEventListener('click', () => {
+  modelDraft = null;
+  renderModelSelection();
+});
+byId('apply-model-selection').addEventListener('click', () => {
+  if (!modelDraft?.length || !modelDraftChanges()) return;
+  state.models = [...modelDraft];
+  modelDraft = null;
+  state.modelFallbackNotice = false;
+  state.resetOffset = 0;
+  state.breakdownOffset = 0;
+  renderModelSelection();
+  refresh();
+});
+byId('model-search').addEventListener('input', event => {
+  modelSearch = event.target.value;
+  renderModelSelection();
+});
+byId('model-families').addEventListener('click', event => {
+  const button = event.target.closest('[data-model-family]');
+  if (!button) return;
+  modelFamily = button.dataset.modelFamily;
+  for (const control of byId('model-families').querySelectorAll('button')) {
+    control.setAttribute('aria-pressed', String(control === button));
   }
-  state.resetOffset = 0;
-  state.breakdownOffset = 0;
-  refresh();
+  renderModelSelection();
 });
-byId('select-all-models').addEventListener('click', () => {
-  state.models = [...state.availableModels];
-  setPressedValues(byId('model-filter'), state.models);
-  state.resetOffset = 0;
-  state.breakdownOffset = 0;
-  refresh();
+function collapseModelExplorer() {
+  byId('model-explorer').hidden = true;
+  byId('toggle-model-explorer').setAttribute('aria-expanded', 'false');
+  renderModelSelection();
+}
+byId('toggle-model-explorer').addEventListener('click', () => {
+  if (byId('toggle-model-explorer').getAttribute('aria-expanded') === 'true') collapseModelExplorer();
+  else {
+    byId('model-explorer').hidden = false;
+    byId('toggle-model-explorer').setAttribute('aria-expanded', 'true');
+    renderModelSelection();
+    byId('model-search').focus();
+  }
 });
-byId('select-gpt').addEventListener('click', () => {
-  const gptModels = state.availableModels.filter(model => GPT_MODELS.includes(model));
-  if (!gptModels.length) { setMessage('analytics-error', t('gptModelsUnavailable')); return; }
-  state.models = gptModels;
-  setPressedValues(byId('model-filter'), state.models);
-  state.resetOffset = 0;
-  state.breakdownOffset = 0;
-  refresh();
+byId('model-explorer').addEventListener('keydown', event => {
+  if (event.key !== 'Escape') return;
+  event.preventDefault();
+  collapseModelExplorer();
+  byId('toggle-model-explorer').focus();
 });
 byId('reset-filter').value = state.resetType;
 byId('weekly-limit-value-models').addEventListener('click', event => {
