@@ -1304,7 +1304,11 @@ async function refresh({ section = 'base', revisionRetry = false, coherent = fal
   clearTimeout(refreshTimer);
   for (const controller of requestControllers.values()) controller?.abort();
   requestControllers.clear();
-  for (const name of ['weekly', 'resets', 'breakdown']) setSectionStatus(name, '');
+  const coherentPending = coherent
+    ? ['weekly', 'resets'].filter(name => lastPayload?.pending_sections?.includes(name)) : [];
+  for (const name of ['weekly', 'resets', 'breakdown']) {
+    setSectionStatus(name, coherentPending.includes(name) ? 'loading' : '');
+  }
   const controller = typeof AbortController === 'function' ? new AbortController() : null;
   requestControllers.set('base', controller);
   const loading = byId('analytics-loading');
@@ -1316,6 +1320,7 @@ async function refresh({ section = 'base', revisionRetry = false, coherent = fal
     pendingBaseSequence = null;
     render(payload);
     if (sequence !== refreshSequence) return;
+    for (const name of coherentPending) setSectionStatus(name, '');
     persistFilters();
     if (loading) loading.hidden = true;
     refreshDiagnostics(sequence);
@@ -1329,6 +1334,7 @@ async function refresh({ section = 'base', revisionRetry = false, coherent = fal
       await refresh(revisionRetry ? { coherent: true } : { revisionRetry: true }); return;
     }
     const message = error instanceof Error ? error.message : t('unableToLoadAnalytics');
+    for (const name of coherentPending) setSectionStatus(name, 'error', `${message} · ${t('showingLastData')}`);
     const localOnly = error?.status === 404 || /local mode/i.test(message);
     setMessage('analytics-local-only', localOnly ? t('localOnly') : '');
     setMessage('analytics-error', lastPayload ? `${message} · ${t('showingLastData')}` : message);

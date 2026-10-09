@@ -1352,6 +1352,7 @@ test('falls back to one coherent response after repeated revision mismatches', a
   await page.goto('/analytics.html');
   await expect.poll(() => requests.filter(section => section === 'full').length).toBe(1);
   await expect(page.locator('#analytics-error')).toBeHidden();
+  await expect(page.locator('#weekly-section-status')).toBeHidden();
   await expect(page.locator('#resets-section-status')).toBeHidden();
   await expect(page.locator('#total-tokens')).toHaveText('1.73M');
   expect(bases).toBe(2);
@@ -1399,6 +1400,47 @@ test('keeps a failed coherent fallback bounded and visible', async ({ page }) =>
   await expect(page.locator('#analytics-error')).toContainText('analytics archive cannot be read');
   await expect(page.locator('#analytics-local-only')).toBeHidden();
   expect(requests).toEqual(['base', 'weekly', 'base', 'weekly', 'full']);
+  await expect(page.locator('#weekly-section-status')).toContainText('analytics archive cannot be read');
+  await expect(page.locator('#resets-section-status')).toBeHidden();
+});
+
+test('labels retained old sections while a coherent fallback loads and after it fails', async ({ page }) => {
+  let phase = 'initial';
+  let fullRequested = false;
+  let releaseFull;
+  const fullReady = new Promise(resolve => { releaseFull = resolve; });
+  const nextPeriod = { ...analyticsPayload.period, range: '24h', from: '2026-10-08T02:30:00Z', to: '2026-10-09T02:30:00Z' };
+  await page.route('**/api/analytics?*', async route => {
+    const section = new URL(route.request().url()).searchParams.get('sections');
+    if (phase === 'initial') return route.fulfill({ json: { ...analyticsPayload, resets: enhancedAnalyticsPayload.resets } });
+    if (section === 'base') {
+      const base = { ...analyticsPayload, period: nextPeriod, revision: 'next', pending_sections: ['weekly', 'resets'] };
+      delete base.weekly_limit_value;
+      return route.fulfill({ json: base });
+    }
+    if (section === 'full') {
+      fullRequested = true;
+      await fullReady;
+      return route.fulfill({ status: 503, json: { error: 'analytics archive cannot be read' } });
+    }
+    return route.fulfill({ json: { period: nextPeriod, revision: 'different',
+      weekly_limit_value: analyticsPayload.weekly_limit_value, resets: enhancedAnalyticsPayload.resets } });
+  });
+  await page.goto('/analytics.html');
+  await expect(page.locator('#resets-body tr')).toHaveCount(1);
+  const oldSections = await page.evaluate(() => JSON.stringify([weeklyValueData, displayedResetData]));
+  phase = 'changed';
+  await page.evaluate(() => { state.range = '24h'; void refresh(); });
+  await expect.poll(() => fullRequested).toBe(true);
+  for (const card of ['weekly-limit-value-card', 'reset-history-card']) {
+    await expect(page.locator(`#${card}`)).toHaveAttribute('aria-busy', 'true');
+  }
+  releaseFull();
+  await expect(page.locator('#analytics-error')).toContainText('analytics archive cannot be read');
+  for (const section of ['weekly', 'resets']) {
+    await expect(page.locator(`#${section}-section-status`)).toContainText('Showing the last successful data');
+  }
+  expect(await page.evaluate(() => JSON.stringify([weeklyValueData, displayedResetData]))).toBe(oldSections);
 });
 
 test('retains explicit unavailable models and validated filters through reload and local navigation', async ({ page }) => {
