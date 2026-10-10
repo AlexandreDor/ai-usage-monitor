@@ -811,6 +811,53 @@ test('falls back once to all models when GPT is unavailable', async ({ page }) =
   expect(queries).toHaveLength(2);
 });
 
+test('recalculates automatic GPT selection after the catalog changes and the page reloads', async ({ page }) => {
+  const queries = [];
+  let availableModels = ['gpt-6-sol'];
+  await page.route('**/api/analytics?*', route => {
+    queries.push(new URL(route.request().url()).searchParams);
+    return route.fulfill({ json: {
+      ...analyticsPayload,
+      available: { ...analyticsPayload.available, models: availableModels },
+    } });
+  });
+  await page.goto('/analytics.html');
+  await expect(page.locator('#model-selection-summary')).toHaveText('1 of 1 selected');
+
+  availableModels = ['gpt-6-sol', 'gpt-6.1-sol'];
+  await page.reload();
+
+  await expect(page.locator('#model-selection-summary')).toHaveText('2 of 2 selected');
+  expect(queries.at(-1).get('models').split(',')).toContain('gpt-6.1-sol');
+  expect(new URL(page.url()).searchParams.has('models')).toBe(false);
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('codex-usage-monitor.analytics-filters')).models)).toBeUndefined();
+});
+
+test('falls back to newly available non-GPT models after an empty archive reloads', async ({ page }) => {
+  const queries = [];
+  let availableModels = [];
+  await page.route('**/api/analytics?*', route => {
+    queries.push(new URL(route.request().url()).searchParams);
+    return route.fulfill({ json: {
+      ...analyticsPayload,
+      available: { ...analyticsPayload.available, models: availableModels },
+    } });
+  });
+  await page.goto('/analytics.html');
+  await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+  await expect(page.locator('#analytics-error')).toBeHidden();
+
+  availableModels = ['legacy-model'];
+  await page.reload();
+
+  await expect.poll(() => queries.length).toBe(3);
+  expect(queries.at(-1).get('models')).toBe('legacy-model');
+  await expect(page.locator('#model-selection-summary')).toHaveText('1 of 1 selected');
+  await expect(page.locator('#analytics-error')).toContainText('No supported GPT model is available');
+  expect(new URL(page.url()).searchParams.has('models')).toBe(false);
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('codex-usage-monitor.analytics-filters')).models)).toBeUndefined();
+});
+
 test('selects GPT when models appear after an initially empty archive', async ({ page }) => {
   const queries = [];
   let availableModels = [];

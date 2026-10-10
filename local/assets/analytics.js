@@ -97,6 +97,7 @@ function persistFilters() {
   if (typeof history === 'object' && typeof location === 'object') {
     const query = new URLSearchParams(queryString());
     for (const key of ['reset_offset', 'reset_limit', 'breakdown_offset', 'timezone']) query.delete(key);
+    if (!state.explicitModels) query.delete('models');
     try { history.replaceState(null, '', `${location.pathname}?${query}${location.hash}`); } catch (_error) { /* Embedded pages may reject URL updates. */ }
   }
   updateExportLink();
