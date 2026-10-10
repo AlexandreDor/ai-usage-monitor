@@ -1107,6 +1107,71 @@ test('keeps a filter reset on the first page when its request fails', async ({ p
   await expect.poll(() => page.evaluate(() => new URLSearchParams(queryString()).get('breakdown_offset'))).toBe('0');
 });
 
+for (const [filter, failures] of [['sources', 1], ['models', 1], ['sources', 2]]) {
+  test(`retries the base before pagination after ${failures} failed ${filter} refreshes`, async ({ page }) => {
+    const queries = [];
+    const total = 155;
+    let failuresRemaining = failures;
+    await page.route('**/api/analytics?*', route => {
+      const query = new URL(route.request().url()).searchParams;
+      queries.push(query);
+      const changed = filter === 'sources' ? query.get('sources') !== 'codex' : query.get('models') !== 'gpt-6-sol';
+      if (changed && query.get('sections') === 'base' && failuresRemaining-- > 0) {
+        return route.fulfill({ status: 500, json: { error: 'temporary filter failure' } });
+      }
+      const offset = Number(query.get('breakdown_offset') || 0);
+      const cost = changed ? 200 : 100;
+      const rows = Array.from({ length: total }, (_value, index) => ({
+        ...paginatedBreakdown[index % paginatedBreakdown.length], provider: `fixture-provider-${index}`,
+        source: changed && filter === 'sources' ? 'hermes' : 'codex',
+        model: changed && filter === 'models' ? 'gpt-6.1-sol' : 'gpt-6-sol',
+        estimated_cost_usd: cost / total, pricing_status: 'priced',
+      }));
+      return route.fulfill({ json: {
+        ...analyticsPayload, revision: 'unchanged-archive',
+        filters: { sources: query.get('sources').split(','), models: query.get('models').split(','), reset_type: 'weekly' },
+        tokens: {
+          ...analyticsPayload.tokens,
+          summary: { ...analyticsPayload.tokens.summary, estimated_cost_usd: cost },
+          breakdown: rows.slice(offset, offset + 50),
+          breakdown_pagination: { total, offset, limit: 50 },
+        },
+      } });
+    });
+    await page.goto('/analytics.html?sources=codex&models=gpt-6-sol');
+    await expect(page.locator('#estimated-cost')).toHaveText('€86.00');
+    await page.locator('#breakdown-next').click();
+    await expect(page.locator('#breakdown-page-label')).toHaveText('51–100 of 155');
+    if (filter === 'sources') {
+      await page.locator('#source-filter [data-filter-value="hermes"]').click();
+    } else {
+      await page.locator('#toggle-model-explorer').click();
+      await page.locator('#model-filter [data-filter-value="gpt-6.1-sol"]').click();
+      await page.locator('#apply-model-selection').click();
+    }
+    await expect(page.locator('#analytics-error')).toContainText('temporary filter failure');
+    await expect(page.locator('#estimated-cost')).toHaveText('€86.00');
+    const queriesBeforeRetry = queries.length;
+    for (let attempt = 1; attempt <= failures; attempt += 1) {
+      await page.locator('#breakdown-next').click();
+      await expect.poll(() => queries.length).toBe(queriesBeforeRetry + attempt);
+      expect(queries.at(-1).get('sections')).toBe('base');
+      expect(queries.at(-1).get('breakdown_offset')).toBe('50');
+      if (attempt < failures) {
+        await expect(page.locator('#estimated-cost')).toHaveText('€86.00');
+        await expect.poll(() => page.evaluate(() => state.breakdownOffset)).toBe(0);
+      }
+    }
+    await expect(page.locator('#estimated-cost')).toHaveText('€172.00');
+    await expect(page.locator('#breakdown-page-label')).toHaveText('51–100 of 155');
+    await expect(page.locator('#breakdown-body tr').first()).toContainText(filter === 'sources' ? 'hermes' : 'gpt-6.1-sol');
+    await expect(page.locator('#analytics-error')).toBeHidden();
+    const selected = await page.evaluate(() => ({ sources: state.sources, models: state.models }));
+    expect(await page.evaluate(() => lastPayload.filters.sources)).toEqual(selected.sources);
+    expect(await page.evaluate(() => lastPayload.filters.models)).toEqual(selected.models);
+  });
+}
+
 test('groups visible Analytics units and excludes missing values and reset markers', async ({ page }) => {
   const payload = {
     ...enhancedAnalyticsPayload,

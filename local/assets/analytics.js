@@ -48,6 +48,7 @@ let modelFamily = 'all';
 let pendingBaseSequence = null;
 let filterTimer = null;
 let filtersPending = false;
+let baseRefreshRequired = false;
 const requestControllers = new Map();
 const sectionSequences = new Map();
 const deferredTables = new Map();
@@ -1369,10 +1370,12 @@ async function loadSection(section, generation, base, query) {
     if (requestControllers.get(section) === controller) requestControllers.delete(section);
   }
 }
-async function refresh({ section = 'base', revisionRetry = false, coherent = false } = {}) {
+async function refresh({ section = 'base', revisionRetry = false, coherent = false, previousOffset } = {}) {
+  const requestedSection = section;
   // A pending base owns an older query. Restart it with the latest controls
   // before it can overwrite a newer component selection or pagination page.
-  if (filtersPending || pendingBaseSequence !== null) section = 'base';
+  // A failed base must also recover before components can use the new filters.
+  if (filtersPending || pendingBaseSequence !== null || baseRefreshRequired) section = 'base';
   filtersPending = false;
   clearTimeout(filterTimer);
   if (section !== 'base' && lastPayload) {
@@ -1402,6 +1405,7 @@ async function refresh({ section = 'base', revisionRetry = false, coherent = fal
     pendingBaseSequence = null;
     render(payload);
     if (sequence !== refreshSequence) return;
+    baseRefreshRequired = false;
     for (const name of coherentPending) setSectionStatus(name, '');
     persistFilters();
     if (loading) loading.hidden = true;
@@ -1410,6 +1414,11 @@ async function refresh({ section = 'base', revisionRetry = false, coherent = fal
     await Promise.all(pending.filter(name => ['weekly', 'resets'].includes(name)).map(name => loadSection(name, sequence, payload, query)));
   } catch (error) {
     if (sequence !== refreshSequence || error?.name === 'AbortError') return;
+    baseRefreshRequired = true;
+    if (previousOffset !== undefined) {
+      if (requestedSection === 'breakdown') state.breakdownOffset = previousOffset;
+      if (requestedSection === 'resets') state.resetOffset = previousOffset;
+    }
     if (error.revisionMismatch) {
       // Two changing snapshots must never be mixed. A single full response
       // pins every section to one database snapshot without an unbounded retry.
@@ -1634,17 +1643,27 @@ byId('apply-dates').addEventListener('click', () => {
   if (!validFilterDate(state.fromDate) || !validFilterDate(state.toDate) || state.fromDate > state.toDate) { setMessage('analytics-error', t('chooseBothDates')); return; }
   queueRefresh();
 });
-byId('resets-previous').addEventListener('click', () => { state.resetOffset = Math.max(0, state.resetOffset - RESET_PAGE_SIZE); refresh({ section: 'resets' }); });
-byId('resets-next').addEventListener('click', () => { state.resetOffset += RESET_PAGE_SIZE; refresh({ section: 'resets' }); });
+byId('resets-previous').addEventListener('click', () => {
+  const previousOffset = state.resetOffset;
+  state.resetOffset = Math.max(0, state.resetOffset - RESET_PAGE_SIZE);
+  refresh({ section: 'resets', previousOffset });
+});
+byId('resets-next').addEventListener('click', () => {
+  const previousOffset = state.resetOffset;
+  state.resetOffset += RESET_PAGE_SIZE;
+  refresh({ section: 'resets', previousOffset });
+});
 byId('breakdown-previous').addEventListener('click', event => {
   if (event.currentTarget.getAttribute('aria-disabled') === 'true') return;
+  const previousOffset = state.breakdownOffset;
   state.breakdownOffset = Math.max(0, state.breakdownOffset - state.breakdownLimit);
-  refresh({ section: 'breakdown' });
+  refresh({ section: 'breakdown', previousOffset });
 });
 byId('breakdown-next').addEventListener('click', event => {
   if (event.currentTarget.getAttribute('aria-disabled') === 'true') return;
+  const previousOffset = state.breakdownOffset;
   state.breakdownOffset += state.breakdownLimit;
-  refresh({ section: 'breakdown' });
+  refresh({ section: 'breakdown', previousOffset });
 });
 byId('toggle-token-overlay').addEventListener('click', () => {
   if (!limitPoints.length || !tokenPoints.length) return;
