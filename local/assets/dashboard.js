@@ -11,6 +11,13 @@ const MAX_SAMPLE_INTERVAL_SECONDS = 86_400;
 const DECIMATION_THRESHOLD = 1000;
 const DECIMATION_SAMPLES = 600;
 const PARIS_TIME_ZONE = 'Europe/Paris';
+const dashboardFormatters = new Map();
+function dashboardFormatter(kind, options) {
+  if (typeof CodexPreferences === 'object') return kind === 'date' ? CodexPreferences.dateFormatter(options) : CodexPreferences.numberFormatter(options, currentLocale());
+  const key = JSON.stringify([kind, currentLocale(), options]);
+  if (!dashboardFormatters.has(key)) dashboardFormatters.set(key, kind === 'date' ? new Intl.DateTimeFormat(currentLocale(), options) : new Intl.NumberFormat(currentLocale(), options));
+  return dashboardFormatters.get(key);
+}
 const SNAPSHOT_SCHEMA_VERSION = 1;
 
 let chart = null;
@@ -83,7 +90,7 @@ function removeElementAttribute(element, name) {
 function formatPercent(value) {
   const pct = validPct(value);
   if (pct === null) return t('notAvailable');
-  return `${new Intl.NumberFormat(currentLocale(), {
+  return `${dashboardFormatter('number', {
     maximumFractionDigits: 1,
   }).format(pct)}%`;
 }
@@ -299,7 +306,7 @@ function formatParisDateTime(value, includeYear = true) {
   const timestamp = typeof value === 'number' ? value : Date.parse(value);
   if (!Number.isFinite(timestamp)) return '-';
 
-  const formatter = new Intl.DateTimeFormat(currentLocale(), {
+  const formatter = dashboardFormatter('date', {
     timeZone: PARIS_TIME_ZONE,
     day: '2-digit',
     month: '2-digit',
@@ -716,7 +723,7 @@ function renderHistory(history) {
   if (typeof CodexChartInteractions === 'object') {
     options = CodexChartInteractions.enhanceOptions(options, {
       formatTitle: value => formatParisDateTime(value),
-      formatValue: value => `${new Intl.NumberFormat(currentLocale(), { maximumFractionDigits: 1 }).format(value)}%`,
+      formatValue: value => `${dashboardFormatter('number', { maximumFractionDigits: 1 }).format(value)}%`,
     });
   }
   try {

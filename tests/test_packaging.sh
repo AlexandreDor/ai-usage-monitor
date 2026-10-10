@@ -8,12 +8,16 @@ VERSION_FILE="${ROOT_DIR}/VERSION"
 BUILD_SCRIPT="${ROOT_DIR}/scripts/build-release.sh"
 MONITOR_UNIT="${ROOT_DIR}/packaging/systemd/codex-usage-monitor.service"
 DASHBOARD_UNIT="${ROOT_DIR}/packaging/systemd/codex-usage-dashboard.service"
+BACKUP_UNIT="${ROOT_DIR}/packaging/systemd/codex-usage-backup.service"
+BACKUP_TIMER="${ROOT_DIR}/packaging/systemd/codex-usage-backup.timer"
 LAN_EXAMPLE="${ROOT_DIR}/packaging/systemd/codex-usage-dashboard.lan.conf.example"
 
 assert_file "$VERSION_FILE"
 assert_file "$BUILD_SCRIPT"
 assert_file "$MONITOR_UNIT"
 assert_file "$DASHBOARD_UNIT"
+assert_file "$BACKUP_UNIT"
+assert_file "$BACKUP_TIMER"
 assert_file "$LAN_EXAMPLE"
 
 version="$(tr -d '[:space:]' < "$VERSION_FILE")"
@@ -54,7 +58,7 @@ fi
 assert_contains "$(<"$LAN_EXAMPLE")" "ExecStart=/usr/bin/env bash /opt/codex-usage-monitor/current/local/serve.sh --bind 192.0.2.20 --port 8080" "LAN override is explicit"
 
 if command -v systemd-analyze >/dev/null 2>&1; then
-  systemd-analyze verify "$MONITOR_UNIT" "$DASHBOARD_UNIT"
+  systemd-analyze verify "$MONITOR_UNIT" "$DASHBOARD_UNIT" "$BACKUP_UNIT" "$BACKUP_TIMER"
 else
   printf 'SKIP: systemd-analyze is unavailable; CI installs/has it on Ubuntu.\n'
 fi
@@ -99,6 +103,11 @@ PY
 archive_listing="$(tar -tzf "$archive_one")"
 assert_contains "$archive_listing" "codex-usage-monitor-${version}/VERSION" "archive has a versioned root"
 assert_contains "$archive_listing" "codex-usage-monitor-${version}/packaging/systemd/codex-usage-monitor.service" "archive has monitor unit"
+assert_contains "$archive_listing" "codex-usage-monitor-${version}/packaging/systemd/codex-usage-backup.service" "archive has backup unit"
+assert_contains "$archive_listing" "codex-usage-monitor-${version}/packaging/systemd/codex-usage-backup.timer" "archive has backup timer"
+for module in http_server.py analytics_cache.py analytics_history_cache.py analytics_export.py diagnostics.py operations.py backup.py; do
+  assert_contains "$archive_listing" "codex-usage-monitor-${version}/local/${module}" "archive has required ${module}"
+done
 assert_contains "$archive_listing" "codex-usage-monitor-${version}/docs/INSTALL.md" "archive has installation docs"
 if grep -Eq '(^|/)(\.env$|runtime/|.*\.sqlite3$|.*\.db$)' <<< "$archive_listing"; then
   fail "release archive contains local secrets or state"

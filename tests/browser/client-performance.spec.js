@@ -195,3 +195,61 @@ test('analytics remains within the idle rendering budget', { tag: '@performance'
 
   await expectIdleRenderingWithinBudget(page, browser, testInfo, 'analytics');
 });
+
+test('analytics loads dense history within client budgets', { tag: '@performance' }, async ({ page, browser }, testInfo) => {
+  const end = Date.now();
+  const at = index => new Date(end - (1800 - index) * 900_000).toISOString();
+  const payload = JSON.parse(JSON.stringify(analyticsPayload));
+  payload.period.from = at(0);
+  payload.period.to = new Date(end).toISOString();
+  payload.limits.series = Array.from({ length: 1800 }, (_, index) => ({ at: at(index), five_h_pct: 100 - index % 90, weekly_pct: 100 - index % 95, ideal_weekly_pct: 100 - index % 96, forecast_chance_24h_pct: index % 100, forecast_chance_6h_pct: index % 80 }));
+  payload.limits.samples = 1800;
+  payload.tokens.series = Array.from({ length: 400 }, (_, index) => ({ at: at(index * 4), input_tokens: 1000, output_tokens: 200, cache_read_tokens: 500, total_tokens: 1700, estimated_cost_usd: 0.015 + index / 1000 }));
+  payload.tokens.series_by_source = payload.tokens.series.map(point => ({ ...point, source: 'codex' }));
+  payload.weekly_limit_value = {
+    series: Array.from({ length: 75 }, (_, index) => ({ at: at(index * 24), value_usd: 150, raw_value_usd: 150, quality: 'good', observed_cost_usd: 3, quota_consumed_pct_points: 2 })),
+    by_model: ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-astra'].map((model, offset) => ({ model, providers: ['openai'], series: Array.from({ length: 75 }, (_, index) => ({ at: at(index * 24), value_usd: 100 + offset * 20 + index, raw_value_usd: 100 + offset * 20 + index, observed_cost_usd: 2, quota_consumed_pct_points: 2, quality: 'good' })) })),
+  };
+  await page.addInitScript(() => {
+    window.performanceFormatterCounts = {};
+    for (const name of ['DateTimeFormat', 'NumberFormat']) {
+      const Original = Intl[name];
+      Intl[name] = new Proxy(Original, { construct(target, args) {
+        window.performanceFormatterCounts[name] = (window.performanceFormatterCounts[name] || 0) + 1;
+        return Reflect.construct(target, args);
+      } });
+    }
+  });
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+  const samples = [];
+  for (let index = 0; index < 3; index += 1) {
+    const session = await page.context().newCDPSession(page);
+    await session.send('Performance.enable');
+    const before = await session.send('Performance.getMetrics');
+    await page.goto('/analytics.html');
+    await page.waitForFunction(() => typeof limitsChart !== 'undefined' && limitsChart && weeklyLimitValueChart && document.getElementById('analytics-loading').hidden);
+    const after = await session.send('Performance.getMetrics');
+    const state = await page.evaluate(() => ({
+      readyMs: performance.now(),
+      domNodes: document.querySelectorAll('*').length,
+      closedTableRows: [...document.querySelectorAll('details.chart-data-details:not([open]) tbody')].reduce((sum, body) => sum + body.rows.length, 0),
+      formatterCounts: window.performanceFormatterCounts,
+      points: limitsChart.data.datasets.find(dataset => dataset.datasetKey === 'weekly')?.data.length ?? limitPoints.length,
+    }));
+    samples.push({ ...state, taskDurationMs: (metricValue(after, 'TaskDuration') - metricValue(before, 'TaskDuration')) * 1000 });
+    await session.detach();
+  }
+  const report = { browserVersion: browser.version(), fixture: { limits: 1800, tokenBuckets: 400, weeklyModelPoints: 525 }, samples };
+  const path = testInfo.outputPath('analytics-loading-performance.json');
+  await writeFile(path, `${JSON.stringify(report, null, 2)}\n`);
+  await testInfo.attach('analytics-loading-performance', { path, contentType: 'application/json' });
+  expect(median(samples.map(sample => sample.readyMs))).toBeLessThan(5000);
+  expect(median(samples.map(sample => sample.taskDurationMs))).toBeLessThan(2000);
+  for (const sample of samples) {
+    expect(sample.closedTableRows).toBe(0);
+    expect(sample.domNodes).toBeLessThan(3000);
+    expect(sample.formatterCounts.DateTimeFormat).toBeLessThan(40);
+    expect(sample.formatterCounts.NumberFormat).toBeLessThan(40);
+    expect(sample.points).toBe(1800);
+  }
+});

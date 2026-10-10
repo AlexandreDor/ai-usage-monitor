@@ -44,6 +44,15 @@
         </button>
       </div>
     </div>
+
+    <details class="advanced-preferences">
+      <summary data-i18n="preferences.advanced">Time and exchange rate</summary>
+      <div class="advanced-preference-fields">
+        <label><span data-i18n="preferences.timezone">Time zone (IANA)</span><input data-preference-input="timezone" type="text" value="Europe/Paris" maxlength="100" autocomplete="off"></label>
+        <label><span data-i18n="preferences.usdToEurRate">EUR per USD</span><input data-preference-input="usdToEurRate" type="number" min="0.000001" max="1000" step="any" value="0.86"></label>
+        <label><span data-i18n="preferences.rateDate">Rate date</span><input data-preference-input="rateDate" type="date"></label>
+      </div>
+    </details>
   </header>
 
   <div id="error-banner" role="alert" hidden></div>
