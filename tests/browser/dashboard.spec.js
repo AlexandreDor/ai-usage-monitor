@@ -2081,6 +2081,44 @@ test('normalizes browser timezone aliases before Analytics and CSV requests', as
   await expect(page.locator('#total-tokens')).toHaveText('1.73M');
 });
 
+for (const action of ['add visible', 'add individual']) {
+  test(`blocks applying more than 50 models after ${action} retains an unavailable choice`, async ({ page }) => {
+    const available = Array.from({ length: 50 }, (_, index) => `available-model-${index}`);
+    const initial = action === 'add visible' ? ['unavailable-model'] : ['unavailable-model', ...available.slice(0, 49)];
+    const queries = [];
+    await page.route('**/api/analytics?*', route => {
+      const query = new URL(route.request().url()).searchParams;
+      queries.push(query);
+      if (query.get('models').split(',').length > 50) {
+        return route.fulfill({ status: 400, json: { error: 'model filter is invalid' } });
+      }
+      return route.fulfill({ json: { ...analyticsPayload, available: { ...analyticsPayload.available, models: available } } });
+    });
+    await page.goto(`/analytics.html?models=${initial.join(',')}`);
+    await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+    await page.locator('#toggle-model-explorer').click();
+    if (action === 'add visible') await page.locator('#select-visible-models').click();
+    else await page.locator('#model-filter [data-filter-value="available-model-49"]').click();
+    await expect(page.locator('#model-selection-tray [data-remove-model]')).toHaveCount(51);
+    await expect(page.locator('#apply-model-selection')).toBeDisabled();
+    await expect(page.locator('#model-draft-status')).toHaveText('Select no more than 50 models to continue.');
+    await page.locator('#language-toggle').click();
+    await expect(page.locator('#model-draft-status')).toHaveText('Sélectionnez au maximum 50 modèles pour continuer.');
+    expect(await page.evaluate(() => state.models)).toEqual(initial);
+    expect(new URL(page.url()).searchParams.get('models').split(',')).toEqual(initial);
+    expect(queries).toHaveLength(1);
+
+    await page.locator('#model-selection-tray [data-remove-model="unavailable-model"]').click();
+    await expect(page.locator('#apply-model-selection')).toBeEnabled();
+    await page.locator('#apply-model-selection').click();
+    await expect.poll(() => queries.at(-1).get('models').split(',').length).toBe(50);
+    await expect(page.locator('#analytics-error')).toBeHidden();
+    await expect(page.locator('#model-draft-status')).toHaveText('Aucune modification en attente.');
+    expect((await page.evaluate(() => state.models))).toEqual(available);
+    expect(new URL(page.url()).searchParams.get('models').split(',')).toEqual(available);
+  });
+}
+
 for (const storageMode of ['URL', 'local storage']) {
   test(`rejects restored ${storageMode} model filters above the API limit`, async ({ page }) => {
     const models = Array.from({ length: 51 }, (_, index) => `model-${index}`);

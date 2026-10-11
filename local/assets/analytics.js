@@ -3,6 +3,7 @@
 const ANALYTICS_REFRESH_MS = 900_000;
 const RESET_PAGE_SIZE = 50;
 const BREAKDOWN_PAGE_SIZE = 50;
+const MAX_MODEL_FILTERS = 50;
 const PARIS_ZONE = 'Europe/Paris';
 const EMPTY_VALUE = '-';
 const PRICE_WARNING_PATTERN = /^No catalog price; assumed zero: (.+)$/u;
@@ -81,8 +82,8 @@ function restoreFilters() {
   const sources = list(saved.sources).filter(value => ['codex', 'opencode', 'hermes'].includes(value));
   if (sources.length) state.sources = [...new Set(sources)];
   const models = [...new Set(list(saved.models).filter(value => typeof value === 'string' && value.length > 0 && value.length <= 200 && !/[\x00-\x1f,]/.test(value)))];
-  state.restoredModelsRejected = models.length > 50;
-  if (models.length && models.length <= 50) { state.models = models; state.explicitModels = true; state.modelAvailabilityResolved = true; }
+  state.restoredModelsRejected = models.length > MAX_MODEL_FILTERS;
+  if (models.length && models.length <= MAX_MODEL_FILTERS) { state.models = models; state.explicitModels = true; state.modelAvailabilityResolved = true; }
   if (['all', '5h', 'weekly'].includes(saved.reset_type)) state.resetType = saved.reset_type;
   if (validFilterDate(saved.from_date) && validFilterDate(saved.to_date) && saved.from_date <= saved.to_date) {
     state.fromDate = saved.from_date; state.toDate = saved.to_date;
@@ -1170,9 +1171,10 @@ function renderModelSelection() {
   empty.hidden = visible.size > 0;
   empty.textContent = t(state.availableModels.length ? 'modelNoResults' : 'modelNoAvailable');
   const changes = modelDraftChanges();
+  const exceedsLimit = draft.length > MAX_MODEL_FILTERS;
   byId('model-apply-bar').hidden = !changes;
-  byId('model-draft-status').textContent = t(!draft.length ? 'modelDraftEmpty' : changes ? 'modelDraftPending' : 'modelDraftSaved', { count: changes });
-  byId('apply-model-selection').disabled = !draft.length || !changes;
+  byId('model-draft-status').textContent = t(exceedsLimit ? 'modelDraftLimit' : !draft.length ? 'modelDraftEmpty' : changes ? 'modelDraftPending' : 'modelDraftSaved', { count: changes, limit: MAX_MODEL_FILTERS });
+  byId('apply-model-selection').disabled = !draft.length || !changes || exceedsLimit;
   byId('reset-model-selection').disabled = !changes;
   byId('clear-model-selection').disabled = !draft.length;
   byId('select-visible-models').disabled = ![...visible].some(model => !draft.includes(model));
@@ -1581,7 +1583,7 @@ byId('reset-model-selection').addEventListener('click', () => {
   byId('toggle-model-explorer').focus();
 });
 byId('apply-model-selection').addEventListener('click', () => {
-  if (!modelDraft?.length || !modelDraftChanges()) return;
+  if (!modelDraft?.length || modelDraft.length > MAX_MODEL_FILTERS || !modelDraftChanges()) return;
   state.explicitModels = true;
   state.models = [...modelDraft];
   modelDraft = null;
