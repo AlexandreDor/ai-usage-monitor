@@ -1013,6 +1013,38 @@ test('paginates the model breakdown with keyboard controls and keeps localizatio
   await expect.poll(() => queries.at(-1)?.get('breakdown_offset')).toBe('0');
 });
 
+for (const preference of ['language', 'currency']) {
+  test(`keeps a pending filter on the first page when ${preference} changes during debounce`, async ({ page }) => {
+    const queries = [];
+    await page.route('**/api/analytics?*', route => {
+      const query = new URL(route.request().url()).searchParams;
+      queries.push(query);
+      const offset = Number(query.get('breakdown_offset') || 0);
+      return route.fulfill({ json: {
+        ...analyticsPayload,
+        tokens: {
+          ...analyticsPayload.tokens,
+          breakdown: paginatedBreakdown.slice(offset, offset + 50),
+          breakdown_pagination: { total: 55, offset, limit: 50 },
+        },
+      } });
+    });
+    await page.goto('/analytics.html');
+    await page.locator('#breakdown-next').click();
+    await expect(page.locator('#breakdown-page-label')).toHaveText('51–55 of 55');
+
+    // Both actions run before the debounced filter request captures its query.
+    await page.evaluate(preference => {
+      document.querySelector('#source-filter [data-filter-value="codex"]').click();
+      document.querySelector(`#${preference}-toggle`).click();
+    }, preference);
+    await expect.poll(() => queries.at(-1)?.get('sources')).toBe('opencode,hermes');
+    expect(queries.at(-1).get('breakdown_offset')).toBe('0');
+    await expect(page.locator('#breakdown-body tr')).toHaveCount(50);
+    await expect(page.locator('#breakdown-body tr').first()).toContainText('fixture-model-00');
+  });
+}
+
 test('keeps the newest breakdown response when pagination requests finish out of order', async ({ page }) => {
   const queries = [];
   let releaseDelayedResponse;

@@ -1677,6 +1677,7 @@ byId('token-metric-toggle').addEventListener('click', () => {
 
 function refreshLocalizedAnalytics() {
   if (!lastPayload) return;
+  const requestedBreakdownOffset = state.breakdownOffset;
   try {
     render(lastPayload);
     // Retained sections remain independent of the new base revision while
@@ -1686,6 +1687,11 @@ function refreshLocalizedAnalytics() {
     if (diagnosticsPayload) renderDiagnostics(diagnosticsPayload);
     renderDiagnosticsStatus();
   } catch (error) { setMessage('analytics-error', error instanceof Error ? error.message : t('unableToLoadAnalytics')); }
+  finally {
+    // Reformatting retained data must preserve the page requested by new filters
+    // or by an in-flight pagination request.
+    state.breakdownOffset = requestedBreakdownOffset;
+  }
 }
 
 let activeTimezone = timezone();
