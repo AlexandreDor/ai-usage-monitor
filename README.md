@@ -142,9 +142,14 @@ The local Analytics page provides:
   calculations finish; each section retains its last valid data on failure;
 - previous-period token and cost comparisons using the same application/model
   filters and an immediately preceding period of equal duration;
-- remembered filters and locally shareable URLs;
+- remembered filters and locally shareable URLs: a filtered URL restores its
+  complete view, including its time zone, without inheriting the recipient's
+  saved model or comparison filters. Opening Analytics without URL filters
+  restores the locally saved choices;
 - full CSV exports of filtered quota/token series, weekly values, allocation,
-  and reset history, independently of the currently displayed table page;
+  and reset history, independently of the currently displayed table page.
+  All reset pages use one SQLite read snapshot, including when the optional
+  cache observer is unavailable or collection writes during the export;
 - an optional diagnostic panel with sanitized monitor health, archive counts,
   and the twenty most recent quota anomalies.
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import hashlib
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import math
@@ -15,7 +16,7 @@ import secrets
 import sqlite3
 import sys
 from statistics import median
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from analytics_cache import REGRESSION_CACHE, SNAPSHOT_REVISIONS, WEEKLY_CACHE
@@ -2557,7 +2558,9 @@ def hermes_baselines(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     return results
 
 
-def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now: int | None = None) -> dict[str, Any]:
+@contextmanager
+def read_snapshot(database: Path, pricing: Path) -> Iterator[Callable[..., dict[str, Any]]]:
+    """Build related payloads from one pinned archive and pricing snapshot."""
     if not database.is_file():
         raise AnalyticsUnavailableError("analytics archive is not available yet")
     try:
@@ -2578,131 +2581,148 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
             estimator_policy = tuple((name, value) for name, value in sorted(globals().items())
                                      if name.startswith("WEEKLY_") and isinstance(value, (str, int, float)))
             cache_namespace = (pinned_revision, pricing_digest, estimator_policy)
-        current = int(now if now is not None else datetime.now(timezone.utc).timestamp())
-        anchor = current
-        if "at" in params:
-            try:
-                anchor = int(params["at"])
-            except ValueError as exc:
-                raise AnalyticsError("at must be a positive epoch integer no later than now") from exc
-            if anchor <= 0 or anchor > current:
-                raise AnalyticsError("at must be a positive epoch integer no later than now")
-        section = params.get("sections", "full")
-        if section not in ("full", "base", "weekly", "resets", "breakdown"):
-            raise AnalyticsError("sections must be base, weekly, resets, or breakdown")
-        if params.get("compare", "") not in ("", "previous"):
-            raise AnalyticsError("compare must be previous")
-        start, end, range_label, granularity = period(connection, params, anchor)
-        if "source" in params and "sources" in params or "model" in params and "models" in params:
-            raise AnalyticsError("use either the singular or plural token filter")
-        sources = selected_values(params.get("sources", params.get("source", "all")), name="source", allowed=SOURCES)
-        models = selected_values(params.get("models", params.get("model", "")), name="model")
-        reset_type = params.get("reset_type", "all")
-        if reset_type not in ("all", "5h", "weekly"):
-            raise AnalyticsError("reset_type must be all, 5h, or weekly")
-        try:
-            reset_offset = int(params.get("reset_offset", "0"))
-            reset_limit = int(params.get("reset_limit", str(DEFAULT_RESET_PAGE_SIZE)))
-        except ValueError as exc:
-            raise AnalyticsError("reset pagination must use integers") from exc
-        if reset_offset < 0 or not 1 <= reset_limit <= 100:
-            raise AnalyticsError("reset_offset must be positive and reset_limit must be 1..100")
-        breakdown_offset = None
-        if "breakdown_offset" in params:
-            try:
-                breakdown_offset = int(params["breakdown_offset"])
-            except ValueError as exc:
-                raise AnalyticsError("breakdown_offset must be an integer") from exc
-            if breakdown_offset < 0:
-                raise AnalyticsError("breakdown_offset must be non-negative")
+        revision = (hashlib.sha256(repr(cache_namespace).encode()).hexdigest()
+                    if cache_namespace is not None else secrets.token_hex(32))
 
-        freshness = collector_freshness(connection, current)
-        cost_loader = _RequestCostEvents(connection, catalog)
-        warnings = [
-            f"{name} collector: {value['last_error']}"
-            for name, value in freshness["collectors"].items()
-            if value["status"] == "error" and value["last_error"]
-        ]
-        result = {
-            "schema_version": 1,
-            "revision": (hashlib.sha256(repr(cache_namespace).encode()).hexdigest()
-                         if cache_namespace is not None else secrets.token_hex(32)),
-            "period": {
-                "range": range_label,
-                "from": iso_utc(start),
-                "to": iso_utc(end),
-                "timezone": params.get("timezone", "Europe/Paris"),
-                "granularity_seconds": granularity,
-                "sample_interval_seconds": freshness["sample_interval_seconds"],
-            },
-            "filters": {"sources": list(sources), "models": list(models), "reset_type": reset_type},
-            "freshness": freshness,
-            "pricing": {"currency": catalog["currency"], "as_of": catalog.get("as_of", "unknown"), "valuation_mode": catalog.get("valuation_mode", "current_catalog")},
-            "warnings": warnings,
-        }
-        if section in ("full", "base", "breakdown"):
-            tokens, token_warnings = token_analytics(
-                connection, catalog, start, end, granularity, sources, models, breakdown_offset,
-            )
-            result["tokens"] = tokens
-            warnings.extend(token_warnings)
-        if section in ("full", "base"):
-            available_sources = [row[0] for row in connection.execute("SELECT DISTINCT source FROM token_usage_events ORDER BY source")]
-            available_models_count = int(scalar(connection, "SELECT COUNT(DISTINCT model) FROM token_usage_events") or 0)
-            if available_models_count > MAX_AVAILABLE_MODELS:
-                raise AnalyticsError(f"available model list exceeds the {MAX_AVAILABLE_MODELS}-model response limit")
-            available_models = [row[0] for row in connection.execute("SELECT DISTINCT model FROM token_usage_events ORDER BY model")]
-            result["available"] = {"sources": available_sources, "models": available_models}
-            result["limits"] = limit_series(connection, start, end, granularity)
-            result["baselines"] = {"hermes": hermes_baselines(connection)}
-            if params.get("compare") == "previous":
-                previous_start = start - (end - start)
-                previous_tokens, previous_warnings = token_analytics(
-                    connection, catalog, previous_start, start, granularity, sources, models, 0,
-                )
-                result["comparison"] = {
-                    "period": {"from": iso_utc(previous_start), "to": iso_utc(start)},
-                    "tokens": {"summary": previous_tokens["summary"]},
-                    "warnings": previous_warnings,
-                }
-        if section in ("full", "weekly"):
-            def compute_weekly():
-                historical = HistoricalFitCache(database) if cache_namespace is not None else None
-                try:
-                    return weekly_limit_value(
-                        connection, catalog, start, end, now=current,
-                        sample_interval_seconds=freshness["sample_interval_seconds"],
-                        cache_namespace=cache_namespace,
-                        cost_loader=cost_loader, historical_cache=historical,
-                    )
-                finally:
-                    if historical is not None:
-                        historical.close()
-            # Exact interval endpoints preserve membership. The only wall-clock
-            # dependency of weekly estimates is the latest-sample stale state.
-            result["weekly_limit_value"] = compute_weekly() if cache_namespace is None else WEEKLY_CACHE.get_or_compute(
-                (cache_namespace, start, end, freshness["sample_interval_seconds"],
-                 freshness["limits_freshness_status"] == "stale"), compute_weekly,
-            )
-        if section in ("full", "base", "resets"):
-            result["resets"] = reset_history(
-                connection, start, end, reset_type, reset_offset, reset_limit,
-                catalog if section != "base" else None,
-                cost_loader=cost_loader,
-            )
-            if section == "base":
-                result["pending_sections"] = ["weekly", "resets"]
-                for item in result["resets"]["items"]:
-                    if item["window"] == "weekly":
-                        item["cycle_cost_status"] = "pending"
-                        item["cycle_cost_reason"] = "pending"
-        return result
+        def build(params: dict[str, str], *, now: int | None = None) -> dict[str, Any]:
+            return _build_payload(connection, database, catalog, params,
+                                  cache_namespace=cache_namespace, revision=revision, now=now)
+
+        yield build
     except AnalyticsError:
         raise
     except (ArchiveCorruptionError, ArchiveSchemaError, OSError, sqlite3.DatabaseError) as exc:
         raise AnalyticsUnavailableError("analytics archive query failed") from exc
     finally:
         connection.close()
+
+
+def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now: int | None = None) -> dict[str, Any]:
+    with read_snapshot(database, pricing) as build:
+        return build(params, now=now)
+
+
+def _build_payload(connection: sqlite3.Connection, database: Path, catalog: dict[str, Any],
+                   params: dict[str, str], *, cache_namespace: tuple | None,
+                   revision: str, now: int | None) -> dict[str, Any]:
+    current = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    anchor = current
+    if "at" in params:
+        try:
+            anchor = int(params["at"])
+        except ValueError as exc:
+            raise AnalyticsError("at must be a positive epoch integer no later than now") from exc
+        if anchor <= 0 or anchor > current:
+            raise AnalyticsError("at must be a positive epoch integer no later than now")
+    section = params.get("sections", "full")
+    if section not in ("full", "base", "weekly", "resets", "breakdown"):
+        raise AnalyticsError("sections must be base, weekly, resets, or breakdown")
+    if params.get("compare", "") not in ("", "previous"):
+        raise AnalyticsError("compare must be previous")
+    start, end, range_label, granularity = period(connection, params, anchor)
+    if "source" in params and "sources" in params or "model" in params and "models" in params:
+        raise AnalyticsError("use either the singular or plural token filter")
+    sources = selected_values(params.get("sources", params.get("source", "all")), name="source", allowed=SOURCES)
+    models = selected_values(params.get("models", params.get("model", "")), name="model")
+    reset_type = params.get("reset_type", "all")
+    if reset_type not in ("all", "5h", "weekly"):
+        raise AnalyticsError("reset_type must be all, 5h, or weekly")
+    try:
+        reset_offset = int(params.get("reset_offset", "0"))
+        reset_limit = int(params.get("reset_limit", str(DEFAULT_RESET_PAGE_SIZE)))
+    except ValueError as exc:
+        raise AnalyticsError("reset pagination must use integers") from exc
+    if reset_offset < 0 or not 1 <= reset_limit <= 100:
+        raise AnalyticsError("reset_offset must be positive and reset_limit must be 1..100")
+    breakdown_offset = None
+    if "breakdown_offset" in params:
+        try:
+            breakdown_offset = int(params["breakdown_offset"])
+        except ValueError as exc:
+            raise AnalyticsError("breakdown_offset must be an integer") from exc
+        if breakdown_offset < 0:
+            raise AnalyticsError("breakdown_offset must be non-negative")
+
+    freshness = collector_freshness(connection, current)
+    cost_loader = _RequestCostEvents(connection, catalog)
+    warnings = [
+        f"{name} collector: {value['last_error']}"
+        for name, value in freshness["collectors"].items()
+        if value["status"] == "error" and value["last_error"]
+    ]
+    result = {
+        "schema_version": 1,
+        "revision": revision,
+        "period": {
+            "range": range_label,
+            "from": iso_utc(start),
+            "to": iso_utc(end),
+            "timezone": params.get("timezone", "Europe/Paris"),
+            "granularity_seconds": granularity,
+            "sample_interval_seconds": freshness["sample_interval_seconds"],
+        },
+        "filters": {"sources": list(sources), "models": list(models), "reset_type": reset_type},
+        "freshness": freshness,
+        "pricing": {"currency": catalog["currency"], "as_of": catalog.get("as_of", "unknown"), "valuation_mode": catalog.get("valuation_mode", "current_catalog")},
+        "warnings": warnings,
+    }
+    if section in ("full", "base", "breakdown"):
+        tokens, token_warnings = token_analytics(
+            connection, catalog, start, end, granularity, sources, models, breakdown_offset,
+        )
+        result["tokens"] = tokens
+        warnings.extend(token_warnings)
+    if section in ("full", "base"):
+        available_sources = [row[0] for row in connection.execute("SELECT DISTINCT source FROM token_usage_events ORDER BY source")]
+        available_models_count = int(scalar(connection, "SELECT COUNT(DISTINCT model) FROM token_usage_events") or 0)
+        if available_models_count > MAX_AVAILABLE_MODELS:
+            raise AnalyticsError(f"available model list exceeds the {MAX_AVAILABLE_MODELS}-model response limit")
+        available_models = [row[0] for row in connection.execute("SELECT DISTINCT model FROM token_usage_events ORDER BY model")]
+        result["available"] = {"sources": available_sources, "models": available_models}
+        result["limits"] = limit_series(connection, start, end, granularity)
+        result["baselines"] = {"hermes": hermes_baselines(connection)}
+        if params.get("compare") == "previous":
+            previous_start = start - (end - start)
+            previous_tokens, previous_warnings = token_analytics(
+                connection, catalog, previous_start, start, granularity, sources, models, 0,
+            )
+            result["comparison"] = {
+                "period": {"from": iso_utc(previous_start), "to": iso_utc(start)},
+                "tokens": {"summary": previous_tokens["summary"]},
+                "warnings": previous_warnings,
+            }
+    if section in ("full", "weekly"):
+        def compute_weekly():
+            historical = HistoricalFitCache(database) if cache_namespace is not None else None
+            try:
+                return weekly_limit_value(
+                    connection, catalog, start, end, now=current,
+                    sample_interval_seconds=freshness["sample_interval_seconds"],
+                    cache_namespace=cache_namespace,
+                    cost_loader=cost_loader, historical_cache=historical,
+                )
+            finally:
+                if historical is not None:
+                    historical.close()
+        # Exact interval endpoints preserve membership. The only wall-clock
+        # dependency of weekly estimates is the latest-sample stale state.
+        result["weekly_limit_value"] = compute_weekly() if cache_namespace is None else WEEKLY_CACHE.get_or_compute(
+            (cache_namespace, start, end, freshness["sample_interval_seconds"],
+             freshness["limits_freshness_status"] == "stale"), compute_weekly,
+        )
+    if section in ("full", "base", "resets"):
+        result["resets"] = reset_history(
+            connection, start, end, reset_type, reset_offset, reset_limit,
+            catalog if section != "base" else None,
+            cost_loader=cost_loader,
+        )
+        if section == "base":
+            result["pending_sections"] = ["weekly", "resets"]
+            for item in result["resets"]["items"]:
+                if item["window"] == "weekly":
+                    item["cycle_cost_status"] = "pending"
+                    item["cycle_cost_reason"] = "pending"
+    return result
 
 
 def main() -> int:

@@ -1,12 +1,18 @@
 import csv
 import io
 import pathlib
+import sqlite3
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "local"))
-from analytics import AnalyticsError, AnalyticsUnavailableError
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "local"))
+import analytics
+import analytics_export
+from storage import connect_database
+from analytics import AnalyticsError
 from analytics_export import build_csv, safe_cell
 
 
@@ -22,19 +28,6 @@ class AnalyticsExportTests(unittest.TestCase):
         self.assertEqual(row["model"], "'=SUM(1,2)")
         self.assertEqual(row["input_tokens"], "123456789")
         self.assertEqual(row["estimated_cost_usd"], "0.12345678")
-
-    def test_all_reset_pages_are_exported_from_one_revision(self):
-        pages = [{"revision": "same", "resets": {"total": 205, "items": [{"window": "weekly", "reset_at": str(i)} for i in range(begin, end)]}} for begin, end in [(0, 100), (100, 200), (200, 205)]]
-        with patch("analytics_export.build_payload", side_effect=pages) as build:
-            body = build_csv(pathlib.Path("db"), pathlib.Path("prices"), {}, "resets", now=2000)
-        self.assertEqual(len(list(csv.DictReader(io.StringIO(body.decode("utf-8-sig"))))), 205)
-        self.assertEqual([call.kwargs["now"] for call in build.call_args_list], [2000, 2000, 2000])
-
-    def test_reset_revision_change_aborts_export(self):
-        pages = [{"revision": "a", "resets": {"total": 2, "items": [{"window": "weekly"}]}}, {"revision": "b", "resets": {"total": 2, "items": [{"window": "weekly"}]}}]
-        with patch("analytics_export.build_payload", side_effect=pages):
-            with self.assertRaises(AnalyticsUnavailableError):
-                build_csv(pathlib.Path("db"), pathlib.Path("prices"), {}, "resets", now=2000)
 
     def test_limits_and_per_source_tokens_keep_units_and_unknown_values(self):
         fixtures = [("limits", {"limits": {"series": [{"at": "UTC", "weekly_pct": None, "five_h_pct": 99.125}]}}), ("tokens", {"tokens": {"series": [], "series_by_source": [{"at": "UTC", "source": "hermes", "total_tokens": 5, "estimated_cost_usd": 1.25}]}})]
@@ -69,6 +62,71 @@ class AnalyticsExportTests(unittest.TestCase):
             self.assertEqual(safe_cell(value), "'" + value)
         self.assertEqual(safe_cell(-12.5), -12.5)
         self.assertEqual(safe_cell("ordinary"), "ordinary")
+
+
+class ResetExportSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.database = pathlib.Path(temporary.name) / "archive.sqlite3"
+        self.pricing = ROOT / "local/pricing.json"
+        self.base = 1_700_000_000
+        self.now = self.base + 300 * 900
+        self.writer = connect_database(self.database)
+        self.addCleanup(self.writer.close)
+        with self.writer:
+            self.writer.executemany("INSERT INTO reset_events VALUES (?, ?, ?, ?, ?, ?)", [
+                ("5h", self.base + index * 900, self.base + index * 900, 20, 100, "scheduled_crossing")
+                for index in range(205)
+            ])
+
+    def export(self):
+        body = build_csv(self.database, self.pricing,
+                         {"range": "all", "reset_type": "5h", "reset_offset": "50"},
+                         "resets", now=self.now)
+        return list(csv.DictReader(io.StringIO(body.decode("utf-8-sig"))))
+
+    def assert_complete_snapshot(self, rows):
+        self.assertEqual(len(rows), 205)
+        self.assertEqual([row["reset_at"] for row in rows], [
+            analytics.iso_utc(self.base + index * 900) for index in reversed(range(205))
+        ])
+        self.assertEqual({row["before_pct"] for row in rows}, {"20.0"})
+
+    def test_all_pages_ignore_display_offset_and_preserve_the_snapshot(self):
+        self.assert_complete_snapshot(self.export())
+
+    def test_observer_failure_does_not_prevent_a_complete_export(self):
+        with patch.object(analytics.SNAPSHOT_REVISIONS, "_read_observation_locked",
+                          side_effect=sqlite3.OperationalError("disk I/O error")):
+            self.assert_complete_snapshot(self.export())
+
+    def test_concurrent_collection_cannot_change_later_export_pages(self):
+        original = analytics.reset_history
+        pages = []
+
+        def read_then_collect(*args, **kwargs):
+            result = original(*args, **kwargs)
+            pages.append(result["offset"])
+            if len(pages) == 1:
+                with self.writer:
+                    self.writer.execute("DELETE FROM reset_events WHERE reset_at_epoch=?", (self.base,))
+                    self.writer.execute("UPDATE reset_events SET before_pct=80")
+                    self.writer.execute("INSERT INTO reset_events VALUES (?, ?, ?, ?, ?, ?)",
+                        ("5h", self.now - 1, self.now - 1, 80, 100, "scheduled_crossing"))
+            return result
+
+        with patch.object(analytics, "reset_history", side_effect=read_then_collect):
+            self.assert_complete_snapshot(self.export())
+        self.assertEqual(pages, [0, 100, 200])
+        fresh = self.export()
+        self.assertEqual(fresh[0]["reset_at"], analytics.iso_utc(self.now - 1))
+        self.assertEqual({row["before_pct"] for row in fresh}, {"80.0"})
+
+    def test_export_limit_still_rejects_oversized_snapshots(self):
+        with patch.object(analytics_export, "MAX_EXPORT_ROWS", 200):
+            with self.assertRaisesRegex(AnalyticsError, "exceeds 200 rows"):
+                self.export()
 
 
 if __name__ == "__main__":

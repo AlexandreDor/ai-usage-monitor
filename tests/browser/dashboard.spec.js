@@ -1720,6 +1720,89 @@ test('labels retained old sections while a coherent fallback loads and after it 
   expect(await page.evaluate(() => JSON.stringify([weeklyValueData, displayedResetData]))).toBe(oldSections);
 });
 
+test('shared automatic filters replace the recipient saved view', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('codex-usage-monitor.analytics-filters', JSON.stringify({
+      range: 'all', sources: ['codex'], models: ['retired-model'], reset_type: '5h', compare: 'previous',
+      from_date: '2026-10-01', to_date: '2026-10-02',
+    }));
+  });
+  const queries = [];
+  await page.route('**/api/analytics?*', route => {
+    queries.push(new URL(route.request().url()).searchParams);
+    return route.fulfill({ json: analyticsPayload });
+  });
+  await page.goto('/analytics.html?range=7d&sources=all&reset_type=weekly&timezone=UTC');
+  await expect(page.locator('#model-selection-summary')).toHaveText('7 of 10 selected');
+  expect(queries[0].get('models').split(',')).toContain('gpt-6.1-sol');
+  expect(queries[0].get('models')).not.toContain('retired-model');
+  expect(queries[0].get('compare')).toBeNull();
+  expect(queries[0].get('sources')).toBe('codex,opencode,hermes');
+  expect(queries[0].get('from_date')).toBeNull();
+  const shared = new URL(page.url()).searchParams;
+  expect(shared.has('models')).toBe(false);
+  expect(shared.has('compare')).toBe(false);
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('codex-usage-monitor.analytics-filters')).models)).toBeUndefined();
+});
+
+test('shared custom dates retain the sender timezone in a fresh browser', async ({ page, browser }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('codex-usage-monitor.preferences', JSON.stringify({ timezone: 'UTC' }));
+  });
+  const routeAnalytics = async (target, queries) => {
+    await target.route('**/api/analytics?*', route => {
+      const query = new URL(route.request().url()).searchParams;
+      queries.push(query);
+      const utc = query.get('timezone') === 'UTC';
+      return route.fulfill({ json: { ...analyticsPayload,
+        period: { ...analyticsPayload.period, range: 'custom', timezone: query.get('timezone'),
+          from: utc ? '2026-10-07T00:00:00Z' : '2026-10-06T22:00:00Z',
+          to: utc ? '2026-10-08T00:00:00Z' : '2026-10-07T22:00:00Z' },
+        tokens: { ...analyticsPayload.tokens, summary: { input_tokens: utc ? 300 : 100,
+          cache_read_tokens: 0, cache_write_tokens: 0, output_tokens: 0, reasoning_tokens: 0,
+          events: 2, estimated_cost_usd: 0, assumed_zero_tokens: 0 } },
+      } });
+    });
+  };
+  const senderQueries = [];
+  await routeAnalytics(page, senderQueries);
+  await page.goto('/analytics.html?from_date=2026-10-07&to_date=2026-10-07&models=gpt-6.1-sol');
+  await expect(page.locator('#total-tokens')).toHaveText('300');
+  const sharedUrl = page.url();
+  const recipientContext = await browser.newContext();
+  try {
+    const recipient = await recipientContext.newPage();
+    const recipientQueries = [];
+    await routeAnalytics(recipient, recipientQueries);
+    await recipient.goto(sharedUrl);
+    await expect(recipient.locator('#total-tokens')).toHaveText('300');
+    expect(recipientQueries[0].get('timezone')).toBe(senderQueries[0].get('timezone'));
+    await expect(recipient.locator('[data-preference-input="timezone"]')).toHaveValue('UTC');
+    expect(new URL(sharedUrl).searchParams.get('timezone')).toBe('UTC');
+    expect(new URL(await recipient.locator('#csv-download').getAttribute('href'), sharedUrl).searchParams.get('timezone')).toBe('UTC');
+  } finally {
+    await recipientContext.close();
+  }
+});
+
+for (const zone of ['Invalid/Zone', '+02:00']) {
+  test(`shared invalid timezone ${zone} preserves the valid browser preference`, async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem('codex-usage-monitor.preferences', JSON.stringify({ timezone: 'UTC' }));
+    });
+    const queries = [];
+    await page.route('**/api/analytics?*', route => {
+      queries.push(new URL(route.request().url()).searchParams);
+      return route.fulfill({ json: analyticsPayload });
+    });
+    await page.goto(`/analytics.html?range=7d&timezone=${encodeURIComponent(zone)}`);
+    await expect(page.locator('#total-tokens')).toHaveText('1.73M');
+    expect(queries[0].get('timezone')).toBe('UTC');
+    expect(new URL(page.url()).searchParams.get('timezone')).toBe('UTC');
+    await expect(page.locator('[data-preference-input="timezone"]')).toHaveValue('UTC');
+  });
+}
+
 test('retains explicit unavailable models and validated filters through reload and local navigation', async ({ page }) => {
   const queries = [];
   await mockUsage(page);

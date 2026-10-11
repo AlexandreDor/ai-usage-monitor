@@ -72,9 +72,17 @@ function restoreFilters() {
   try { saved = JSON.parse(localStorage.getItem(FILTER_STORAGE_KEY) || '{}') || {}; if (typeof saved !== 'object' || Array.isArray(saved)) saved = {}; } catch (_error) { /* Storage is optional. */ }
   if (typeof location === 'object' && typeof URLSearchParams === 'function') {
     const query = new URLSearchParams(location.search);
+    const keys = ['range', 'sources', 'models', 'from_date', 'to_date', 'reset_type', 'compare', 'timezone'];
+    // A shared URL describes a complete view. Missing keys use defaults,
+    // rather than inheriting unrelated filters from the recipient's browser.
+    if (keys.some(key => query.has(key))) saved = {};
     if (!query.has('range') && query.has('from_date') && query.has('to_date')) saved.range = 'custom';
-    for (const key of ['range', 'sources', 'models', 'from_date', 'to_date', 'reset_type', 'compare']) {
+    for (const key of keys) {
       if (query.has(key)) saved[key] = query.get(key);
+    }
+    if (query.has('timezone') && typeof CodexPreferences === 'object') {
+      const zone = CodexPreferences.canonicalTimezone(query.get('timezone'));
+      if (zone) CodexPreferences.set({ timezone: zone });
     }
   }
   if (['24h', '7d', '30d', '90d', '1y', 'all', 'custom'].includes(saved.range)) state.range = saved.range;
@@ -98,7 +106,7 @@ function persistFilters() {
   try { localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(saved)); } catch (_error) { /* Storage is optional. */ }
   if (typeof history === 'object' && typeof location === 'object') {
     const query = new URLSearchParams(queryString());
-    for (const key of ['reset_offset', 'reset_limit', 'breakdown_offset', 'timezone']) query.delete(key);
+    for (const key of ['reset_offset', 'reset_limit', 'breakdown_offset']) query.delete(key);
     if (!state.explicitModels) query.delete('models');
     try { history.replaceState(null, '', `${location.pathname}?${query}${location.hash}`); } catch (_error) { /* Embedded pages may reject URL updates. */ }
   }

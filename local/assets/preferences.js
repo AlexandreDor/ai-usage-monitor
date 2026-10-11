@@ -913,6 +913,7 @@
     locale,
     numberLocale,
     timezone: () => preferences.timezone,
+    canonicalTimezone,
     convertUsd: value => Number(value) * (preferences.currency === 'EUR' ? preferences.usdToEurRate : 1),
     dateFormatter: options => formatter('date', locale(), { ...options, timeZone: preferences.timezone }),
     numberFormatter: (options = {}, language = numberLocale()) => formatter('number', language, options),
