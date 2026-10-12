@@ -1009,7 +1009,7 @@ spreadsheet formula is escaped. Exports above 10,000 rows or 16 MiB fail with an
 explicit request to shorten the period rather than silently truncate.
 
 The read-only API retains its existing full JSON response by default. Optional
-`sections=base|weekly|resets|breakdown` selects a component, `at` anchors the
+`sections=base|weekly|resets|breakdown|limits|tokens` selects a component, `at` anchors the
 period endpoint to a Unix timestamp, `timezone` selects custom-date boundaries,
 and `compare=previous` adds the preceding-period summary. Every response includes
 an opaque archive/pricing `revision`; the frontend only combines components
@@ -1031,10 +1031,15 @@ New entries are committed together at the end of the request. Unavailable, locke
 caches fall back to ordinary calculation; deleting the cache is safe.
 
 `/api/analytics.csv?dataset=limits|tokens|weekly_value|breakdown|resets` accepts the
-same period/source/model/reset filters. `/api/diagnostics` exposes only an
-allowlisted projection: health status and times, counters, fixed error labels,
-and recent anomaly types/percentages. Raw health errors, account identifiers,
-private filesystem paths and configuration are not served.
+same period/source/model/reset filters. Allocation and reset CSV pages share
+one pinned archive transaction and pricing catalog, including when collection
+commits during a download. Limit and token
+series exports do not calculate an unrelated allocation table.
+
+`/api/diagnostics` exposes only an allowlisted projection: health status and
+times, counters, fixed error labels, and recent anomaly types/percentages.
+Raw health errors, account identifiers, private filesystem paths and
+configuration are not served.
 
 Static assets use ETag revalidation, so changed releases are picked up immediately
 while unchanged files return 304. JSON, CSV, diagnostics and runtime snapshots
@@ -1051,8 +1056,16 @@ python3 local/backup.py --database local/runtime/usage-history.sqlite3 \
 ```
 
 The backup directory is private and backups are mode `600`. The tool uses the
-SQLite backup API, checks integrity and the current archive schema, publishes
+same trusted ancestry requirement for the source archive and destination:
+ancestors must be owned by the current user or root, and must not be writable
+by other users unless protected by the sticky bit, as with `/tmp`. A private
+directory inside a group-writable non-sticky tree is rejected before SQLite
+opens the archive. Choose a private tree when using the local command above.
+The tool opens only its reserved temporary file and checks that the verified
+file is the same nonempty inode that will be published. It uses the SQLite
+backup API, checks integrity and the current archive schema, publishes
 atomically, and only prunes verified owned backups matching its naming scheme.
+The source archive is excluded by file identity, including aliased paths.
 Concurrent runs are rejected. A failed copy leaves previous backups intact;
 unsafe, linked or unverifiable retention candidates are left untouched.
 The copy phase has a thirty-second deadline. These backups remain on this

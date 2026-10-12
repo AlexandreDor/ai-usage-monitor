@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import closing
+from urllib.parse import unquote, urlsplit
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -114,6 +115,30 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(before, source.read_bytes())
         self.assertEqual(2, len(self.files()))
 
+    def test_retention_preserves_source_with_double_slash_alias(self):
+        first = self.create()
+        source = self.destination / first["backup"]
+        alias = pathlib.Path("/" + str(source))
+        self.assertTrue(alias.samefile(source))
+        self.assertNotEqual(alias, source)
+        before = source.read_bytes()
+        result = backup.create_backup(alias, self.destination, keep=1)
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(before, source.read_bytes())
+        self.assertEqual(2, len(self.files()))
+
+    def test_lock_cannot_alias_source_with_double_slash_path(self):
+        self.destination.mkdir(mode=0o700)
+        source = self.destination / backup.LOCK_NAME
+        with closing(sqlite3.connect(source)) as copied:
+            self.writer.backup(copied)
+        source.chmod(0o600)
+        before = source.read_bytes()
+        with self.assertRaises(operations.UnsafePathError):
+            backup.create_backup(pathlib.Path("/" + str(source)), self.destination)
+        self.assertEqual(before, source.read_bytes())
+        self.assertEqual([], self.files())
+
     def test_permissive_umask_cannot_create_public_backup_or_lock(self):
         previous = os.umask(0)
         try:
@@ -202,6 +227,114 @@ class BackupTests(unittest.TestCase):
         with mock.patch("operations.os.geteuid", return_value=os.geteuid() + 1):
             with self.assertRaises(OSError):
                 self.create()
+
+    def test_replaceable_destination_ancestor_cannot_redirect_sqlite_copy(self):
+        shared = self.runtime / "shared"
+        shared.mkdir(mode=0o700)
+        shared.chmod(0o777)
+        container = shared / "container"
+        container.mkdir(mode=0o700)
+        destination = container / "backups"
+        destination.mkdir(mode=0o700)
+        original_connect = sqlite3.connect
+        redirected = []
+
+        def replace_ancestor(path, *args, **kwargs):
+            if isinstance(path, str) and ".codex-backup-" in path:
+                container.rename(shared / "moved")
+                container.mkdir(mode=0o700)
+                destination.mkdir(mode=0o700)
+                redirected.append(path)
+            return original_connect(path, *args, **kwargs)
+
+        with mock.patch.object(backup.sqlite3, "connect", side_effect=replace_ancestor):
+            with self.assertRaises(operations.UnsafePathError):
+                backup.create_backup(self.database, destination)
+        self.assertEqual([], redirected)
+        self.assertEqual([], list(destination.iterdir()))
+
+    def test_owner_directory_move_cannot_publish_an_unverified_inode(self):
+        container = self.runtime / "container"
+        container.mkdir(mode=0o700)
+        destination = container / "backups"
+        destination.mkdir(mode=0o700)
+        moved = self.runtime / "moved"
+        original_connect = sqlite3.connect
+        redirected = []
+
+        def move_owner_directory(path, *args, **kwargs):
+            if isinstance(path, str) and ".codex-backup-" in path and not redirected:
+                container.rename(moved)
+                container.mkdir(mode=0o700)
+                destination.mkdir(mode=0o700)
+                replacement = pathlib.Path(unquote(urlsplit(path).path)) if path.startswith("file:") else pathlib.Path(path)
+                replacement.touch(mode=0o600)
+                redirected.append(path)
+            return original_connect(path, *args, **kwargs)
+
+        with mock.patch.object(backup.sqlite3, "connect", side_effect=move_owner_directory):
+            with self.assertRaises(operations.UnsafePathError):
+                backup.create_backup(self.database, destination)
+        self.assertEqual(1, len(redirected))
+        self.assertEqual([], list((moved / "backups").glob("codex-usage-*.sqlite3")))
+        self.assertEqual([], list((moved / "backups").glob(".codex-backup-*.tmp")))
+
+    def test_writable_ancestors_are_rejected_for_source_and_destination(self):
+        shared = self.runtime / "shared"
+        shared.mkdir(mode=0o700)
+        private = shared / "private"
+        private.mkdir(mode=0o700)
+        source = private / "archive.sqlite3"
+        with closing(sqlite3.connect(source)) as copied:
+            self.writer.backup(copied)
+        source.chmod(0o600)
+        destination = private / "backups"
+        destination.mkdir(mode=0o700)
+        for mode in (0o775, 0o777):
+            shared.chmod(mode)
+            for database, target in ((self.database, destination), (source, self.destination)):
+                with self.subTest(mode=oct(mode), source=database == source):
+                    with mock.patch.object(backup.sqlite3, "connect", wraps=sqlite3.connect) as opened:
+                        with self.assertRaises(operations.UnsafePathError):
+                            backup.create_backup(database, target)
+                        opened.assert_not_called()
+
+    def test_untrusted_ancestor_owner_is_rejected_even_when_readonly_or_sticky(self):
+        ancestor = self.runtime / "ancestor"
+        ancestor.mkdir(mode=0o700)
+        destination = ancestor / "backups"
+        destination.mkdir(mode=0o700)
+        identity = ancestor.stat()
+        original_fstat = os.fstat
+
+        def untrusted_owner(descriptor):
+            metadata = original_fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) == (identity.st_dev, identity.st_ino):
+                fields = list(metadata)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return metadata
+
+        for mode in (0o555, 0o1777):
+            ancestor.chmod(mode)
+            with self.subTest(mode=oct(mode)), mock.patch("operations.os.fstat", side_effect=untrusted_owner):
+                with self.assertRaises(operations.UnsafePathError):
+                    backup.create_backup(self.database, destination)
+        ancestor.chmod(0o700)
+
+    def test_trusted_sticky_ancestor_preserves_private_backup_workflow(self):
+        shared = self.runtime / "sticky"
+        shared.mkdir(mode=0o700)
+        shared.chmod(0o1777)
+        private = shared / "private"
+        private.mkdir(mode=0o700)
+        destination = private / "backups"
+        result = backup.create_backup(self.database, destination)
+        restored = storage.connect_database(destination / result["backup"], read_only=True)
+        restored.close()
+        self.assertEqual("ok", result["status"])
+        self.assertGreater((destination / result["backup"]).stat().st_size, 0)
+        self.assertEqual(0o600, (destination / result["backup"]).stat().st_mode & 0o777)
 
     def test_schema_failure_and_missing_source_have_sanitized_cli_errors(self):
         with self.writer:

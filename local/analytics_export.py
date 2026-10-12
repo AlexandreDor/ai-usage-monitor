@@ -16,7 +16,7 @@ TOKEN_COLUMNS = ("input_tokens", "cache_read_tokens", "cache_write_tokens", "out
 LIMIT_COLUMNS = ("at", "five_h_pct", "weekly_pct", "ideal_weekly_pct", "forecast_chance_24h_pct", "forecast_chance_6h_pct", "forecast_generated_at", "samples")
 WEEKLY_COLUMNS = ("at", "model", "providers", "observed_cost_usd", "quota_consumed_pct_points", "raw_value_usd", "value_usd", "quality", "reason", "inferred", "carried", "source_at", "source_age_seconds", "source_method", "value_lower_usd", "value_upper_usd", "high_uncertainty")
 RESET_COLUMNS = ("window", "category", "reset_at", "observed_at", "before_pct", "after_pct", "detection_method", "forecast_chance_24h_pct", "forecast_chance_6h_pct", "estimated_cycle_cost_usd", "extrapolated_100_value_usd", "cycle_cost_status", "cycle_cost_reason")
-DATASET_SECTIONS = {"limits": "base", "tokens": "breakdown", "weekly_value": "weekly", "breakdown": "breakdown", "resets": "resets"}
+DATASET_SECTIONS = {"limits": "limits", "tokens": "tokens", "weekly_value": "weekly", "breakdown": "breakdown", "resets": "resets"}
 
 
 def safe_cell(value: Any) -> Any:
@@ -41,21 +41,31 @@ def build_csv(database: Path, pricing: Path, params: dict[str, str], dataset: st
     query.pop("reset_offset", None)
     query["sections"] = DATASET_SECTIONS[dataset]
     query["reset_limit"] = "100"
-    # Every reset page reads the same transaction, even when optional cache
+    # Every allocation/reset page reads the same transaction, even when cache
     # observation fails or collection commits while the export is running.
-    if dataset == "resets":
+    if dataset in ("resets", "breakdown"):
+        offset_key = "reset_offset" if dataset == "resets" else "breakdown_offset"
+        query[offset_key] = "0"
         with read_snapshot(database, pricing) as build:
-            resets = build(query, now=current)["resets"]
-            if resets["total"] > MAX_EXPORT_ROWS:
+            def page():
+                payload = build(query, now=current)
+                if dataset == "resets":
+                    return payload["resets"]["items"], payload["resets"]
+                return payload["tokens"]["breakdown"], payload["tokens"]["breakdown_pagination"]
+
+            items, pagination = page()
+            total = pagination["total"]
+            if total > MAX_EXPORT_ROWS:
                 raise AnalyticsError(f"CSV export exceeds {MAX_EXPORT_ROWS} rows; choose a shorter period")
-            rows = list(resets["items"])
-            while len(rows) < resets["total"]:
-                query["reset_offset"] = str(len(rows))
-                items = build(query, now=current)["resets"]["items"]
-                if not items:
-                    raise AnalyticsUnavailableError("analytics reset export is incomplete")
+            rows = list(items)
+            while len(rows) < total:
+                query[offset_key] = str(len(rows))
+                items, pagination = page()
+                if not items or pagination["offset"] != len(rows) or pagination["total"] != total:
+                    raise AnalyticsUnavailableError(f"analytics {dataset} export is incomplete")
                 rows.extend(items)
-        columns = RESET_COLUMNS
+        columns = (RESET_COLUMNS if dataset == "resets" else
+                   ("source", "provider", "model", *TOKEN_COLUMNS, "pricing_status", "events"))
     else:
         payload = build_payload(database, pricing, query, now=current)
         if dataset == "limits":
@@ -64,9 +74,6 @@ def build_csv(database: Path, pricing: Path, params: dict[str, str], dataset: st
             columns = ("at", "source", *TOKEN_COLUMNS)
             tokens = payload["tokens"]
             rows = tokens.get("series_by_source") or [dict(row, source="all") for row in tokens["series"]]
-        elif dataset == "breakdown":
-            columns = ("source", "provider", "model", *TOKEN_COLUMNS, "pricing_status", "events")
-            rows = payload["tokens"]["breakdown"]
         elif dataset == "weekly_value":
             columns = WEEKLY_COLUMNS
             data = payload["weekly_limit_value"]

@@ -36,7 +36,8 @@ def _verify(path: Path) -> None:
     connection.close()
 
 
-def _retention_candidates(destination: Path, directory: int, *, source: Path) -> list[str]:
+def _retention_candidates(destination: Path, directory: int, *, source: Path,
+                          source_identity: tuple[int, int]) -> list[str]:
     candidates = []
     for name in os.listdir(directory):
         if not BACKUP_NAME.fullmatch(name) or destination / name == source:
@@ -45,6 +46,9 @@ def _retention_candidates(destination: Path, directory: int, *, source: Path) ->
         try:
             descriptor = open_owned_regular(name, directory)
             metadata = os.fstat(descriptor)
+            # Equivalent paths (including leading //) must not prune the source.
+            if (metadata.st_dev, metadata.st_ino) == source_identity:
+                continue
             if stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1:
                 continue
             _verify(destination / name)
@@ -62,8 +66,13 @@ def create_backup(database: Path, destination_directory: Path, *, keep: int = 14
     """Publish a coherent backup, then prune verified backups under one lock."""
     if type(keep) is not int or not 1 <= keep <= 10000:
         raise BackupError("invalid_retention")
-    database = validate_archive_path(database)
-    destination, directory = open_private_directory(destination_directory, create=True)
+    # SQLite reopens paths, including during retention verification. Reject
+    # ancestry another user could replace after the descriptor-based checks.
+    database = validate_archive_path(database, require_stable_path=True)
+    source_metadata = database.stat(follow_symlinks=False)
+    source_identity = (source_metadata.st_dev, source_metadata.st_ino)
+    destination, directory = open_private_directory(destination_directory, create=True,
+                                                     require_stable_path=True)
     lock = -1
     temporary_fd = -1
     temporary_name = None
@@ -72,7 +81,7 @@ def create_backup(database: Path, destination_directory: Path, *, keep: int = 14
             raise UnsafePathError("unsafe lock")
         lock = open_owned_regular(LOCK_NAME, directory, flags=os.O_RDWR | os.O_CREAT)
         metadata = os.fstat(lock)
-        if metadata.st_nlink != 1:
+        if metadata.st_nlink != 1 or (metadata.st_dev, metadata.st_ino) == source_identity:
             raise UnsafePathError("unsafe lock")
         # Secure an existing lock too; lock contents never carry archive data.
         os.fchmod(lock, 0o600)
@@ -93,7 +102,9 @@ def create_backup(database: Path, destination_directory: Path, *, keep: int = 14
         temporary = destination / temporary_name
         source = storage.connect_database(database, read_only=True)
         try:
-            target = sqlite3.connect(str(temporary))
+            # Open only the file already reserved with mode 0600; a moved path
+            # must not cause SQLite to create a new, potentially public file.
+            target = sqlite3.connect(temporary.as_uri() + "?mode=rw", uri=True)
             try:
                 deadline = time.monotonic() + BACKUP_TIMEOUT_SECONDS
 
@@ -110,6 +121,11 @@ def create_backup(database: Path, destination_directory: Path, *, keep: int = 14
         finally:
             source.close()
         _verify(temporary)
+        reserved = os.fstat(temporary_fd)
+        verified = temporary.stat(follow_symlinks=False)
+        if ((reserved.st_dev, reserved.st_ino) != (verified.st_dev, verified.st_ino)
+                or reserved.st_size == 0):
+            raise UnsafePathError("backup file changed")
         os.fsync(temporary_fd)
         # Hard-link publication is atomic and cannot overwrite an old backup,
         # even if a generated name unexpectedly collides.
@@ -119,7 +135,8 @@ def create_backup(database: Path, destination_directory: Path, *, keep: int = 14
         temporary_name = None
         os.fsync(directory)
 
-        candidates = _retention_candidates(destination, directory, source=database)
+        candidates = _retention_candidates(destination, directory, source=database,
+                                            source_identity=source_identity)
         # Always retain the just-published file, including clock rollback.
         ordered = [final_name] + [name for name in candidates if name != final_name]
         removed = 0

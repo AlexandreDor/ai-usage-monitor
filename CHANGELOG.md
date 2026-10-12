@@ -37,6 +37,11 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Fixed
 
+- Reject replaceable source/destination ancestry before SQLite backup opens,
+  publish only the reserved, verified nonempty backup inode, and preserve source
+  archives even when their paths use aliases.
+- Export allocations above the JSON response limit from one paginated snapshot;
+  limit and token CSV exports no longer depend on allocation-table size.
 - Preserve special characters in read-only SQLite archive URIs.
 - Give Analytics charts translated accessible names.
 

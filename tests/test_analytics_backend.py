@@ -159,6 +159,15 @@ class AnalyticsBackendTests(unittest.TestCase):
             self.assertEqual(partial[field], full[field])
             self.assertEqual(partial['revision'], full['revision'])
             self.assertNotIn('limits', partial)
+        with patch.object(analytics, 'token_analytics', side_effect=AssertionError('unrequested tokens')):
+            limits = self.payload({'range': 'all', 'sections': 'limits'})
+        self.assertEqual(limits['limits'], full['limits'])
+        self.assertNotIn('tokens', limits)
+        self.assertNotIn('available', limits)
+        with patch.object(analytics, 'limit_series', side_effect=AssertionError('unrequested limits')):
+            tokens = self.payload({'range': 'all', 'sections': 'tokens'})
+        self.assertEqual(tokens['tokens'], {key: value for key, value in full['tokens'].items() if key != 'breakdown'})
+        self.assertNotIn('breakdown', tokens['tokens'])
 
     def test_reset_cycle_outside_weekly_horizon_matches_cold_and_warm_full(self):
         end = self.base

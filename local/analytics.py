@@ -2040,6 +2040,8 @@ def token_analytics(
     sources: Sequence[str],
     models: Sequence[str],
     breakdown_offset: int | None,
+    *,
+    include_breakdown: bool = True,
 ) -> tuple[dict[str, Any], list[str]]:
     """Aggregate token usage while preserving each effective pricing period."""
     prices = price_index(catalog)
@@ -2050,7 +2052,7 @@ def token_analytics(
         connection,
         f"SELECT COUNT(*) FROM (SELECT 1 FROM token_usage_events WHERE {conditions} GROUP BY source, provider, model)",
         values,
-    ) or 0)
+    ) or 0) if include_breakdown else 0
     if breakdown_offset is None and breakdown_total > MAX_BREAKDOWN_ROWS:
         raise AnalyticsError(f"token breakdown exceeds the {MAX_BREAKDOWN_ROWS}-group response limit")
     last_page_offset = (
@@ -2118,7 +2120,7 @@ def token_analytics(
         group["assumed_zero"] = group["assumed_zero"] or assumed_zero
 
     breakdown_page_keys: tuple[tuple[str, str, str], ...] | None = None
-    if breakdown_offset is not None:
+    if include_breakdown and breakdown_offset is not None:
         page_rows = connection.execute(
             f"SELECT source, provider, model FROM token_usage_events WHERE {conditions} "
             "GROUP BY source, provider, model ORDER BY source, model, provider LIMIT ? OFFSET ?",
@@ -2129,13 +2131,13 @@ def token_analytics(
         )
 
     breakdown_groups: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for segment_start, raw in segmented_rows(
+    for segment_start, raw in (segmented_rows(
         f"source, provider, model, {sums}, COUNT(*) AS events",
         "source, provider, model",
         MAX_BREAKDOWN_PROCESSING_ROWS,
         f"token breakdown exceeds the {MAX_BREAKDOWN_PROCESSING_ROWS}-row processing limit",
         breakdown_page_keys,
-    ):
+    ) if include_breakdown else ()):
         item = token_row(raw)
         key = (str(item["source"]), str(item["provider"]), str(item["model"]))
         normalize_token_counts(item)
@@ -2245,9 +2247,10 @@ def token_analytics(
         "summary": summary,
         "series": series,
         "series_by_source": series_by_source,
-        "breakdown": breakdown,
     }
-    if breakdown_offset is not None:
+    if include_breakdown:
+        result["breakdown"] = breakdown
+    if include_breakdown and breakdown_offset is not None:
         result["breakdown_pagination"] = {
             "total": breakdown_total,
             "offset": effective_breakdown_offset,
@@ -2615,8 +2618,8 @@ def _build_payload(connection: sqlite3.Connection, database: Path, catalog: dict
         if anchor <= 0 or anchor > current:
             raise AnalyticsError("at must be a positive epoch integer no later than now")
     section = params.get("sections", "full")
-    if section not in ("full", "base", "weekly", "resets", "breakdown"):
-        raise AnalyticsError("sections must be base, weekly, resets, or breakdown")
+    if section not in ("full", "base", "weekly", "resets", "breakdown", "limits", "tokens"):
+        raise AnalyticsError("sections must be base, weekly, resets, breakdown, limits, or tokens")
     if params.get("compare", "") not in ("", "previous"):
         raise AnalyticsError("compare must be previous")
     start, end, range_label, granularity = period(connection, params, anchor)
@@ -2666,12 +2669,15 @@ def _build_payload(connection: sqlite3.Connection, database: Path, catalog: dict
         "pricing": {"currency": catalog["currency"], "as_of": catalog.get("as_of", "unknown"), "valuation_mode": catalog.get("valuation_mode", "current_catalog")},
         "warnings": warnings,
     }
-    if section in ("full", "base", "breakdown"):
+    if section in ("full", "base", "breakdown", "tokens"):
         tokens, token_warnings = token_analytics(
             connection, catalog, start, end, granularity, sources, models, breakdown_offset,
+            include_breakdown=section != "tokens",
         )
         result["tokens"] = tokens
         warnings.extend(token_warnings)
+    if section in ("full", "base", "limits"):
+        result["limits"] = limit_series(connection, start, end, granularity)
     if section in ("full", "base"):
         available_sources = [row[0] for row in connection.execute("SELECT DISTINCT source FROM token_usage_events ORDER BY source")]
         available_models_count = int(scalar(connection, "SELECT COUNT(DISTINCT model) FROM token_usage_events") or 0)
@@ -2679,7 +2685,6 @@ def _build_payload(connection: sqlite3.Connection, database: Path, catalog: dict
             raise AnalyticsError(f"available model list exceeds the {MAX_AVAILABLE_MODELS}-model response limit")
         available_models = [row[0] for row in connection.execute("SELECT DISTINCT model FROM token_usage_events ORDER BY model")]
         result["available"] = {"sources": available_sources, "models": available_models}
-        result["limits"] = limit_series(connection, start, end, granularity)
         result["baselines"] = {"hermes": hermes_baselines(connection)}
         if params.get("compare") == "previous":
             previous_start = start - (end - start)

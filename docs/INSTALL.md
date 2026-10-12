@@ -224,7 +224,11 @@ sudo systemctl list-timers codex-usage-backup.timer
 Use a service override to change the destination or `--keep`. The destination
 must be owned by `codex-monitor`, private and writable within the service's
 `ReadWritePaths`; a different location requires extending that allowlist. The
-backup command verifies the current v4 schema and integrity before publication,
+source and destination ancestry must be owned by root or the service account;
+group/other-writable ancestors are rejected unless they have the sticky bit.
+Private children of root-owned sticky `/tmp` remain supported. This prevents
+another user from replacing a checked directory before SQLite opens its path.
+The backup command verifies the current v4 schema and integrity before publication,
 uses mode `600`, rejects symlinks and overlapping runs, and preserves existing
 backups after a failed copy. Transfer a verified backup to separate storage if
 off-machine recovery is required. Restore using the documented
