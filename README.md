@@ -1027,8 +1027,12 @@ Changed or deleted historical data recompute the affected fits. The archive
 and complete chart data remain authoritative. The cache directory is private
 (`0700`), its database is `0600`, and storage is bounded to 2,048 entries,
 8 MiB of results shared by pricing and fits, and 16 MiB of SQLite pages.
-New entries are committed together at the end of the request. Unavailable, locked or corrupt
-caches fall back to ordinary calculation; deleting the cache is safe.
+New entries are committed together at the end of the request. Cache path ancestors
+must be real directories owned by root or the current user, with no group/other
+write permission unless protected by the sticky bit. Private children of trusted
+sticky directories such as `/tmp` remain supported. Unsafe paths and unavailable,
+locked or corrupt caches fall back to ordinary calculation; deleting the cache
+is safe.
 
 `/api/analytics.csv?dataset=limits|tokens|weekly_value|breakdown|resets` accepts the
 same period/source/model/reset filters. Allocation and reset CSV pages share

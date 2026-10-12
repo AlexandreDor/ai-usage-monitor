@@ -37,6 +37,9 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Fixed
 
+- Disable persistent Analytics caching under replaceable or symlinked ancestors
+  before SQLite opens a path, while preserving calculations and trusted sticky
+  directories.
 - Reject replaceable source/destination ancestry before SQLite backup opens,
   publish only the reserved, verified nonempty backup inode, and preserve source
   archives even when their paths use aliases.

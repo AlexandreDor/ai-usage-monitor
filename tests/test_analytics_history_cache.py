@@ -73,6 +73,43 @@ class HistoricalAnalyticsTests(unittest.TestCase):
         right.pop('revision')
         self.assertEqual(left, right)
 
+    def test_replaceable_cache_ancestor_cannot_redirect_analytics_writes(self):
+        expected = self.uncached()
+        shared = Path(self.temp.name) / 'shared'
+        shared.mkdir(mode=0o700)
+        private = shared / 'private'
+        private.mkdir(mode=0o700)
+        database = private / 'archive.sqlite3'
+        with closing(sqlite3.connect(self.database)) as source, closing(sqlite3.connect(database)) as target:
+            source.backup(target)
+        self.database = database
+        victim = Path(self.temp.name) / 'unrelated.sqlite3'
+        with closing(sqlite3.connect(victim)) as target, target:
+            target.execute('CREATE TABLE private_data(value TEXT)')
+            target.execute("INSERT INTO private_data VALUES ('preserve me')")
+        victim.chmod(0o600)
+        original_digest = hashlib.sha256(victim.read_bytes()).hexdigest()
+        cache = HistoricalFitCache(database)
+        original_connect = sqlite3.connect
+        redirected = []
+
+        def replace_ancestor(path, *args, **kwargs):
+            if str(path) == str(cache.path) and not redirected:
+                private.rename(shared / 'displaced')
+                private.mkdir(mode=0o700)
+                cache.directory.mkdir(mode=0o700)
+                cache.path.symlink_to(victim)
+                redirected.append(path)
+            return original_connect(path, *args, **kwargs)
+
+        shared.chmod(0o777)
+        with self.fresh_caches(), patch('analytics_history_cache.sqlite3.connect', side_effect=replace_ancestor):
+            actual = self.payload()
+        self.assertEqual(original_digest, hashlib.sha256(victim.read_bytes()).hexdigest())
+        self.assertEqual(redirected, [])
+        self.assertFalse(cache.directory.exists())
+        self.assert_equal_except_revision(actual, expected)
+
     def test_append_outside_causal_horizon_and_fresh_process_reuse(self):
         original = self.warm()
         with closing(connect_database(self.database)) as writer, writer:
@@ -277,6 +314,7 @@ class FitStorageTests(unittest.TestCase):
         self.assertEqual(missing.get_or_compute(('a',),lambda:{'ok':False,'reason':'computed'}),
                          {'ok':False,'reason':'computed'})
         denied = HistoricalFitCache(self.archive)
+        denied.directory.mkdir(mode=0o700)
         with patch('analytics_history_cache.os.open',side_effect=PermissionError('read only')):
             self.assertEqual(denied.get_or_compute(('a',),lambda:{'ok':False,'reason':'computed'}),
                              {'ok':False,'reason':'computed'})
@@ -285,6 +323,84 @@ class FitStorageTests(unittest.TestCase):
         self.assertEqual(insecure.get_or_compute(('a',),lambda:{'ok':False,'reason':'computed'}),
                          {'ok':False,'reason':'computed'})
         self.assertFalse(insecure.path.exists())
+
+    def test_writable_nonsticky_ancestors_disable_cache_before_opening_sqlite(self):
+        shared = Path(self.temp.name) / 'shared'
+        shared.mkdir(mode=0o700)
+        private = shared / 'private'
+        private.mkdir(mode=0o700)
+        computed = {'ok': False, 'reason': 'computed'}
+        for mode in (0o775, 0o777):
+            shared.chmod(mode)
+            with self.subTest(mode=oct(mode)):
+                cache = HistoricalFitCache(private / 'archive.sqlite3')
+                self.addCleanup(cache.close)
+                with patch('analytics_history_cache.sqlite3.connect', wraps=sqlite3.connect) as opened:
+                    self.assertEqual(cache.get_or_compute(('a',), lambda: computed), computed)
+                    opened.assert_not_called()
+                self.assertTrue(cache.disabled)
+                self.assertFalse(cache.directory.exists())
+
+    def test_foreign_owned_ancestors_disable_cache_even_when_readonly_or_sticky(self):
+        ancestor = Path(self.temp.name) / 'ancestor'
+        ancestor.mkdir(mode=0o700)
+        private = ancestor / 'private'
+        private.mkdir(mode=0o700)
+        identity = ancestor.stat()
+        original_fstat = os.fstat
+
+        def untrusted_owner(descriptor):
+            metadata = original_fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) == (identity.st_dev, identity.st_ino):
+                fields = list(metadata)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return metadata
+
+        for mode in (0o555, 0o1777):
+            ancestor.chmod(mode)
+            with self.subTest(mode=oct(mode)), patch('operations.os.fstat', side_effect=untrusted_owner):
+                cache = HistoricalFitCache(private / 'archive.sqlite3')
+                self.addCleanup(cache.close)
+                with patch('analytics_history_cache.sqlite3.connect', wraps=sqlite3.connect) as opened:
+                    self.assertEqual(cache.get_or_compute(('a',), lambda: {'ok': False}), {'ok': False})
+                    opened.assert_not_called()
+                self.assertTrue(cache.disabled)
+                self.assertFalse(cache.directory.exists())
+        ancestor.chmod(0o700)
+
+    def test_symlink_ancestor_disables_cache_without_writing_to_its_target(self):
+        ancestor = Path(self.temp.name) / 'ancestor'
+        ancestor.mkdir(mode=0o700)
+        private = ancestor / 'private'
+        private.mkdir(mode=0o700)
+        alias = Path(self.temp.name) / 'alias'
+        alias.symlink_to(ancestor, target_is_directory=True)
+        cache = HistoricalFitCache(alias / 'private' / 'archive.sqlite3')
+        self.addCleanup(cache.close)
+        with patch('analytics_history_cache.sqlite3.connect', wraps=sqlite3.connect) as opened:
+            self.assertEqual(cache.get_or_compute(('a',), lambda: {'ok': False}), {'ok': False})
+            opened.assert_not_called()
+        self.assertTrue(cache.disabled)
+        self.assertFalse(cache.directory.exists())
+
+    def test_trusted_sticky_ancestor_preserves_private_cache_persistence(self):
+        shared = Path(self.temp.name) / 'sticky'
+        shared.mkdir(mode=0o700)
+        shared.chmod(0o1777)
+        private = shared / 'private'
+        private.mkdir(mode=0o700)
+        archive = private / 'archive.sqlite3'
+        cache = HistoricalFitCache(archive)
+        self.addCleanup(cache.close)
+        computed = {'ok': False, 'reason': 'cached'}
+        self.assertEqual(cache.get_or_compute(('a',), lambda: computed), computed)
+        cache.close()
+        self.assertEqual(cache.directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(cache.path.stat().st_mode & 0o777, 0o600)
+        reopened = HistoricalFitCache(archive)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.get_or_compute(('a',), lambda: self.fail('disk hit missed')), computed)
 
 
 if __name__ == '__main__':

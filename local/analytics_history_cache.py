@@ -11,6 +11,8 @@ from pathlib import Path
 import sqlite3
 import stat
 
+from operations import open_private_directory
+
 
 FIT_CACHE_VERSION = 1  # Bump when fit implementation/serialization semantics change.
 
@@ -103,10 +105,10 @@ class HistoricalFitCache:
         if self.connection is not None:
             return self.connection
         try:
-            # Refuse redirected parents as well as redirected cache files.
-            parent = self.directory.parent.lstat()
-            if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_mode & 0o022:
-                raise OSError('unsafe cache parent')
+            # SQLite reopens pathnames. Every ancestor must be protected from
+            # replacement by another user, just as for archive backups.
+            _, descriptor = open_private_directory(self.directory.parent, require_stable_path=True)
+            os.close(descriptor)
             self.directory.mkdir(mode=0o700, exist_ok=True)
             if not self._private(self.directory, directory=True):
                 raise OSError('unsafe cache directory')
