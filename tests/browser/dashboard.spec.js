@@ -1661,6 +1661,63 @@ for (const section of ['breakdown', 'resets']) {
   });
 }
 
+for (const [section, failedSection] of [
+  ['breakdown', 'base'], ['resets', 'base'], ['breakdown', 'full'], ['resets', 'full'],
+]) {
+  test(`retries the requested ${section} page after ${failedSection} revision recovery fails`, async ({ page }) => {
+    const queries = [];
+    let revision = 'before-collection';
+    let failRecovery = true;
+    await page.route('**/api/analytics?*', route => {
+      const query = new URL(route.request().url()).searchParams;
+      queries.push(query);
+      const requestedSection = query.get('sections');
+      if (revision === 'after-collection' && requestedSection === failedSection && failRecovery) {
+        failRecovery = false;
+        return route.fulfill({ status: 503, json: { error: 'temporary recovery failure' } });
+      }
+      const breakdownOffset = Number(query.get('breakdown_offset') || 0);
+      const resetOffset = Number(query.get('reset_offset') || 0);
+      const payload = {
+        ...analyticsPayload,
+        revision,
+        tokens: {
+          ...analyticsPayload.tokens,
+          breakdown_pagination: { total: 155, offset: breakdownOffset, limit: 50 },
+        },
+        resets: { ...enhancedAnalyticsPayload.resets, total: 155, offset: resetOffset },
+      };
+      if (revision === 'after-collection' && failedSection === 'full') {
+        if (requestedSection === 'base') {
+          payload.pending_sections = ['weekly'];
+          delete payload.weekly_limit_value;
+        } else if (requestedSection === 'weekly' && failRecovery) {
+          payload.revision = 'collected-again';
+        }
+      }
+      return route.fulfill({ json: payload });
+    });
+    await page.goto('/analytics.html');
+    const label = page.locator(section === 'breakdown' ? '#breakdown-page-label' : '#reset-page-label');
+    const next = page.locator(section === 'breakdown' ? '#breakdown-next' : '#resets-next');
+    const offsetKey = section === 'breakdown' ? 'breakdown_offset' : 'reset_offset';
+    await expect(label).toHaveText('1–50 of 155');
+
+    revision = 'after-collection';
+    await next.click();
+    await expect(page.locator('#analytics-error')).toContainText('temporary recovery failure');
+    const retainedOffset = failedSection === 'base' ? 0 : 50;
+    await expect(label).toHaveText(failedSection === 'base' ? '1–50 of 155' : '51–100 of 155');
+    expect(await page.evaluate(key => new URLSearchParams(queryString()).get(key), offsetKey)).toBe(String(retainedOffset));
+
+    await next.click();
+    await expect(label).toHaveText(failedSection === 'base' ? '51–100 of 155' : '101–150 of 155');
+    await expect(page.locator('#weekly-section-status')).toBeHidden();
+    expect(queries.at(-1).get(offsetKey)).toBe(String(retainedOffset + 50));
+    await expect(page.locator('#analytics-error')).toBeHidden();
+  });
+}
+
 test('falls back to one coherent response after repeated revision mismatches', async ({ page }) => {
   let bases = 0;
   const requests = [];

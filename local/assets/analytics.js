@@ -1382,17 +1382,24 @@ async function loadSection(section, generation, base, query) {
     if (requestControllers.get(section) === controller) requestControllers.delete(section);
   }
 }
+function displayedPageOffset(section) {
+  if (section === 'breakdown') return safeNumber(lastPayload?.tokens?.breakdown_pagination?.offset);
+  if (section === 'resets') return safeNumber(displayedResetData?.offset);
+  return undefined;
+}
 async function refresh({ section = 'base', revisionRetry = false, coherent = false, previousOffset } = {}) {
   const requestedSection = section;
   // A pending base owns an older query. Restart it with the latest controls
   // before it can overwrite a newer component selection or pagination page.
   // A failed base must also recover before components can use the new filters.
-  if (filtersPending || pendingBaseSequence !== null || baseRefreshRequired) section = 'base';
+  if (filtersPending || pendingBaseSequence !== null || baseRefreshRequired || revisionRetry || coherent) section = 'base';
   filtersPending = false;
   clearTimeout(filterTimer);
   if (section !== 'base' && lastPayload) {
     try { await loadSection(section, refreshSequence, lastPayload, queryString()); }
-    catch (error) { if (error.revisionMismatch) await refresh({ revisionRetry: true }); }
+    catch (error) {
+      if (error.revisionMismatch) await refresh({ section, revisionRetry: true, previousOffset: displayedPageOffset(section) });
+    }
     updateExportLink();
     return;
   }
@@ -1427,14 +1434,17 @@ async function refresh({ section = 'base', revisionRetry = false, coherent = fal
   } catch (error) {
     if (sequence !== refreshSequence || error?.name === 'AbortError') return;
     baseRefreshRequired = true;
-    if (previousOffset !== undefined) {
-      if (requestedSection === 'breakdown') state.breakdownOffset = previousOffset;
-      if (requestedSection === 'resets') state.resetOffset = previousOffset;
-    }
     if (error.revisionMismatch) {
       // Two changing snapshots must never be mixed. A single full response
       // pins every section to one database snapshot without an unbounded retry.
-      await refresh(revisionRetry ? { coherent: true } : { revisionRetry: true }); return;
+      await refresh({
+        section: requestedSection, previousOffset: displayedPageOffset(requestedSection),
+        ...(revisionRetry ? { coherent: true } : { revisionRetry: true }),
+      }); return;
+    }
+    if (previousOffset !== undefined) {
+      if (requestedSection === 'breakdown') state.breakdownOffset = previousOffset;
+      if (requestedSection === 'resets') state.resetOffset = previousOffset;
     }
     const message = error instanceof Error ? error.message : t('unableToLoadAnalytics');
     for (const name of coherentPending) setSectionStatus(name, 'error', `${message} · ${t('showingLastData')}`);
