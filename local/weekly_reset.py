@@ -87,6 +87,60 @@ def observe_full_weekly_reset(encoded: str, *, epoch: Any, pct: Any,
     return encoded, confirmed_at, candidate is not None
 
 
+def legacy_baseline_has_evidence(connection, *, epoch: int, pct: Any,
+                                 reset_at: Any, owner: str, before_epoch: int,
+                                 history_entries=()) -> bool:
+    """Require a retained baseline with no intervening, possibly partial poll.
+
+    Legacy detector timestamps tracked complete windows only. Missing values
+    or a departed owner can therefore be invisible in that state alone.
+    Absence of corroborating history is insufficient evidence for migration.
+    """
+    observations = []
+    if connection is not None:
+        observations.extend(connection.execute(
+            "SELECT scraped_at_epoch, weekly_pct, weekly_reset_at, limit_id "
+            "FROM snapshots WHERE scraped_at_epoch >= ? AND scraped_at_epoch < ? "
+            "ORDER BY scraped_at_epoch LIMIT 2", (epoch, before_epoch),
+        ).fetchall())
+    observations.extend(
+        (entry.epoch_microseconds // 1_000_000, entry.public.get("weekly_pct"),
+         entry.public.get("weekly_reset_at"), entry.public.get("limit_id"))
+        for entry in history_entries
+        if epoch * 1_000_000 <= entry.epoch_microseconds < before_epoch * 1_000_000
+    )
+    return bool(observations) and all(
+        tuple(row) == (epoch, pct, reset_at, owner) for row in observations
+    )
+
+
+def _legacy_cli_evidence(args, pct, reset) -> bool:
+    from pathlib import Path
+    import sqlite3
+    from history import read_existing_history
+    from storage import ArchiveCorruptionError, ArchiveSchemaError, connect_database
+
+    connection = None
+    try:
+        if args.legacy_archive and Path(args.legacy_archive).exists():
+            connection = connect_database(Path(args.legacy_archive), read_only=True)
+        entries = ()
+        if args.legacy_history:
+            loaded = read_existing_history(Path(args.legacy_history))
+            if loaded.corrupt:
+                return False
+            entries = loaded.entries
+        return legacy_baseline_has_evidence(
+            connection, epoch=args.epoch, pct=pct, reset_at=reset, owner=args.owner,
+            before_epoch=args.before_epoch, history_entries=entries,
+        )
+    except (OSError, ValueError, sqlite3.DatabaseError, ArchiveCorruptionError, ArchiveSchemaError):
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("state")
@@ -95,11 +149,17 @@ def main() -> None:
     parser.add_argument("reset")
     parser.add_argument("owner")
     parser.add_argument("interval", type=int)
+    parser.add_argument("--legacy-archive")
+    parser.add_argument("--legacy-history")
+    parser.add_argument("--before-epoch", type=int)
     args = parser.parse_args()
     try:
         pct, reset = float(args.pct), float(args.reset)
     except ValueError:
         pct = reset = None
+    if args.before_epoch is not None and not _legacy_cli_evidence(args, pct, reset):
+        print("\n0\n0")
+        return
     state, confirmed, pending = observe_full_weekly_reset(
         args.state, epoch=args.epoch, pct=pct, reset_at=reset,
         owner=args.owner, interval=args.interval,

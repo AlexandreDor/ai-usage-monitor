@@ -18,7 +18,7 @@ import sys
 from typing import Any
 
 from storage import ArchiveCorruptionError, canonicalize_limit_id, connect_database
-from weekly_reset import observe_full_weekly_reset
+from weekly_reset import legacy_baseline_has_evidence, observe_full_weekly_reset
 
 
 # These are intentionally named and shared with archive.py/monitor.sh's
@@ -302,7 +302,8 @@ def _resolve_full_weekly_shift(connection: sqlite3.Connection, limit_id: str,
 
 def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str,
                    pct: Any, reset_at: Any, epoch: int,
-                   sample_interval: Any, force_baseline: bool) -> None:
+                   sample_interval: Any, force_baseline: bool,
+                   prior_observation_epoch: int) -> None:
     current_pct = _number(pct)
     current_reset = _epoch(reset_at)
     current_interval = (
@@ -360,7 +361,11 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     full_weekly_pending = False
     if window == "weekly":
         full_state = "" if force_baseline else state.get("full_weekly_reset_state", "")
-        if not force_baseline and "full_weekly_reset_state" not in state:
+        if (not force_baseline and "full_weekly_reset_state" not in state
+                and previous_epoch >= prior_observation_epoch
+                and legacy_baseline_has_evidence(
+                    connection, epoch=previous_epoch, pct=previous_pct,
+                    reset_at=state.get("last_reset_at"), owner=limit_id, before_epoch=epoch)):
             # Pre-feature detector state still has a useful complete baseline.
             # Only absence permits migration: an explicit empty value records
             # a partial observation or another deliberate chain cancellation.
@@ -543,6 +548,11 @@ def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any]) -
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """, (limit_id,),
         )
+    # Capture this before the 5h detector processes the current sample and
+    # overwrites a timestamp that can reveal an intervening legacy partial.
+    prior_observation_epoch = connection.execute(
+        "SELECT COALESCE(MAX(updated_at_epoch), 0) FROM anomaly_detector_state"
+    ).fetchone()[0]
     for window, pct_key, reset_key in WINDOWS:
         _detect_window(
             connection, limit_id=limit_id, window=window,
@@ -550,6 +560,7 @@ def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any]) -
             epoch=epoch,
             sample_interval=snapshot.get("sample_interval_seconds"),
             force_baseline=force_baseline,
+            prior_observation_epoch=prior_observation_epoch,
         )
 
 

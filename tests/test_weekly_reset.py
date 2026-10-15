@@ -25,6 +25,7 @@ import weekly_window_start
 class FullWeeklyResetTests(unittest.TestCase):
     def sample(self, epoch, deadline, pct=100, owner="group-a"):
         return {
+            "schema_version": 1,
             "scraped_at_epoch": epoch,
             "scraped_at": dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "five_h_pct": 50, "five_h_reset": "later", "five_h_reset_at": 2_000_000_000,
@@ -174,27 +175,38 @@ class FullWeeklyResetTests(unittest.TestCase):
                 c.close()
 
     def test_legacy_detector_migrates_only_an_absent_complete_baseline(self):
-        for baseline in ("legacy", "canceled", "partial"):
+        for baseline in ("legacy", "canceled", "partial", "pct_missing", "both_missing",
+                         "owner_return", "no_history"):
             with self.subTest(baseline=baseline), tempfile.TemporaryDirectory() as directory:
                 c = storage.connect_database(pathlib.Path(directory) / "archive.sqlite3")
                 try:
                     sample = self.sample(100, 10000)
                     anomalies.process_snapshot(c, sample)
-                    archive.insert_snapshot(c, sample)
-                    if baseline == "partial":
-                        sample = self.sample(500, None)
+                    if baseline != "no_history":
+                        archive.insert_snapshot(c, sample)
+                    if baseline == "owner_return":
+                        sample = self.sample(300, 10000, owner="group-b")
+                        anomalies.process_snapshot(c, sample)
+                        archive.insert_snapshot(c, sample)
+                    if baseline in {"partial", "pct_missing", "both_missing", "owner_return"}:
+                        sample = self.sample(500, None, pct=100 if baseline == "partial" else None)
+                        if baseline in {"both_missing", "owner_return"}:
+                            sample["five_h_pct"] = None
+                            sample["five_h_reset_at"] = None
                         anomalies.process_snapshot(c, sample)
                         archive.insert_snapshot(c, sample)
                     row = c.execute(
-                        "SELECT state_json FROM anomaly_detector_state WHERE window='weekly'"
+                        "SELECT state_json FROM anomaly_detector_state WHERE window='weekly' AND limit_id=?",
+                        (storage.canonicalize_limit_id("group-a"),),
                     ).fetchone()
                     state = json.loads(row[0])
                     if baseline == "canceled":
                         state["full_weekly_reset_state"] = ""
                     else:
                         state.pop("full_weekly_reset_state")
-                    c.execute("UPDATE anomaly_detector_state SET state_json=? WHERE window='weekly'",
-                              (json.dumps(state),))
+                    c.execute("UPDATE anomaly_detector_state SET state_json=?, updated_at_epoch=? "
+                              "WHERE window='weekly' AND limit_id=?",
+                              (json.dumps(state), state["last_epoch"], storage.canonicalize_limit_id("group-a")))
                     c.commit()
                     for epoch, deadline in ((1000, 13000), (1900, 13010)):
                         sample = self.sample(epoch, deadline)
@@ -209,12 +221,50 @@ class FullWeeklyResetTests(unittest.TestCase):
                             "SELECT reset_at_epoch, observed_at_epoch, detection_method "
                             "FROM reset_events WHERE window='weekly'"
                         ).fetchall())
-                    elif baseline == "partial":
+                    elif baseline != "canceled":
                         self.assertEqual(0, c.execute(
                             "SELECT count(*) FROM reset_events WHERE window='weekly'"
                         ).fetchone()[0])
                 finally:
                     c.close()
+
+    def test_legacy_cli_requires_consistent_retained_observations(self):
+        cases = {"archive": True, "history": True, "both": True,
+                 "partial_archive": False, "partial_history": False,
+                 "corrupt_history": False, "missing": False}
+        for case, eligible in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                database, history = root / "archive.sqlite3", root / "history.json"
+                if case in {"archive", "both", "partial_archive"}:
+                    c = storage.connect_database(database)
+                    try:
+                        archive.insert_snapshot(c, self.sample(100, 10000))
+                        if case == "partial_archive":
+                            archive.insert_snapshot(c, self.sample(500, None, pct=None))
+                        c.commit()
+                    finally:
+                        c.close()
+                if case in {"history", "both", "partial_history", "partial_archive"}:
+                    rows = [self.sample(100, 10000)]
+                    if case == "partial_history":
+                        rows.append(self.sample(500, None, pct=None))
+                    history.write_text(json.dumps(rows))
+                if case == "corrupt_history":
+                    history.write_text("invalid JSON")
+                result = subprocess.run([
+                    sys.executable, str(pathlib.Path(weekly_window_start.__file__).with_name("weekly_reset.py")),
+                    "", "100", "100", "10000", storage.canonicalize_limit_id("group-a"), "900",
+                    "--legacy-archive", str(database), "--legacy-history", str(history),
+                    "--before-epoch", "1000",
+                ], check=True, capture_output=True, text=True)
+                state = result.stdout.splitlines()[0]
+                self.assertEqual(eligible, bool(state))
+                state, _event, _pending = self.observe(state, 1000, 13000,
+                                                       owner=storage.canonicalize_limit_id("group-a"))
+                self.assertEqual(1000 if eligible else 0, self.observe(
+                    state, 1900, 13010, owner=storage.canonicalize_limit_id("group-a"),
+                )[1])
 
 
 class WeeklyHookTests(unittest.TestCase):

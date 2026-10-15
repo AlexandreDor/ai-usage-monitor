@@ -1320,7 +1320,7 @@ PYEOF
 observe_full_weekly_reset() {
   python3 "${SCRIPT_DIR}/weekly_reset.py" "${1-$full_weekly_reset_state}" \
     "${2-$scraped_at_epoch}" "${3-$weekly_pct}" "${4-$weekly_reset_at}" \
-    "${5-$limit_id}" "${6-$sample_interval_seconds}"
+    "${5-$limit_id}" "${6-$sample_interval_seconds}" "${@:7}"
 }
 
 weekly_reset_message() {
@@ -3042,7 +3042,9 @@ check_thresholds() {
     && [[ "$observed_weekly_limit_id" == "$limit_id" ]]; then
     if ! full_weekly_reset_result="$(observe_full_weekly_reset "" \
         "$last_sampled_at_epoch" "$observed_weekly_pct" "$observed_weekly_reset_at" \
-        "$observed_weekly_limit_id" "$last_sample_interval_seconds")"; then
+        "$observed_weekly_limit_id" "$last_sample_interval_seconds" \
+        --legacy-archive "$ARCHIVE_FILE" --legacy-history "$HISTORY_FILE" \
+        --before-epoch "$scraped_at_epoch")"; then
       ALERT_PROCESSING_ERROR="full weekly reset baseline migration failed"
       return 1
     fi

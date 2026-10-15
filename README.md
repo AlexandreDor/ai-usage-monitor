@@ -649,7 +649,9 @@ the hook. Confirmation after the old deadline still supersedes that scheduled
 reset and runs only one hook. An unconfirmed deadline-shift anomaly is deferred
 until confirmation; rejecting the candidate retains the original anomaly.
 Upgrades seed the new classifier from a complete same-owner legacy baseline
-only when its state field is absent; an explicitly canceled chain stays canceled.
+only when its state field is absent and retained observations corroborate it
+without an intervening poll. An explicitly canceled chain stays canceled;
+missing or unreadable history starts a new baseline instead of guessing continuity.
 Analytics labels this `full_observed` evidence separately from a
 measured refill and assigns it no measured quota gain or unused end-of-week
 quota. A 5-hour reset
