@@ -681,6 +681,7 @@ def ingest(
     history_path: Path,
     snapshot: dict[str, Any],
     retention_days: int,
+    *, legacy_weekly_state: str | None = None,
 ) -> None:
     # Reject future rolling-history entries before creating or mutating the
     # SQLite archive.  Legacy malformed entries are still salvaged as before.
@@ -714,7 +715,7 @@ def ingest(
             rebuild_reset_events(connection)
             # Detector state is compact and independent from snapshots.  The
             # same call is idempotent when a live cycle replays this sample.
-            process_snapshot(connection, snapshot)
+            process_snapshot(connection, snapshot, legacy_weekly_state=legacy_weekly_state)
     finally:
         connection.close()
     os.chmod(database_path, 0o600)
@@ -787,7 +788,8 @@ def run(args: argparse.Namespace) -> int:
     database_path = Path(args.database)
     history_path = Path(args.history)
     try:
-        ingest(database_path, history_path, snapshot, retention_days)
+        ingest(database_path, history_path, snapshot, retention_days,
+               legacy_weekly_state=getattr(args, "legacy_weekly_state", None))
         return 0
     except ArchiveCorruptionError as exc:
         try:
@@ -797,7 +799,8 @@ def run(args: argparse.Namespace) -> int:
             return 1
         warn(f"Corrupt archive copied to {backup}; rebuilding it from rolling history.")
         try:
-            ingest(database_path, history_path, snapshot, retention_days)
+            ingest(database_path, history_path, snapshot, retention_days,
+                   legacy_weekly_state=getattr(args, "legacy_weekly_state", None))
             return 0
         except (ArchiveCorruptionError, OSError, OverflowError, sqlite3.DatabaseError) as rebuild_error:
             error(f"Could not rebuild archive after corruption: {rebuild_error}")
@@ -812,6 +815,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--database", required=True, help="SQLite archive path")
     parser.add_argument("--history", required=True, help="Rolling history JSON path")
     parser.add_argument("--retention-days", required=True, help="0 for unlimited, otherwise 1..36500")
+    parser.add_argument("--legacy-weekly-state")
     return parser
 
 

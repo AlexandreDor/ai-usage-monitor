@@ -229,7 +229,7 @@ class FullWeeklyResetTests(unittest.TestCase):
                     c.close()
 
     def test_legacy_cli_requires_consistent_retained_observations(self):
-        cases = {"archive": True, "history": True, "both": True,
+        cases = {"archive": True, "history": True, "both": True, "prior_data": True,
                  "partial_archive": False, "partial_history": False,
                  "corrupt_history": False, "missing": False}
         for case, eligible in cases.items():
@@ -252,10 +252,13 @@ class FullWeeklyResetTests(unittest.TestCase):
                     history.write_text(json.dumps(rows))
                 if case == "corrupt_history":
                     history.write_text("invalid JSON")
+                prior = self.observe("", 100, 10000,
+                                     owner=storage.canonicalize_limit_id("group-a"))[0]
                 result = subprocess.run([
                     sys.executable, str(pathlib.Path(weekly_window_start.__file__).with_name("weekly_reset.py")),
                     "", "100", "100", "10000", storage.canonicalize_limit_id("group-a"), "900",
                     "--legacy-archive", str(database), "--legacy-history", str(history),
+                    "--legacy-observation", "" if case == "missing" else prior,
                     "--before-epoch", "1000",
                 ], check=True, capture_output=True, text=True)
                 state = result.stdout.splitlines()[0]
@@ -265,6 +268,26 @@ class FullWeeklyResetTests(unittest.TestCase):
                 self.assertEqual(1000 if eligible else 0, self.observe(
                     state, 1900, 13010, owner=storage.canonicalize_limit_id("group-a"),
                 )[1])
+
+    def test_legacy_live_proof_is_shared_with_anomalies_without_an_archive_baseline(self):
+        for prior_complete in (True, False):
+            with self.subTest(prior_complete=prior_complete), tempfile.TemporaryDirectory() as directory:
+                c = storage.connect_database(pathlib.Path(directory) / "archive.sqlite3")
+                try:
+                    anomalies.process_snapshot(c, self.sample(100, 10000))
+                    row = c.execute("SELECT state_json FROM anomaly_detector_state WHERE window='weekly'").fetchone()
+                    state = json.loads(row[0])
+                    state.pop("full_weekly_reset_state")
+                    c.execute("UPDATE anomaly_detector_state SET state_json=? WHERE window='weekly'", (json.dumps(state),))
+                    proof = self.observe("", 100, 10000,
+                                         owner=storage.canonicalize_limit_id("group-a"))[0] if prior_complete else ""
+                    for epoch, deadline in ((1000, 13000), (1900, 13010)):
+                        anomalies.process_snapshot(c, self.sample(epoch, deadline), legacy_weekly_state=proof)
+                    self.assertEqual(0 if prior_complete else 1, c.execute(
+                        "SELECT count(*) FROM quota_anomalies WHERE window='weekly' AND anomaly_type='reset_shift'"
+                    ).fetchone()[0])
+                finally:
+                    c.close()
 
 
 class WeeklyHookTests(unittest.TestCase):

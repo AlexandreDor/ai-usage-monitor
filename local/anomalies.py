@@ -303,7 +303,7 @@ def _resolve_full_weekly_shift(connection: sqlite3.Connection, limit_id: str,
 def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str,
                    pct: Any, reset_at: Any, epoch: int,
                    sample_interval: Any, force_baseline: bool,
-                   prior_observation_epoch: int) -> None:
+                   prior_observation_epoch: int, legacy_weekly_state: str | None) -> None:
     current_pct = _number(pct)
     current_reset = _epoch(reset_at)
     current_interval = (
@@ -365,7 +365,8 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
                 and previous_epoch >= prior_observation_epoch
                 and legacy_baseline_has_evidence(
                     connection, epoch=previous_epoch, pct=previous_pct,
-                    reset_at=state.get("last_reset_at"), owner=limit_id, before_epoch=epoch)):
+                    reset_at=state.get("last_reset_at"), owner=limit_id, before_epoch=epoch,
+                    prior_state=legacy_weekly_state)):
             # Pre-feature detector state still has a useful complete baseline.
             # Only absence permits migration: an explicit empty value records
             # a partial observation or another deliberate chain cancellation.
@@ -524,7 +525,8 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     _save_state(connection, limit_id, window, state, epoch)
 
 
-def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any]) -> None:
+def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any], *,
+                     legacy_weekly_state: str | None = None) -> None:
     """Process one normalized snapshot inside the caller's transaction."""
     epoch = _epoch(snapshot.get("scraped_at_epoch"))
     if epoch is None:
@@ -561,6 +563,7 @@ def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any]) -
             sample_interval=snapshot.get("sample_interval_seconds"),
             force_baseline=force_baseline,
             prior_observation_epoch=prior_observation_epoch,
+            legacy_weekly_state=legacy_weekly_state,
         )
 
 
@@ -632,7 +635,8 @@ def command(args: argparse.Namespace) -> None:
         with connection:
             if args.action == "observe":
                 value = json.load(sys.stdin)
-                process_snapshot(connection, _parse_snapshot(value))
+                process_snapshot(connection, _parse_snapshot(value),
+                                 legacy_weekly_state=args.legacy_weekly_state)
             elif args.action == "journal":
                 if not mark_journaled(connection, args.anomaly_id, args.at):
                     raise ValueError("unknown or already journaled anomaly")
@@ -646,6 +650,8 @@ def parser() -> argparse.ArgumentParser:
     for action in ("pending", "observe"):
         command_parser = sub.add_parser(action)
         command_parser.add_argument("--database", required=True)
+        if action == "observe":
+            command_parser.add_argument("--legacy-weekly-state")
     journal = sub.add_parser("journal")
     journal.add_argument("--database", required=True)
     journal.add_argument("anomaly_id")

@@ -89,7 +89,7 @@ def observe_full_weekly_reset(encoded: str, *, epoch: Any, pct: Any,
 
 def legacy_baseline_has_evidence(connection, *, epoch: int, pct: Any,
                                  reset_at: Any, owner: str, before_epoch: int,
-                                 history_entries=()) -> bool:
+                                 history_entries=(), prior_state: str | None = None) -> bool:
     """Require a retained baseline with no intervening, possibly partial poll.
 
     Legacy detector timestamps tracked complete windows only. Missing values
@@ -109,7 +109,14 @@ def legacy_baseline_has_evidence(connection, *, epoch: int, pct: Any,
         for entry in history_entries
         if epoch * 1_000_000 <= entry.epoch_microseconds < before_epoch * 1_000_000
     )
-    return bool(observations) and all(
+    corroborated = bool(observations)
+    if prior_state is not None:
+        prior = _load(prior_state)
+        if (pct != 100 or prior.get("epoch") != epoch or prior.get("reset") != reset_at
+                or prior.get("owner") != owner or prior.get("candidate") is not None):
+            return False
+        corroborated = True
+    return corroborated and all(
         tuple(row) == (epoch, pct, reset_at, owner) for row in observations
     )
 
@@ -133,6 +140,7 @@ def _legacy_cli_evidence(args, pct, reset) -> bool:
         return legacy_baseline_has_evidence(
             connection, epoch=args.epoch, pct=pct, reset_at=reset, owner=args.owner,
             before_epoch=args.before_epoch, history_entries=entries,
+            prior_state=args.legacy_observation or "",
         )
     except (OSError, ValueError, sqlite3.DatabaseError, ArchiveCorruptionError, ArchiveSchemaError):
         return False
@@ -151,6 +159,7 @@ def main() -> None:
     parser.add_argument("interval", type=int)
     parser.add_argument("--legacy-archive")
     parser.add_argument("--legacy-history")
+    parser.add_argument("--legacy-observation")
     parser.add_argument("--before-epoch", type=int)
     args = parser.parse_args()
     try:
