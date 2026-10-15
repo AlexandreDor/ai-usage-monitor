@@ -1318,9 +1318,9 @@ PYEOF
 }
 
 observe_full_weekly_reset() {
-  python3 "${SCRIPT_DIR}/weekly_reset.py" "$full_weekly_reset_state" \
-    "$scraped_at_epoch" "$weekly_pct" "$weekly_reset_at" "$limit_id" \
-    "$sample_interval_seconds"
+  python3 "${SCRIPT_DIR}/weekly_reset.py" "${1-$full_weekly_reset_state}" \
+    "${2-$scraped_at_epoch}" "${3-$weekly_pct}" "${4-$weekly_reset_at}" \
+    "${5-$limit_id}" "${6-$sample_interval_seconds}"
 }
 
 weekly_reset_message() {
@@ -2843,6 +2843,7 @@ check_thresholds() {
   local observed_weekly_reset_at=0
   local observed_weekly_limit_id=""
   local full_weekly_reset_state="" full_weekly_reset_result full_weekly_event_at=0
+  local full_weekly_reset_state_present=0
   local confirmed_full_weekly_reset_at=0
   local -a full_weekly_reset_fields=()
   local last_five_h_sampled_at_epoch=0
@@ -2934,6 +2935,7 @@ check_thresholds() {
     while IFS='=' read -r state_key state_value; do
       case "$state_key" in
         full_weekly_reset_state)
+          full_weekly_reset_state_present=1
           [[ ${#state_value} -le 4096 && "$state_value" =~ ^[A-Za-z0-9+/=]*$ ]] \
             && full_weekly_reset_state="$state_value"
           ;;
@@ -3032,6 +3034,19 @@ check_thresholds() {
   if [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ && "$five_h_reset_at" =~ ^[0-9]+$ ]] \
     && (( five_h_reset_at > 0 )); then
     five_h_observation_valid=1
+  fi
+  # Upgrade only a missing field from the old complete owner-scoped baseline.
+  # An explicitly empty state is a canceled chain and must stay canceled.
+  if (( state_loaded == 1 && full_weekly_reset_state_present == 0 )) \
+    && (( last_sampled_at_epoch >= last_five_h_sampled_at_epoch )) \
+    && [[ "$observed_weekly_limit_id" == "$limit_id" ]]; then
+    if ! full_weekly_reset_result="$(observe_full_weekly_reset "" \
+        "$last_sampled_at_epoch" "$observed_weekly_pct" "$observed_weekly_reset_at" \
+        "$observed_weekly_limit_id" "$last_sample_interval_seconds")"; then
+      ALERT_PROCESSING_ERROR="full weekly reset baseline migration failed"
+      return 1
+    fi
+    full_weekly_reset_state="${full_weekly_reset_result%%$'\n'*}"
   fi
   if ! full_weekly_reset_result="$(observe_full_weekly_reset)"; then
     ALERT_PROCESSING_ERROR="full weekly reset classification failed"

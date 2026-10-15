@@ -173,6 +173,49 @@ class FullWeeklyResetTests(unittest.TestCase):
             finally:
                 c.close()
 
+    def test_legacy_detector_migrates_only_an_absent_complete_baseline(self):
+        for baseline in ("legacy", "canceled", "partial"):
+            with self.subTest(baseline=baseline), tempfile.TemporaryDirectory() as directory:
+                c = storage.connect_database(pathlib.Path(directory) / "archive.sqlite3")
+                try:
+                    sample = self.sample(100, 10000)
+                    anomalies.process_snapshot(c, sample)
+                    archive.insert_snapshot(c, sample)
+                    if baseline == "partial":
+                        sample = self.sample(500, None)
+                        anomalies.process_snapshot(c, sample)
+                        archive.insert_snapshot(c, sample)
+                    row = c.execute(
+                        "SELECT state_json FROM anomaly_detector_state WHERE window='weekly'"
+                    ).fetchone()
+                    state = json.loads(row[0])
+                    if baseline == "canceled":
+                        state["full_weekly_reset_state"] = ""
+                    else:
+                        state.pop("full_weekly_reset_state")
+                    c.execute("UPDATE anomaly_detector_state SET state_json=? WHERE window='weekly'",
+                              (json.dumps(state),))
+                    c.commit()
+                    for epoch, deadline in ((1000, 13000), (1900, 13010)):
+                        sample = self.sample(epoch, deadline)
+                        anomalies.process_snapshot(c, sample)
+                        archive.insert_snapshot(c, sample)
+                    archive.rebuild_reset_events(c)
+                    self.assertEqual(0 if baseline == "legacy" else 1, c.execute(
+                        "SELECT count(*) FROM quota_anomalies WHERE window='weekly' AND anomaly_type='reset_shift'"
+                    ).fetchone()[0])
+                    if baseline == "legacy":
+                        self.assertEqual([(1000, 1900, "full_observed")], c.execute(
+                            "SELECT reset_at_epoch, observed_at_epoch, detection_method "
+                            "FROM reset_events WHERE window='weekly'"
+                        ).fetchall())
+                    elif baseline == "partial":
+                        self.assertEqual(0, c.execute(
+                            "SELECT count(*) FROM reset_events WHERE window='weekly'"
+                        ).fetchone()[0])
+                finally:
+                    c.close()
+
 
 class WeeklyHookTests(unittest.TestCase):
     def run_statuses(self, samples, *, repeat=False):

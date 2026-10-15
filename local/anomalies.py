@@ -360,6 +360,15 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     full_weekly_pending = False
     if window == "weekly":
         full_state = "" if force_baseline else state.get("full_weekly_reset_state", "")
+        if not force_baseline and "full_weekly_reset_state" not in state:
+            # Pre-feature detector state still has a useful complete baseline.
+            # Only absence permits migration: an explicit empty value records
+            # a partial observation or another deliberate chain cancellation.
+            full_state = observe_full_weekly_reset(
+                "", epoch=previous_epoch, pct=previous_pct,
+                reset_at=state.get("last_reset_at"), owner=limit_id,
+                interval=previous_interval,
+            )[0]
         full_state, full_weekly_confirmed, full_weekly_pending = observe_full_weekly_reset(
             full_state, epoch=epoch, pct=current_pct, reset_at=current_reset,
             owner=limit_id, interval=current_interval,
