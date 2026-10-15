@@ -38,6 +38,7 @@ from history import (
     canonicalize_limit_id,
     opaque_limit_id_from_raw,
 )
+from weekly_reset import observe_full_weekly_reset
 
 RECENT_SECONDS = 24 * 60 * 60
 MEDIUM_SECONDS = 7 * 24 * 60 * 60
@@ -655,6 +656,24 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
                 (current[0], current[0], previous_pct, current_pct),
             )
         previous_weekly = current
+
+    # Full quota cannot increase on a refill. Confirm a material deadline
+    # advance with a third, fresh observation before recording this weaker
+    # evidence. Keep it distinct from measured refills and planned crossings.
+    full_state = ""
+    for current in rows:
+        full_state, confirmed_at, _pending = observe_full_weekly_reset(
+            full_state, epoch=current[0], pct=current[3], reset_at=current[4],
+            owner=current[6], interval=current[5],
+        )
+        if confirmed_at:
+            connection.execute(
+                """INSERT OR IGNORE INTO reset_events (
+                    window, reset_at_epoch, observed_at_epoch,
+                    before_pct, after_pct, detection_method
+                ) VALUES ('weekly', ?, ?, 100, 100, 'full_observed')""",
+                (confirmed_at, current[0]),
+            )
 
 
 def ingest(

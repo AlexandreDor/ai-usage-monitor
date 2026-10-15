@@ -1317,6 +1317,21 @@ raise SystemExit(0 if detected else 1)
 PYEOF
 }
 
+observe_full_weekly_reset() {
+  python3 "${SCRIPT_DIR}/weekly_reset.py" "$full_weekly_reset_state" \
+    "$scraped_at_epoch" "$weekly_pct" "$weekly_reset_at" "$limit_id" \
+    "$sample_interval_seconds"
+}
+
+weekly_reset_message() {
+  if (( confirmed_full_weekly_reset_at > 0 \
+        && confirmed_full_weekly_reset_at == weekly_armed_reset_at )); then
+    printf '📅 Codex · Weekly quota · Cycle renewed\nA later weekly deadline was confirmed while quota remained full. No quota increase was measurable.'
+  else
+    format_alert_message reset weekly
+  fi
+}
+
 is_reset_observation_gap_acceptable() {
   local previous_at="$1" current_at="$2" previous_interval="$3" current_interval="$4"
   PYTHONPATH="$(dirname "$ANOMALIES_PY")${PYTHONPATH:+:${PYTHONPATH}}" \
@@ -2073,6 +2088,8 @@ persist_alert_state() {
     "observed_weekly_pct=${observed_weekly_pct}" \
     "observed_weekly_reset_at=${observed_weekly_reset_at}" \
     "observed_weekly_limit_id=${observed_weekly_limit_id}" \
+    "full_weekly_reset_state=${full_weekly_reset_state}" \
+    "confirmed_full_weekly_reset_at=${confirmed_full_weekly_reset_at}" \
     "last_five_h_sampled_at_epoch=${last_five_h_sampled_at_epoch}" \
     "last_five_h_sample_interval_seconds=${last_five_h_sample_interval_seconds}" \
     "last_sampled_at_epoch=${last_sampled_at_epoch}" \
@@ -2825,6 +2842,9 @@ check_thresholds() {
   local observed_weekly_pct=""
   local observed_weekly_reset_at=0
   local observed_weekly_limit_id=""
+  local full_weekly_reset_state="" full_weekly_reset_result full_weekly_event_at=0
+  local confirmed_full_weekly_reset_at=0
+  local -a full_weekly_reset_fields=()
   local last_five_h_sampled_at_epoch=0
   local last_five_h_sample_interval_seconds=900
   local last_sampled_at_epoch=0
@@ -2913,6 +2933,14 @@ check_thresholds() {
     state_loaded=1
     while IFS='=' read -r state_key state_value; do
       case "$state_key" in
+        full_weekly_reset_state)
+          [[ ${#state_value} -le 4096 && "$state_value" =~ ^[A-Za-z0-9+/=]*$ ]] \
+            && full_weekly_reset_state="$state_value"
+          ;;
+        confirmed_full_weekly_reset_at)
+          [[ "$state_value" =~ ^(0|[1-9][0-9]{0,11})$ ]] \
+            && confirmed_full_weekly_reset_at="$state_value"
+          ;;
         state_version)
           [[ "$state_value" =~ ^[0-9]+$ ]] || { ALERT_PROCESSING_ERROR="invalid alert state version"; return 1; }
           state_version="$state_value"
@@ -3004,6 +3032,17 @@ check_thresholds() {
   if [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ && "$five_h_reset_at" =~ ^[0-9]+$ ]] \
     && (( five_h_reset_at > 0 )); then
     five_h_observation_valid=1
+  fi
+  if ! full_weekly_reset_result="$(observe_full_weekly_reset)"; then
+    ALERT_PROCESSING_ERROR="full weekly reset classification failed"
+    return 1
+  fi
+  mapfile -t full_weekly_reset_fields <<< "$full_weekly_reset_result"
+  full_weekly_event_at="${full_weekly_reset_fields[1]}"
+  # A confirmed proof is not consumed until the weekly write-ahead intent is
+  # ready. Earlier 5h persistence must retain its recoverable candidate.
+  if (( full_weekly_event_at == 0 )); then
+    full_weekly_reset_state="${full_weekly_reset_fields[0]}"
   fi
 
   # Armed cycles are owner-scoped. Resolve restored arms before any delivery
@@ -3808,9 +3847,16 @@ check_thresholds() {
     && [[ "$limit_id" == "$observed_weekly_limit_id" ]] \
     && (( observed_weekly_reset_recovery == 0 )) \
     && (( observed_weekly_scheduled_due == 0 )) \
-    && is_random_weekly_reset "$observed_weekly_pct" "$weekly_pct" \
-      "$observed_weekly_reset_at" "$weekly_reset_at"; then
-    weekly_armed_reset_at="$scraped_at_epoch"
+    && { (( full_weekly_event_at > 0 )) \
+      || is_random_weekly_reset "$observed_weekly_pct" "$weekly_pct" \
+        "$observed_weekly_reset_at" "$weekly_reset_at"; }; then
+    if (( full_weekly_event_at > 0 )); then
+      full_weekly_reset_state="${full_weekly_reset_fields[0]}"
+      weekly_armed_reset_at="$full_weekly_event_at"
+      confirmed_full_weekly_reset_at="$full_weekly_event_at"
+    else
+      weekly_armed_reset_at="$scraped_at_epoch"
+    fi
     weekly_armed_limit_id="$limit_id"
     observed_weekly_reset=1
     notified_weekly_thresholds=""
@@ -3842,7 +3888,7 @@ check_thresholds() {
       && [[ "$(configured_alert_channels_json)" != "[]" ]]; then
       weekly_network_request=1
       if ! weekly_request_json="$(network_reset_request_json weekly "$limit_id" \
-          "$weekly_armed_reset_at" "$scraped_at_epoch")"; then
+          "$weekly_armed_reset_at" "$scraped_at_epoch" "$(weekly_reset_message)")"; then
         ALERT_PROCESSING_ERROR="weekly reset request construction failed"
         return 1
       fi
@@ -4125,7 +4171,7 @@ check_thresholds() {
         last_notified_weekly_reset_at="$weekly_armed_reset_at"
       elif register_network_alert reset weekly reset \
         "$cycle_key" \
-        "$(format_alert_message reset weekly)" \
+        "$(weekly_reset_message)" \
         "{\"limit_id\":\"${limit_id}\",\"reset_epoch\":${weekly_armed_reset_at}}" \
         "$weekly_armed_reset_at" "$((weekly_armed_reset_at + 7 * 24 * 60 * 60))" false \
         "$cycle_key"; then

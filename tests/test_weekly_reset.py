@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Regression coverage for weekly renewals with no visible quota increase."""
+
+import datetime as dt
+import pathlib
+import json
+import os
+import sqlite3
+import subprocess
+import time
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "local"))
+import analytics
+import anomalies
+import archive
+import storage
+from weekly_reset import observe_full_weekly_reset
+import weekly_window_start
+
+
+class FullWeeklyResetTests(unittest.TestCase):
+    def sample(self, epoch, deadline, pct=100, owner="group-a"):
+        return {
+            "scraped_at_epoch": epoch,
+            "scraped_at": dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "five_h_pct": 50, "five_h_reset": "later", "five_h_reset_at": 2_000_000_000,
+            "weekly_pct": pct, "weekly_reset": "later", "weekly_reset_at": deadline,
+            "sample_interval_seconds": 900, "history_window_hours": 192,
+            "limit_id": storage.canonicalize_limit_id(owner) if owner else None,
+        }
+
+    def observe(self, state, epoch, deadline, pct=100, owner="group-a"):
+        return observe_full_weekly_reset(state, epoch=epoch, pct=pct,
+                                        reset_at=deadline, owner=owner, interval=900)
+
+    def test_confirmation_tolerates_drift_and_consumption_and_deduplicates(self):
+        state, event, pending = self.observe("", 100, 10_000)
+        state, event, pending = self.observe(state, 1000, 13_000)
+        self.assertEqual((0, True), (event, pending))
+        replay = self.observe(state, 1000, 13_000)
+        self.assertEqual((state, 0, True), replay)
+        state, event, pending = self.observe(state, 1900, 13_010, pct=99)
+        self.assertEqual((1000, False), (event, pending))
+        self.assertEqual(0, self.observe(state, 2800, 13_010, pct=99)[1])
+
+    def test_small_backward_and_nonfull_movements_are_not_candidates(self):
+        for before, after, first_pct in ((10_000, 10_010, 100),
+                                         (10_000, 9000, 100),
+                                         (10_000, 13_000, 99)):
+            with self.subTest(before=before, after=after, pct=first_pct):
+                state = self.observe("", 100, before, pct=first_pct)[0]
+                state, event, pending = self.observe(state, 1000, after)
+                self.assertEqual((0, False), (event, pending))
+
+    def test_candidate_cannot_survive_stale_partial_or_foreign_samples(self):
+        for epoch, deadline, pct, owner in ((5000, 13_000, 100, "group-a"),
+                                           (1900, None, 100, "group-a"),
+                                           (1900, 13_000, None, "group-a"),
+                                           (1900, 13_000, 100, "group-b"),
+                                           (1900, 13_000, 100, None)):
+            with self.subTest(epoch=epoch, pct=pct, owner=owner):
+                state = self.observe("", 100, 10_000)[0]
+                state = self.observe(state, 1000, 13_000)[0]
+                state, event, pending = self.observe(state, epoch, deadline, pct, owner)
+                self.assertEqual((0, False), (event, pending))
+
+    def test_reverted_candidate_is_not_confirmed(self):
+        state = self.observe("", 100, 10_000)[0]
+        state = self.observe(state, 1000, 13_000)[0]
+        self.assertEqual((0, False), self.observe(state, 1900, 10_000)[1:])
+
+    def test_incident_agrees_across_anomalies_archive_and_analytics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            c = storage.connect_database(pathlib.Path(directory) / "archive.sqlite3")
+            c.row_factory = sqlite3.Row
+            try:
+                for epoch, deadline in ((1792044001, 1792473311),
+                                        (1792044901, 1792649701),
+                                        (1792045801, 1792649711)):
+                    sample = self.sample(epoch, deadline)
+                    with c:
+                        anomalies.process_snapshot(c, sample)
+                        archive.insert_snapshot(c, sample)
+                        archive.rebuild_reset_events(c)
+                    if epoch == 1792044901:
+                        self.assertEqual(0, c.execute("SELECT count(*) FROM reset_events WHERE window='weekly'").fetchone()[0])
+                self.assertEqual(0, c.execute("SELECT count(*) FROM quota_anomalies WHERE window='weekly'").fetchone()[0])
+                row = c.execute("SELECT * FROM reset_events WHERE window='weekly'").fetchone()
+                self.assertEqual((1792044901, 1792045801, "full_observed"),
+                                 (row["reset_at_epoch"], row["observed_at_epoch"], row["detection_method"]))
+                payload = analytics.reset_history(c, 1792000000, 1792100000, "weekly", 0, 50)
+                self.assertEqual("random", payload["items"][0]["category"])
+                self.assertEqual(0, payload["items"][0]["unused_pct_points"])
+                self.assertEqual(0, payload["weekly_summary"]["end_of_week"]["count"])
+                self.assertEqual(1, payload["weekly_summary"]["random"]["count"])
+                self.assertEqual(0, payload["weekly_summary"]["random"]["net_vs_ideal_pct_points"])
+            finally:
+                c.close()
+
+    def test_invalid_state_is_a_new_baseline(self):
+        for state in ("bad", "W10=", "e30=", None):
+            with self.subTest(state=state):
+                self.assertEqual((0, False), self.observe(state, 100, 10_000)[1:])
+
+
+class WeeklyHookTests(unittest.TestCase):
+    def run_statuses(self, samples, *, repeat=False):
+        clock = {"now": 100, "sample": 0}
+        commands = []
+
+        def status(_codex, **kwargs):
+            index = clock["sample"]
+            pct, reset, owner = samples[min(index, len(samples) - 1)]
+            clock["now"] = 100 + index
+            clock["sample"] += 1
+            self.assertEqual(5, kwargs["timeout_seconds"])
+            return dict(scraped_at=dt.datetime.fromtimestamp(clock["now"], dt.timezone.utc).isoformat(),
+                        weekly_pct=pct, weekly_reset_at=reset, limit_id=owner)
+
+        def run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, '{"type":"turn.completed","usage":{"input_tokens":10}}', "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "hook.log"
+            environment = {"CODEX_ALERT_EVENT": "reset", "CODEX_ALERT_WINDOW": "weekly",
+                           "WEEKLY_START_MAX_ATTEMPTS": "2", "WEEKLY_START_WAIT_SECONDS": "0",
+                           "CODEX_ALERT_RESET_AT": "100",
+                           "WEEKLY_START_RETRY_WINDOW_SECONDS": "60", "WEEKLY_START_LOG_FILE": str(path)}
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(weekly_window_start, "run_bounded", side_effect=run), \
+                    mock.patch.object(weekly_window_start, "fetch_status", side_effect=status), \
+                    mock.patch.object(weekly_window_start.time, "time", side_effect=lambda: clock["now"]), \
+                    mock.patch.object(weekly_window_start.time, "sleep"):
+                result = weekly_window_start.run_hook()
+                if repeat:
+                    self.assertEqual(result, weekly_window_start.run_hook())
+            return result, path.read_text(), commands
+
+    def test_successful_codex_request_and_future_date_do_not_prove_start(self):
+        result, log, commands = self.run_statuses([(100, 10_000, "owner")] * 3, repeat=True)
+        self.assertEqual(1, result)
+        self.assertIn("unverified", log)
+        self.assertEqual(2, sum("exec" in command for command in commands))
+        self.assertTrue(all("gpt-6.1-sol" in command for command in commands if "exec" in command))
+
+    def test_timeout_reaps_descendant_holding_output_pipes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = pathlib.Path(directory) / "child.pid"
+            code = ("import subprocess,sys,time; "
+                    "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+                    f"open({str(pid_path)!r},'w').write(str(child.pid)); time.sleep(60)")
+            started = time.monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                weekly_window_start.run_bounded([sys.executable, "-c", code], timeout=0.5)
+            self.assertLess(time.monotonic() - started, 4)
+            child = int(pid_path.read_text())
+            # A reparented child can briefly remain as a zombie until init
+            # reaps it; it must no longer execute or hold the output pipe.
+            proc_status = pathlib.Path(f"/proc/{child}/stat")
+            if proc_status.exists():
+                self.assertEqual("Z", proc_status.read_text().split()[2])
+
+    def test_terminating_hook_reaps_its_separate_request_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = pathlib.Path(directory) / "child.pid"
+            child_code = f"import os,time; open({str(pid_path)!r},'w').write(str(os.getpid())); time.sleep(60)"
+            parent_code = ("import sys; sys.path.insert(0, 'local'); "
+                           "import weekly_window_start as hook; hook.install_signal_handlers(); "
+                           f"hook.run_bounded([sys.executable, '-c', {child_code!r}], timeout=60)")
+            root = pathlib.Path(__file__).resolve().parents[1]
+            parent = subprocess.Popen([sys.executable, "-c", parent_code], cwd=root,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 4
+                while not pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(pid_path.exists())
+                parent.terminate()
+                parent.communicate(timeout=4)
+                self.assertEqual(143, parent.returncode)
+                child = int(pid_path.read_text())
+                proc_status = pathlib.Path(f"/proc/{child}/stat")
+                if proc_status.exists():
+                    self.assertEqual("Z", proc_status.read_text().split()[2])
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.communicate(timeout=2)
+
+    def test_consumption_confirms_active_cycle(self):
+        result, log, _ = self.run_statuses([(100, 10_000, "owner"), (99, 10_000, "owner")])
+        self.assertEqual(0, result)
+        self.assertIn("quota consumption observed", log)
+
+    def test_full_deadline_requires_another_observation(self):
+        result, log, _ = self.run_statuses([(100, 10_000, "owner"),
+                                           (100, 13_000, "owner"), (100, 13_010, "owner")])
+        self.assertEqual(0, result)
+        self.assertIn("quota consumption remains unverified", log)
+
+    def test_owner_change_does_not_acknowledge_start(self):
+        result, log, _ = self.run_statuses([(100, 10_000, "a"), (99, 13_000, "b")])
+        self.assertEqual(1, result)
+        self.assertIn("owner changed", log)
+
+    def test_stale_partial_and_nonfinite_evidence_is_rejected(self):
+        baseline = {"scraped_at": "1970-01-01T00:01:40Z", "weekly_pct": 100,
+                    "weekly_reset_at": 10_000, "limit_id": "a"}
+        for changes in ({"weekly_pct": None}, {"weekly_pct": float("nan")},
+                        {"weekly_reset_at": True}, {"limit_id": None},
+                        {"scraped_at": "1970-01-01T00:00:01Z"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                weekly_window_start.status_evidence({**baseline, **changes}, 100)
+
+
+if __name__ == "__main__":
+    unittest.main()

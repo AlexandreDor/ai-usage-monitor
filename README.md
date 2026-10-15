@@ -170,6 +170,9 @@ period-wide token or cost totals.
   runs local `5h:reset` hooks, but stays silent on Discord/Telegram.
 - Detection of conservative early weekly refills and full 5-hour cycles whose
   quota stays at 100% while the reset deadline advances.
+- Weekly 100% → 100% deadline advances are confirmed by a subsequent fresh
+  observation before notifying or running `weekly:reset` hooks. They are
+  labeled as cycles observed at full quota, without claiming a measured refill.
 - Discord and Telegram delivery with independent durable state per channel.
 - Bounded retries for temporary network errors without replaying a channel that
   already succeeded.
@@ -588,6 +591,30 @@ one duplicate execution; hooks with externally visible side effects should use
 idempotence. Observed local 5-hour resets remain local-only during retries:
 replaying their hook never creates a network reset occurrence.
 
+The optional maintained weekly starter is `local/weekly_window_start.py`:
+
+```dotenv
+ALERT_SCRIPT_1=/home/user/ai-usage-monitor/local/weekly_window_start.py
+ALERT_SCRIPT_1_EVENTS=weekly:reset
+ALERT_SCRIPT_TIMEOUT_SECONDS=1800
+```
+
+This replaces older private `local/scripts/weekly-window-start.sh` hooks; those
+user files are never overwritten by an upgrade. It reads status before making
+a request and skips the request if current quota consumption already proves an
+active cycle. Otherwise it sends an ephemeral, read-only `Salut` with
+GPT-6.1 Sol and medium reasoning. It accepts observed quota consumption or a
+confirmed deadline advance, and distinguishes the latter from verified usage.
+A successful Codex response plus an unchanged future deadline at 100% remains
+unverified. A durable private receipt caps each reset occurrence at ten attempts
+or 1795 seconds, including bounded child processes; monitor retries and process
+restarts retain that budget. An exhausted occurrence stays unverified without
+sending further Codex requests. The `WEEKLY_START_MAX_ATTEMPTS`, `WEEKLY_START_WAIT_SECONDS`
+(default 120), `WEEKLY_START_RETRY_WINDOW_SECONDS` and `WEEKLY_START_LOG_FILE`
+environment overrides can be set in a trusted wrapper. No request is made to
+force a whole percentage point of consumption. Diagnostics remain in the
+private runtime log. Enabling the hook makes real Codex requests and uses quota.
+
 ### History and collection
 
 | Variable | Default | Accepted values | Description |
@@ -607,7 +634,17 @@ open or migrate the archive.
 The detector tolerates quota noise up to 5 percentage points and reset-date
 movement up to 30 minutes; a disappeared reset date is confirmed after two
 valid observations. Planned deadline crossings, the recognized weekly refill
-pattern, and the recognized full 5-hour pattern are excluded. A 5-hour reset
+pattern, confirmed weekly cycles at full quota, and the recognized full
+5-hour pattern are excluded. A weekly full-quota cycle requires an advance of
+at least 30 minutes before the old deadline, then another complete observation
+confirming the new deadline within 60 seconds. Both adjacent gaps must be at
+most `max(3600, 2 * sample_interval_seconds)` and all observations must belong
+to the same known limit group. Partial samples and owner changes cancel an
+unconfirmed candidate. The event is anchored to the first advanced observation;
+its confirmation time is retained separately. Small date drift cannot replay
+the hook. Analytics labels this `full_observed` evidence separately from a
+measured refill and assigns it no measured quota gain or unused end-of-week
+quota. A 5-hour reset
 with 100% remaining is recognized only from two complete observations in the
 same limit group, with a strictly later valid deadline; the first observation
 carrying the new deadline anchors the event. Repeating that deadline is

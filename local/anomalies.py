@@ -18,6 +18,7 @@ import sys
 from typing import Any
 
 from storage import ArchiveCorruptionError, canonicalize_limit_id, connect_database
+from weekly_reset import observe_full_weekly_reset
 
 
 # These are intentionally named and shared with archive.py/monitor.sh's
@@ -290,6 +291,12 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
         or RESET_OBSERVATION_DEFAULT_INTERVAL_SECONDS
     )
     if current_pct is None:
+        # A partial sample cannot confirm a provisional full-quota cycle.
+        if window == "weekly":
+            state, exists = _load_state(connection, limit_id, window, epoch)
+            if exists and epoch > state.get("last_epoch", 0):
+                state["full_weekly_reset_state"] = ""
+                _save_state(connection, limit_id, window, state, epoch)
         return
     state, state_exists = _load_state(connection, limit_id, window, epoch)
     # Switching the globally active group must not erase a durable baseline.
@@ -308,6 +315,11 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
             "reset_shift_episode_started": 0,
             "quota_increase_active": False, "reset_shift_signature": None,
         })
+        if window == "weekly":
+            state["full_weekly_reset_state"] = observe_full_weekly_reset(
+                "", epoch=epoch, pct=current_pct, reset_at=current_reset,
+                owner=limit_id, interval=current_interval,
+            )[0]
         _record_reset_history(state, epoch, current_reset)
         _save_state(connection, limit_id, window, state, epoch)
         return
@@ -324,9 +336,19 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     if previous_reset is None:
         previous_reset = _epoch(state.get("last_available_reset_at"))
     scheduled_crossing = _scheduled_crossing(state, epoch)
+    full_weekly_confirmed = 0
+    full_weekly_pending = False
+    if window == "weekly":
+        full_state = "" if force_baseline else state.get("full_weekly_reset_state", "")
+        full_state, full_weekly_confirmed, full_weekly_pending = observe_full_weekly_reset(
+            full_state, epoch=epoch, pct=current_pct, reset_at=current_reset,
+            owner=limit_id, interval=current_interval,
+        )
+        state["full_weekly_reset_state"] = full_state
     recognized_weekly = window == "weekly" and _weekly_reset(
         previous_pct, current_pct, previous_reset, current_reset
     )
+    recognized_weekly = recognized_weekly or full_weekly_confirmed or full_weekly_pending
     recognized_five_hour = (
         window == "5h"
         and reset_observation_gap_acceptable(
