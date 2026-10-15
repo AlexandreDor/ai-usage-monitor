@@ -281,6 +281,25 @@ def _record_reset_history(state: dict[str, Any], epoch: int,
             state["stable_count"] = 0
 
 
+def _resolve_full_weekly_shift(connection: sqlite3.Connection, limit_id: str,
+                               state: dict[str, Any], confirmed_at: int = 0) -> None:
+    """Release a deferred anomaly unless its original candidate was confirmed."""
+    pending = state.pop("pending_full_weekly_shift", None)
+    if not isinstance(pending, dict) or pending.get("epoch") == confirmed_at:
+        return
+    epoch = _epoch(pending.get("epoch"))
+    before, after = _epoch(pending.get("before_reset")), _epoch(pending.get("after_reset"))
+    if epoch is None or before is None or after is None:
+        return
+    _insert_anomaly(
+        connection, limit_id=limit_id, window="weekly", anomaly_type="reset_shift",
+        episode=f"{before}:{after}:{epoch}", detected_at=epoch,
+        before_pct=100, after_pct=100, before_reset=before, after_reset=after,
+        message=f"weekly reset date moved by {abs(after - before) // 60} minutes "
+                "without a confirmed quota reset.",
+    )
+
+
 def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str,
                    pct: Any, reset_at: Any, epoch: int,
                    sample_interval: Any, force_baseline: bool) -> None:
@@ -295,6 +314,7 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
         if window == "weekly":
             state, exists = _load_state(connection, limit_id, window, epoch)
             if exists and epoch > state.get("last_epoch", 0):
+                _resolve_full_weekly_shift(connection, limit_id, state)
                 state["full_weekly_reset_state"] = ""
                 _save_state(connection, limit_id, window, state, epoch)
         return
@@ -345,6 +365,15 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
             owner=limit_id, interval=current_interval,
         )
         state["full_weekly_reset_state"] = full_state
+        # Keep the original movement durable while confirmation is pending.
+        # A rejected/replaced candidate must not erase the shift just because
+        # the normal baseline has already advanced to its provisional date.
+        _resolve_full_weekly_shift(connection, limit_id, state, full_weekly_confirmed)
+        if (full_weekly_pending and previous_reset is not None and current_reset is not None
+                and abs(current_reset - previous_reset) > RESET_SHIFT_TOLERANCE_SECONDS):
+            state["pending_full_weekly_shift"] = {
+                "epoch": epoch, "before_reset": previous_reset, "after_reset": current_reset,
+            }
     recognized_weekly = window == "weekly" and _weekly_reset(
         previous_pct, current_pct, previous_reset, current_reset
     )
@@ -493,6 +522,12 @@ def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any]) -
     active_limit = active[0] if active else None
     force_baseline = active_limit != limit_id
     if force_baseline:
+        if active_limit is not None:
+            previous, exists = _load_state(connection, active_limit, "weekly", epoch)
+            if exists and epoch > previous.get("last_epoch", 0):
+                _resolve_full_weekly_shift(connection, active_limit, previous)
+                previous["full_weekly_reset_state"] = ""
+                _save_state(connection, active_limit, "weekly", previous, epoch)
         connection.execute(
             """
             INSERT INTO metadata(key, value) VALUES('anomaly_active_limit_id', ?)

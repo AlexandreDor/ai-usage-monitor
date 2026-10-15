@@ -74,8 +74,9 @@ def run_hook() -> int:
             or os.environ.get("CODEX_ALERT_WINDOW") != "weekly"):
         return 0
     local = Path(__file__).resolve().parent
-    log_path = Path(os.environ.get("WEEKLY_START_LOG_FILE", local / "runtime" / "weekly-window-start.log"))
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime = Path(os.environ.get("CODEX_MONITOR_RUNTIME_DIR") or local / "runtime")
+    log_path = Path(os.environ.get("WEEKLY_START_LOG_FILE", runtime / "weekly-window-start.log"))
+    log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     with os.fdopen(descriptor, "a", encoding="utf-8") as output:
         def log(message: str) -> None:
@@ -157,7 +158,8 @@ def run_hook() -> int:
                 log(f"Attempt {attempt}/{attempts}: model=gpt-6.1-sol reasoning=medium")
                 try:
                     result = run_bounded([
-                        codex, "exec", "--ephemeral", "--model", "gpt-6.1-sol",
+                        codex, "exec", "--ephemeral", "--skip-git-repo-check",
+                        "--model", "gpt-6.1-sol",
                         "--sandbox", "read-only", "-c", 'model_reasoning_effort="medium"',
                         "-c", 'approval_policy="never"', "--color", "never", "--json",
                         "-C", str(local.parent), "Salut",

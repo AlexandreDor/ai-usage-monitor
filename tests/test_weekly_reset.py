@@ -106,6 +106,73 @@ class FullWeeklyResetTests(unittest.TestCase):
             with self.subTest(state=state):
                 self.assertEqual((0, False), self.observe(state, 100, 10_000)[1:])
 
+    def test_confirmation_after_old_deadline_has_one_archive_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            c = storage.connect_database(pathlib.Path(directory) / "archive.sqlite3")
+            try:
+                for epoch, deadline, pct in ((10000, 14000, 99), (10900, 14000, 100),
+                                             (13600, 20000, 100), (14500, 20010, 100),
+                                             (15400, 20011, 100)):
+                    archive.insert_snapshot(c, self.sample(epoch, deadline, pct))
+                archive.rebuild_reset_events(c)
+                self.assertEqual([(13600, 14500, "full_observed")], c.execute(
+                    "SELECT reset_at_epoch, observed_at_epoch, detection_method "
+                    "FROM reset_events WHERE window='weekly'"
+                ).fetchall())
+            finally:
+                c.close()
+
+    def test_rejected_candidates_release_the_original_anomaly_once_after_restart(self):
+        interruptions = ((1900, 13061, 100, "group-a"),  # Drift beyond confirmation tolerance.
+                         (1900, 13000, None, "group-a"),
+                         (1900, None, 100, "group-a"),
+                         (5000, 13000, 100, "group-a"),
+                         (1900, 13000, 100, "group-b"),
+                         (1900, 10000, 100, "group-a"))
+        for interruption in interruptions:
+            with self.subTest(interruption=interruption), tempfile.TemporaryDirectory() as directory:
+                database = pathlib.Path(directory) / "archive.sqlite3"
+                c = storage.connect_database(database)
+                try:
+                    for epoch, deadline in ((100, 10000), (1000, 13000)):
+                        sample = self.sample(epoch, deadline)
+                        anomalies.process_snapshot(c, sample)
+                        archive.insert_snapshot(c, sample)
+                    self.assertEqual(0, c.execute("SELECT count(*) FROM quota_anomalies").fetchone()[0])
+                    c.commit()
+                finally:
+                    c.close()
+                c = storage.connect_database(database)
+                try:
+                    sample = self.sample(*interruption)
+                    anomalies.process_snapshot(c, sample)
+                    anomalies.process_snapshot(c, sample)  # Replayed collection is idempotent.
+                    archive.insert_snapshot(c, sample)
+                    archive.rebuild_reset_events(c)
+                    self.assertEqual([(1000, storage.canonicalize_limit_id("group-a"))], c.execute(
+                        "SELECT detected_at_epoch, limit_id FROM quota_anomalies "
+                        "WHERE window='weekly' AND anomaly_type='reset_shift' "
+                        "AND before_reset_at=10000 AND after_reset_at=13000"
+                    ).fetchall())
+                    self.assertEqual(0, c.execute(
+                        "SELECT count(*) FROM reset_events WHERE window='weekly'"
+                    ).fetchone()[0])
+                finally:
+                    c.close()
+
+    def test_replaced_candidate_releases_only_the_unconfirmed_shift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            c = storage.connect_database(pathlib.Path(directory) / "archive.sqlite3")
+            try:
+                for epoch, deadline in ((100, 10000), (1000, 13000),
+                                        (1900, 16000), (2800, 16010)):
+                    anomalies.process_snapshot(c, self.sample(epoch, deadline))
+                self.assertEqual([(10000, 13000)], c.execute(
+                    "SELECT before_reset_at, after_reset_at FROM quota_anomalies WHERE window='weekly'"
+                ).fetchall())
+            finally:
+                c.close()
+
 
 class WeeklyHookTests(unittest.TestCase):
     def run_statuses(self, samples, *, repeat=False):
@@ -147,6 +214,61 @@ class WeeklyHookTests(unittest.TestCase):
         self.assertIn("unverified", log)
         self.assertEqual(2, sum("exec" in command for command in commands))
         self.assertTrue(all("gpt-6.1-sol" in command for command in commands if "exec" in command))
+
+    def test_packaged_hook_uses_external_runtime_and_retains_budget_across_upgrades(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime, requests = root / "runtime", root / "requests.jsonl"
+            codex = root / "fake-codex"
+            codex.write_text(
+                f"#!{sys.executable}\n"
+                "import json,os,pathlib,sys\n"
+                "if '--skip-git-repo-check' not in sys.argv: sys.exit(3)\n"
+                "cwd=pathlib.Path(sys.argv[sys.argv.index('-C')+1])\n"
+                "assert not (cwd/'.git').exists()\n"
+                "with open(os.environ['WEEKLY_START_TEST_REQUESTS'],'a') as f: "
+                "f.write(json.dumps(sys.argv)+'\\n')\n"
+                "print('{\"type\":\"turn.completed\"}')\n"
+            )
+            codex.chmod(0o700)
+            environment = {"CODEX_ALERT_EVENT": "reset", "CODEX_ALERT_WINDOW": "weekly",
+                           "CODEX_ALERT_RESET_AT": "100", "CODEX_ALERT_CODEX_BIN": str(codex),
+                           "CODEX_MONITOR_RUNTIME_DIR": str(runtime),
+                           "WEEKLY_START_MAX_ATTEMPTS": "1", "WEEKLY_START_WAIT_SECONDS": "0",
+                           "WEEKLY_START_RETRY_WINDOW_SECONDS": "60",
+                           "WEEKLY_START_TEST_REQUESTS": str(requests)}
+
+            def status(*_args, **_kwargs):
+                return {"scraped_at": dt.datetime.fromtimestamp(int(time.time()), dt.timezone.utc).isoformat(),
+                        "weekly_pct": 100, "weekly_reset_at": int(time.time()) + 10000,
+                        "limit_id": "owner"}
+
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(weekly_window_start, "fetch_status", side_effect=status):
+                for version in ("v1", "v2"):
+                    local = root / version / "local"
+                    local.mkdir(parents=True)
+                    module = local / "weekly_window_start.py"
+                    module.touch()
+                    local.chmod(0o555)
+                    try:
+                        with mock.patch.object(weekly_window_start, "__file__", str(module)):
+                            self.assertEqual(1, weekly_window_start.run_hook())
+                        self.assertFalse((local / "runtime").exists())
+                    finally:
+                        local.chmod(0o755)
+            # The second release retries the same occurrence with the same
+            # durable budget, rather than issuing another request.
+            commands = [json.loads(line) for line in requests.read_text().splitlines()]
+            self.assertEqual(1, len(commands))
+            self.assertEqual(str(root / "v1"), commands[0][commands[0].index("-C") + 1])
+            log = runtime / "weekly-window-start.log"
+            self.assertIn("Codex exit=0", log.read_text())
+            self.assertEqual(0o700, runtime.stat().st_mode & 0o777)
+            self.assertEqual(0o600, log.stat().st_mode & 0o777)
+            receipts = list(runtime.glob(".weekly-window-start-budget-*.json"))
+            self.assertEqual(1, len(receipts))
+            self.assertEqual(1, json.loads(receipts[0].read_text())["attempts"])
 
     def test_timeout_reaps_descendant_holding_output_pipes(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -3846,11 +3846,15 @@ check_thresholds() {
   if (( observed_weekly_reset_at > 0 )) \
     && [[ "$limit_id" == "$observed_weekly_limit_id" ]] \
     && (( observed_weekly_reset_recovery == 0 )) \
-    && (( observed_weekly_scheduled_due == 0 )) \
     && { (( full_weekly_event_at > 0 )) \
-      || is_random_weekly_reset "$observed_weekly_pct" "$weekly_pct" \
-        "$observed_weekly_reset_at" "$weekly_reset_at"; }; then
+      || { (( observed_weekly_scheduled_due == 0 )) \
+        && is_random_weekly_reset "$observed_weekly_pct" "$weekly_pct" \
+          "$observed_weekly_reset_at" "$weekly_reset_at"; }; }; then
     if (( full_weekly_event_at > 0 )); then
+      # This advance was first seen before the old deadline. Confirmation
+      # can arrive after that deadline: it still supersedes the old arm,
+      # rather than delivering a scheduled reset followed by a second hook.
+      observed_weekly_scheduled_due=0
       full_weekly_reset_state="${full_weekly_reset_fields[0]}"
       weekly_armed_reset_at="$full_weekly_event_at"
       confirmed_full_weekly_reset_at="$full_weekly_event_at"

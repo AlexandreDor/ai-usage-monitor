@@ -609,7 +609,10 @@ A successful Codex response plus an unchanged future deadline at 100% remains
 unverified. A durable private receipt caps each reset occurrence at ten attempts
 or 1795 seconds, including bounded child processes; monitor retries and process
 restarts retain that budget. An exhausted occurrence stays unverified without
-sending further Codex requests. The `WEEKLY_START_MAX_ATTEMPTS`, `WEEKLY_START_WAIT_SECONDS`
+sending further Codex requests. Logs and receipts use `CODEX_MONITOR_RUNTIME_DIR`
+when configured, so packaged releases keep their state under `/var/lib` across
+upgrades. The starter also supports release archives without Git metadata.
+The `WEEKLY_START_MAX_ATTEMPTS`, `WEEKLY_START_WAIT_SECONDS`
 (default 120), `WEEKLY_START_RETRY_WINDOW_SECONDS` and `WEEKLY_START_LOG_FILE`
 environment overrides can be set in a trusted wrapper. No request is made to
 force a whole percentage point of consumption. Diagnostics remain in the
@@ -642,7 +645,10 @@ most `max(3600, 2 * sample_interval_seconds)` and all observations must belong
 to the same known limit group. Partial samples and owner changes cancel an
 unconfirmed candidate. The event is anchored to the first advanced observation;
 its confirmation time is retained separately. Small date drift cannot replay
-the hook. Analytics labels this `full_observed` evidence separately from a
+the hook. Confirmation after the old deadline still supersedes that scheduled
+reset and runs only one hook. An unconfirmed deadline-shift anomaly is deferred
+until confirmation; rejecting the candidate retains the original anomaly.
+Analytics labels this `full_observed` evidence separately from a
 measured refill and assigns it no measured quota gain or unused end-of-week
 quota. A 5-hour reset
 with 100% remaining is recognized only from two complete observations in the
