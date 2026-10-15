@@ -8,8 +8,53 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Added
 
+- Progressive Analytics loading, previous-period comparisons, remembered filters
+  and locally shareable views, complete filtered CSV downloads, and sanitized
+  monitor/archive/anomaly diagnostics.
+- Shared IANA timezone, user-set EUR conversion rate and optional rate date.
+- Verified atomic live-WAL backups with safe retention and an opt-in daily
+  systemd timer.
+- Dense-history loading and rendering performance budgets in CI and release
+  validation, alongside the existing idle benchmarks.
+- Prototype a compact Analytics model explorer with searchable model cards, family
+  filters, selected-model chips and explicit Apply/Cancel for batch changes.
+  The explorer starts collapsed and expands without internal scrolling.
+  Date range, application and model filters share a unified row layout and
+  selection styling.
+  English and French controls support keyboard navigation and mobile layouts.
 - Select GPT-6.1 Sol by default in Analytics and the GPT quick selection,
   with its own weekly-limit value curve and Standard API reference prices.
+
+### Performance
+
+- Reuse model identities, pricing checks and regression sensitivity solves while
+  preserving all estimator checks and complete chart data.
+- Bound and coalesce reusable analytics work, invalidate caches after archive or
+  pricing changes, and preserve live stale-data transitions.
+- Populate closed chart tables on demand and reuse locale-aware formatters.
+- Serve compressed text responses and revalidate unchanged static assets with
+  ETags while keeping local usage responses uncacheable.
+
+### Fixed
+
+- Preserve SQLite reader locks during archive-path validation so diagnostics
+  cannot leave Analytics attached to deleted WAL files after collection.
+- Preserve requested allocation and reset pages when a collection changes the
+  archive revision and Analytics reloads a coherent snapshot; failed recovery
+  or a failed reset replacement retries from the displayed page without
+  skipping it, including overlapping pagination requests in different tables.
+- Restore Python 3.9 backup compatibility with non-following path metadata
+  reads, and require the backup suite on Python 3.9.25 in CI.
+- Disable persistent Analytics caching under replaceable or symlinked ancestors
+  before SQLite opens a path, while preserving calculations and trusted sticky
+  directories.
+- Reject replaceable source/destination ancestry before SQLite backup opens,
+  publish only the reserved, verified nonempty backup inode, and preserve source
+  archives even when their paths use aliases.
+- Export allocations above the JSON response limit from one paginated snapshot;
+  limit and token CSV exports no longer depend on allocation-table size.
+- Preserve special characters in read-only SQLite archive URIs.
+- Give Analytics charts translated accessible names.
 
 ### Changed
 

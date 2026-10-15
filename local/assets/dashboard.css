@@ -562,3 +562,9 @@ canvas.time-slice-chart {
     text-align: left;
   }
 }
+
+.advanced-preferences { margin-top: 1rem; color: var(--muted, #8b949e); font-size: .8rem; }
+.advanced-preferences summary { cursor: pointer; }
+.advanced-preference-fields { display: flex; flex-wrap: wrap; gap: .8rem; margin-top: .7rem; }
+.advanced-preference-fields label { display: grid; gap: .3rem; }
+.advanced-preference-fields input { color: #e6edf3; background: #161b22; border: 1px solid #30363d; border-radius: 5px; padding: .45rem; max-width: 100%; color-scheme: dark; }

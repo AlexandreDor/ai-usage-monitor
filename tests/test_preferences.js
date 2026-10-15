@@ -24,7 +24,7 @@ function createContext(initialValue = null) {
 }
 
 const defaults = createContext();
-if (JSON.stringify(defaults.CodexPreferences.get()) !== JSON.stringify({ language: 'en', currency: 'EUR' })) {
+if (JSON.stringify(defaults.CodexPreferences.get()) !== JSON.stringify({ language: 'en', currency: 'EUR', timezone: 'Europe/Paris', usdToEurRate: 0.86, rateDate: '' })) {
   fail('default preferences are incorrect');
 }
 if (defaults.CodexPreferences.formatCurrency(11.25) !== '€9.68') fail('default EUR formatting is incorrect');
@@ -68,8 +68,28 @@ if (defaults.CodexPreferences.t('analytics.idealWeeklyPace') !== 'Rythme hebdoma
 if (defaults.CodexPreferences.t('analytics.breakdownPaginationAria') !== 'Pagination de la ventilation par modèle') fail('French breakdown pagination translation is missing');
 
 const invalid = createContext('{not-json');
-if (JSON.stringify(invalid.CodexPreferences.get()) !== JSON.stringify({ language: 'en', currency: 'EUR' })) {
+if (JSON.stringify(invalid.CodexPreferences.get()) !== JSON.stringify({ language: 'en', currency: 'EUR', timezone: 'Europe/Paris', usdToEurRate: 0.86, rateDate: '' })) {
   fail('invalid stored preferences did not fall back to defaults');
 }
 
+const api = defaults.CodexPreferences;
+const first = api.numberFormatter({ maximumFractionDigits: 2 });
+if (first !== api.numberFormatter({ maximumFractionDigits: 2 })) fail('number formatter was not reused');
+const dateFirst = api.dateFormatter({ year: 'numeric' });
+if (dateFirst !== api.dateFormatter({ year: 'numeric' })) fail('date formatter was not reused');
+api.set({ language: 'en', currency: 'EUR', timezone: 'UTC', usdToEurRate: 0.9, rateDate: '2026-10-07' });
+if (api.numberFormatter({ maximumFractionDigits: 2 }) === first) fail('locale switch reused the wrong number formatter');
+if (api.dateFormatter({ year: 'numeric' }) === dateFirst) fail('timezone switch reused the wrong date formatter');
+if (api.formatCurrency(10) !== '€9.00' || api.convertUsd(10) !== 9) fail('custom exchange rate was not applied');
+if (api.timezone() !== 'UTC' || api.get().rateDate !== '2026-10-07') fail('custom timezone/rate date not saved');
+api.set({ timezone: 'Invalid/Zone', usdToEurRate: -3, rateDate: '2026-02-31' });
+if (api.timezone() !== 'Europe/Paris' || api.get().usdToEurRate !== 0.86 || api.get().rateDate !== '') fail('invalid preferences accepted');
+for (const [input, expected] of [['PST', 'America/Los_Angeles'], ['utc', 'UTC'], ['europe/paris', 'Europe/Paris'], ['Etc/GMT-2', 'Etc/GMT-2']]) {
+  api.set({ timezone: input });
+  if (api.timezone() !== expected) fail(`timezone ${input} was not normalized to its IANA name`);
+}
+const storedAlias = createContext(JSON.stringify({ timezone: 'PST' }));
+if (storedAlias.CodexPreferences.timezone() !== 'America/Los_Angeles') fail('stored alias was not normalized on load');
+api.set({ timezone: '+02:00' });
+if (api.timezone() !== 'Europe/Paris') fail('numeric UTC offset accepted as an IANA zone');
 console.log('PASS: preference tests');

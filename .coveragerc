@@ -1,10 +1,9 @@
 [run]
 branch = True
 source = local
-omit =
-    local/analytics.py
-    local/archive.py
-    local/token_usage.py
+parallel = True
+relative_files = True
+sigterm = True
 
 [report]
 fail_under = 60

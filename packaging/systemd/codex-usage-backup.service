@@ -1,0 +1,19 @@
+[Unit]
+Description=Verified Codex Usage Monitor archive backup
+
+[Service]
+Type=oneshot
+User=codex-monitor
+Group=codex-monitor
+WorkingDirectory=/opt/codex-usage-monitor/current/local
+ExecStart=/usr/bin/python3 /opt/codex-usage-monitor/current/local/backup.py --database /var/lib/codex-usage-monitor/usage-history.sqlite3 --destination-dir /var/lib/codex-usage-monitor/backups --keep 14
+TimeoutStartSec=120
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/codex-usage-monitor
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+LockPersonality=yes

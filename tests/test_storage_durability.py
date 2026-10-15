@@ -28,6 +28,13 @@ class StorageDurabilityTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
+    def test_readonly_archive_uri_preserves_special_filename_characters(self):
+        path = pathlib.Path(self.directory.name) / "history?#percent%.sqlite3"
+        with storage.connect_database(path) as connection:
+            connection.execute("INSERT INTO metadata(key,value) VALUES ('uri_test','exact')")
+        with storage.connect_database(path, read_only=True) as connection:
+            self.assertEqual(connection.execute("SELECT value FROM metadata WHERE key='uri_test'").fetchone()[0], "exact")
+
     def test_legacy_migration_has_recoverable_backup_and_wal(self):
         with sqlite3.connect(self.path) as connection:
             connection.executescript(

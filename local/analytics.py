@@ -5,16 +5,22 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import hashlib
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import math
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import sys
 from statistics import median
-from typing import Any, Iterable, Sequence
-from zoneinfo import ZoneInfo
+from typing import Any, Callable, Iterable, Iterator, Sequence
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from analytics_cache import REGRESSION_CACHE, SNAPSHOT_REVISIONS, WEEKLY_CACHE
+from analytics_history_cache import ContentRanges, FIT_CACHE_VERSION, HistoricalFitCache
 
 from storage import ArchiveCorruptionError, ArchiveSchemaError, connect_database
 from token_usage import MAX_PRICING_BOUNDARIES as MAX_CATALOG_PRICING_BOUNDARIES
@@ -109,9 +115,9 @@ def iso_utc(epoch: int | None) -> str | None:
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace("+00:00", "Z") if epoch is not None else None
 
 
-def parse_day(raw: str, *, end: bool) -> int:
+def parse_day(raw: str, *, end: bool, zone: ZoneInfo = PARIS) -> int:
     try:
-        value = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=PARIS)
+        value = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=zone)
         if end:
             value += timedelta(days=1)
         return int(value.timestamp())
@@ -161,11 +167,15 @@ def random_reset_impact(connection: sqlite3.Connection, reset_at: int, before: A
 
 
 def period(connection: sqlite3.Connection, params: dict[str, str], now: int) -> tuple[int, int, str, int]:
+    try:
+        zone = ZoneInfo(params.get("timezone", "Europe/Paris"))
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise AnalyticsError("timezone must be a valid IANA timezone") from exc
     from_date, to_date = params.get("from_date", ""), params.get("to_date", "")
     if bool(from_date) != bool(to_date):
         raise AnalyticsError("from_date and to_date must be provided together")
     if from_date:
-        start, end, label = parse_day(from_date, end=False), parse_day(to_date, end=True), "custom"
+        start, end, label = parse_day(from_date, end=False, zone=zone), parse_day(to_date, end=True, zone=zone), "custom"
     else:
         label = params.get("range", "30d")
         if label == "all":
@@ -220,7 +230,8 @@ def price_index(catalog: dict[str, Any]) -> dict[tuple[str, str], list[dict[str,
         if not isinstance(raw_periods, list):
             raw_periods = [entry]
         periods = [
-            {**period, "_effective_from_epoch": _pricing_period_epoch(period)}
+            {**period, "_effective_from_epoch": _pricing_period_epoch(period),
+             "_positive_price": _positive_price(period)}
             for period in raw_periods
         ]
         for model in [entry["model"], *entry.get("aliases", [])]:
@@ -327,7 +338,9 @@ def _event_cost(
     occurred_at = _row_value(row, "occurred_at_epoch")
     occurred_epoch = int(occurred_at) if isinstance(occurred_at, (int, float)) and not isinstance(occurred_at, bool) else None
     price = _price_at(prices, provider, model, occurred_epoch)
-    if not _positive_price(price):
+    positive_price = (price["_positive_price"] if price is not None and "_positive_price" in price
+                      else _positive_price(price))
+    if not positive_price:
         return None, "missing_price"
     counters = []
     for field in ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens"):
@@ -374,6 +387,31 @@ def _load_cost_events(
         cost, reason = _event_cost(row, prices)
         events.append((int(epoch), cost, reason, row["quality"]))
     return events
+
+
+class _RequestCostEvents:
+    """Reuse identical priced evidence inside a single pinned transaction."""
+
+    def __init__(self, connection: sqlite3.Connection, catalog: dict[str, Any]):
+        self.connection = connection
+        self.prices = price_index(catalog)
+        self.loaded = None
+
+    def load(self, start: int, end: int, *, rows=None, events=None):
+        if self.loaded is not None:
+            loaded_start, loaded_end, loaded_events, epochs = self.loaded
+            if loaded_start <= start and end <= loaded_end:
+                return loaded_events[bisect.bisect_left(epochs, start):bisect.bisect_left(epochs, end)]
+        events = (events if events is not None else
+                  _load_cost_events(self.connection, self.prices, start, end, rows=rows))
+        epochs = [event[0] for event in events]
+        # Invalid timestamps are represented by zero by the estimator. Do not
+        # slice a synthetic or unsorted epoch index as if it were archive data.
+        if all(start <= epoch < end for epoch in epochs) and all(
+            left <= right for left, right in zip(epochs, epochs[1:])
+        ):
+            self.loaded = (start, end, events, epochs)
+        return events
 
 
 def _interval_event_cost(
@@ -610,6 +648,12 @@ def _mixed_qr_solve(
     count = len(q_columns)
     projected = [sum(q_columns[index][row] * response[row] for row in range(len(response)))
                  for index in range(count)]
+    return _mixed_r_solve(r, projected)
+
+
+def _mixed_r_solve(r: list[list[float]], projected: list[float]) -> list[float] | None:
+    """Back-substitute an already projected response, including unit responses."""
+    count = len(projected)
     coefficients = [0.0] * count
     for index in range(count - 1, -1, -1):
         diagonal = r[index][index]
@@ -687,13 +731,16 @@ def _fit_mixed_regression(
     # that cross zero or move by more than half remain usable, but are exposed
     # as high-uncertainty estimates with their sensitivity bounds.
     response_floor = WEEKLY_VALUE_MIXED_QUANTIZATION_FLOOR_POINTS / 100.0
+    influences = []
+    for sample_index in range(sample_count):
+        # Q^T times a unit response is exactly this row of Q. Avoid
+        # multiplying/summing the other (all-zero) response coordinates.
+        projected = [column[sample_index] for column in q_columns]
+        influences.append(_mixed_r_solve(r, projected))
     coefficient_error_bounds: list[float] = []
     for coefficient_index, scale in enumerate(scales):
         sensitivity = 0.0
-        for sample_index in range(sample_count):
-            unit = [0.0] * sample_count
-            unit[sample_index] = 1.0
-            influence = _mixed_qr_solve(q_columns, r, unit)
+        for influence in influences:
             if influence is None:
                 sensitivity = math.inf
                 break
@@ -756,6 +803,7 @@ def _mixed_training_fit(
     identity_events: list[tuple[int, str | None, float | None, str | None, str | None]],
     identity_event_epochs: list[int],
     reset_epochs: set[int],
+    interval_cost_cache: dict | None = None,
 ) -> dict[str, Any]:
     """Fit a target's historical mixed-model attribution without future data."""
     target_start = int(target["start_epoch"])
@@ -780,6 +828,7 @@ def _mixed_training_fit(
     eligible = _adaptive_training_observations(
         rows, row_epochs, regime_start, target_start, target_limit,
         identity_events, identity_event_epochs, reset_epochs,
+        interval_cost_cache,
     )
     target_identities = set(target["identities"])
     feature_identities = target_identities | {
@@ -818,6 +867,7 @@ def _adaptive_training_observations(
     identity_events: list[tuple[int, str | None, float | None, str | None, str | None]],
     identity_event_epochs: list[int],
     reset_epochs: set[int],
+    interval_cost_cache: dict | None = None,
 ) -> list[dict[str, Any]]:
     """Build causal, non-overlapping observations once quota signal is measurable."""
     left = bisect.bisect_left(row_epochs, start_epoch)
@@ -877,9 +927,15 @@ def _adaptive_training_observations(
                 continue
             if delta < WEEKLY_VALUE_TRAINING_MIN_QUOTA_DELTA_POINTS:
                 continue
-            costs, identities, reason, polled_delta = _interval_identity_costs(
-                identity_events, start_at, at, identity_event_epochs,
-            )
+            interval = (start_at, at)
+            cached_cost = interval_cost_cache.get(interval) if interval_cost_cache is not None else None
+            if cached_cost is None:
+                cached_cost = _interval_identity_costs(
+                    identity_events, start_at, at, identity_event_epochs,
+                )
+                if interval_cost_cache is not None:
+                    interval_cost_cache[interval] = cached_cost
+            costs, identities, reason, polled_delta = cached_cost
             if reason is None and costs is not None:
                 observations.append({
                     "start_epoch": start_at,
@@ -1268,6 +1324,9 @@ def weekly_limit_value(
     *,
     now: int | None = None,
     sample_interval_seconds: int = 900,
+    cache_namespace: tuple | None = None,
+    cost_loader: _RequestCostEvents | None = None,
+    historical_cache: HistoricalFitCache | None = None,
 ) -> dict[str, Any]:
     """Build the aggregate and per-model weekly-value estimates.
 
@@ -1284,13 +1343,30 @@ def weekly_limit_value(
     history_start = evaluation_start - WEEKLY_VALUE_MAX_WINDOW_SECONDS - WEEKLY_VALUE_MIXED_TRAINING_HORIZON_SECONDS
     identities = connection.execute(
         """SELECT occurred_at_epoch, provider, model, input_tokens,
-                  cache_read_tokens, cache_write_tokens, output_tokens, quality
+                  cache_read_tokens, cache_write_tokens, output_tokens, quality,
+                  source, reasoning_tokens
            FROM token_usage_events
            WHERE occurred_at_epoch >= ? AND occurred_at_epoch < ?
            ORDER BY occurred_at_epoch, id""",
         (history_start, end),
     ).fetchall()
-    events = _load_cost_events(connection, prices, history_start, end, rows=identities)
+    event_content = None
+    raw_epochs = [row['occurred_at_epoch'] for row in identities]
+    if (cache_namespace is not None and all(type(epoch) is int for epoch in raw_epochs)
+            and all(left <= right for left, right in zip(raw_epochs, raw_epochs[1:]))):
+        event_content = ContentRanges(raw_epochs, (tuple(row) for row in identities))
+    events = None
+    if historical_cache is not None and event_content is not None:
+        events = []
+        historical_namespace = hashlib.sha256(repr(cache_namespace[1:]).encode()).hexdigest()
+        for block, left, right, digest in event_content.chunks:
+            def compute_events():
+                return _load_cost_events(connection, prices, history_start, end, rows=identities[left:right])
+            events.extend(historical_cache.cost_events(
+                (historical_namespace, block, right-left, digest), right-left, compute_events))
+    events = (cost_loader.load(history_start, end, rows=identities, events=events) if cost_loader is not None
+              else events if events is not None
+              else _load_cost_events(connection, prices, history_start, end, rows=identities))
     display_start = evaluation_start - WEEKLY_VALUE_MAX_WINDOW_SECONDS
     models = sorted({row["model"].strip().lower() for row in identities
                      if isinstance(row["occurred_at_epoch"], int)
@@ -1322,6 +1398,7 @@ def weekly_limit_value(
         for row in target_rows
     }
     identity_events = _identity_events(identities, events)
+    normalized_identities = [event[1] for event in identity_events]
     identity_event_epochs = [event[0] for event in identity_events]
     reset_epochs = {
         row[0]
@@ -1342,7 +1419,20 @@ def weekly_limit_value(
             target_observations[target_row["scraped_at_epoch"]] = observation
         elif observation_reason is not None:
             target_observation_reasons[target_row["scraped_at_epoch"]] = observation_reason
+    # Snapshot identity still governs response memoization. Historical fits
+    # depend only on their causal horizon and exact target; indexing content
+    # once avoids rehashing every overlapping 28-day training slice.
+    content_ranges = None
+    if (cache_namespace is not None and target_observations
+            and all(left <= right for left, right in zip(identity_event_epochs, identity_event_epochs[1:]))):
+        sorted_resets = sorted(reset_epochs)
+        content_ranges = (
+            ContentRanges(history_epochs, (tuple(row) for row in history_rows)),
+            event_content or ContentRanges(identity_event_epochs, (tuple(row) for row in identities)),
+            ContentRanges(sorted_resets, sorted_resets),
+        )
     mixed_fit_cache: dict[int, dict[str, Any]] = {}
+    interval_cost_cache: dict = {}
     mixed_rejections: dict[str, int] = {}
     mixed_inferred_points = 0
     mixed_target_windows = sum(epoch >= start for epoch in target_observations)
@@ -1363,14 +1453,14 @@ def weekly_limit_value(
         identity = model
         providers = sorted({
             row["provider"].strip().lower()
-            for row in identities
-            if _event_identity(row) == identity
+            for row, normalized in zip(identities, normalized_identities)
+            if normalized == identity
             and isinstance(row["provider"], str) and row["provider"].strip()
         })
         model_events = [
-            event if _event_identity(row) == identity
+            event if normalized == identity
             else (event[0], None, "mixed_models", event[3])
-            for row, event in zip(identities, events)
+            for normalized, event in zip(normalized_identities, events)
         ]
         estimate = _weekly_limit_value(connection, catalog, evaluation_start, end,
                                        cost_events=model_events, **kwargs)
@@ -1396,10 +1486,32 @@ def weekly_limit_value(
             target_epoch = target["end_epoch"]
             fit = mixed_fit_cache.get(target_epoch)
             if fit is None:
-                fit = _mixed_training_fit(
-                    history_rows, history_epochs, candidate_rows, candidate_epochs, target,
-                    identity_events, identity_event_epochs, reset_epochs,
-                )
+                def compute_fit():
+                    return _mixed_training_fit(
+                        history_rows, history_epochs, candidate_rows, candidate_epochs, target,
+                        identity_events, identity_event_epochs, reset_epochs,
+                        interval_cost_cache,
+                    )
+                # Every target has a complete causal training horizon in these
+                # inputs. A changing display start/end cannot change this fit.
+                if content_ranges is None:
+                    fit = compute_fit()
+                else:
+                    horizon = target["start_epoch"] - WEEKLY_VALUE_MIXED_TRAINING_HORIZON_SECONDS
+                    row_content, event_content, reset_content = content_ranges
+                    fit_key = (
+                        FIT_CACHE_VERSION, cache_namespace[1:],
+                        row_content.digest(horizon, target["start_epoch"], inclusive_end=True),
+                        event_content.digest(horizon, target["start_epoch"]),
+                        reset_content.digest(horizon, target["start_epoch"], inclusive_end=True),
+                        target_epoch, target["start_epoch"], target["limit_id"],
+                        target["deadline"], target["fraction"],
+                        tuple(sorted(target["costs"].items())), tuple(sorted(target["identities"])),
+                    )
+                    def reusable_fit():
+                        return (compute_fit() if historical_cache is None else
+                                historical_cache.get_or_compute(fit_key, compute_fit))
+                    fit = REGRESSION_CACHE.get_or_compute(fit_key, reusable_fit)
                 mixed_fit_cache[target_epoch] = fit
             if fit.get("ok"):
                 inferred = _mixed_point_from_fit(point, target, identity, fit)
@@ -1713,6 +1825,7 @@ def weekly_reset_cycle_metrics(
     connection: sqlite3.Connection,
     catalog: dict[str, Any],
     reset_rows: Sequence[sqlite3.Row],
+    *, cost_loader: _RequestCostEvents | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Calculate full-cycle costs from all local token events in one pass."""
     if not reset_rows:
@@ -1783,7 +1896,8 @@ def weekly_reset_cycle_metrics(
         }
     first_start = min(row["reset_at_epoch"] for row in valid_resets)
     last_end = max(row["reset_at_epoch"] for row in valid_resets)
-    events = _load_cost_events(connection, price_index(catalog), first_start, last_end)
+    events = (cost_loader.load(first_start, last_end) if cost_loader is not None
+              else _load_cost_events(connection, price_index(catalog), first_start, last_end))
     event_index = _event_index(events)
     previous_by_limit: dict[str, sqlite3.Row] = {}
     metrics: dict[int, dict[str, Any]] = {}
@@ -1926,6 +2040,8 @@ def token_analytics(
     sources: Sequence[str],
     models: Sequence[str],
     breakdown_offset: int | None,
+    *,
+    include_breakdown: bool = True,
 ) -> tuple[dict[str, Any], list[str]]:
     """Aggregate token usage while preserving each effective pricing period."""
     prices = price_index(catalog)
@@ -1936,7 +2052,7 @@ def token_analytics(
         connection,
         f"SELECT COUNT(*) FROM (SELECT 1 FROM token_usage_events WHERE {conditions} GROUP BY source, provider, model)",
         values,
-    ) or 0)
+    ) or 0) if include_breakdown else 0
     if breakdown_offset is None and breakdown_total > MAX_BREAKDOWN_ROWS:
         raise AnalyticsError(f"token breakdown exceeds the {MAX_BREAKDOWN_ROWS}-group response limit")
     last_page_offset = (
@@ -2004,7 +2120,7 @@ def token_analytics(
         group["assumed_zero"] = group["assumed_zero"] or assumed_zero
 
     breakdown_page_keys: tuple[tuple[str, str, str], ...] | None = None
-    if breakdown_offset is not None:
+    if include_breakdown and breakdown_offset is not None:
         page_rows = connection.execute(
             f"SELECT source, provider, model FROM token_usage_events WHERE {conditions} "
             "GROUP BY source, provider, model ORDER BY source, model, provider LIMIT ? OFFSET ?",
@@ -2015,13 +2131,13 @@ def token_analytics(
         )
 
     breakdown_groups: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for segment_start, raw in segmented_rows(
+    for segment_start, raw in (segmented_rows(
         f"source, provider, model, {sums}, COUNT(*) AS events",
         "source, provider, model",
         MAX_BREAKDOWN_PROCESSING_ROWS,
         f"token breakdown exceeds the {MAX_BREAKDOWN_PROCESSING_ROWS}-row processing limit",
         breakdown_page_keys,
-    ):
+    ) if include_breakdown else ()):
         item = token_row(raw)
         key = (str(item["source"]), str(item["provider"]), str(item["model"]))
         normalize_token_counts(item)
@@ -2131,9 +2247,10 @@ def token_analytics(
         "summary": summary,
         "series": series,
         "series_by_source": series_by_source,
-        "breakdown": breakdown,
     }
-    if breakdown_offset is not None:
+    if include_breakdown:
+        result["breakdown"] = breakdown
+    if include_breakdown and breakdown_offset is not None:
         result["breakdown_pagination"] = {
             "total": breakdown_total,
             "offset": effective_breakdown_offset,
@@ -2266,6 +2383,7 @@ def reset_history(
     offset: int,
     limit: int,
     catalog: dict[str, Any] | None = None,
+    *, cost_loader: _RequestCostEvents | None = None,
 ) -> dict[str, Any]:
     clauses, values = ["reset_at_epoch >= ?", "reset_at_epoch < ?"], [start, end]
     if kind != "all":
@@ -2320,7 +2438,7 @@ def reset_history(
     }
     page_weekly_rows = [row for row in rows if row["window"] == "weekly"]
     cycle_metrics = (
-        weekly_reset_cycle_metrics(connection, catalog, page_weekly_rows)
+        weekly_reset_cycle_metrics(connection, catalog, page_weekly_rows, cost_loader=cost_loader)
         if catalog is not None and page_weekly_rows else {}
     )
     return {
@@ -2443,7 +2561,9 @@ def hermes_baselines(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     return results
 
 
-def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now: int | None = None) -> dict[str, Any]:
+@contextmanager
+def read_snapshot(database: Path, pricing: Path) -> Iterator[Callable[..., dict[str, Any]]]:
+    """Build related payloads from one pinned archive and pricing snapshot."""
     if not database.is_file():
         raise AnalyticsUnavailableError("analytics archive is not available yet")
     try:
@@ -2451,92 +2571,163 @@ def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now:
     except (CollectorError, OSError, UnicodeError, ValueError) as exc:
         raise AnalyticsUnavailableError("pricing catalog cannot be read") from exc
     try:
+        preopen_revision = SNAPSHOT_REVISIONS.observe(database)
         connection = connect_database(database, read_only=True)
     except (ArchiveCorruptionError, ArchiveSchemaError, OSError, sqlite3.DatabaseError) as exc:
         raise AnalyticsUnavailableError("analytics archive cannot be read") from exc
     connection.row_factory = sqlite3.Row
     try:
-        connection.execute("BEGIN")
-        current = int(now if now is not None else datetime.now(timezone.utc).timestamp())
-        start, end, range_label, granularity = period(connection, params, current)
-        if "source" in params and "sources" in params or "model" in params and "models" in params:
-            raise AnalyticsError("use either the singular or plural token filter")
-        sources = selected_values(params.get("sources", params.get("source", "all")), name="source", allowed=SOURCES)
-        models = selected_values(params.get("models", params.get("model", "")), name="model")
-        reset_type = params.get("reset_type", "all")
-        if reset_type not in ("all", "5h", "weekly"):
-            raise AnalyticsError("reset_type must be all, 5h, or weekly")
-        try:
-            reset_offset = int(params.get("reset_offset", "0"))
-            reset_limit = int(params.get("reset_limit", str(DEFAULT_RESET_PAGE_SIZE)))
-        except ValueError as exc:
-            raise AnalyticsError("reset pagination must use integers") from exc
-        if reset_offset < 0 or not 1 <= reset_limit <= 100:
-            raise AnalyticsError("reset_offset must be positive and reset_limit must be 1..100")
-        breakdown_offset = None
-        if "breakdown_offset" in params:
-            try:
-                breakdown_offset = int(params["breakdown_offset"])
-            except ValueError as exc:
-                raise AnalyticsError("breakdown_offset must be an integer") from exc
-            if breakdown_offset < 0:
-                raise AnalyticsError("breakdown_offset must be non-negative")
+        pinned_revision = SNAPSHOT_REVISIONS.pin(connection, database, expected=preopen_revision)
+        cache_namespace = None
+        if pinned_revision is not None:
+            pricing_digest = hashlib.sha256(json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            estimator_policy = tuple((name, value) for name, value in sorted(globals().items())
+                                     if name.startswith("WEEKLY_") and isinstance(value, (str, int, float)))
+            cache_namespace = (pinned_revision, pricing_digest, estimator_policy)
+        revision = (hashlib.sha256(repr(cache_namespace).encode()).hexdigest()
+                    if cache_namespace is not None else secrets.token_hex(32))
 
-        tokens, warnings = token_analytics(
-            connection,
-            catalog,
-            start,
-            end,
-            granularity,
-            sources,
-            models,
-            breakdown_offset,
-        )
-        available_sources = [row[0] for row in connection.execute("SELECT DISTINCT source FROM token_usage_events ORDER BY source")]
-        available_models_count = int(scalar(connection, "SELECT COUNT(DISTINCT model) FROM token_usage_events") or 0)
-        if available_models_count > MAX_AVAILABLE_MODELS:
-            raise AnalyticsError(f"available model list exceeds the {MAX_AVAILABLE_MODELS}-model response limit")
-        available_models = [row[0] for row in connection.execute("SELECT DISTINCT model FROM token_usage_events ORDER BY model")]
-        freshness = collector_freshness(connection, current)
-        warnings.extend(
-            f"{name} collector: {value['last_error']}"
-            for name, value in freshness["collectors"].items()
-            if value["status"] == "error" and value["last_error"]
-        )
-        return {
-            "schema_version": 1,
-            "period": {
-                "range": range_label,
-                "from": iso_utc(start),
-                "to": iso_utc(end),
-                "timezone": "Europe/Paris",
-                "granularity_seconds": granularity,
-                "sample_interval_seconds": freshness["sample_interval_seconds"],
-            },
-            "filters": {"sources": list(sources), "models": list(models), "reset_type": reset_type},
-            "available": {"sources": available_sources, "models": available_models},
-            "freshness": freshness,
-            "limits": limit_series(connection, start, end, granularity),
-            "weekly_limit_value": weekly_limit_value(
-                connection,
-                catalog,
-                start,
-                end,
-                now=current,
-                sample_interval_seconds=freshness["sample_interval_seconds"],
-            ),
-            "tokens": tokens,
-            "resets": reset_history(connection, start, end, reset_type, reset_offset, reset_limit, catalog),
-            "baselines": {"hermes": hermes_baselines(connection)},
-            "pricing": {"currency": catalog["currency"], "as_of": catalog.get("as_of", "unknown"), "valuation_mode": catalog.get("valuation_mode", "current_catalog")},
-            "warnings": warnings,
-        }
+        def build(params: dict[str, str], *, now: int | None = None) -> dict[str, Any]:
+            return _build_payload(connection, database, catalog, params,
+                                  cache_namespace=cache_namespace, revision=revision, now=now)
+
+        yield build
     except AnalyticsError:
         raise
     except (ArchiveCorruptionError, ArchiveSchemaError, OSError, sqlite3.DatabaseError) as exc:
         raise AnalyticsUnavailableError("analytics archive query failed") from exc
     finally:
         connection.close()
+
+
+def build_payload(database: Path, pricing: Path, params: dict[str, str], *, now: int | None = None) -> dict[str, Any]:
+    with read_snapshot(database, pricing) as build:
+        return build(params, now=now)
+
+
+def _build_payload(connection: sqlite3.Connection, database: Path, catalog: dict[str, Any],
+                   params: dict[str, str], *, cache_namespace: tuple | None,
+                   revision: str, now: int | None) -> dict[str, Any]:
+    current = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    anchor = current
+    if "at" in params:
+        try:
+            anchor = int(params["at"])
+        except ValueError as exc:
+            raise AnalyticsError("at must be a positive epoch integer no later than now") from exc
+        if anchor <= 0 or anchor > current:
+            raise AnalyticsError("at must be a positive epoch integer no later than now")
+    section = params.get("sections", "full")
+    if section not in ("full", "base", "weekly", "resets", "breakdown", "limits", "tokens"):
+        raise AnalyticsError("sections must be base, weekly, resets, breakdown, limits, or tokens")
+    if params.get("compare", "") not in ("", "previous"):
+        raise AnalyticsError("compare must be previous")
+    start, end, range_label, granularity = period(connection, params, anchor)
+    if "source" in params and "sources" in params or "model" in params and "models" in params:
+        raise AnalyticsError("use either the singular or plural token filter")
+    sources = selected_values(params.get("sources", params.get("source", "all")), name="source", allowed=SOURCES)
+    models = selected_values(params.get("models", params.get("model", "")), name="model")
+    reset_type = params.get("reset_type", "all")
+    if reset_type not in ("all", "5h", "weekly"):
+        raise AnalyticsError("reset_type must be all, 5h, or weekly")
+    try:
+        reset_offset = int(params.get("reset_offset", "0"))
+        reset_limit = int(params.get("reset_limit", str(DEFAULT_RESET_PAGE_SIZE)))
+    except ValueError as exc:
+        raise AnalyticsError("reset pagination must use integers") from exc
+    if reset_offset < 0 or not 1 <= reset_limit <= 100:
+        raise AnalyticsError("reset_offset must be positive and reset_limit must be 1..100")
+    breakdown_offset = None
+    if "breakdown_offset" in params:
+        try:
+            breakdown_offset = int(params["breakdown_offset"])
+        except ValueError as exc:
+            raise AnalyticsError("breakdown_offset must be an integer") from exc
+        if breakdown_offset < 0:
+            raise AnalyticsError("breakdown_offset must be non-negative")
+
+    freshness = collector_freshness(connection, current)
+    cost_loader = _RequestCostEvents(connection, catalog)
+    warnings = [
+        f"{name} collector: {value['last_error']}"
+        for name, value in freshness["collectors"].items()
+        if value["status"] == "error" and value["last_error"]
+    ]
+    result = {
+        "schema_version": 1,
+        "revision": revision,
+        "period": {
+            "range": range_label,
+            "from": iso_utc(start),
+            "to": iso_utc(end),
+            "timezone": params.get("timezone", "Europe/Paris"),
+            "granularity_seconds": granularity,
+            "sample_interval_seconds": freshness["sample_interval_seconds"],
+        },
+        "filters": {"sources": list(sources), "models": list(models), "reset_type": reset_type},
+        "freshness": freshness,
+        "pricing": {"currency": catalog["currency"], "as_of": catalog.get("as_of", "unknown"), "valuation_mode": catalog.get("valuation_mode", "current_catalog")},
+        "warnings": warnings,
+    }
+    if section in ("full", "base", "breakdown", "tokens"):
+        tokens, token_warnings = token_analytics(
+            connection, catalog, start, end, granularity, sources, models, breakdown_offset,
+            include_breakdown=section != "tokens",
+        )
+        result["tokens"] = tokens
+        warnings.extend(token_warnings)
+    if section in ("full", "base", "limits"):
+        result["limits"] = limit_series(connection, start, end, granularity)
+    if section in ("full", "base"):
+        available_sources = [row[0] for row in connection.execute("SELECT DISTINCT source FROM token_usage_events ORDER BY source")]
+        available_models_count = int(scalar(connection, "SELECT COUNT(DISTINCT model) FROM token_usage_events") or 0)
+        if available_models_count > MAX_AVAILABLE_MODELS:
+            raise AnalyticsError(f"available model list exceeds the {MAX_AVAILABLE_MODELS}-model response limit")
+        available_models = [row[0] for row in connection.execute("SELECT DISTINCT model FROM token_usage_events ORDER BY model")]
+        result["available"] = {"sources": available_sources, "models": available_models}
+        result["baselines"] = {"hermes": hermes_baselines(connection)}
+        if params.get("compare") == "previous":
+            previous_start = start - (end - start)
+            previous_tokens, previous_warnings = token_analytics(
+                connection, catalog, previous_start, start, granularity, sources, models, 0,
+            )
+            result["comparison"] = {
+                "period": {"from": iso_utc(previous_start), "to": iso_utc(start)},
+                "tokens": {"summary": previous_tokens["summary"]},
+                "warnings": previous_warnings,
+            }
+    if section in ("full", "weekly"):
+        def compute_weekly():
+            historical = HistoricalFitCache(database) if cache_namespace is not None else None
+            try:
+                return weekly_limit_value(
+                    connection, catalog, start, end, now=current,
+                    sample_interval_seconds=freshness["sample_interval_seconds"],
+                    cache_namespace=cache_namespace,
+                    cost_loader=cost_loader, historical_cache=historical,
+                )
+            finally:
+                if historical is not None:
+                    historical.close()
+        # Exact interval endpoints preserve membership. The only wall-clock
+        # dependency of weekly estimates is the latest-sample stale state.
+        result["weekly_limit_value"] = compute_weekly() if cache_namespace is None else WEEKLY_CACHE.get_or_compute(
+            (cache_namespace, start, end, freshness["sample_interval_seconds"],
+             freshness["limits_freshness_status"] == "stale"), compute_weekly,
+        )
+    if section in ("full", "base", "resets"):
+        result["resets"] = reset_history(
+            connection, start, end, reset_type, reset_offset, reset_limit,
+            catalog if section != "base" else None,
+            cost_loader=cost_loader,
+        )
+        if section == "base":
+            result["pending_sections"] = ["weekly", "resets"]
+            for item in result["resets"]["items"]:
+                if item["window"] == "weekly":
+                    item["cycle_cost_status"] = "pending"
+                    item["cycle_cost_reason"] = "pending"
+    return result
 
 
 def main() -> int:

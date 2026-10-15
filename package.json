@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "test:browser": "playwright test --grep-invert @performance",
-    "test:performance": "playwright test --grep @performance --workers=1"
+    "test:performance": "playwright test --grep @performance --workers=1 && python3 tests/benchmark_analytics.py"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.10.2",

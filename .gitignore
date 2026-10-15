@@ -3,6 +3,7 @@ local/.env
 local/.alert_state
 local/.monitor.lock
 local/runtime/
+.*.analytics-cache/
 
 # User alert scripts stay local. Keep only the directory placeholder tracked.
 local/scripts/*

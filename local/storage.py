@@ -954,7 +954,7 @@ def connect_database(database_path: Path, *, read_only: bool = False) -> sqlite3
         raise OSError(f"archive database must not be a symbolic link: {database_path}")
     if read_only:
         connection = sqlite3.connect(
-            f"file:{database_path}?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+            database_path.absolute().as_uri() + "?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
             factory=RetryingConnection,
         )
         try:

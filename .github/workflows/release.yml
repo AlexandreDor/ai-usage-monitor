@@ -72,18 +72,12 @@ jobs:
           expected_node="$(tr -d '[:space:]' < .node-version)"
           test "$(node --version)" = "v$expected_node"
           bash -n local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
-          python -m unittest tests.test_migrations
-          python -m unittest tests.test_codex_client
           python -m compileall -q local tests
-          systemd-analyze verify packaging/systemd/codex-usage-monitor.service packaging/systemd/codex-usage-dashboard.service
-          python -m coverage run --branch --rcfile=.coveragerc -m unittest \
-            tests.test_migrations tests.test_alerts tests.test_anomalies \
-            tests.test_history tests.test_codex_client tests.test_config \
-            tests.test_storage_durability
-          python -m coverage report --rcfile=.coveragerc
-          SKIP_PYTHON_TESTS=1 tests/run.sh
+          systemd-analyze verify packaging/systemd/codex-usage-monitor.service packaging/systemd/codex-usage-dashboard.service packaging/systemd/codex-usage-backup.service packaging/systemd/codex-usage-backup.timer
+          scripts/test-coverage.sh
           npx playwright install --with-deps chromium
           npm run test:browser
+          npm run test:performance
           npm audit --audit-level=low
           shellcheck -x local/*.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/fixtures/*.sh
 
