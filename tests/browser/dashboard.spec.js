@@ -1718,6 +1718,111 @@ for (const [section, failedSection] of [
   });
 }
 
+test('retries the visible reset page when its replacement fails during revision recovery', async ({ page }) => {
+  const resetOffsets = [];
+  let revision = 'before-collection';
+  let recoveryBaseLoaded = false;
+  let failReplacement = true;
+  await page.route('**/api/analytics?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    const section = query.get('sections');
+    const offset = Number(query.get('reset_offset') || 0);
+    if (section === 'resets') {
+      resetOffsets.push(offset);
+      if (recoveryBaseLoaded && failReplacement) {
+        failReplacement = false;
+        return route.fulfill({ status: 503, json: { error: 'temporary reset replacement failure' } });
+      }
+    }
+    const payload = {
+      ...analyticsPayload, revision,
+      resets: { ...enhancedAnalyticsPayload.resets, total: 155, offset },
+    };
+    if (revision === 'after-collection' && section === 'base') {
+      recoveryBaseLoaded = true;
+      payload.pending_sections = ['weekly', 'resets'];
+      delete payload.weekly_limit_value;
+    }
+    return route.fulfill({ json: payload });
+  });
+  await page.goto('/analytics.html');
+  await expect(page.locator('#reset-page-label')).toHaveText('1–50 of 155');
+
+  revision = 'after-collection';
+  await page.locator('#resets-next').click();
+  await expect(page.locator('#resets-section-status')).toContainText('temporary reset replacement failure');
+  await expect(page.locator('#reset-page-label')).toHaveText('1–50 of 155');
+  expect(await page.evaluate(() => state.resetOffset)).toBe(0);
+
+  await page.locator('#resets-next').click();
+  await expect(page.locator('#reset-page-label')).toHaveText('51–100 of 155');
+  await expect(page.locator('#resets-section-status')).toBeHidden();
+  expect(resetOffsets).toEqual([50, 50, 50]);
+});
+
+for (const [firstSection, secondSection, trigger] of [
+  ['resets', 'breakdown', 'revision'], ['breakdown', 'resets', 'revision'],
+  ['resets', 'breakdown', 'pending base'], ['breakdown', 'resets', 'pending base'],
+]) {
+  test(`retains both pages when ${secondSection} interrupts ${firstSection} through a ${trigger} and recovery fails`, async ({ page }) => {
+    const queries = [];
+    let phase = 'initial';
+    let baseRequests = 0;
+    let release;
+    const held = new Promise(resolve => { release = resolve; });
+    const offsetKey = section => section === 'breakdown' ? 'breakdown_offset' : 'reset_offset';
+    const label = section => page.locator(section === 'breakdown' ? '#breakdown-page-label' : '#reset-page-label');
+    const next = section => page.locator(section === 'breakdown' ? '#breakdown-next' : '#resets-next');
+    await page.route('**/api/analytics?*', async route => {
+      const query = new URL(route.request().url()).searchParams;
+      queries.push(query);
+      const section = query.get('sections');
+      if (phase === 'overlap') {
+        if (section === 'base') {
+          baseRequests += 1;
+          if (trigger === 'revision' || baseRequests === 3) {
+            phase = 'retry';
+            return route.fulfill({ status: 503, json: { error: 'overlapping recovery failed' } });
+          }
+          await held;
+        } else if (section === firstSection) await held;
+      }
+      return route.fulfill({ json: {
+        ...analyticsPayload,
+        revision: phase === 'initial' ? 'before' : 'after',
+        tokens: { ...analyticsPayload.tokens, breakdown_pagination: {
+          total: 155, offset: Number(query.get('breakdown_offset') || 0), limit: 50,
+        } },
+        resets: { ...enhancedAnalyticsPayload.resets, total: 155, offset: Number(query.get('reset_offset') || 0) },
+      } });
+    });
+    try {
+      await page.goto('/analytics.html');
+      await expect(label(firstSection)).toHaveText('1–50 of 155');
+      await expect(label(secondSection)).toHaveText('1–50 of 155');
+      phase = 'overlap';
+      if (trigger === 'pending base') {
+        await page.evaluate(() => { void refresh(); });
+        await expect.poll(() => baseRequests).toBe(1);
+      }
+      await next(firstSection).click();
+      await expect.poll(() => queries.some(query => query.get(offsetKey(firstSection)) === '50')).toBe(true);
+      await next(secondSection).click();
+      await expect(page.locator('#analytics-error')).toContainText('overlapping recovery failed');
+      for (const section of [firstSection, secondSection]) {
+        await expect(label(section)).toHaveText('1–50 of 155');
+        expect(await page.evaluate(key => new URLSearchParams(queryString()).get(key), offsetKey(section))).toBe('0');
+      }
+      release();
+      await next(firstSection).click();
+      await expect(label(firstSection)).toHaveText('51–100 of 155');
+      await next(secondSection).click();
+      await expect(label(secondSection)).toHaveText('51–100 of 155');
+      await expect(page.locator('#analytics-error')).toBeHidden();
+    } finally { release(); }
+  });
+}
+
 test('falls back to one coherent response after repeated revision mismatches', async ({ page }) => {
   let bases = 0;
   const requests = [];

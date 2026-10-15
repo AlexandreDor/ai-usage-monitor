@@ -51,6 +51,7 @@ let filterTimer = null;
 let filtersPending = false;
 let baseRefreshRequired = false;
 const requestControllers = new Map();
+const pendingPageOffsets = new Map();
 const sectionSequences = new Map();
 const deferredTables = new Map();
 const localFormatters = new Map();
@@ -1366,6 +1367,7 @@ async function loadSection(section, generation, base, query) {
       lastPayload = { ...lastPayload, tokens: { ...lastPayload.tokens, breakdown: component.tokens.breakdown, breakdown_pagination: component.tokens.breakdown_pagination } };
       renderBreakdown(component.tokens.breakdown, component.tokens.breakdown_pagination);
     }
+    if (section === 'breakdown' || section === 'resets') pendingPageOffsets.delete(section);
     lastPayload.pending_sections = (lastPayload.pending_sections || []).filter(value => value !== section);
     lastPayload.warnings = [...new Set([...(lastPayload.warnings || []), ...(component.warnings || [])])];
     renderWarnings(lastPayload.warnings);
@@ -1376,7 +1378,8 @@ async function loadSection(section, generation, base, query) {
     // Only ordinary failures should restore the page already on screen.
     if (error.revisionMismatch) throw error;
     if (section === 'breakdown') state.breakdownOffset = safeNumber(lastPayload?.tokens?.breakdown_pagination?.offset);
-    if (section === 'resets') state.resetOffset = safeNumber(lastPayload?.resets?.offset);
+    if (section === 'resets') state.resetOffset = displayedPageOffset(section);
+    pendingPageOffsets.delete(section);
     setSectionStatus(section, 'error', `${error.message} · ${t('sectionFailed')}`);
   } finally {
     if (requestControllers.get(section) === controller) requestControllers.delete(section);
@@ -1387,8 +1390,24 @@ function displayedPageOffset(section) {
   if (section === 'resets') return safeNumber(displayedResetData?.offset);
   return undefined;
 }
+function resetPagination() {
+  state.resetOffset = 0;
+  state.breakdownOffset = 0;
+  pendingPageOffsets.clear();
+}
+function rollbackPendingPages() {
+  for (const [section, offset] of pendingPageOffsets) {
+    if (section === 'breakdown') state.breakdownOffset = offset;
+    if (section === 'resets') state.resetOffset = offset;
+  }
+  pendingPageOffsets.clear();
+}
 async function refresh({ section = 'base', revisionRetry = false, coherent = false, previousOffset } = {}) {
-  const requestedSection = section;
+  // Keep the first baseline until its table is accepted. A base restart may
+  // cancel several page requests, and rapid clicks must not replace it.
+  if (previousOffset !== undefined && ['breakdown', 'resets'].includes(section) && !pendingPageOffsets.has(section)) {
+    pendingPageOffsets.set(section, previousOffset);
+  }
   // A pending base owns an older query. Restart it with the latest controls
   // before it can overwrite a newer component selection or pagination page.
   // A failed base must also recover before components can use the new filters.
@@ -1398,7 +1417,7 @@ async function refresh({ section = 'base', revisionRetry = false, coherent = fal
   if (section !== 'base' && lastPayload) {
     try { await loadSection(section, refreshSequence, lastPayload, queryString()); }
     catch (error) {
-      if (error.revisionMismatch) await refresh({ section, revisionRetry: true, previousOffset: displayedPageOffset(section) });
+      if (error.revisionMismatch) await refresh({ revisionRetry: true });
     }
     updateExportLink();
     return;
@@ -1424,6 +1443,8 @@ async function refresh({ section = 'base', revisionRetry = false, coherent = fal
     pendingBaseSequence = null;
     render(payload);
     if (sequence !== refreshSequence) return;
+    pendingPageOffsets.delete('breakdown');
+    if (!payload.pending_sections?.includes('resets')) pendingPageOffsets.delete('resets');
     baseRefreshRequired = false;
     for (const name of coherentPending) setSectionStatus(name, '');
     persistFilters();
@@ -1437,15 +1458,9 @@ async function refresh({ section = 'base', revisionRetry = false, coherent = fal
     if (error.revisionMismatch) {
       // Two changing snapshots must never be mixed. A single full response
       // pins every section to one database snapshot without an unbounded retry.
-      await refresh({
-        section: requestedSection, previousOffset: displayedPageOffset(requestedSection),
-        ...(revisionRetry ? { coherent: true } : { revisionRetry: true }),
-      }); return;
+      await refresh(revisionRetry ? { coherent: true } : { revisionRetry: true }); return;
     }
-    if (previousOffset !== undefined) {
-      if (requestedSection === 'breakdown') state.breakdownOffset = previousOffset;
-      if (requestedSection === 'resets') state.resetOffset = previousOffset;
-    }
+    rollbackPendingPages();
     const message = error instanceof Error ? error.message : t('unableToLoadAnalytics');
     for (const name of coherentPending) setSectionStatus(name, 'error', `${message} · ${t('showingLastData')}`);
     const localOnly = error?.status === 404 || /local mode/i.test(message);
@@ -1556,8 +1571,7 @@ for (const button of document.querySelectorAll('[data-range]')) {
       item.setAttribute('aria-pressed', String(item === button));
     });
     state.range = button.dataset.range;
-    state.resetOffset = 0;
-    state.breakdownOffset = 0;
+    resetPagination();
     byId('custom-dates').hidden = state.range !== 'custom';
     if (state.range !== 'custom') queueRefresh();
   });
@@ -1571,8 +1585,7 @@ byId('source-filter').addEventListener('click', event => {
     button.setAttribute('aria-pressed', 'true');
     state.sources = [button.dataset.filterValue];
   }
-  state.resetOffset = 0;
-  state.breakdownOffset = 0;
+  resetPagination();
   queueRefresh();
 });
 function setModelDraft(models) {
@@ -1608,8 +1621,7 @@ byId('apply-model-selection').addEventListener('click', () => {
   state.models = [...modelDraft];
   modelDraft = null;
   state.modelFallbackNotice = false;
-  state.resetOffset = 0;
-  state.breakdownOffset = 0;
+  resetPagination();
   renderModelSelection();
   byId('toggle-model-explorer').focus();
   queueRefresh();
@@ -1659,9 +1671,15 @@ byId('weekly-limit-value-models').addEventListener('click', event => {
     if (control.dataset.weeklyModel === key) control.focus();
   }
 });
-byId('reset-filter').addEventListener('change', event => { state.resetType = event.target.value; state.resetOffset = 0; persistFilters(); refresh({ section: 'resets' }); });
+byId('reset-filter').addEventListener('change', event => {
+  state.resetType = event.target.value;
+  state.resetOffset = 0;
+  pendingPageOffsets.delete('resets');
+  persistFilters();
+  refresh({ section: 'resets' });
+});
 byId('apply-dates').addEventListener('click', () => {
-  state.fromDate = byId('from-date').value; state.toDate = byId('to-date').value; state.resetOffset = 0; state.breakdownOffset = 0;
+  state.fromDate = byId('from-date').value; state.toDate = byId('to-date').value; resetPagination();
   if (!validFilterDate(state.fromDate) || !validFilterDate(state.toDate) || state.fromDate > state.toDate) { setMessage('analytics-error', t('chooseBothDates')); return; }
   queueRefresh();
 });

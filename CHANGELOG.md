@@ -41,7 +41,8 @@ Git tag and the value in `VERSION` is the single source of truth.
   cannot leave Analytics attached to deleted WAL files after collection.
 - Preserve requested allocation and reset pages when a collection changes the
   archive revision and Analytics reloads a coherent snapshot; failed recovery
-  retries the same page without skipping it.
+  or a failed reset replacement retries from the displayed page without
+  skipping it, including overlapping pagination requests in different tables.
 - Restore Python 3.9 backup compatibility with non-following path metadata
   reads, and require the backup suite on Python 3.9.25 in CI.
 - Disable persistent Analytics caching under replaceable or symlinked ancestors
