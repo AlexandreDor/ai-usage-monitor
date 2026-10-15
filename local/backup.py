@@ -69,7 +69,7 @@ def create_backup(database: Path, destination_directory: Path, *, keep: int = 14
     # SQLite reopens paths, including during retention verification. Reject
     # ancestry another user could replace after the descriptor-based checks.
     database = validate_archive_path(database, require_stable_path=True)
-    source_metadata = database.stat(follow_symlinks=False)
+    source_metadata = database.lstat()
     source_identity = (source_metadata.st_dev, source_metadata.st_ino)
     destination, directory = open_private_directory(destination_directory, create=True,
                                                      require_stable_path=True)
@@ -122,7 +122,7 @@ def create_backup(database: Path, destination_directory: Path, *, keep: int = 14
             source.close()
         _verify(temporary)
         reserved = os.fstat(temporary_fd)
-        verified = temporary.stat(follow_symlinks=False)
+        verified = temporary.lstat()
         if ((reserved.st_dev, reserved.st_ino) != (verified.st_dev, verified.st_ino)
                 or reserved.st_size == 0):
             raise UnsafePathError("backup file changed")

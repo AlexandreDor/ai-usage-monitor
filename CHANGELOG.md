@@ -37,6 +37,8 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Fixed
 
+- Restore Python 3.9 backup compatibility with non-following path metadata
+  reads, and require the backup suite on Python 3.9.25 in CI.
 - Disable persistent Analytics caching under replaceable or symlinked ancestors
   before SQLite opens a path, while preserving calculations and trusted sticky
   directories.

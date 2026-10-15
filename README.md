@@ -346,10 +346,12 @@ under `coverage/`; no global Python installation is modified.
 
 CI runs on pull requests and pushes to `dev` or `main`, avoiding duplicate runs
 for feature-branch pushes. New commits cancel older runs for the same pull
-request or branch. Static quality checks, functional tests with coverage, and
-browser/performance tests run in parallel. The existing `test` check requires
-all three jobs to succeed, including when a job fails or is skipped. Release
-validation uses the same coverage runner and retains all quality checks.
+request or branch. Static quality checks, functional tests with coverage,
+backup compatibility on Python 3.9.25, and browser/performance tests run in
+parallel. The backup suite exercises the minimum supported Python version,
+including live WAL copies, retention, path safety and CLI status output.
+The existing `test` check requires all four jobs to succeed, including when a
+job fails or is skipped. Release validation uses the same coverage runner.
 `npm audit --audit-level=low` is also blocking: every vulnerability reported at
 low severity or above fails the CI job, while `package-lock.json` remains the
 reproducible installation source. Migration tests cover fresh archives,
