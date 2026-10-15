@@ -75,23 +75,28 @@ def open_owned_regular(name: str, directory: int, *, flags: int = os.O_RDONLY) -
         0o600, dir_fd=directory,
     )
     try:
-        metadata = os.fstat(descriptor)
-        if (not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != os.geteuid()
-                or metadata.st_mode & 0o022):
-            raise UnsafePathError("unsafe file")
+        _check_owned_regular(os.fstat(descriptor))
     except BaseException:
         os.close(descriptor)
         raise
     return descriptor
 
 
+def _check_owned_regular(metadata: os.stat_result) -> None:
+    if (not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o022):
+        raise UnsafePathError("unsafe file")
+
+
 def validate_archive_path(path: Path, *, require_stable_path: bool = False) -> Path:
     path = Path(path)
     parent, directory = open_private_directory(path.parent, require_stable_path=require_stable_path)
     try:
-        descriptor = open_owned_regular(path.name, directory)
-        os.close(descriptor)
+        # Closing any raw descriptor for a SQLite database drops this process's
+        # POSIX locks, including locks owned by other SQLite connections. Check
+        # metadata without opening the archive so persistent readers stay safe.
+        _check_owned_regular(os.stat(path.name, dir_fd=directory, follow_symlinks=False))
     finally:
         os.close(directory)
     return parent / path.name

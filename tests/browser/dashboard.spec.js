@@ -1610,6 +1610,57 @@ test('progressively loads compatible sections and scopes pagination to the affec
   expect(requests.at(-1).get('sections')).toBe('breakdown');
 });
 
+for (const section of ['breakdown', 'resets']) {
+  test(`preserves the requested ${section} page when collection changes the archive revision`, async ({ page }) => {
+    const queries = [];
+    let revision = 'before-collection';
+    await page.route('**/api/analytics?*', route => {
+      const query = new URL(route.request().url()).searchParams;
+      queries.push(query);
+      const breakdownOffset = Number(query.get('breakdown_offset') || 0);
+      const resetOffset = Number(query.get('reset_offset') || 0);
+      const payload = {
+        ...analyticsPayload,
+        revision,
+        tokens: {
+          ...analyticsPayload.tokens,
+          breakdown: paginatedBreakdown.slice(breakdownOffset, breakdownOffset + 50),
+          breakdown_pagination: { total: 55, offset: breakdownOffset, limit: 50 },
+        },
+        resets: { ...enhancedAnalyticsPayload.resets, offset: resetOffset },
+      };
+      if (query.get('sections') === 'base') {
+        payload.pending_sections = ['weekly', 'resets'];
+        delete payload.weekly_limit_value;
+      }
+      return route.fulfill({ json: payload });
+    });
+    await page.goto('/analytics.html');
+    const label = page.locator(section === 'breakdown' ? '#breakdown-page-label' : '#reset-page-label');
+    await expect(label).toHaveText('1–50 of 55');
+    await expect(page.locator('#weekly-section-status')).toBeHidden();
+    await expect(page.locator('#resets-section-status')).toBeHidden();
+
+    revision = 'after-collection';
+    const before = queries.length;
+    await page.locator(section === 'breakdown' ? '#breakdown-next' : '#resets-next').click();
+    await expect(label).toHaveText('51–55 of 55');
+    await expect(page.locator('#weekly-section-status')).toBeHidden();
+    await expect(page.locator('#resets-section-status')).toBeHidden();
+    await expect(page.locator('#analytics-error')).toBeHidden();
+    const offsetKey = section === 'breakdown' ? 'breakdown_offset' : 'reset_offset';
+    const sections = queries.slice(before).map(query => query.get('sections'));
+    expect(sections.slice(0, 2)).toEqual([section, 'base']);
+    expect(sections.slice(2).sort()).toEqual(['resets', 'weekly']);
+    for (const query of queries.slice(before)) expect(query.get(offsetKey)).toBe('50');
+    expect(await page.evaluate(() => lastPayload.revision)).toBe('after-collection');
+    if (section === 'breakdown') {
+      await expect(page.locator('#breakdown-body tr')).toHaveCount(5);
+      await expect(page.locator('#breakdown-body tr').first()).toContainText('fixture-model-50');
+    }
+  });
+}
+
 test('falls back to one coherent response after repeated revision mismatches', async ({ page }) => {
   let bases = 0;
   const requests = [];

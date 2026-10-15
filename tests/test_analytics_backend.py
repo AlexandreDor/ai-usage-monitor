@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -16,6 +17,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'local'))
 import analytics
 import analytics_cache
+import diagnostics
 from analytics_cache import AnalyticsCache, SnapshotRevisions, archive_revision
 from storage import connect_database
 from storage import PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY
@@ -321,6 +323,43 @@ class AnalyticsBackendTests(unittest.TestCase):
             for field in ('tokens', 'limits', 'weekly_limit_value', 'resets'):
                 self.assertEqual(original[field], recovered[field])
             self.assertFalse(monitor._observers)
+
+    def test_diagnostics_preserve_sqlite_locks_across_collector_processes(self):
+        # A raw open/close of the archive releases this process's POSIX locks,
+        # even while SQLite still believes its persistent observer owns them.
+        # Later collectors can then delete WAL files that the observer uses.
+        # Keep each collector alive after committing to exercise live WAL reads.
+        collect = (
+            'import sqlite3, sys\n'
+            'connection = sqlite3.connect(sys.argv[1])\n'
+            'connection.execute("UPDATE token_usage_events SET input_tokens=?", '
+            '(int(sys.argv[2]),))\n'
+            'connection.commit()\n'
+            'print("committed", flush=True)\n'
+            'sys.stdin.readline()\n'
+            'connection.close()\n'
+        )
+        with self.isolated_snapshot_caches():
+            self.payload({'range': 'all', 'sections': 'base'})
+            status = diagnostics.build_diagnostics(self.db.parent, self.db)
+            self.assertEqual(status['archive']['status'], 'healthy')
+            for count in (400000, 500000, 600000):
+                with self.subTest(count=count), subprocess.Popen(
+                    [sys.executable, '-c', collect, str(self.db), str(count)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True,
+                ) as collector:
+                    try:
+                        self.assertEqual(collector.stdout.readline(), 'committed\n')
+                        payload = self.payload({'range': 'all', 'sections': 'base'})
+                        self.assertEqual(payload['tokens']['summary']['input_tokens'], count * 2)
+                        self.assertEqual(
+                            diagnostics.build_diagnostics(self.db.parent, self.db)['archive']['status'],
+                            'healthy',
+                        )
+                    finally:
+                        _, errors = collector.communicate('\n', timeout=10)
+                    self.assertEqual(collector.returncode, 0, errors)
 
     def test_evicted_preopen_observer_does_not_name_snapshot(self):
         other = self.db.with_name('other.sqlite3')

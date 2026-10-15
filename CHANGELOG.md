@@ -37,6 +37,10 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Fixed
 
+- Preserve SQLite reader locks during archive-path validation so diagnostics
+  cannot leave Analytics attached to deleted WAL files after collection.
+- Preserve requested allocation and reset pages when a collection changes the
+  archive revision and Analytics reloads a coherent snapshot.
 - Restore Python 3.9 backup compatibility with non-following path metadata
   reads, and require the backup suite on Python 3.9.25 in CI.
 - Disable persistent Analytics caching under replaceable or symlinked ancestors

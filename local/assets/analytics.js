@@ -1372,10 +1372,12 @@ async function loadSection(section, generation, base, query) {
     setSectionStatus(section, '');
   } catch (error) {
     if (generation !== refreshSequence || sequence !== sectionSequences.get(section) || error?.name === 'AbortError') return;
+    // A new archive revision needs a coherent reload of the requested page.
+    // Only ordinary failures should restore the page already on screen.
+    if (error.revisionMismatch) throw error;
     if (section === 'breakdown') state.breakdownOffset = safeNumber(lastPayload?.tokens?.breakdown_pagination?.offset);
     if (section === 'resets') state.resetOffset = safeNumber(lastPayload?.resets?.offset);
     setSectionStatus(section, 'error', `${error.message} · ${t('sectionFailed')}`);
-    if (error.revisionMismatch) throw error;
   } finally {
     if (requestControllers.get(section) === controller) requestControllers.delete(section);
   }
