@@ -260,14 +260,28 @@ def observe_weekly_reset_history(connection, *, epoch, pct, reset_at, owner, int
     legacy_interrupted = state.get("legacy_interrupted") is True
     if not evidence:
         retained = connection.execute(
-            "SELECT limit_id FROM snapshots WHERE scraped_at_epoch < ? "
+            "SELECT scraped_at_epoch, limit_id FROM snapshots WHERE scraped_at_epoch < ? "
             "ORDER BY scraped_at_epoch DESC LIMIT 1", (epoch,),
         ).fetchone()
         prior_owners = ([prior_owner] if prior_owner is not None else [])
         if state:
             prior_owners.append(state.get("owner"))
         if retained:
-            prior_owners.append(retained[0])
+            prior_owners.append(retained[1])
+        legacy_baseline = connection.execute(
+            "SELECT scraped_at_epoch FROM snapshots WHERE scraped_at_epoch < ? "
+            "AND weekly_pct IS NOT NULL AND weekly_reset_at IS NOT NULL "
+            "ORDER BY scraped_at_epoch DESC LIMIT 1", (epoch,),
+        ).fetchone()
+        if legacy_baseline:
+            # Legacy live polls can switch away and return before upgrading.
+            # Backfill skips same-owner partials, so inspect foreign state since
+            # the last complete weekly archive, even across an archived return.
+            legacy_interrupted |= connection.execute(
+                "SELECT 1 FROM anomaly_detector_state WHERE limit_id != ? "
+                "AND updated_at_epoch > ? AND updated_at_epoch <= ? LIMIT 1",
+                (owner, legacy_baseline[0], epoch),
+            ).fetchone() is not None
         # Partial live polls may never reach snapshots. Remember an interrupted
         # upgrade bridge until the first complete baseline, including an owner
         # saved by the legacy detector before this version's first observation.
