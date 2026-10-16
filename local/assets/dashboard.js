@@ -470,6 +470,7 @@ function setHistoryState(state) {
 
 function setHistoryCanvasVisible(visible) {
   const canvas = document.getElementById('history-chart');
+  document.getElementById('history-chart-wrap').hidden = !visible;
   canvas.hidden = !visible;
   removeElementAttribute(canvas, 'aria-describedby');
 }
@@ -707,7 +708,7 @@ function renderHistory(history) {
   const context = document.getElementById('history-chart').getContext('2d');
   let options = {
     responsive: true,
-    maintainAspectRatio: true,
+    maintainAspectRatio: false,
     parsing: false,
     normalized: true,
     animation: false,

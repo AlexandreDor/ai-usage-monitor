@@ -513,6 +513,9 @@ canvas.time-slice-chart {
   touch-action: pan-y pinch-zoom;
 }
 
+.history-chart-wrap { position: relative; height: 220px; }
+.history-chart-wrap canvas { max-height: none; }
+
 @media (max-width: 720px) {
   body {
     padding-inline: 12px;
@@ -615,4 +618,28 @@ canvas.time-slice-chart {
   .grid { gap: 14px; }
   .history-card { padding: 20px; }
   .history-label { margin-bottom: 10px; }
+}
+
+@media (min-width: 1000px) and (min-height: 650px) {
+  body { display: flex; flex-direction: column; height: 100dvh; }
+  header, .forecast-strip, .reset-credit-strip, #error-banner { width: 100%; flex-shrink: 0; }
+  .grid { width: 100%; flex: 0 1 auto; min-height: 0; grid-template-rows: auto minmax(170px, 1fr); }
+  .history-card { display: flex; flex-direction: column; min-height: 0; }
+  .history-label, .history-error { flex-shrink: 0; }
+  .history-chart-wrap { flex: 1 1 220px; min-height: 100px; max-height: 220px; }
+}
+
+@media (min-width: 1000px) and (max-height: 800px) {
+  body { padding-block: 10px 12px; }
+  header { gap: 6px; margin-bottom: 12px; }
+  header h1 { font-size: 2.75rem; }
+  .advanced-preferences { margin-top: 0; }
+  .forecast-strip { min-height: 48px; padding: 8px 12px; margin-bottom: 12px; }
+  .reset-credit-strip { padding: 8px 12px; margin-bottom: 12px; }
+  .limit-card { padding: 16px 20px; }
+  .pct-value { font-size: 3.25rem; margin-bottom: 10px; }
+  .pace-indicator { margin-top: 10px; padding: 6px 10px; }
+  .grid { gap: 10px; }
+  .history-card { padding: 16px; }
+  .history-label { margin-bottom: 8px; }
 }

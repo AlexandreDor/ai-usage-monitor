@@ -111,7 +111,7 @@ test('works offline and exposes no serious or critical accessibility violations'
   const historyOrder = await page.locator('.history-card').evaluate(card => [
     ...card.children,
   ].map(child => child.id));
-  expect(historyOrder.indexOf('history-error')).toBeLessThan(historyOrder.indexOf('history-chart'));
+  expect(historyOrder.indexOf('history-error')).toBeLessThan(historyOrder.indexOf('history-chart-wrap'));
   expect(externalRequests).toEqual([]);
   await expect(page.locator('body')).not.toContainText('—');
 
@@ -884,41 +884,52 @@ test('selects GPT when models appear after an initially empty archive', async ({
   await expect(page.locator('#analytics-error')).toBeHidden();
 });
 
-for (const language of ['en', 'fr']) {
-  test(`keeps the complete dashboard within a Full HD browser window (${language})`, async ({ page }) => {
-    // Leave room for browser toolbars and the taskbar on a 1920x1080 screen.
-    await page.setViewportSize({ width: 1920, height: 900 });
-    await mockUsage(page);
-    await page.route('**/data.json?*', route => route.fulfill({ json: {
-      ...snapshot,
-      reset_credits: { available_count: 3, next_expiration_at: Math.floor(DASHBOARD_NOW.getTime() / 1000) - 1, expiration_known: true },
-    } }));
-    await page.goto('/dashboard.html');
-    await expect(page.locator('#reset-credits-count')).toHaveText('3');
-    await page.evaluate(language => CodexPreferences.set({ language }), language);
-    // Include the responsive chart's final size in the page height check.
-    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+for (const viewport of [
+  { width: 1920, height: 1050 },
+  { width: 1920, height: 900 },
+  { width: 1536, height: 840 },
+  { width: 1536, height: 800 },
+  { width: 1536, height: 720 },
+  { width: 1280, height: 650 },
+]) {
+  for (const language of ['en', 'fr']) {
+    test(`keeps the complete dashboard within a desktop browser window ${viewport.width}x${viewport.height} (${language})`, async ({ page }) => {
+      // Cover browser toolbars and display scaling, beyond physical screen resolution.
+      await page.setViewportSize(viewport);
+      await mockUsage(page);
+      await page.route('**/data.json?*', route => route.fulfill({ json: {
+        ...snapshot,
+        reset_credits: { available_count: 3, next_expiration_at: Math.floor(DASHBOARD_NOW.getTime() / 1000) - 1, expiration_known: true },
+      } }));
+      await page.goto('/dashboard.html');
+      await expect(page.locator('#reset-credits-count')).toHaveText('3');
+      await page.evaluate(language => CodexPreferences.set({ language }), language);
+      // Include the responsive chart's final size in the page height check.
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 
-    const layout = await page.evaluate(() => {
-      const history = document.querySelector('.history-card').getBoundingClientRect();
-      const preferences = document.querySelector('.preference-controls').getBoundingClientRect();
-      const links = document.querySelector('.dashboard-links').getBoundingClientRect();
-      const overlaps = !(preferences.right <= links.left || preferences.left >= links.right || preferences.bottom <= links.top || preferences.top >= links.bottom);
-      return {
-        viewportHeight: window.innerHeight,
-        scrollHeight: document.documentElement.scrollHeight,
-        historyBottom: history.bottom,
-        historyVisible: history.top >= 0 && history.bottom <= window.innerHeight,
-        navigationOverlap: overlaps,
-        creditsHeight: document.querySelector('.reset-credit-strip').getBoundingClientRect().height,
-      };
+      const layout = await page.evaluate(() => {
+        const history = document.querySelector('.history-card').getBoundingClientRect();
+        const preferences = document.querySelector('.preference-controls').getBoundingClientRect();
+        const links = document.querySelector('.dashboard-links').getBoundingClientRect();
+        const overlaps = !(preferences.right <= links.left || preferences.left >= links.right || preferences.bottom <= links.top || preferences.top >= links.bottom);
+        return {
+          viewportHeight: window.innerHeight,
+          scrollHeight: document.documentElement.scrollHeight,
+          historyBottom: history.bottom,
+          historyVisible: history.top >= 0 && history.bottom <= window.innerHeight,
+          canvasHeight: document.getElementById('history-chart').getBoundingClientRect().height,
+          navigationOverlap: overlaps,
+          creditsHeight: document.querySelector('.reset-credit-strip').getBoundingClientRect().height,
+        };
+      });
+      expect(layout.scrollHeight).toBeLessThanOrEqual(layout.viewportHeight);
+      expect(layout.historyBottom).toBeLessThanOrEqual(layout.viewportHeight);
+      expect(layout.historyVisible).toBe(true);
+      expect(layout.canvasHeight).toBeGreaterThanOrEqual(100);
+      expect(layout.navigationOverlap).toBe(false);
+      expect(layout.creditsHeight).toBeLessThanOrEqual(64);
     });
-    expect(layout.scrollHeight).toBeLessThanOrEqual(layout.viewportHeight);
-    expect(layout.historyBottom).toBeLessThanOrEqual(layout.viewportHeight);
-    expect(layout.historyVisible).toBe(true);
-    expect(layout.navigationOverlap).toBe(false);
-    expect(layout.creditsHeight).toBeLessThanOrEqual(64);
-  });
+  }
 }
 
 test('renders detailed analytics, reset markers and cost mode by default', async ({ page }) => {
