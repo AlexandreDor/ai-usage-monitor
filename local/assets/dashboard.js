@@ -40,7 +40,7 @@ let activeRefreshKey = null;
 let queuedRefreshState = null;
 let collectionInFlight = null;
 const pendingResetUpdates = new Map();
-let serverResetCheckAtMs = null;
+const serverResetChecks = new Set();
 
 function renderRefreshControl() {
   const button = document.getElementById('refresh-codex');
@@ -258,8 +258,9 @@ function resetUpdateDelay(data, scrapedAt, now) {
     if (scrapedAt >= due - 5_000 || now >= due + 60_000) pendingResetUpdates.delete(key);
   }
   const deadlines = [...pendingResetUpdates.values()];
-  if (serverResetCheckAtMs !== null && scrapedAt < serverResetCheckAtMs && now < serverResetCheckAtMs + 65_000) {
-    deadlines.push(serverResetCheckAtMs + 5_000);
+  for (const check of serverResetChecks) {
+    if (scrapedAt >= check || now >= check + 65_000) serverResetChecks.delete(check);
+    else deadlines.push(check + 5_000);
   }
   return deadlines.length ? Math.max(5_000, Math.min(...deadlines) - now) : Infinity;
 }
@@ -320,11 +321,18 @@ function applyDashboardActiveInterval(rawValue) {
   }
 }
 
-function applyResetCheckAt(rawValue) {
-  const seconds = Number(rawValue);
-  const deadline = Number.isSafeInteger(seconds) && seconds > 0 ? seconds * 1000 : null;
-  if (deadline === serverResetCheckAtMs) return;
-  serverResetCheckAtMs = deadline;
+function applyResetChecks(rawValue) {
+  const checks = new Set((typeof rawValue === 'string' ? rawValue.split(',') : [])
+    .map(Number).filter(seconds => Number.isSafeInteger(seconds) && seconds > 0)
+    .map(seconds => seconds * 1000));
+  const previous = [...serverResetChecks].join(',');
+  // Retain elapsed checks until their result has been read. A heartbeat can
+  // stop advertising a completed check before its publication-grace timer.
+  for (const check of serverResetChecks) {
+    if (check > Date.now() && !checks.has(check)) serverResetChecks.delete(check);
+  }
+  for (const check of checks) serverResetChecks.add(check);
+  if (previous === [...serverResetChecks].join(',')) return;
   if (isLocalDashboard() && document.visibilityState === 'visible') {
     scheduleRefresh(mainFailure ? null : dashboardData);
   }
@@ -341,7 +349,7 @@ async function sendDashboardHeartbeat() {
       credentials: 'same-origin',
     });
     applyDashboardActiveInterval(response.headers?.get('X-Codex-Dashboard-Interval-Seconds'));
-    if (response.ok) applyResetCheckAt(response.headers?.get('X-Codex-Reset-Check-At'));
+    if (response.ok) applyResetChecks(response.headers?.get('X-Codex-Reset-Checks-At'));
   } catch (_error) {
     // Activity signaling is advisory and must never hide otherwise valid data.
   } finally {

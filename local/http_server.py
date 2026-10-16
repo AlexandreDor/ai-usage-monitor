@@ -18,7 +18,7 @@ import time
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from analytics import AnalyticsError, build_payload
-from refresh import next_reset_check, request_refresh
+from refresh import pending_reset_checks, request_refresh
 
 root = pathlib.Path(__file__).parent.resolve()
 port = 8080
@@ -260,9 +260,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             return
         self.send_response(204)
         self.send_header("X-Codex-Dashboard-Interval-Seconds", str(dashboard_active_interval))
-        reset_check_at = next_reset_check(runtime_directory)
-        if reset_check_at is not None:
-            self.send_header("X-Codex-Reset-Check-At", str(reset_check_at))
+        reset_checks = pending_reset_checks(runtime_directory)
+        if reset_checks:
+            self.send_header("X-Codex-Reset-Checks-At", ",".join(map(str, reset_checks)))
         self.send_header("Content-Length", "0")
         self.end_headers()
 

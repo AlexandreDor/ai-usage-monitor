@@ -304,7 +304,7 @@ Loop mode also schedules a live collection 30 seconds after each announced
 share one collection; a regular or manual collection after that deadline also
 satisfies the check. Failed reset checks retry 30 seconds after the attempt
 finishes. These checks use the same collection lock and preserve the regular
-history/Gist cadence. The dashboard receives the persisted next check time in
+history/Gist cadence. The dashboard receives all persisted pending check times in
 its activity heartbeat, including after reopening or reloading the page.
 
 The live dashboard calculates snapshot freshness directly from `scraped_at` and

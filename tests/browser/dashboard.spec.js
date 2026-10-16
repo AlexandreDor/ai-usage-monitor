@@ -108,19 +108,45 @@ for (const window of ['five_h', 'weekly']) test(`recovers the monitor's pending 
     [window + '_reset_at']: checkAt + 18000,
   };
   await page.route('**/api/dashboard-heartbeat', route => route.fulfill({
-    status: 204, headers: { 'X-Codex-Reset-Check-At': String(checkAt) },
+    status: 204, headers: { 'X-Codex-Reset-Checks-At': String(checkAt) },
   }));
   await page.route('**/data.json?*', route => route.fulfill({ json: current }));
   await page.goto('/dashboard.html');
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   await page.reload();
-  await expect.poll(() => page.evaluate(() => serverResetCheckAtMs)).toBe(checkAt * 1000);
+  await expect.poll(() => page.evaluate(() => [...serverResetChecks])).toEqual([checkAt * 1000]);
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   await page.clock.runFor(14000);
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   current = { ...current, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 15000).toISOString() };
   await page.clock.runFor(1000);
   await expect(page.locator('#five-h-pct')).toHaveText('100%');
+});
+
+for (const secondDelay of [20, 28]) test(`retains both pending checks when the second finishes after ${secondDelay}s`, async ({ page }) => {
+  await mockUsage(page);
+  const epoch = Math.floor(DASHBOARD_NOW.getTime() / 1000);
+  let current = {
+    ...snapshot, scraped_at: new Date(DASHBOARD_NOW.getTime() - 5000).toISOString(),
+    five_h_reset_at: epoch + 18000, weekly_reset_at: epoch + 7 * 86400,
+  };
+  let heartbeats = 0;
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({
+    status: 204, headers: {
+      'X-Codex-Reset-Checks-At': ++heartbeats === 1
+        ? `${epoch + 10},${epoch + secondDelay}` : `${epoch + 18030}`,
+    },
+  }));
+  await page.route('**/data.json?*', route => route.fulfill({ json: current }));
+  await page.goto('/dashboard.html');
+  await expect.poll(() => page.evaluate(() => serverResetChecks.size)).toBe(2);
+  current = { ...current, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 10000).toISOString() };
+  await page.clock.runFor(15000);
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+  await expect(page.locator('#weekly-pct')).toHaveText('36%');
+  current = { ...current, weekly_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + secondDelay * 1000).toISOString() };
+  await page.clock.runFor((secondDelay + 5 - 15) * 1000);
+  await expect(page.locator('#weekly-pct')).toHaveText('100%');
 });
 
 test('signals visible local dashboard activity without affecting rendering', async ({ page }) => {

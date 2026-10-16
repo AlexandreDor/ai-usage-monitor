@@ -94,19 +94,19 @@ def plan(runtime, now):
     return identifier, int(delay)
 
 
-def next_reset_check(runtime):
-    """Expose only the next check time, never the private scheduler state."""
+def pending_reset_checks(runtime):
+    """Expose pending check times, never the private scheduler state."""
     state = read_json(runtime / "reset-refresh.json")
     pending = state.get("pending", {})
     if not isinstance(pending, dict):
-        return None
+        return []
     deadlines = [due for due in pending.values() if type(due) is int and due > 0]
     if not deadlines:
-        return None
+        return []
     retry_at = state.get("retry_at", 0)
     if type(retry_at) is not int:
         retry_at = 0
-    return max(min(deadlines), retry_at)
+    return sorted({max(due, retry_at) for due in deadlines})
 
 
 def complete(runtime, identifier, status, now, started_at=None):

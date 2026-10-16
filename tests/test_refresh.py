@@ -79,23 +79,30 @@ class RefreshTests(unittest.TestCase):
         refresh.complete(self.runtime, "-", 0, self.now + 70, self.now + 30)
         self.assertEqual(refresh.plan(self.runtime, self.now + 70), ("-", 0))
 
-    def test_next_check_survives_advanced_snapshot_and_reports_retry(self):
+    def test_pending_checks_survive_advanced_snapshot_and_report_retry(self):
         self.snapshot(self.now + 10)
         refresh.plan(self.runtime, self.now)
         self.snapshot(self.now + 18000, sampled=self.now + 15)
         refresh.plan(self.runtime, self.now + 20)
-        self.assertEqual(refresh.next_reset_check(self.runtime), self.now + 40)
+        self.assertEqual(refresh.pending_reset_checks(self.runtime), [self.now + 40, self.now + 18030])
         refresh.complete(self.runtime, "-", 1, self.now + 50, self.now + 40)
-        self.assertEqual(refresh.next_reset_check(self.runtime), self.now + 80)
+        self.assertEqual(refresh.pending_reset_checks(self.runtime), [self.now + 80, self.now + 18030])
         refresh.complete(self.runtime, "-", 0, self.now + 80)
-        self.assertEqual(refresh.next_reset_check(self.runtime), self.now + 18030)
+        self.assertEqual(refresh.pending_reset_checks(self.runtime), [self.now + 18030])
 
-    def test_next_check_ignores_missing_or_malformed_deadlines(self):
-        self.assertIsNone(refresh.next_reset_check(self.runtime))
+    def test_pending_checks_include_both_nearby_resets(self):
+        self.snapshot(self.now + 10, self.now + 20)
+        refresh.plan(self.runtime, self.now)
+        self.snapshot(self.now + 18000, self.now + 7 * 86400, sampled=self.now + 25)
+        refresh.plan(self.runtime, self.now + 25)
+        self.assertEqual(refresh.pending_reset_checks(self.runtime), [self.now + 40, self.now + 50, self.now + 18030, self.now + 7 * 86400 + 30])
+
+    def test_pending_checks_ignore_missing_or_malformed_deadlines(self):
+        self.assertEqual(refresh.pending_reset_checks(self.runtime), [])
         for pending in [[], None, {}, {"five_h:1": True}, {"five_h:1": "30"}]:
             with self.subTest(pending=pending):
                 refresh.write_json(self.runtime / "reset-refresh.json", {"pending": pending})
-                self.assertIsNone(refresh.next_reset_check(self.runtime))
+                self.assertEqual(refresh.pending_reset_checks(self.runtime), [])
 
     def test_invalid_reset_values_and_future_outliers_are_ignored(self):
         for value in [None, 0, -1, True, "123", [], self.now + 9 * 86400]:
