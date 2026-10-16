@@ -568,3 +568,21 @@ canvas.time-slice-chart {
 .advanced-preference-fields { display: flex; flex-wrap: wrap; gap: .8rem; margin-top: .7rem; }
 .advanced-preference-fields label { display: grid; gap: .3rem; }
 .advanced-preference-fields input { color: #e6edf3; background: #161b22; border: 1px solid #30363d; border-radius: 5px; padding: .45rem; max-width: 100%; color-scheme: dark; }
+
+.reset-credit-strip {
+  max-width: 960px;
+  margin: 0 auto 20px;
+  padding: 18px 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.reset-credit-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 48px;
+  margin: 12px 0;
+}
+.reset-credit-metrics > div { display: flex; flex-direction: column; gap: 4px; }
+.reset-credit-metrics strong { color: var(--text); font-size: 1.25rem; }
+.reset-credit-metrics span { color: var(--muted); font-size: .8rem; }

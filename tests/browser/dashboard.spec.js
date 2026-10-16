@@ -549,7 +549,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#random-reset-count')).toHaveText('1');
   await expect(page.locator('#random-reset-impact')).toHaveText('30.004 pts gained · 0 pts lost vs ideal pace');
   await expect(page.locator('#end-week-reset-count')).toHaveText('1');
-  await expect(page.locator('.metric-card')).toHaveCount(10);
+  await expect(page.locator('.metric-grid[aria-label] .metric-card')).toHaveCount(10);
   await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#limits-chart-card #token-metric-toggle')).toHaveCount(1);
   await expect(page.locator('#toggle-token-overlay')).toHaveAttribute('aria-pressed', 'true');
@@ -2435,3 +2435,89 @@ for (const storageMode of ['URL', 'local storage']) {
     await expect(page.locator('#analytics-warnings')).toContainText('exceeds 50 models');
   });
 }
+
+test('account reset credits count down, localize, and retain the observed balance at expiry', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  await mockUsage(page);
+  await page.clock.pauseAt(new Date(DASHBOARD_NOW.getTime() + 1000));
+  const expiration = Math.floor(DASHBOARD_NOW.getTime() / 1000) + 121;
+  const data = { ...snapshot, reset_credits: { available_count: 3, next_expiration_at: expiration, expiration_known: true } };
+  await page.route('**/data.json?*', route => route.fulfill({ json: data }));
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#reset-credits-count')).toHaveText('3');
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Expires in 2 min');
+  await expect(page.locator('#reset-credits-observed')).toContainText('03/08/2026 19:30');
+  await page.clock.runFor(60_000);
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Expires in 1 min');
+  await page.evaluate(() => CodexPreferences.set({ language: 'fr' }));
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Expire dans 1 min');
+  await page.clock.runFor(60_000);
+  await expect(page.locator('#reset-credits-expiration')).toContainText('Expiration atteinte');
+  await expect(page.locator('#reset-credits-count')).toHaveText('3');
+  await page.setViewportSize({ width: 375, height: 812 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.clock.resume();
+  expectNoAxeViolations(await new AxeBuilder({ page }).analyze(), ['critical', 'serious']);
+});
+
+test('account reset credits distinguish missing, zero, unknown expiry, and non-expiring balances', async ({ page }) => {
+  await mockUsage(page);
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#reset-credits-count')).toHaveText('-');
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Unavailable');
+  for (const [credits, count, expiration] of [
+    [{ available_count: 0, next_expiration_at: null, expiration_known: true }, '0', 'No resets available'],
+    [{ available_count: 2, next_expiration_at: null, expiration_known: false }, '2', 'Expiration unavailable'],
+    [{ available_count: 2, next_expiration_at: null, expiration_known: true }, '2', 'No expiration'],
+  ]) {
+    await page.evaluate(credits => renderData({ ...dashboardData, reset_credits: credits }, { schedule: false }), credits);
+    await expect(page.locator('#reset-credits-count')).toHaveText(count);
+    await expect(page.locator('#reset-credits-expiration')).toHaveText(expiration);
+  }
+  await page.evaluate(() => renderData({ ...dashboardData, reset_credits: null }, { schedule: false }));
+  await expect(page.locator('#reset-credits-count')).toHaveText('-');
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Unavailable');
+});
+
+test('analytics tracks reset-credit balances and observed expiration durations with a table fallback', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  const now = Date.parse('2026-08-04T10:00:00Z');
+  await page.clock.install({ time: now - 1000 });
+  await page.clock.pauseAt(now);
+  const payload = structuredClone(analyticsPayload);
+  payload.limits.reset_credits_current = { at: '2026-08-04T10:00:00Z', available_count: 2, next_expiration_at: now / 1000 + 7200, expiration_known: true };
+  payload.limits.series = payload.limits.series.map((point, index) => ({
+    ...point, reset_credits_observed_at: point.at, reset_credits_available: 3 - index,
+    reset_credits_next_expiration_at: Date.parse(point.at) / 1000 + (4 - index * 2) * 3600,
+    reset_credits_expiration_known: true, reset_credits_expiration_seconds: (4 - index * 2) * 3600,
+  }));
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+  await page.goto('/analytics.html');
+  await expect(page.locator('#reset-credits-count')).toHaveText('2');
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Expires in 2 h 0 min');
+  await expect.poll(() => page.evaluate(() => resetCreditsChart?.data.datasets.map(dataset => dataset.data.map(point => point.y)))).toEqual([[3, 2], [4, 2]]);
+  expect(await page.evaluate(() => resetCreditsChart.options.scales.y.ticks.precision)).toBe(0);
+  await page.locator('#reset-credits-card summary').click();
+  await expect(page.locator('#reset-credits-data-body tr')).toHaveCount(2);
+  await expect(page.locator('#reset-credits-data-body tr').first()).toContainText('Expires in 4 h 0 min');
+  await page.clock.runFor(60_000);
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Expires in 1 h 59 min');
+  // Historical values remain relative to their collection, not the browser clock.
+  await expect(page.locator('#reset-credits-data-body tr').first()).toContainText('Expires in 4 h 0 min');
+  await page.evaluate(() => CodexPreferences.set({ language: 'fr' }));
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Expire dans 1 h 59 min');
+  await expect(page.locator('#reset-credits-card h2')).toHaveText('Évolution des crédits de reset');
+  await page.setViewportSize({ width: 375, height: 812 });
+  const layout = await page.locator('#reset-credits-card').evaluate(card => ({
+    right: card.getBoundingClientRect().right,
+    overflow: card.scrollWidth > card.clientWidth,
+  }));
+  expect(layout.right).toBeLessThanOrEqual(375);
+  expect(layout.overflow).toBe(false);
+  await page.clock.resume();
+  expectNoAxeViolations(await new AxeBuilder({ page }).include('#reset-credits-card').analyze(), ['critical', 'serious']);
+  await page.locator('#reset-credits-card').screenshot({ path: 'test-results/reset-credits-analytics-mobile.png' });
+  await page.evaluate(() => { window.Chart = undefined; renderChartSection('credits', lastPayload.limits); });
+  await expect(page.locator('#reset-credits-chart-wrap')).toBeHidden();
+  await expect(page.locator('#reset-credits-data-body tr')).toHaveCount(2);
+});

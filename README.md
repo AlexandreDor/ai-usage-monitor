@@ -17,6 +17,9 @@ reset probabilities from the independent Codex Forecast service.
 - Current remaining quota for the active 5-hour and weekly windows, with both
   dashboard cards visible by default.
 - Reset dates and weekly pace compared with ideal consumption.
+- Available account reset credits and a live countdown to their soonest expiration
+  when provided by Codex. Missing or incomplete expiry details remain unavailable;
+  credit identifiers and descriptions are never published.
 - Rolling history chart generated from local quota and Forecast snapshots.
 - The 5-hour series and reset markers are hidden by default in charts, and
   5-hour reset statistics are hidden by default; they remain available from
@@ -48,6 +51,11 @@ The local Analytics page provides:
   weekly resets (weekly history is selected by default; All and 5-hour remain
   available), with the last Forecast probabilities observed less than 45
   minutes before each reset when available;
+- account reset credit history: available balance, soonest expiry, and time to
+  expiry at each observation, with a chart, accessible table, and quota CSV
+  columns. The current balance uses the latest collection independently of the
+  selected historical period and token filters. Historical balances are not
+  reconstructed before collection was enabled;
 - local token consumption from Codex, OpenCode, and Hermes;
 - uncached input, cache read, cache write, output, reasoning, and total token
   counters;
@@ -355,7 +363,7 @@ job fails or is skipped. Release validation uses the same coverage runner.
 `npm audit --audit-level=low` is also blocking: every vulnerability reported at
 low severity or above fails the CI job, while `package-lock.json` remains the
 reproducible installation source. Migration tests cover fresh archives,
-supported v1–v3 archives upgrading to v4, data/integrity preservation, and
+supported v1–v4 archives upgrading to v5, data/integrity preservation, and
 rejection of future or partial schemas. The packaged systemd units are
 validated by CI and can be installed with
 [`docs/INSTALL.md`](docs/INSTALL.md).
@@ -600,9 +608,9 @@ replaying their hook never creates a network reset occurrence.
 | `CODEX_BIN` | `codex` | Executable name or path | Codex CLI command used by the monitor. |
 | `MONITOR_DEBUG` | `0` | `0` or `1` | Enables bounded sanitized Codex and HTTP diagnostics. |
 
-The SQLite archive retains detailed quota, Forecast, reset, anomaly, and token
-data for Analytics. Existing schema v1, v2, and v3 archives migrate
-transactionally to v4 on their next writable monitor cycle; `--check` does not
+The SQLite archive retains detailed quota, Forecast, reset, reset-credit, anomaly, and token
+data for Analytics. Existing schema v1, v2, v3, and v4 archives migrate
+transactionally to v5 on their next writable monitor cycle; `--check` does not
 open or migrate the archive.
 The detector tolerates quota noise up to 5 percentage points and reset-date
 movement up to 30 minutes; a disappeared reset date is confirmed after two
@@ -1198,7 +1206,7 @@ the `backup()` destination is autonomous.
 ### Restore safely
 
 The restore is fail-fast. It first reserves a new mode-`700` safety directory,
-before creating and verifying an autonomous schema v4 archive next to the
+before creating and verifying an autonomous schema v5 archive next to the
 active database. A safety-directory collision therefore creates no candidate;
 a corrupt, unrelated, or obsolete-schema candidate also leaves the active
 database intact. Once the candidate is valid, stop at least both services and

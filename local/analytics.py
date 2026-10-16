@@ -2273,9 +2273,12 @@ def limit_series(connection: sqlite3.Connection, start: int, end: int, granulari
                   GROUP BY bucket_epoch
              )
              SELECT latest.bucket_epoch, snapshots.five_h_pct,
-                    snapshots.weekly_pct, snapshots.weekly_reset_at, latest.samples
+                    snapshots.weekly_pct, snapshots.weekly_reset_at, latest.samples,
+                    snapshots.scraped_at_epoch, credits.available_count,
+                    credits.next_expiration_at, credits.expiration_known
                FROM latest
                JOIN snapshots ON snapshots.scraped_at_epoch = latest.latest_epoch
+               LEFT JOIN reset_credit_snapshots credits ON credits.scraped_at_epoch = latest.latest_epoch
               ORDER BY latest.bucket_epoch""",
         (granularity, granularity, start, end),
     ).fetchall()
@@ -2302,6 +2305,14 @@ def limit_series(connection: sqlite3.Connection, start: int, end: int, granulari
         (granularity, granularity, start, end),
     ).fetchall()
     forecasts_by_bucket = {int(row["bucket_epoch"]): row for row in forecast_rows}
+    current_credits = connection.execute(
+        """SELECT snapshots.scraped_at_epoch, credits.available_count,
+                  credits.next_expiration_at, credits.expiration_known
+             FROM snapshots LEFT JOIN reset_credit_snapshots credits
+               ON credits.scraped_at_epoch = snapshots.scraped_at_epoch
+            ORDER BY snapshots.scraped_at_epoch DESC LIMIT 1"""
+    ).fetchone()
+
     reset_markers = connection.execute(
         """
         SELECT window, reset_at_epoch, observed_at_epoch, before_pct, after_pct,
@@ -2316,9 +2327,23 @@ def limit_series(connection: sqlite3.Connection, start: int, end: int, granulari
     return {
         "samples": int(sum(row["samples"] for row in rows)),
         "forecast_samples": int(sum(row["samples"] for row in forecast_rows)),
+        "reset_credits_current": ({
+            "at": iso_utc(current_credits["scraped_at_epoch"]),
+            "available_count": current_credits["available_count"],
+            "next_expiration_at": current_credits["next_expiration_at"],
+            "expiration_known": bool(current_credits["expiration_known"]),
+        } if current_credits is not None else None),
         "series": [
             {
                 "at": iso_utc(row["bucket_epoch"]),
+                "reset_credits_observed_at": iso_utc(row["scraped_at_epoch"]),
+                "reset_credits_available": row["available_count"],
+                "reset_credits_next_expiration_at": row["next_expiration_at"],
+                "reset_credits_expiration_known": bool(row["expiration_known"]),
+                "reset_credits_expiration_seconds": (
+                    max(0, row["next_expiration_at"] - row["scraped_at_epoch"])
+                    if row["expiration_known"] and row["next_expiration_at"] is not None else None
+                ),
                 "five_h_pct": round(row["five_h_pct"], 3) if row["five_h_pct"] is not None else None,
                 "weekly_pct": round(row["weekly_pct"], 3) if row["weekly_pct"] is not None else None,
                 "ideal_weekly_pct": ideal_weekly_remaining(row["bucket_epoch"], row["weekly_reset_at"]),

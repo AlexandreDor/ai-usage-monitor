@@ -72,6 +72,15 @@
     <span class="forecast-status" id="forecast-status" data-i18n="dashboard.forecastUnavailable">Forecast unavailable</span>
   </aside>
 
+  <section class="reset-credit-strip" aria-labelledby="reset-credit-title">
+    <h2 id="reset-credit-title" class="card-label" data-i18n="resetCredits.title">Account reset credits</h2>
+    <div class="reset-credit-metrics">
+      <div><strong id="reset-credits-count">-</strong><span data-i18n="resetCredits.available">Available resets</span></div>
+      <div><strong id="reset-credits-expiration" data-i18n="resetCredits.unavailable">Unavailable</strong><span data-i18n="resetCredits.expiration">Soonest expiration</span></div>
+    </div>
+    <p id="reset-credits-observed" class="reset-info"></p>
+  </section>
+
   <main class="grid">
     <section class="card limit-card" id="five-hour-card" aria-labelledby="five-hour-title">
       <h2 class="card-label" id="five-hour-title" data-i18n="dashboard.fiveHourLimit">5-Hour Limit</h2>

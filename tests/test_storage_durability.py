@@ -67,7 +67,7 @@ class StorageDurabilityTests(unittest.TestCase):
         storage.connect_database(self.path).close()
         self.assertEqual(1, len(list(self.path.parent.glob(f"{self.path.name}.pre-migration.*"))))
 
-    def test_v4_delete_gets_one_backup_before_wal_transition(self):
+    def test_current_delete_gets_one_backup_before_wal_transition(self):
         connection = storage.connect_database(self.path)
         connection.close()
         storage.checkpoint_database(self.path, mode="TRUNCATE")
@@ -79,14 +79,14 @@ class StorageDurabilityTests(unittest.TestCase):
         backups = list(self.path.parent.glob(f"{self.path.name}.pre-migration.*"))
         self.assertEqual(1, len(backups))
         with sqlite3.connect(backups[0]) as connection:
-            self.assertEqual((4,), connection.execute("PRAGMA user_version").fetchone())
+            self.assertEqual((5,), connection.execute("PRAGMA user_version").fetchone())
             self.assertEqual(("ok",), connection.execute("PRAGMA quick_check").fetchone())
 
         with storage.connect_database(self.path) as connection:
             self.assertEqual(("wal",), connection.execute("PRAGMA journal_mode").fetchone())
         self.assertEqual(1, len(list(self.path.parent.glob(f"{self.path.name}.pre-migration.*"))))
 
-    def test_valid_v4_wal_open_does_not_repair_or_backup(self):
+    def test_valid_current_wal_open_does_not_repair_or_backup(self):
         connection = storage.connect_database(self.path)
         connection.close()
         connection = storage.connect_database(self.path)
