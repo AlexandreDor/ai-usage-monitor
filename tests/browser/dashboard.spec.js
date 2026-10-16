@@ -30,6 +30,76 @@ async function mockUsage(page, history = [snapshot]) {
   await page.route('**/history.json?*', route => route.fulfill({ json: history }));
 }
 
+test('collects fresh Codex quotas from the button and prevents duplicate requests', async ({ page }) => {
+  await mockUsage(page);
+  let finish;
+  const gate = new Promise(resolve => { finish = resolve; });
+  let requests = 0;
+  let current = snapshot;
+  await page.route('**/data.json?*', route => route.fulfill({ json: current }));
+  await page.route('**/api/refresh', async route => {
+    requests += 1;
+    expect(route.request().method()).toBe('POST');
+    expect(route.request().headers()['x-codex-dashboard-refresh']).toBe('1');
+    expect(route.request().postData()).toBeNull();
+    await gate;
+    current = { ...snapshot, five_h_pct: 99, weekly_pct: 98, scraped_at: DASHBOARD_NOW.toISOString() };
+    await route.fulfill({ json: { success: true } });
+  });
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  const button = page.getByRole('button', { name: 'Refresh Codex', exact: true });
+  await button.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#refresh-codex')).toBeDisabled();
+  await expect(page.locator('#refresh-codex')).toHaveAttribute('aria-busy', 'true');
+  await page.evaluate(() => { void collectCodex(); });
+  expect(requests).toBe(1);
+  finish();
+  await expect(page.locator('#five-h-pct')).toHaveText('99%');
+  await expect(button).toBeEnabled();
+  await expect(page.locator('#error-banner')).toBeHidden();
+  await page.locator('#language-toggle').click();
+  await expect(page.getByRole('button', { name: 'Actualiser Codex', exact: true })).toBeEnabled();
+});
+
+test('preserves quotas and restores the button after collection failure', async ({ page }) => {
+  await mockUsage(page);
+  await page.route('**/api/refresh', route => route.fulfill({ status: 503 }));
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await page.getByRole('button', { name: 'Refresh Codex', exact: true }).click();
+  await expect(page.locator('#error-banner')).toContainText('monitor is running in loop mode');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await expect(page.locator('#refresh-codex')).toBeEnabled();
+});
+
+for (const window of ['five_h', 'weekly']) test(`reloads after the ${window} reset even if its next deadline was already announced`, async ({ page }) => {
+  await mockUsage(page);
+  const reset = Math.floor(DASHBOARD_NOW.getTime() / 1000) + 10;
+  let requests = 0;
+  await page.route('**/data.json?*', route => {
+    requests += 1;
+    return route.fulfill({ json: {
+      ...snapshot,
+      scraped_at: requests === 1 ? DASHBOARD_NOW.toISOString() : new Date(DASHBOARD_NOW.getTime() + 15000).toISOString(),
+      [window + '_reset_at']: requests === 1 ? reset : reset + 18000,
+      five_h_pct: requests === 1 ? 1 : 20,
+    } });
+  });
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('1%');
+  await page.clock.runFor(15000);
+  await page.evaluate(() => refresh());
+  await page.clock.runFor(29000);
+  expect(requests).toBe(2);
+  await page.route('**/data.json?*', route => route.fulfill({ json: {
+    ...snapshot, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 45000).toISOString(),
+  } }));
+  await page.clock.runFor(1000);
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+});
+
 test('signals visible local dashboard activity without affecting rendering', async ({ page }) => {
   await page.clock.install({ time: DASHBOARD_NOW });
   const heartbeats = [];

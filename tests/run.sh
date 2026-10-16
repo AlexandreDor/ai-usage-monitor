@@ -14,6 +14,7 @@ if [[ "${SKIP_PYTHON_TESTS:-0}" != 1 ]]; then
   python3 "$TEST_DIR/test_analytics_history_cache.py"
   python3 "$TEST_DIR/test_analytics_export.py"
   python3 "$TEST_DIR/test_http_features.py"
+  python3 "$TEST_DIR/test_refresh.py"
   python3 "$TEST_DIR/test_diagnostics.py"
   python3 "$TEST_DIR/test_backup.py"
   python3 "$TEST_DIR/test_coverage_runner.py"

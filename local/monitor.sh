@@ -4780,6 +4780,7 @@ run_once() {
   if ! flock -n "$lock_fd"; then
     echo "[INFO] Another monitor cycle is active; this cycle was skipped."
     exec {lock_fd}>&-
+    [[ "${4:-0}" != 1 ]] || return 75
     return 0
   fi
 
@@ -4840,41 +4841,42 @@ effective_collection_interval() {
 run_loop() {
   local interval="$1" fail_fast="$2"
   local now_epoch completed_at next_regular last_attempt delay effective cycle_status=0 live_due
+  local refresh_request reset_delay refresh_plan
 
   now_epoch="$(date -u +%s)"
-  effective="$(effective_collection_interval "$interval" "$now_epoch")"
   last_attempt="$now_epoch"
-  run_once "$effective" full "$interval" || cycle_status=$?
-  if (( cycle_status != 0 )); then
-    echo "[WARN] Scrape cycle failed, will retry at the next scheduled check"
-    (( fail_fast == 1 )) && return "$cycle_status"
-  fi
-  completed_at="$(date -u +%s)"
-  delay="$(seconds_until_next_interval "$completed_at" "$interval")"
-  next_regular=$((completed_at + delay))
-  echo "[$(format_paris_now)] Next regular check at $(format_paris_timestamp "$next_regular") (in ${delay}s)..."
+  next_regular="$now_epoch"
 
   while true; do
     now_epoch="$(date -u +%s)"
+    refresh_plan="$(python3 "$SCRIPT_DIR/refresh.py" plan "$RUNTIME_DIR" "$now_epoch")" || return 1
+    read -r refresh_request reset_delay <<< "$refresh_plan"
     cycle_status=0
     if (( now_epoch >= next_regular )); then
       effective="$(effective_collection_interval "$interval" "$now_epoch")"
       last_attempt="$now_epoch"
-      run_once "$effective" full "$interval" || cycle_status=$?
+      run_once "$effective" full "$interval" 1 || cycle_status=$?
       completed_at="$(date -u +%s)"
       delay="$(seconds_until_next_interval "$completed_at" "$interval")"
       next_regular=$((completed_at + delay))
       echo "[$(format_paris_now)] Next regular check at $(format_paris_timestamp "$next_regular") (in ${delay}s)..."
+    elif [[ "$refresh_request" != - ]] || (( reset_delay == 0 )); then
+      last_attempt="$now_epoch"
+      effective="$(effective_collection_interval "$interval" "$now_epoch")"
+      run_once "$effective" live "$interval" 1 || cycle_status=$?
     elif (( interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS )) \
       && dashboard_activity_recent "$now_epoch" \
       && (( now_epoch - last_attempt >= DASHBOARD_ACTIVE_INTERVAL_SECONDS )); then
       last_attempt="$now_epoch"
-      run_once "$DASHBOARD_ACTIVE_INTERVAL_SECONDS" live "$interval" || cycle_status=$?
+      run_once "$DASHBOARD_ACTIVE_INTERVAL_SECONDS" live "$interval" 1 || cycle_status=$?
       echo "[$(format_paris_now)] Dashboard active; next live check is eligible in ${DASHBOARD_ACTIVE_INTERVAL_SECONDS}s."
     else
       delay=$((next_regular - now_epoch))
-      if (( interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS && delay > DASHBOARD_HEARTBEAT_POLL_SECONDS )); then
+      if (( delay > DASHBOARD_HEARTBEAT_POLL_SECONDS )); then
         delay="$DASHBOARD_HEARTBEAT_POLL_SECONDS"
+      fi
+      if (( reset_delay > 0 && reset_delay < delay )); then
+        delay="$reset_delay"
       fi
       if (( interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS )) && dashboard_activity_recent "$now_epoch"; then
         live_due=$((last_attempt + DASHBOARD_ACTIVE_INTERVAL_SECONDS))
@@ -4887,7 +4889,12 @@ run_loop() {
       continue
     fi
 
-    if (( cycle_status != 0 )); then
+    python3 "$SCRIPT_DIR/refresh.py" complete "$RUNTIME_DIR" "$refresh_request" "$cycle_status" "$now_epoch" || return 1
+    if (( cycle_status == 75 )); then
+      sleep "$DASHBOARD_HEARTBEAT_POLL_SECONDS"
+      continue
+    fi
+    if (( cycle_status != 0 && cycle_status != 75 )); then
       echo "[WARN] Scrape cycle failed, will retry at the next scheduled check"
       (( fail_fast == 1 )) && return "$cycle_status"
     fi

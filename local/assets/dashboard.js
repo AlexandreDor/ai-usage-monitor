@@ -38,6 +38,43 @@ let dashboardSource = null;
 let refreshInFlight = null;
 let activeRefreshKey = null;
 let queuedRefreshState = null;
+let collectionInFlight = null;
+const pendingResetUpdates = new Map();
+
+function renderRefreshControl() {
+  const button = document.getElementById('refresh-codex');
+  if (!button) return;
+  button.hidden = !isLocalDashboard();
+  button.disabled = collectionInFlight !== null;
+  setElementAttribute(button, 'aria-busy', String(collectionInFlight !== null));
+  button.textContent = t(collectionInFlight ? 'refreshingCodex' : 'refreshCodex');
+}
+
+function collectCodex() {
+  if (collectionInFlight) return collectionInFlight;
+  if (!isLocalDashboard()) return Promise.resolve();
+  collectionInFlight = (async () => {
+    try {
+      const response = await fetch('api/refresh', {
+        method: 'POST',
+        headers: { 'X-Codex-Dashboard-Refresh': '1' },
+        cache: 'no-store',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error(t(response.status === 409 ? 'collectionBusy' : 'collectionUnavailable'));
+      // Finish any earlier snapshot read before requesting the new collection.
+      if (refreshInFlight) await refreshInFlight;
+      await refresh();
+    } catch (error) {
+      setMainError(error instanceof Error ? error.message : t('collectionUnavailable'));
+    } finally {
+      collectionInFlight = null;
+      renderRefreshControl();
+    }
+  })();
+  renderRefreshControl();
+  return collectionInFlight;
+}
 
 function t(key, values = {}) {
   return typeof CodexPreferences === 'object' ? CodexPreferences.t(`dashboard.${key}`, values) : key;
@@ -204,6 +241,24 @@ function consumeRefreshRetryDelay(maximumMs) {
   return delay;
 }
 
+function resetUpdateDelay(data, scrapedAt, now) {
+  for (const window of ['five_h', 'weekly']) {
+    const reset = data?.[`${window}_reset_at`];
+    if (!Number.isInteger(reset) || reset <= 0) continue;
+    const key = `${window}:${reset}`;
+    for (const [previousKey, due] of pendingResetUpdates) {
+      if (previousKey.startsWith(`${window}:`) && previousKey !== key && due - 35_000 > now) {
+        pendingResetUpdates.delete(previousKey);
+      }
+    }
+    if (reset * 1000 + 30_000 > scrapedAt) pendingResetUpdates.set(key, reset * 1000 + 35_000);
+  }
+  for (const [key, due] of pendingResetUpdates) {
+    if (scrapedAt >= due - 5_000 || now >= due + 60_000) pendingResetUpdates.delete(key);
+  }
+  return pendingResetUpdates.size ? Math.max(5_000, Math.min(...pendingResetUpdates.values()) - now) : Infinity;
+}
+
 function scheduleRefresh(data = null) {
   clearTimeout(refreshTimer);
   refreshTimer = null;
@@ -218,6 +273,7 @@ function scheduleRefresh(data = null) {
   const scrapedAt = Date.parse(rawScrapedAt);
 
   if (!isLocalDashboard()) {
+    pendingResetUpdates.clear();
     const nextUpdate = (Math.floor((now - 5_000) / snapshotIntervalMs) + 1) * snapshotIntervalMs + 5_000;
     refreshTimer = setTimeout(refresh, Math.max(REFRESH_RETRY_INITIAL_MS, nextUpdate - now));
     return;
@@ -228,18 +284,22 @@ function scheduleRefresh(data = null) {
     resetRefreshRetry();
   }
 
+  // Allow five seconds for the monitor to publish its reset + 30s check,
+  // then briefly retry if that collection is still running.
+  const resetDelay = resetUpdateDelay(data, scrapedAt, now);
+
   const nextUpdate = Number.isFinite(scrapedAt)
     ? scrapedAt + dashboardActiveIntervalMs + REFRESH_RETRY_INITIAL_MS
     : Number.NaN;
   if (Number.isFinite(nextUpdate) && nextUpdate > now) {
     resetRefreshRetry();
-    refreshTimer = setTimeout(refresh, nextUpdate - now);
+    refreshTimer = setTimeout(refresh, Math.min(nextUpdate - now, resetDelay));
     return;
   }
 
   refreshTimer = setTimeout(
     refresh,
-    consumeRefreshRetryDelay(dashboardActiveIntervalMs),
+    Math.min(consumeRefreshRetryDelay(dashboardActiveIntervalMs), resetDelay),
   );
 }
 
@@ -843,6 +903,7 @@ async function fetchGist(gistId) {
 }
 
 function refresh() {
+  renderRefreshControl();
   const gistId = GIST_ID;
   const requestedState = {
     gistId,
@@ -893,6 +954,7 @@ function refresh() {
 }
 
 function refreshLocalizedDashboard() {
+  renderRefreshControl();
   if (dashboardSource) renderSource(dashboardSource);
   if (dashboardData) renderData(dashboardData, { schedule: false, clearError: false });
   else renderFreshness();
@@ -915,10 +977,12 @@ function refreshLocalizedDashboard() {
 }
 
 if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(refreshLocalizedDashboard);
+document.getElementById('refresh-codex')?.addEventListener('click', collectCodex);
 document.addEventListener('visibilitychange', handleDashboardVisibility);
 window.addEventListener('pageshow', handleDashboardVisibility);
 window.addEventListener('pagehide', handleDashboardPageHide);
 renderSource(isLocalDashboard() ? 'local' : 'external');
+renderRefreshControl();
 renderFreshness();
 startDashboardHeartbeat();
 refresh();

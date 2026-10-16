@@ -291,6 +291,18 @@ the optional Gist. Hiding or closing every dashboard tab restores the regular
 cadence after at most 90 seconds. A regular `LOOP_INTERVAL` shorter than or
 equal to the active interval keeps its existing complete-cycle behavior.
 
+The **Refresh Codex** button requests an immediate live quota collection and
+reloads the displayed data when it finishes. It requires `monitor.sh --loop`
+and `serve.sh` to share the same runtime directory. The button is disabled
+while a request is running; collection failures preserve the last valid data.
+It is hidden in external Gist mode.
+
+Loop mode also schedules a live collection 30 seconds after each announced
+5-hour or weekly reset, even with every dashboard tab closed. Coincident resets
+share one collection; a regular or manual collection after that deadline also
+satisfies the check. Failed reset checks retry after 30 seconds. These checks
+use the same collection lock and preserve the regular history/Gist cadence.
+
 The live dashboard calculates snapshot freshness directly from `scraped_at` and
 `sample_interval_seconds`. It marks data stale once its age exceeds the greater
 of two collection intervals or one interval plus 60 seconds. The source remains
@@ -416,8 +428,11 @@ TLS; only bind it to a trusted network. It exposes an explicit allowlist of
 dashboard assets, sanitized JSON files, and the read-only Analytics API. It does
 not serve `.env`, SQLite, health data, the dashboard heartbeat, delivery
 journals, locks, or directory listings. The local dashboard sends a bodyless
-`POST /api/dashboard-heartbeat`; the server records activity but never launches
-the separate monitor process.
+`POST /api/dashboard-heartbeat` to record activity and `POST /api/refresh` to
+request a live collection from the separate monitor loop. Both require a
+dashboard-specific header and reject request bodies. The server never launches
+Codex or the monitor itself. Refresh requests wait up to 60 seconds for the
+monitor result; an unavailable monitor produces an explicit error.
 
 ## Configuration
 

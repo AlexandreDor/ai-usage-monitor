@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -120,6 +121,26 @@ class HttpFeatureTests(unittest.TestCase):
             self.assertEqual(self.request(path)[0], 400, path)
         for path in ["/http_server.py", "/backup.py", "/runtime/health.json", "/runtime/history.sqlite3", "/../monitor.sh"]:
             self.assertEqual(self.request(path)[0], 404, path)
+
+    def test_refresh_requires_empty_post_and_dashboard_header(self):
+        self.assertEqual(self.request("/api/refresh")[0], 404)
+        self.assertEqual(self.request("/api/refresh", method="POST")[0], 403)
+        headers = {"X-Codex-Dashboard-Refresh": "1"}
+        with mock.patch.object(http_server, "request_refresh", return_value=True) as collect:
+            status, response_headers, body = self.request("/api/refresh", headers, "POST")
+            self.assertEqual(status, 200)
+            self.assertTrue(json.loads(body)["success"])
+            self.assertEqual(response_headers["Cache-Control"], "no-store")
+            collect.assert_called_once_with(self.runtime)
+        self.assertEqual(self.request("/api/refresh", {**headers, "Content-Length": "1"}, "POST")[0], 400)
+        self.assertEqual(self.request("/api/refresh", {**headers, "Transfer-Encoding": "chunked"}, "POST")[0], 400)
+        for result in [False, TimeoutError(), OSError()]:
+            with mock.patch.object(http_server, "request_refresh", **({"side_effect": result} if isinstance(result, Exception) else {"return_value": result})):
+                self.assertEqual(self.request("/api/refresh", headers, "POST")[0], 503)
+        with http_server.refresh_lock:
+            self.assertEqual(self.request("/api/refresh", headers, "POST")[0], 409)
+        for path in ["/dashboard-refresh.json", "/dashboard-refresh-result.json", "/reset-refresh.json", "/refresh.py"]:
+            self.assertEqual(self.request(path)[0], 404)
 
 
 if __name__ == "__main__":

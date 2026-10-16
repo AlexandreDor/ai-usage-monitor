@@ -8,6 +8,9 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Added
 
+- Local dashboard button to collect fresh Codex quotas, plus automatic live
+  collections 30 seconds after announced 5-hour and weekly resets, including
+  when the dashboard is closed.
 - Progressive Analytics loading, previous-period comparisons, remembered filters
   and locally shareable views, complete filtered CSV downloads, and sanitized
   monitor/archive/anomaly diagnostics.
