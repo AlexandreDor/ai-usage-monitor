@@ -1736,7 +1736,12 @@ function refreshLocalizedAnalytics() {
 
 let activeTimezone = timezone();
 if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(() => {
-  if (activeTimezone !== timezone()) { activeTimezone = timezone(); queueRefresh(); }
+  if (activeTimezone !== timezone()) {
+    activeTimezone = timezone();
+    // Custom dates move their UTC boundaries when the selected zone changes.
+    if (state.range === 'custom') resetPagination();
+    queueRefresh();
+  }
   else refreshLocalizedAnalytics();
 });
 for (const button of document.querySelectorAll('[data-range]')) {
