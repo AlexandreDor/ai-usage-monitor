@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import datetime as dt
 import json
 import math
@@ -38,7 +39,7 @@ from history import (
     canonicalize_limit_id,
     opaque_limit_id_from_raw,
 )
-from weekly_reset import observe_full_weekly_reset
+from weekly_reset import prune_full_weekly_resets, saved_full_weekly_resets
 
 RECENT_SECONDS = 24 * 60 * 60
 MEDIUM_SECONDS = 7 * 24 * 60 * 60
@@ -371,6 +372,7 @@ def compact(connection: sqlite3.Connection, retention_days: int) -> None:
 
     if retention_days > 0:
         cutoff = anchor - retention_days * 24 * 60 * 60
+        prune_full_weekly_resets(connection, cutoff)
         connection.execute("DELETE FROM snapshots WHERE scraped_at_epoch < ?", (cutoff,))
         connection.execute(
             "DELETE FROM forecast_samples WHERE scraped_at_epoch < ?", (cutoff,)
@@ -397,7 +399,7 @@ def compact(connection: sqlite3.Connection, retention_days: int) -> None:
 
 
 def rebuild_reset_events(connection: sqlite3.Connection) -> None:
-    """Derive scheduled and unexpected weekly resets from retained snapshots."""
+    """Combine durable full-quota proofs with other snapshot-derived resets."""
     rows = connection.execute(
         """
         SELECT scraped_at_epoch, five_h_pct, five_h_reset_at,
@@ -407,6 +409,24 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
         """
     ).fetchall()
     connection.execute("DELETE FROM reset_events")
+    full_events = saved_full_weekly_resets(connection)
+    full_epochs_by_owner: dict[str, list[int]] = {}
+    for first_at, confirmed_at, owner in full_events:
+        full_epochs_by_owner.setdefault(owner, []).append(first_at)
+        connection.execute(
+            """INSERT INTO reset_events (
+                window, reset_at_epoch, observed_at_epoch,
+                before_pct, after_pct, detection_method
+            ) VALUES ('weekly', ?, ?, 100, 100, 'full_observed')""",
+            (first_at, confirmed_at),
+        )
+
+    def spans_full_reset(previous, current) -> bool:
+        # A removed full/live observation must not turn its confirmed cycle
+        # into a second scheduled crossing or measured refill at another time.
+        epochs = full_epochs_by_owner.get(current[6], ())
+        return bisect_right(epochs, previous[0]) < bisect_right(epochs, current[0])
+
     windows = (("5h", 1, 2), ("weekly", 3, 4))
     scheduled_5h_cycles = set()
     scheduled_weekly_cycles = set()
@@ -453,6 +473,7 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
                     or (
                         isinstance(current_reset_at, int)
                         and current_reset_at > reset_at
+                        and not spans_full_reset(previous, current)
                     )
                 )
             ):
@@ -603,6 +624,7 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             and isinstance(current_deadline, int)
             and current_deadline > previous_deadline
             and previous[0] < previous_deadline <= current[0]
+            and not spans_full_reset(previous, current)
         ):
             # The complete baseline can span same-owner partial snapshots.
             # Classify a crossed planned deadline from that baseline as a
@@ -639,6 +661,7 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             and isinstance(previous_pct, (int, float))
             and isinstance(previous_deadline, int)
             and not scheduled_crossing
+            and not spans_full_reset(previous, current)
             and current_deadline >= previous_deadline + RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS
             and refill_change > 0
             and (
@@ -656,24 +679,6 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
                 (current[0], current[0], previous_pct, current_pct),
             )
         previous_weekly = current
-
-    # Full quota cannot increase on a refill. Confirm a material deadline
-    # advance with a third, fresh observation before recording this weaker
-    # evidence. Keep it distinct from measured refills and planned crossings.
-    full_state = ""
-    for current in rows:
-        full_state, confirmed_at, _pending = observe_full_weekly_reset(
-            full_state, epoch=current[0], pct=current[3], reset_at=current[4],
-            owner=current[6], interval=current[5],
-        )
-        if confirmed_at:
-            connection.execute(
-                """INSERT OR IGNORE INTO reset_events (
-                    window, reset_at_epoch, observed_at_epoch,
-                    before_pct, after_pct, detection_method
-                ) VALUES ('weekly', ?, ?, 100, 100, 'full_observed')""",
-                (confirmed_at, current[0]),
-            )
 
 
 def ingest(
@@ -711,11 +716,11 @@ def ingest(
                 (SCHEMA_VERSION,),
             )
             insert_snapshot(connection, snapshot)
+            # Record the fresh confirmation before compaction can discard
+            # evidence. Live polls use this same idempotent detector path.
+            process_snapshot(connection, snapshot, legacy_weekly_state=legacy_weekly_state)
             compact(connection, retention_days)
             rebuild_reset_events(connection)
-            # Detector state is compact and independent from snapshots.  The
-            # same call is idempotent when a live cycle replays this sample.
-            process_snapshot(connection, snapshot, legacy_weekly_state=legacy_weekly_state)
     finally:
         connection.close()
     os.chmod(database_path, 0o600)

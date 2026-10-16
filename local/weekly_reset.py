@@ -11,6 +11,7 @@ from typing import Any
 
 MIN_ADVANCE_SECONDS = 1800
 CONFIRMATION_TOLERANCE_SECONDS = 60
+CONFIRMED_EVENT_KEY_PREFIX = "full_weekly_reset_confirmed:"
 
 
 def _number(value: Any) -> bool:
@@ -85,6 +86,68 @@ def observe_full_weekly_reset(encoded: str, *, epoch: Any, pct: Any,
     # The shell state reader uses '=' as its delimiter, so omit base64 padding.
     encoded = base64.b64encode(json.dumps(state, separators=(",", ":")).encode()).decode().rstrip("=")
     return encoded, confirmed_at, candidate is not None
+
+
+def observe_and_record_full_weekly_reset(connection, encoded: str,
+                                         **observation: Any) -> tuple[str, int, bool]:
+    """Persist a confirmed proof in the caller's detector transaction.
+
+    These small metadata records are independent of downsampled snapshots and
+    include the candidate and its confirming observation. A live poll records
+    the same evidence without adding a quota snapshot. Canceled candidates
+    never become evidence, even if a later compaction removes their partials.
+    """
+    result = observe_full_weekly_reset(encoded, **observation)
+    confirmed_at = result[1]
+    if confirmed_at:
+        connection.execute(
+            "INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)",
+            (f"{CONFIRMED_EVENT_KEY_PREFIX}{confirmed_at}",
+             json.dumps({"state": encoded, "observation": observation}, separators=(",", ":"))),
+        )
+        connection.execute(
+            """INSERT INTO reset_events (
+                window, reset_at_epoch, observed_at_epoch,
+                before_pct, after_pct, detection_method
+            ) VALUES ('weekly', ?, ?, 100, 100, 'full_observed')
+            ON CONFLICT(window, reset_at_epoch) DO UPDATE SET
+                observed_at_epoch = excluded.observed_at_epoch,
+                before_pct = 100, after_pct = 100, detection_method = 'full_observed'
+            WHERE reset_events.detection_method != 'full_observed'""",
+            (confirmed_at, int(observation["epoch"])),
+        )
+    return result
+
+
+def saved_full_weekly_resets(connection) -> list[tuple[int, int, str]]:
+    """Return validated (first observation, confirmation, owner) proofs."""
+    events = []
+    for key, value in connection.execute(
+            "SELECT key, value FROM metadata WHERE key GLOB ?",
+            (CONFIRMED_EVENT_KEY_PREFIX + "*",)):
+        try:
+            proof = json.loads(value)
+            observation = proof["observation"]
+            _state, confirmed_at, _pending = observe_full_weekly_reset(
+                proof["state"], **observation,
+            )
+            if confirmed_at and key == f"{CONFIRMED_EVENT_KEY_PREFIX}{confirmed_at}":
+                events.append((confirmed_at, int(observation["epoch"]), observation["owner"]))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return sorted(events)
+
+
+def prune_full_weekly_resets(connection, cutoff: int) -> None:
+    """Apply archive retention to durable proofs as well as their events."""
+    for first_at, _confirmed_at, _owner in saved_full_weekly_resets(connection):
+        if first_at < cutoff:
+            connection.execute("DELETE FROM metadata WHERE key = ?",
+                               (f"{CONFIRMED_EVENT_KEY_PREFIX}{first_at}",))
+    connection.execute(
+        "DELETE FROM reset_events WHERE detection_method = 'full_observed' AND reset_at_epoch < ?",
+        (cutoff,),
+    )
 
 
 def legacy_baseline_has_evidence(connection, *, epoch: int, pct: Any,

@@ -289,10 +289,12 @@ the default 900-second interval, later runs align with `:00`, `:15`, `:30`, and
 While a locally served dashboard tab is visible, loop mode also refreshes the
 current quota snapshot and evaluates alerts at `DASHBOARD_ACTIVE_INTERVAL_SECONDS`
 (300 seconds by default). These
-live checks do not write `history.json`, SQLite, Forecast or token samples, or
-the optional Gist. Hiding or closing every dashboard tab restores the regular
-cadence after at most 90 seconds. A regular `LOOP_INTERVAL` shorter than or
-equal to the active interval keeps its existing complete-cycle behavior.
+live checks do not add `history.json`, SQLite quota, Forecast or token samples,
+or update the optional Gist. Compact detector state, anomalies and confirmed
+full-quota weekly cycles are persisted in SQLite. Hiding or closing every
+dashboard tab restores the regular cadence after at most 90 seconds. A regular
+`LOOP_INTERVAL` shorter than or equal to the active interval keeps its existing
+complete-cycle behavior.
 
 The live dashboard calculates snapshot freshness directly from `scraped_at` and
 `sample_interval_seconds`. It marks data stale once its age exceeds the greater
@@ -656,7 +658,14 @@ canceled chain stays canceled; unavailable or incomplete evidence starts a new
 baseline instead of guessing continuity.
 Analytics labels this `full_observed` evidence separately from a
 measured refill and assigns it no measured quota gain or unused end-of-week
-quota. A 5-hour reset
+quota. Each fresh confirmation saves its candidate and confirming observation
+independently of quota snapshots, including in live mode. Rebuilding reset
+history preserves its original event and confirmation times after 30-minute
+or hourly compaction, without inventing cycles from discarded partial samples
+or duplicating a superseded scheduled reset. These proofs follow
+`ARCHIVE_RETENTION_DAYS`; zero keeps them indefinitely. Historical quota samples
+without a saved confirmation do not establish a full-quota cycle retroactively.
+A 5-hour reset
 with 100% remaining is recognized only from two complete observations in the
 same limit group, with a strictly later valid deadline; the first observation
 carrying the new deadline anchors the event. Repeating that deadline is
@@ -669,9 +678,10 @@ retained until it can be delivered.
 The rolling JSON history is separate and retains samples according to their
 actual timestamps. Changing the collection interval does not change the time
 span requested by `HISTORY_RETENTION_HOURS`; only the defensive entry and size
-limits can shorten it. Dashboard-triggered live checks update only `data.json`,
-so they never increase graph or archive density. Alerts use every successful
-live observation, while Forecast and token collection remain on full cycles.
+limits can shorten it. Dashboard-triggered live checks update `data.json` and
+compact detector/event records, so they never increase quota graph or snapshot
+archive density. Alerts use every successful live observation, while Forecast
+and token collection remain on full cycles.
 
 ### Token Analytics
 

@@ -42,6 +42,9 @@ Git tag and the value in `VERSION` is the single source of truth.
 - Confirm weekly 100% → 100% deadline advances consistently in alerts, anomaly
   detection and reset history, with durable hook deduplication and distinct
   full-quota evidence instead of an unsupported refill claim.
+- Preserve confirmed full-quota weekly cycles and their original observation
+  times across live/full collection, restarts and archive compaction, without
+  reconstructing canceled candidates or duplicating superseded reset events.
 - Provide a maintained, bounded weekly starter that validates cycle evidence
   instead of declaring success from any future reset date.
 - Disable persistent Analytics caching under replaceable or symlinked ancestors

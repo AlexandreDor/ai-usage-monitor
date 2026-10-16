@@ -18,7 +18,11 @@ import sys
 from typing import Any
 
 from storage import ArchiveCorruptionError, canonicalize_limit_id, connect_database
-from weekly_reset import legacy_baseline_has_evidence, observe_full_weekly_reset
+from weekly_reset import (
+    legacy_baseline_has_evidence,
+    observe_and_record_full_weekly_reset,
+    observe_full_weekly_reset,
+)
 
 
 # These are intentionally named and shared with archive.py/monitor.sh's
@@ -375,8 +379,8 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
                 reset_at=state.get("last_reset_at"), owner=limit_id,
                 interval=previous_interval,
             )[0]
-        full_state, full_weekly_confirmed, full_weekly_pending = observe_full_weekly_reset(
-            full_state, epoch=epoch, pct=current_pct, reset_at=current_reset,
+        full_state, full_weekly_confirmed, full_weekly_pending = observe_and_record_full_weekly_reset(
+            connection, full_state, epoch=epoch, pct=current_pct, reset_at=current_reset,
             owner=limit_id, interval=current_interval,
         )
         state["full_weekly_reset_state"] = full_state

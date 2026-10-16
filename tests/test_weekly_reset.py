@@ -18,7 +18,7 @@ import analytics
 import anomalies
 import archive
 import storage
-from weekly_reset import observe_full_weekly_reset
+from weekly_reset import CONFIRMED_EVENT_KEY_PREFIX, observe_full_weekly_reset, saved_full_weekly_resets
 import weekly_window_start
 
 
@@ -114,7 +114,9 @@ class FullWeeklyResetTests(unittest.TestCase):
                 for epoch, deadline, pct in ((10000, 14000, 99), (10900, 14000, 100),
                                              (13600, 20000, 100), (14500, 20010, 100),
                                              (15400, 20011, 100)):
-                    archive.insert_snapshot(c, self.sample(epoch, deadline, pct))
+                    sample = self.sample(epoch, deadline, pct)
+                    anomalies.process_snapshot(c, sample)
+                    archive.insert_snapshot(c, sample)
                 archive.rebuild_reset_events(c)
                 self.assertEqual([(13600, 14500, "full_observed")], c.execute(
                     "SELECT reset_at_epoch, observed_at_epoch, detection_method "
@@ -288,6 +290,197 @@ class FullWeeklyResetTests(unittest.TestCase):
                     ).fetchone()[0])
                 finally:
                     c.close()
+
+
+class FullWeeklyResetHistoryTests(unittest.TestCase):
+    sample = FullWeeklyResetTests.sample
+    base = 1_800_000_000  # Aligned with both archive bucket sizes.
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.database = pathlib.Path(self.directory.name) / "archive.sqlite3"
+        self.connection = storage.connect_database(self.database)
+        self.addCleanup(lambda: self.connection.close())
+
+    def poll(self, offset, reset, pct=100, *, archived=True, owner="group-a"):
+        sample = self.sample(self.base + offset, self.base + reset, pct, owner)
+        with self.connection:
+            anomalies.process_snapshot(self.connection, sample)
+            if archived:
+                archive.insert_snapshot(self.connection, sample)
+
+    def events(self):
+        return self.connection.execute(
+            "SELECT reset_at_epoch, observed_at_epoch, detection_method "
+            "FROM reset_events WHERE window='weekly' ORDER BY reset_at_epoch"
+        ).fetchall()
+
+    def test_confirmed_event_survives_compaction_restart_and_rebuild(self):
+        old, new = 5 * 86400, 7 * 86400
+        self.poll(-900, old)
+        self.poll(0, new)
+        self.poll(900, new, 99)
+        expected = [(self.base, self.base + 900, "full_observed")]
+        self.assertEqual(expected, self.events())
+        for offset in range(1800, 25 * 3600 + 1, 900):
+            self.poll(offset, new, 99)
+        self.connection.close()
+        self.connection = storage.connect_database(self.database)
+        for retention in (0, 365):
+            with self.connection:
+                archive.compact(self.connection, retention)
+                archive.rebuild_reset_events(self.connection)
+            self.assertEqual(expected, self.events())
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM snapshots WHERE scraped_at_epoch=?", (self.base,),
+        ).fetchone())
+        self.poll(8 * 86400, 14 * 86400, 99)
+        with self.connection:
+            archive.compact(self.connection, 0)
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual(expected, self.events())
+
+    def test_partial_cancellation_cannot_be_recreated_after_compaction(self):
+        old, new = 5 * 86400, 7 * 86400
+        for offset, reset, pct in ((-900, old, 100), (0, new, 100),
+                                   (450, new, None), (900, new, 100)):
+            self.poll(offset, reset, pct)
+        for offset in range(1800, 25 * 3600 + 1, 900):
+            self.poll(offset, new)
+        with self.connection:
+            archive.compact(self.connection, 0)
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([], self.events())
+        self.assertEqual([], saved_full_weekly_resets(self.connection))
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM snapshots WHERE scraped_at_epoch=?", (self.base + 450,),
+        ).fetchone())
+        self.assertEqual(1, self.connection.execute(
+            "SELECT count(*) FROM quota_anomalies WHERE window='weekly' AND anomaly_type='reset_shift'"
+        ).fetchone()[0])
+
+    def test_live_confirmation_is_immediate_and_survives_next_full_poll(self):
+        self.poll(0, 400000)
+        self.poll(300, 600000, archived=False)
+        self.poll(600, 600000, archived=False)
+        expected = [(self.base + 300, self.base + 600, "full_observed")]
+        self.assertEqual(expected, self.events())
+        self.poll(900, 600000, 99)
+        self.poll(600, 600000, archived=False)  # Replayed confirmation is harmless.
+        with self.connection:
+            self.connection.execute("DELETE FROM reset_events")
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual(expected, self.events())
+        self.assertEqual(2, self.connection.execute("SELECT count(*) FROM snapshots").fetchone()[0])
+        self.assertEqual(1, len(saved_full_weekly_resets(self.connection)))
+
+    def test_live_partial_breaks_an_apparent_full_snapshot_chain(self):
+        self.poll(0, 400000)
+        self.poll(300, 600000, archived=False)
+        self.poll(450, 600000, None, archived=False)
+        self.poll(900, 600000)
+        self.poll(1800, 600000)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([], self.events())
+
+    def test_live_confirmation_does_not_duplicate_the_superseded_scheduled_reset(self):
+        self.poll(10000, 14000, 99)
+        self.poll(12700, 14000)
+        self.poll(13600, 20000, archived=False)
+        self.poll(14500, 20010, archived=False)
+        self.poll(15400, 20011, 99)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([(self.base + 13600, self.base + 14500, "full_observed")], self.events())
+
+    def test_live_confirmation_does_not_duplicate_a_snapshot_refill(self):
+        self.poll(10000, 14000, 99)
+        self.poll(10900, 14000, archived=False)
+        self.poll(11800, 20000, archived=False)
+        self.poll(12700, 20010, archived=False)
+        self.poll(13600, 20011)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([(self.base + 11800, self.base + 12700, "full_observed")], self.events())
+
+    def test_full_proof_does_not_suppress_another_owners_scheduled_reset(self):
+        self.poll(0, 400000, archived=False)
+        self.poll(300, 600000, archived=False)
+        self.poll(600, 600000, archived=False)
+        with self.connection:
+            for offset, reset in ((0, 400), (900, 600000)):
+                archive.insert_snapshot(self.connection, self.sample(
+                    self.base + offset, self.base + reset, owner="group-b",
+                ))
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([
+            (self.base + 300, self.base + 600, "full_observed"),
+            (self.base + 400, self.base + 900, "scheduled_crossing"),
+        ], self.events())
+
+    def test_invalid_or_foreign_confirmation_proof_is_not_an_event(self):
+        self.poll(0, 400000)
+        self.poll(300, 600000, archived=False)
+        self.poll(600, 600000, archived=False)
+        key = f"{CONFIRMED_EVENT_KEY_PREFIX}{self.base + 300}"
+        original = self.connection.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()[0]
+        foreign = json.loads(original)
+        foreign["observation"]["owner"] = storage.canonicalize_limit_id("group-b")
+        partial = json.loads(original)
+        partial["observation"]["pct"] = None
+        for invalid in (None, [], {}, foreign, partial):
+            with self.subTest(invalid=invalid), self.connection:
+                self.connection.execute("UPDATE metadata SET value=? WHERE key=?", (json.dumps(invalid), key))
+                archive.rebuild_reset_events(self.connection)
+                self.assertEqual([], self.events())
+        with self.connection:
+            self.connection.execute("UPDATE metadata SET value=? WHERE key=?", (original, key))
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([(self.base + 300, self.base + 600, "full_observed")], self.events())
+
+    def test_confirmed_proofs_follow_the_configured_retention_boundary(self):
+        self.poll(-900, 5 * 86400)
+        self.poll(0, 7 * 86400)
+        self.poll(900, 7 * 86400, 99)
+        self.poll(86400, 7 * 86400, 99)
+        with self.connection:
+            archive.compact(self.connection, 1)
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual(1, len(self.events()))
+        self.poll(86401, 7 * 86400, 99)
+        with self.connection:
+            archive.compact(self.connection, 1)
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([], self.events())
+        self.assertEqual([], self.connection.execute(
+            "SELECT key FROM metadata WHERE key GLOB ?", (CONFIRMED_EVENT_KEY_PREFIX + "*",),
+        ).fetchall())
+
+    def test_snapshot_backfill_without_fresh_proof_does_not_guess_full_cycles(self):
+        with self.connection:
+            for offset, reset in ((0, 400000), (900, 600000), (1800, 600000)):
+                archive.insert_snapshot(self.connection, self.sample(self.base + offset, self.base + reset))
+            self.connection.execute(
+                "INSERT INTO reset_events VALUES ('weekly', ?, ?, 100, 100, 'full_observed')",
+                (self.base + 900, self.base + 1800),
+            )
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([], self.events())
+
+    def test_confirmation_proof_and_detector_state_roll_back_together(self):
+        self.poll(0, 400000)
+        self.poll(900, 600000)
+        with self.assertRaisesRegex(RuntimeError, "interrupted transaction"):
+            with self.connection:
+                anomalies.process_snapshot(self.connection, self.sample(self.base + 1800, self.base + 600000))
+                self.assertEqual(1, len(self.events()))
+                raise RuntimeError("interrupted transaction")
+        self.assertEqual([], self.events())
+        self.assertEqual([], saved_full_weekly_resets(self.connection))
+        self.poll(1800, 600000)
+        self.assertEqual([(self.base + 900, self.base + 1800, "full_observed")], self.events())
 
 
 class WeeklyHookTests(unittest.TestCase):
