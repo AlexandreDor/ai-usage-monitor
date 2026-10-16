@@ -14,6 +14,7 @@ CONFIRMATION_TOLERANCE_SECONDS = 60
 CONFIRMED_EVENT_KEY_PREFIX = "full_weekly_reset_confirmed:"
 OBSERVED_EVENT_KEY_PREFIX = "weekly_reset_observed:"
 WEEKLY_EVIDENCE_START_KEY = "weekly_reset_evidence_start"
+WEEKLY_HISTORY_STATE_KEY = "weekly_reset_history_state"
 RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT = 20.0
 RANDOM_WEEKLY_RESET_FULL_REFILL_PCT = 98.0
 RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS = MIN_ADVANCE_SECONDS
@@ -181,9 +182,9 @@ def _observed_weekly_event(previous, current) -> WeeklyResetEvent | None:
                 or sample["epoch"] <= 0 or not 0 <= sample["pct"] <= 100
                 or sample["reset_at"] <= 0 or sample["interval"] <= 0):
             return None
-    owner = current["owner"]
+    owner = current.get("owner")
     if (not isinstance(owner, str) or not owner or owner == "__unknown__"
-            or previous["owner"] != owner or current["epoch"] <= previous["epoch"]
+            or previous.get("owner") != owner or current["epoch"] <= previous["epoch"]
             or not current["epoch"] < current["reset_at"] <= current["epoch"] + 8 * 86400):
         return None
     scheduled = (
@@ -231,6 +232,50 @@ def saved_observed_weekly_resets(connection) -> list[WeeklyResetEvent]:
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
             continue
     return sorted(events)
+
+
+def observe_weekly_reset_history(connection, *, epoch, pct, reset_at, owner, interval,
+                                 prior_observation_epoch=0, full_state="") -> None:
+    """Classify events from a separate last complete, owner-scoped baseline.
+
+    Anomaly state also tracks incomplete percentages and cannot serve as this
+    baseline. Same-owner partials retain it; every foreign/unknown observation
+    clears it, even if an owner returns through another partial observation.
+    """
+    row = connection.execute("SELECT value FROM metadata WHERE key=?", (WEEKLY_HISTORY_STATE_KEY,)).fetchone()
+    try:
+        state = json.loads(row[0]) if row else {}
+        if (not isinstance(state, dict)
+                or not _number(state.get("observed_at")) or state["observed_at"] <= 0):
+            state = {}
+    except (TypeError, ValueError):
+        state = {}
+    if epoch <= state.get("observed_at", prior_observation_epoch):
+        return
+    known_owner = isinstance(owner, str) and owner and owner != "__unknown__"
+    baseline = state.get("baseline") if known_owner and state.get("owner") == owner else None
+    interval = int(interval) if _number(interval) and interval > 0 else 900
+    complete = (_number(pct) and 0 <= pct <= 100 and _number(reset_at)
+                and epoch < reset_at <= epoch + 8 * 86400 and known_owner)
+    if complete:
+        current = {"epoch": epoch, "pct": pct, "reset_at": reset_at, "owner": owner, "interval": interval}
+        if isinstance(baseline, dict):
+            record_observed_weekly_reset(connection, baseline, current)
+        if not connection.execute("SELECT 1 FROM metadata WHERE key=?", (WEEKLY_EVIDENCE_START_KEY,)).fetchone():
+            pending = _load(full_state).get("candidate")
+            confirmed = any(proof.confirmed_at == epoch for proof in saved_full_weekly_resets(connection))
+            # Preserve the initial legacy transition only until a complete baseline
+            # exists. A known full candidate/confirmation already has stronger
+            # evidence and must not be reclassified by sparse legacy snapshots.
+            start = epoch if baseline is not None or pending or confirmed else epoch + 1
+            connection.execute("INSERT INTO metadata(key, value) VALUES (?, ?)",
+                               (WEEKLY_EVIDENCE_START_KEY, str(start)))
+        baseline = current
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (WEEKLY_HISTORY_STATE_KEY,
+         json.dumps({"observed_at": epoch, "owner": owner, "baseline": baseline}, separators=(",", ":"))),
+    )
 
 
 def prune_weekly_reset_evidence(connection, cutoff: int) -> None:

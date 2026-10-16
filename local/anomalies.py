@@ -22,12 +22,11 @@ from weekly_reset import (
     RANDOM_WEEKLY_RESET_FULL_REFILL_PCT,
     RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT,
     RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS,
-    WEEKLY_EVIDENCE_START_KEY,
     is_weekly_refill,
     legacy_baseline_has_evidence,
     observe_and_record_full_weekly_reset,
     observe_full_weekly_reset,
-    record_observed_weekly_reset,
+    observe_weekly_reset_history,
 )
 
 
@@ -391,16 +390,6 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     recognized_weekly = window == "weekly" and _weekly_reset(
         previous_pct, current_pct, previous_reset, current_reset
     )
-    if (window == "weekly" and state_exists and not force_baseline
-            and state.get("last_reset_at") is not None
-            and not full_weekly_confirmed and not full_weekly_pending):
-        record_observed_weekly_reset(
-            connection,
-            {"epoch": previous_epoch, "pct": previous_pct, "reset_at": previous_reset,
-             "owner": limit_id, "interval": previous_interval},
-            {"epoch": epoch, "pct": current_pct, "reset_at": current_reset,
-             "owner": limit_id, "interval": current_interval},
-        )
     recognized_weekly = recognized_weekly or full_weekly_confirmed or full_weekly_pending
     recognized_five_hour = (
         window == "5h"
@@ -541,20 +530,9 @@ def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any], *
     if epoch is None:
         return
     limit_id = _limit_id(snapshot.get("limit_id"))
-    prior_weekly_state = connection.execute(
-        "SELECT 1 FROM anomaly_detector_state WHERE limit_id=? AND window='weekly'", (limit_id,),
-    ).fetchone()
     prior_observation_epoch = connection.execute(
         "SELECT COALESCE(MAX(updated_at_epoch), 0) FROM anomaly_detector_state"
     ).fetchone()[0]
-    # Once every poll is classified, sparse snapshots must not invent events
-    # that contradict its complete live/full observation stream. On a fresh
-    # archive, keep historical snapshot backfill through the initial baseline.
-    if epoch > prior_observation_epoch:
-        connection.execute(
-            "INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)",
-            (WEEKLY_EVIDENCE_START_KEY, str(epoch if prior_weekly_state else epoch + 1)),
-        )
     active = connection.execute(
         "SELECT value FROM metadata WHERE key = 'anomaly_active_limit_id'"
     ).fetchone()
@@ -585,6 +563,14 @@ def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any], *
             prior_observation_epoch=prior_observation_epoch,
             legacy_weekly_state=legacy_weekly_state,
         )
+    weekly_state, _exists = _load_state(connection, limit_id, "weekly", epoch)
+    observe_weekly_reset_history(
+        connection, epoch=epoch, pct=snapshot.get("weekly_pct"),
+        reset_at=snapshot.get("weekly_reset_at"), owner=limit_id,
+        interval=snapshot.get("sample_interval_seconds"),
+        prior_observation_epoch=prior_observation_epoch,
+        full_state=weekly_state.get("full_weekly_reset_state", ""),
+    )
 
 
 def pending_anomalies(connection: sqlite3.Connection) -> list[dict[str, Any]]:

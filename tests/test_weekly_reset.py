@@ -18,7 +18,10 @@ import analytics
 import anomalies
 import archive
 import storage
-from weekly_reset import CONFIRMED_EVENT_KEY_PREFIX, observe_full_weekly_reset, saved_full_weekly_resets
+from weekly_reset import (
+    CONFIRMED_EVENT_KEY_PREFIX, WEEKLY_EVIDENCE_START_KEY, WEEKLY_HISTORY_STATE_KEY,
+    observe_full_weekly_reset, saved_full_weekly_resets,
+)
 import weekly_window_start
 
 
@@ -478,6 +481,85 @@ class FullWeeklyResetHistoryTests(unittest.TestCase):
 
     def test_unknown_live_partial_interrupts_successor_baseline(self):
         self.assert_interrupted_owner_cannot_reuse_a_full_proof(archived=False, owner=None)
+
+    def test_partial_owner_return_does_not_revive_the_old_complete_baseline(self):
+        self.poll(0, 1000, 99)
+        self.poll(100, 1000, archived=False)
+        self.poll(300, 3000, archived=False)
+        self.poll(600, 3000, archived=False)
+        with self.connection:
+            for offset, owner in ((900, "group-b"), (1200, "group-a")):
+                anomalies.process_snapshot(self.connection, self.sample(self.base + offset, None, None, owner))
+        self.poll(4000, 6000)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([(self.base + 300, self.base + 600, "full_observed")], self.events())
+
+    def assert_initial_partial_preserves_legacy_backfill(self, pct, *, archived):
+        with self.connection:
+            archive.insert_snapshot(self.connection, self.sample(self.base, self.base + 1000, 20))
+            partial = self.sample(self.base + 500, None, pct)
+            anomalies.process_snapshot(self.connection, partial)
+            if archived:
+                archive.insert_snapshot(self.connection, partial)
+        self.assertIsNone(self.connection.execute(
+            "SELECT value FROM metadata WHERE key=?", (WEEKLY_EVIDENCE_START_KEY,),
+        ).fetchone())
+        self.poll(1500, 5000, 99)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([(self.base + 1000, self.base + 1500, "scheduled_crossing")], self.events())
+
+    def test_first_archived_missing_percentage_keeps_initial_legacy_transition(self):
+        self.assert_initial_partial_preserves_legacy_backfill(None, archived=True)
+
+    def test_first_live_missing_percentage_keeps_initial_legacy_transition(self):
+        self.assert_initial_partial_preserves_legacy_backfill(None, archived=False)
+
+    def test_first_archived_missing_deadline_keeps_initial_legacy_transition(self):
+        self.assert_initial_partial_preserves_legacy_backfill(20, archived=True)
+
+    def test_first_live_missing_deadline_keeps_initial_legacy_transition(self):
+        self.assert_initial_partial_preserves_legacy_backfill(20, archived=False)
+
+    def test_legacy_anomaly_state_cannot_bridge_an_archived_owner_interruption(self):
+        self.poll(0, 1000, 20)
+        for offset, owner in ((500, "group-b"), (700, "group-a")):
+            partial = self.sample(self.base + offset, None, None, owner)
+            with self.connection:
+                anomalies.process_snapshot(self.connection, partial)
+                archive.insert_snapshot(self.connection, partial)
+        # Legacy detectors retained the last complete A percentage/deadline
+        # across partial returns, but had no independent event baseline.
+        with self.connection:
+            self.connection.execute("DELETE FROM metadata WHERE key IN (?, ?)",
+                                    (WEEKLY_HISTORY_STATE_KEY, WEEKLY_EVIDENCE_START_KEY))
+            for owner, encoded in self.connection.execute(
+                    "SELECT limit_id,state_json FROM anomaly_detector_state WHERE window='weekly'").fetchall():
+                state = json.loads(encoded)
+                state.pop("full_weekly_reset_state", None)
+                self.connection.execute("UPDATE anomaly_detector_state SET state_json=? "
+                                        "WHERE window='weekly' AND limit_id=?", (json.dumps(state), owner))
+        self.poll(1500, 5000, 99)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([], self.events())
+
+    def test_missing_date_partial_keeps_complete_scheduled_baseline(self):
+        self.poll(0, 1000)
+        self.poll(300, 3000, archived=False)
+        self.poll(600, 3000)
+        partial = self.sample(self.base + 1000, None, 20)
+        with self.connection:
+            anomalies.process_snapshot(self.connection, partial)
+            archive.insert_snapshot(self.connection, partial)
+        self.poll(4000, 6000, 99)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([
+            (self.base + 300, self.base + 600, "full_observed"),
+            (self.base + 3000, self.base + 4000, "scheduled_crossing"),
+        ], self.events())
 
     def test_scheduled_successor_preserves_consumed_quota_and_retention(self):
         self.poll(0, 1000, 99)
