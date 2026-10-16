@@ -37,6 +37,8 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Fixed
 
+- Reset Analytics allocation and reset-history pages when changing the timezone
+  of a custom date range, preventing empty pages after its UTC boundaries move.
 - Preserve SQLite reader locks during archive-path validation so diagnostics
   cannot leave Analytics attached to deleted WAL files after collection.
 - Preserve requested allocation and reset pages when a collection changes the
