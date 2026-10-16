@@ -405,6 +405,53 @@ class FullWeeklyResetHistoryTests(unittest.TestCase):
             archive.rebuild_reset_events(self.connection)
         self.assertEqual([(self.base + 11800, self.base + 12700, "full_observed")], self.events())
 
+    def test_distinct_measured_refill_after_a_live_full_reset_is_preserved(self):
+        self.poll(0, 400000, 99)
+        self.poll(100, 400000, archived=False)
+        self.poll(300, 500000, archived=False)
+        self.poll(400, 500000, archived=False)
+        self.poll(500, 500000, 80, archived=False)
+        self.poll(900, 600000)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([
+            (self.base + 300, self.base + 400, "full_observed"),
+            (self.base + 900, self.base + 900, "random_observed"),
+        ], self.events())
+
+    def test_scheduled_successor_uses_the_live_proofs_deadline_and_confirmation_gap(self):
+        self.poll(0, 1000, 99)
+        self.poll(100, 1000, archived=False)
+        self.poll(300, 3000, archived=False)
+        self.poll(600, 3000, archived=False)
+        self.poll(4000, 6000, 99)
+        expected = [
+            (self.base + 300, self.base + 600, "full_observed"),
+            (self.base + 3000, self.base + 4000, "scheduled_crossing"),
+        ]
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual(expected, self.events())
+        # The durable proof is also a sufficient baseline when the first quota
+        # snapshot after a live-only confirmation arrives after its deadline.
+        with self.connection:
+            self.connection.execute("DELETE FROM snapshots WHERE scraped_at_epoch=?", (self.base,))
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual(expected, self.events())
+
+    def test_earlier_scheduled_crossing_is_not_superseded_by_a_later_full_reset(self):
+        self.poll(0, 1000, 99)
+        self.poll(1100, 3000, archived=False)
+        self.poll(1200, 6000, archived=False)
+        self.poll(1500, 6000, archived=False)
+        self.poll(1800, 6000)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([
+            (self.base + 1000, self.base + 1800, "scheduled_crossing"),
+            (self.base + 1200, self.base + 1500, "full_observed"),
+        ], self.events())
+
     def test_full_proof_does_not_suppress_another_owners_scheduled_reset(self):
         self.poll(0, 400000, archived=False)
         self.poll(300, 600000, archived=False)

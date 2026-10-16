@@ -6,12 +6,20 @@ import argparse
 import base64
 import json
 import math
-from typing import Any
+from typing import Any, NamedTuple
 
 
 MIN_ADVANCE_SECONDS = 1800
 CONFIRMATION_TOLERANCE_SECONDS = 60
 CONFIRMED_EVENT_KEY_PREFIX = "full_weekly_reset_confirmed:"
+
+
+class FullWeeklyResetProof(NamedTuple):
+    first_at: int
+    confirmed_at: int
+    owner: str
+    deadline: int
+    interval: int
 
 
 def _number(value: Any) -> bool:
@@ -119,8 +127,8 @@ def observe_and_record_full_weekly_reset(connection, encoded: str,
     return result
 
 
-def saved_full_weekly_resets(connection) -> list[tuple[int, int, str]]:
-    """Return validated (first observation, confirmation, owner) proofs."""
+def saved_full_weekly_resets(connection) -> list[FullWeeklyResetProof]:
+    """Return validated proofs, including the confirmed cycle's deadline."""
     events = []
     for key, value in connection.execute(
             "SELECT key, value FROM metadata WHERE key GLOB ?",
@@ -132,7 +140,12 @@ def saved_full_weekly_resets(connection) -> list[tuple[int, int, str]]:
                 proof["state"], **observation,
             )
             if confirmed_at and key == f"{CONFIRMED_EVENT_KEY_PREFIX}{confirmed_at}":
-                events.append((confirmed_at, int(observation["epoch"]), observation["owner"]))
+                interval = observation.get("interval", 900)
+                interval = int(interval) if _number(interval) and interval > 0 else 900
+                events.append(FullWeeklyResetProof(
+                    confirmed_at, int(observation["epoch"]), observation["owner"],
+                    int(observation["reset_at"]), interval,
+                ))
         except (KeyError, TypeError, ValueError, OverflowError):
             continue
     return sorted(events)
@@ -140,10 +153,10 @@ def saved_full_weekly_resets(connection) -> list[tuple[int, int, str]]:
 
 def prune_full_weekly_resets(connection, cutoff: int) -> None:
     """Apply archive retention to durable proofs as well as their events."""
-    for first_at, _confirmed_at, _owner in saved_full_weekly_resets(connection):
-        if first_at < cutoff:
+    for proof in saved_full_weekly_resets(connection):
+        if proof.first_at < cutoff:
             connection.execute("DELETE FROM metadata WHERE key = ?",
-                               (f"{CONFIRMED_EVENT_KEY_PREFIX}{first_at}",))
+                               (f"{CONFIRMED_EVENT_KEY_PREFIX}{proof.first_at}",))
     connection.execute(
         "DELETE FROM reset_events WHERE detection_method = 'full_observed' AND reset_at_epoch < ?",
         (cutoff,),
