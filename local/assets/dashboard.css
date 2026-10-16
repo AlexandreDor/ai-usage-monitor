@@ -570,18 +570,24 @@ canvas.time-slice-chart {
 .advanced-preference-fields input { color: #e6edf3; background: #161b22; border: 1px solid #30363d; border-radius: 5px; padding: .45rem; max-width: 100%; color-scheme: dark; }
 
 .reset-credit-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 24px;
   max-width: 960px;
   margin: 0 auto 20px;
-  padding: 18px 24px;
+  padding: 12px 24px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);
 }
+.reset-credit-strip .card-label { flex-basis: 100%; margin-bottom: 0; }
+.reset-credit-strip .reset-info { font-size: .8rem; }
 .reset-credit-metrics {
   display: flex;
   flex-wrap: wrap;
   gap: 16px 48px;
-  margin: 12px 0;
+  margin: 0;
 }
 .reset-credit-metrics > div { display: flex; flex-direction: column; gap: 4px; }
 .reset-credit-metrics strong { color: var(--text); font-size: 1.25rem; }
