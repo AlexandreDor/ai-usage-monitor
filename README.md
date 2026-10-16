@@ -170,6 +170,9 @@ period-wide token or cost totals.
   runs local `5h:reset` hooks, but stays silent on Discord/Telegram.
 - Detection of conservative early weekly refills and full 5-hour cycles whose
   quota stays at 100% while the reset deadline advances.
+- Weekly 100% → 100% deadline advances are confirmed by a subsequent fresh
+  observation before notifying or running `weekly:reset` hooks. They are
+  labeled as cycles observed at full quota, without claiming a measured refill.
 - Discord and Telegram delivery with independent durable state per channel.
 - Bounded retries for temporary network errors without replaying a channel that
   already succeeded.
@@ -286,10 +289,12 @@ the default 900-second interval, later runs align with `:00`, `:15`, `:30`, and
 While a locally served dashboard tab is visible, loop mode also refreshes the
 current quota snapshot and evaluates alerts at `DASHBOARD_ACTIVE_INTERVAL_SECONDS`
 (300 seconds by default). These
-live checks do not write `history.json`, SQLite, Forecast or token samples, or
-the optional Gist. Hiding or closing every dashboard tab restores the regular
-cadence after at most 90 seconds. A regular `LOOP_INTERVAL` shorter than or
-equal to the active interval keeps its existing complete-cycle behavior.
+live checks do not add `history.json`, SQLite quota, Forecast or token samples,
+or update the optional Gist. Compact detector state, anomalies and confirmed
+full-quota weekly cycles are persisted in SQLite. Hiding or closing every
+dashboard tab restores the regular cadence after at most 90 seconds. A regular
+`LOOP_INTERVAL` shorter than or equal to the active interval keeps its existing
+complete-cycle behavior.
 
 The live dashboard calculates snapshot freshness directly from `scraped_at` and
 `sample_interval_seconds`. It marks data stale once its age exceeds the greater
@@ -588,6 +593,33 @@ one duplicate execution; hooks with externally visible side effects should use
 idempotence. Observed local 5-hour resets remain local-only during retries:
 replaying their hook never creates a network reset occurrence.
 
+The optional maintained weekly starter is `local/weekly_window_start.py`:
+
+```dotenv
+ALERT_SCRIPT_1=/home/user/ai-usage-monitor/local/weekly_window_start.py
+ALERT_SCRIPT_1_EVENTS=weekly:reset
+ALERT_SCRIPT_TIMEOUT_SECONDS=1800
+```
+
+This replaces older private `local/scripts/weekly-window-start.sh` hooks; those
+user files are never overwritten by an upgrade. It reads status before making
+a request and skips the request if current quota consumption already proves an
+active cycle. Otherwise it sends an ephemeral, read-only `Salut` with
+GPT-6.1 Sol and medium reasoning. It accepts observed quota consumption or a
+confirmed deadline advance, and distinguishes the latter from verified usage.
+A successful Codex response plus an unchanged future deadline at 100% remains
+unverified. A durable private receipt caps each reset occurrence at ten attempts
+or 1795 seconds, including bounded child processes; monitor retries and process
+restarts retain that budget. An exhausted occurrence stays unverified without
+sending further Codex requests. Logs and receipts use `CODEX_MONITOR_RUNTIME_DIR`
+when configured, so packaged releases keep their state under `/var/lib` across
+upgrades. The starter also supports release archives without Git metadata.
+The `WEEKLY_START_MAX_ATTEMPTS`, `WEEKLY_START_WAIT_SECONDS`
+(default 120), `WEEKLY_START_RETRY_WINDOW_SECONDS` and `WEEKLY_START_LOG_FILE`
+environment overrides can be set in a trusted wrapper. No request is made to
+force a whole percentage point of consumption. Diagnostics remain in the
+private runtime log. Enabling the hook makes real Codex requests and uses quota.
+
 ### History and collection
 
 | Variable | Default | Accepted values | Description |
@@ -607,7 +639,38 @@ open or migrate the archive.
 The detector tolerates quota noise up to 5 percentage points and reset-date
 movement up to 30 minutes; a disappeared reset date is confirmed after two
 valid observations. Planned deadline crossings, the recognized weekly refill
-pattern, and the recognized full 5-hour pattern are excluded. A 5-hour reset
+pattern, confirmed weekly cycles at full quota, and the recognized full
+5-hour pattern are excluded. A weekly full-quota cycle requires an advance of
+at least 30 minutes before the old deadline, then another complete observation
+confirming the new deadline within 60 seconds. Both adjacent gaps must be at
+most `max(3600, 2 * sample_interval_seconds)` and all observations must belong
+to the same known limit group. Partial samples and owner changes cancel an
+unconfirmed candidate. The event is anchored to the first advanced observation;
+its confirmation time is retained separately. Small date drift cannot replay
+the hook. Confirmation after the old deadline still supersedes that scheduled
+reset and runs only one hook. An unconfirmed deadline-shift anomaly is deferred
+until confirmation; rejecting the candidate retains the original anomaly.
+Upgrades seed the new classifier from a complete same-owner legacy baseline
+only when its state field is absent and the previous saved observation corroborates
+it without a conflicting retained poll. That observation is captured before
+the current collection overwrites it, including in live mode. An explicitly
+canceled chain stays canceled; unavailable or incomplete evidence starts a new
+baseline instead of guessing continuity.
+Analytics labels this `full_observed` evidence separately from a
+measured refill and assigns it no measured quota gain or unused end-of-week
+quota. Each fresh confirmation saves its candidate and confirming observation
+independently of quota snapshots, including in live mode. Rebuilding reset
+history preserves its original event and confirmation times after 30-minute
+or hourly compaction, without inventing cycles from discarded partial samples
+or duplicating a superseded scheduled reset. Once the detector observes a
+baseline, subsequent scheduled and measured weekly resets are also saved from
+its actual live/full observations, including the measured before/after quota.
+Sparse snapshots cannot override those decisions or turn a pending full-quota
+candidate into a measured refill. Older scheduled/refill history retains its
+snapshot backfill behavior. These proofs follow
+`ARCHIVE_RETENTION_DAYS`; zero keeps them indefinitely. Historical quota samples
+without a saved confirmation do not establish a full-quota cycle retroactively.
+A 5-hour reset
 with 100% remaining is recognized only from two complete observations in the
 same limit group, with a strictly later valid deadline; the first observation
 carrying the new deadline anchors the event. Repeating that deadline is
@@ -620,9 +683,10 @@ retained until it can be delivered.
 The rolling JSON history is separate and retains samples according to their
 actual timestamps. Changing the collection interval does not change the time
 span requested by `HISTORY_RETENTION_HOURS`; only the defensive entry and size
-limits can shorten it. Dashboard-triggered live checks update only `data.json`,
-so they never increase graph or archive density. Alerts use every successful
-live observation, while Forecast and token collection remain on full cycles.
+limits can shorten it. Dashboard-triggered live checks update `data.json` and
+compact detector/event records, so they never increase quota graph or snapshot
+archive density. Alerts use every successful live observation, while Forecast
+and token collection remain on full cycles.
 
 ### Token Analytics
 

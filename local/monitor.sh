@@ -1317,6 +1317,21 @@ raise SystemExit(0 if detected else 1)
 PYEOF
 }
 
+observe_full_weekly_reset() {
+  python3 "${SCRIPT_DIR}/weekly_reset.py" "${1-$full_weekly_reset_state}" \
+    "${2-$scraped_at_epoch}" "${3-$weekly_pct}" "${4-$weekly_reset_at}" \
+    "${5-$limit_id}" "${6-$sample_interval_seconds}" "${@:7}"
+}
+
+weekly_reset_message() {
+  if (( confirmed_full_weekly_reset_at > 0 \
+        && confirmed_full_weekly_reset_at == weekly_armed_reset_at )); then
+    printf '📅 Codex · Weekly quota · Cycle renewed\nA later weekly deadline was confirmed while quota remained full. No quota increase was measurable.'
+  else
+    format_alert_message reset weekly
+  fi
+}
+
 is_reset_observation_gap_acceptable() {
   local previous_at="$1" current_at="$2" previous_interval="$3" current_interval="$4"
   PYTHONPATH="$(dirname "$ANOMALIES_PY")${PYTHONPATH:+:${PYTHONPATH}}" \
@@ -2073,6 +2088,8 @@ persist_alert_state() {
     "observed_weekly_pct=${observed_weekly_pct}" \
     "observed_weekly_reset_at=${observed_weekly_reset_at}" \
     "observed_weekly_limit_id=${observed_weekly_limit_id}" \
+    "full_weekly_reset_state=${full_weekly_reset_state}" \
+    "confirmed_full_weekly_reset_at=${confirmed_full_weekly_reset_at}" \
     "last_five_h_sampled_at_epoch=${last_five_h_sampled_at_epoch}" \
     "last_five_h_sample_interval_seconds=${last_five_h_sample_interval_seconds}" \
     "last_sampled_at_epoch=${last_sampled_at_epoch}" \
@@ -2807,6 +2824,7 @@ check_thresholds() {
   local scraped_at_epoch="$7"
   local limit_id="${8:-default}"
   local sample_interval_seconds="${9:-900}"
+  local legacy_weekly_prior_state="${10-}"
   if ! limit_id="$(canonicalize_alert_limit_id "$limit_id")"; then
     ALERT_PROCESSING_ERROR="invalid alert limit ID"
     return 1
@@ -2825,6 +2843,10 @@ check_thresholds() {
   local observed_weekly_pct=""
   local observed_weekly_reset_at=0
   local observed_weekly_limit_id=""
+  local full_weekly_reset_state="" full_weekly_reset_result full_weekly_event_at=0
+  local full_weekly_reset_state_present=0
+  local confirmed_full_weekly_reset_at=0
+  local -a full_weekly_reset_fields=()
   local last_five_h_sampled_at_epoch=0
   local last_five_h_sample_interval_seconds=900
   local last_sampled_at_epoch=0
@@ -2913,6 +2935,15 @@ check_thresholds() {
     state_loaded=1
     while IFS='=' read -r state_key state_value; do
       case "$state_key" in
+        full_weekly_reset_state)
+          full_weekly_reset_state_present=1
+          [[ ${#state_value} -le 4096 && "$state_value" =~ ^[A-Za-z0-9+/=]*$ ]] \
+            && full_weekly_reset_state="$state_value"
+          ;;
+        confirmed_full_weekly_reset_at)
+          [[ "$state_value" =~ ^(0|[1-9][0-9]{0,11})$ ]] \
+            && confirmed_full_weekly_reset_at="$state_value"
+          ;;
         state_version)
           [[ "$state_value" =~ ^[0-9]+$ ]] || { ALERT_PROCESSING_ERROR="invalid alert state version"; return 1; }
           state_version="$state_value"
@@ -3004,6 +3035,33 @@ check_thresholds() {
   if [[ "$five_h_pct" =~ ^([0-9]+([.][0-9]+)?)$ && "$five_h_reset_at" =~ ^[0-9]+$ ]] \
     && (( five_h_reset_at > 0 )); then
     five_h_observation_valid=1
+  fi
+  # Upgrade only a missing field from the old complete owner-scoped baseline.
+  # An explicitly empty state is a canceled chain and must stay canceled.
+  if (( state_loaded == 1 && full_weekly_reset_state_present == 0 )) \
+    && (( last_sampled_at_epoch >= last_five_h_sampled_at_epoch )) \
+    && [[ "$observed_weekly_limit_id" == "$limit_id" ]]; then
+    if ! full_weekly_reset_result="$(observe_full_weekly_reset "" \
+        "$last_sampled_at_epoch" "$observed_weekly_pct" "$observed_weekly_reset_at" \
+        "$observed_weekly_limit_id" "$last_sample_interval_seconds" \
+        --legacy-archive "$ARCHIVE_FILE" --legacy-history "$HISTORY_FILE" \
+        --legacy-observation "$legacy_weekly_prior_state" \
+        --before-epoch "$scraped_at_epoch")"; then
+      ALERT_PROCESSING_ERROR="full weekly reset baseline migration failed"
+      return 1
+    fi
+    full_weekly_reset_state="${full_weekly_reset_result%%$'\n'*}"
+  fi
+  if ! full_weekly_reset_result="$(observe_full_weekly_reset)"; then
+    ALERT_PROCESSING_ERROR="full weekly reset classification failed"
+    return 1
+  fi
+  mapfile -t full_weekly_reset_fields <<< "$full_weekly_reset_result"
+  full_weekly_event_at="${full_weekly_reset_fields[1]}"
+  # A confirmed proof is not consumed until the weekly write-ahead intent is
+  # ready. Earlier 5h persistence must retain its recoverable candidate.
+  if (( full_weekly_event_at == 0 )); then
+    full_weekly_reset_state="${full_weekly_reset_fields[0]}"
   fi
 
   # Armed cycles are owner-scoped. Resolve restored arms before any delivery
@@ -3807,10 +3865,21 @@ check_thresholds() {
   if (( observed_weekly_reset_at > 0 )) \
     && [[ "$limit_id" == "$observed_weekly_limit_id" ]] \
     && (( observed_weekly_reset_recovery == 0 )) \
-    && (( observed_weekly_scheduled_due == 0 )) \
-    && is_random_weekly_reset "$observed_weekly_pct" "$weekly_pct" \
-      "$observed_weekly_reset_at" "$weekly_reset_at"; then
-    weekly_armed_reset_at="$scraped_at_epoch"
+    && { (( full_weekly_event_at > 0 )) \
+      || { (( observed_weekly_scheduled_due == 0 )) \
+        && is_random_weekly_reset "$observed_weekly_pct" "$weekly_pct" \
+          "$observed_weekly_reset_at" "$weekly_reset_at"; }; }; then
+    if (( full_weekly_event_at > 0 )); then
+      # This advance was first seen before the old deadline. Confirmation
+      # can arrive after that deadline: it still supersedes the old arm,
+      # rather than delivering a scheduled reset followed by a second hook.
+      observed_weekly_scheduled_due=0
+      full_weekly_reset_state="${full_weekly_reset_fields[0]}"
+      weekly_armed_reset_at="$full_weekly_event_at"
+      confirmed_full_weekly_reset_at="$full_weekly_event_at"
+    else
+      weekly_armed_reset_at="$scraped_at_epoch"
+    fi
     weekly_armed_limit_id="$limit_id"
     observed_weekly_reset=1
     notified_weekly_thresholds=""
@@ -3842,7 +3911,7 @@ check_thresholds() {
       && [[ "$(configured_alert_channels_json)" != "[]" ]]; then
       weekly_network_request=1
       if ! weekly_request_json="$(network_reset_request_json weekly "$limit_id" \
-          "$weekly_armed_reset_at" "$scraped_at_epoch")"; then
+          "$weekly_armed_reset_at" "$scraped_at_epoch" "$(weekly_reset_message)")"; then
         ALERT_PROCESSING_ERROR="weekly reset request construction failed"
         return 1
       fi
@@ -4125,7 +4194,7 @@ check_thresholds() {
         last_notified_weekly_reset_at="$weekly_armed_reset_at"
       elif register_network_alert reset weekly reset \
         "$cycle_key" \
-        "$(format_alert_message reset weekly)" \
+        "$(weekly_reset_message)" \
         "{\"limit_id\":\"${limit_id}\",\"reset_epoch\":${weekly_armed_reset_at}}" \
         "$weekly_armed_reset_at" "$((weekly_armed_reset_at + 7 * 24 * 60 * 60))" false \
         "$cycle_key"; then
@@ -4653,12 +4722,33 @@ archive_snapshot() {
   printf '%s\n' "$json" | python3 "$SCRIPT_DIR/archive.py" \
     --database "$ARCHIVE_FILE" \
     --history "$HISTORY_FILE" \
-    --retention-days "$ARCHIVE_RETENTION_DAYS"
+    --retention-days "$ARCHIVE_RETENTION_DAYS" --legacy-weekly-state "${2-}"
 }
 
 observe_quota_anomalies() {
   local json="$1"
-  printf '%s\n' "$json" | python3 "$ANOMALIES_PY" observe --database "$ARCHIVE_FILE"
+  printf '%s\n' "$json" | python3 "$ANOMALIES_PY" observe --database "$ARCHIVE_FILE" \
+    --legacy-weekly-state "${2-}"
+}
+
+capture_weekly_prior_state() {
+  PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$DATA_FILE" <<'PYEOF'
+import sys
+from pathlib import Path
+from history import read_current_data
+from weekly_reset import observe_full_weekly_reset
+try:
+    entry = read_current_data(Path(sys.argv[1]))
+    if entry is not None:
+        value = entry.public
+        print(observe_full_weekly_reset(
+            "", epoch=entry.epoch_microseconds // 1_000_000, pct=value.get("weekly_pct"),
+            reset_at=value.get("weekly_reset_at"), owner=value.get("limit_id"),
+            interval=value.get("sample_interval_seconds", 900),
+        )[0])
+except (OSError, ValueError):
+    pass
+PYEOF
 }
 
 collect_token_usage() {
@@ -4694,7 +4784,11 @@ run_cycle() {
   echo "[$(format_paris_now)] Scraping codex status (${cycle_mode} cycle)..."
 
   local json public_json gist_json status=0 history_json="[]" storage_ok=1
+  local legacy_weekly_prior_state=""
   CYCLE_ERROR=""
+  # Preserve the previous live observation before data.json, the archive and
+  # anomaly state are replaced by this poll. Live partials are not in history.
+  legacy_weekly_prior_state="$(capture_weekly_prior_state)" || legacy_weekly_prior_state=""
   if json=$(fetch_status_json "$interval_seconds"); then
     echo "$json" | python3 -m json.tool 2>/dev/null || echo "$json"
     public_json="$json"
@@ -4704,7 +4798,7 @@ run_cycle() {
       fi
     fi
     if [[ "$cycle_mode" == full ]]; then
-      if ! archive_snapshot "$public_json"; then
+      if ! archive_snapshot "$public_json" "$legacy_weekly_prior_state"; then
         status=1
         storage_ok=0
         append_cycle_error "Long-term archive update failed"
@@ -4745,13 +4839,13 @@ run_cycle() {
     limit_id=$(json_get_field "$json" "limit_id")
     scraped_at=$(json_get_field "$json" "scraped_at")
     scraped_at_epoch=$(timestamp_to_epoch "$scraped_at") || scraped_at_epoch=$(date -u +%s)
-    if ! observe_quota_anomalies "$public_json"; then
+    if ! observe_quota_anomalies "$public_json" "$legacy_weekly_prior_state"; then
       status=1
       append_cycle_error "Quota anomaly detector failed"
     fi
     check_thresholds "$five_h" "$weekly" "$five_h_reset" "$weekly_reset" \
       "$five_h_reset_at" "$weekly_reset_at" "$scraped_at_epoch" "$limit_id" \
-      "$interval_seconds" \
+      "$interval_seconds" "$legacy_weekly_prior_state" \
       || { status=1; append_cycle_error "${ALERT_PROCESSING_ERROR:-alert processing failed}"; }
   else
     status=1
