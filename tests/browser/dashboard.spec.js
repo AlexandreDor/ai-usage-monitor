@@ -116,6 +116,7 @@ for (const window of ['five_h', 'weekly']) test(`recovers the monitor's pending 
   await page.reload();
   await expect.poll(() => page.evaluate(() => [...serverResetChecks])).toEqual([checkAt * 1000]);
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await page.evaluate(() => refresh());
   await page.clock.runFor(14000);
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   current = { ...current, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 15000).toISOString() };
@@ -140,6 +141,7 @@ for (const secondDelay of [20, 28]) test(`retains both pending checks when the s
   await page.route('**/data.json?*', route => route.fulfill({ json: current }));
   await page.goto('/dashboard.html');
   await expect.poll(() => page.evaluate(() => serverResetChecks.size)).toBe(2);
+  await page.evaluate(() => refresh());
   current = { ...current, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 10000).toISOString() };
   await page.clock.runFor(15000);
   await expect(page.locator('#five-h-pct')).toHaveText('100%');
