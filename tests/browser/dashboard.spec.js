@@ -2181,6 +2181,70 @@ test('shares validated time-zone and dated exchange-rate preferences across page
   await expect(page.locator('[data-preference-input="rateDate"]')).toHaveValue('2026-10-07');
 });
 
+for (const range of ['custom', '30d', 'all']) {
+  test(`keeps valid pagination after changing the timezone for ${range} dates`, async ({ page }) => {
+    const queries = [];
+    await page.route('**/api/analytics?*', route => {
+      const query = new URL(route.request().url()).searchParams;
+      queries.push(query);
+      const zone = query.get('timezone');
+      const total = range === 'custom' && zone === 'America/New_York' ? 50 : 51;
+      const resetOffset = Number(query.get('reset_offset') || 0);
+      // Allocation clamps stale offsets; reset history returns the requested page.
+      const breakdownOffset = Math.min(Number(query.get('breakdown_offset') || 0), Math.floor((total - 1) / 50) * 50);
+      const period = { ...analyticsPayload.period, range, timezone: zone };
+      if (range === 'custom') {
+        period.from = zone === 'UTC' ? '2025-01-01T00:00:00Z' : '2025-01-01T05:00:00Z';
+        period.to = zone === 'UTC' ? '2026-01-01T00:00:00Z' : '2026-01-01T05:00:00Z';
+      }
+      const resets = {
+        ...enhancedAnalyticsPayload.resets, total, offset: resetOffset,
+        items: Array.from({ length: total }, (_, index) => ({
+          ...analyticsPayload.resets.items[0], reset_at: new Date(Date.UTC(2025, 0, 1 + (50 - index) * 7, 0, 30)).toISOString(),
+        })).slice(resetOffset, resetOffset + 50),
+      };
+      const tokens = {
+        ...analyticsPayload.tokens,
+        breakdown: paginatedBreakdown.slice(breakdownOffset, Math.min(breakdownOffset + 50, total)),
+        breakdown_pagination: { total, offset: breakdownOffset, limit: 50 },
+      };
+      const payload = { ...analyticsPayload, revision: 'unchanged-archive', period, tokens, resets };
+      if (query.get('sections') === 'base') {
+        payload.pending_sections = ['weekly', 'resets'];
+        delete payload.weekly_limit_value;
+      }
+      return route.fulfill({ json: payload });
+    });
+    const dates = range === 'custom' ? 'from_date=2025-01-01&to_date=2025-12-31' : `range=${range}`;
+    await page.goto(`/analytics.html?${dates}&timezone=UTC`);
+    await expect(page.locator('#reset-page-label')).toHaveText('1–50 of 51');
+    await page.locator('#resets-next').click();
+    await expect(page.locator('#reset-page-label')).toHaveText('51–51 of 51');
+    await page.locator('#breakdown-next').click();
+    await expect(page.locator('#breakdown-page-label')).toHaveText('51–51 of 51');
+
+    const previousRequests = queries.length;
+    await page.locator('.advanced-preferences summary').click();
+    await page.locator('[data-preference-input="timezone"]').fill('America/New_York');
+    await page.locator('[data-preference-input="timezone"]').blur();
+    await expect.poll(() => queries.slice(previousRequests).length).toBe(3);
+    const label = range === 'custom' ? '1–50 of 50' : '51–51 of 51';
+    await expect(page.locator('#reset-page-label')).toHaveText(label);
+    await expect(page.locator('#breakdown-page-label')).toHaveText(label);
+    await expect(page.locator('#resets-body tr')).toHaveCount(range === 'custom' ? 50 : 1);
+    await expect(page.locator('#weekly-section-status')).toBeHidden();
+    await expect(page.locator('#resets-section-status')).toBeHidden();
+    const newQueries = queries.slice(previousRequests);
+    expect(newQueries.map(query => query.get('sections')).sort()).toEqual(['base', 'resets', 'weekly']);
+    for (const query of newQueries) {
+      expect(query.get('timezone')).toBe('America/New_York');
+      expect(query.get('reset_offset')).toBe(range === 'custom' ? '0' : '50');
+      expect(query.get('breakdown_offset')).toBe(range === 'custom' ? '0' : '50');
+    }
+    await expect(page.locator('#analytics-error')).toBeHidden();
+  });
+}
+
 test('opens accessible data tables when Chart construction fails and limits diagnostics to safe fields', async ({ page }) => {
   await page.route('**/assets/chart.umd.min.js', route => route.fulfill({ contentType: 'application/javascript', body: 'window.Chart = function() { throw new Error("broken chart"); };' }));
   await page.route('**/api/analytics?*', route => route.fulfill({ json: analyticsPayload }));
