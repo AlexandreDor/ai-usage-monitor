@@ -884,29 +884,42 @@ test('selects GPT when models appear after an initially empty archive', async ({
   await expect(page.locator('#analytics-error')).toBeHidden();
 });
 
-test('keeps the complete dashboard above the fold at 1920x1080', async ({ page }) => {
-  await page.setViewportSize({ width: 1920, height: 1080 });
-  await mockUsage(page);
-  await page.goto('/dashboard.html');
+for (const language of ['en', 'fr']) {
+  test(`keeps the complete dashboard within a Full HD browser window (${language})`, async ({ page }) => {
+    // Leave room for browser toolbars and the taskbar on a 1920x1080 screen.
+    await page.setViewportSize({ width: 1920, height: 900 });
+    await mockUsage(page);
+    await page.route('**/data.json?*', route => route.fulfill({ json: {
+      ...snapshot,
+      reset_credits: { available_count: 3, next_expiration_at: Math.floor(DASHBOARD_NOW.getTime() / 1000) - 1, expiration_known: true },
+    } }));
+    await page.goto('/dashboard.html');
+    await expect(page.locator('#reset-credits-count')).toHaveText('3');
+    await page.evaluate(language => CodexPreferences.set({ language }), language);
+    // Include the responsive chart's final size in the page height check.
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 
-  const layout = await page.evaluate(() => {
-    const history = document.querySelector('.history-card').getBoundingClientRect();
-    const preferences = document.querySelector('.preference-controls').getBoundingClientRect();
-    const links = document.querySelector('.dashboard-links').getBoundingClientRect();
-    const overlaps = !(preferences.right <= links.left || preferences.left >= links.right || preferences.bottom <= links.top || preferences.top >= links.bottom);
-    return {
-      viewportHeight: window.innerHeight,
-      scrollHeight: document.documentElement.scrollHeight,
-      historyBottom: history.bottom,
-      historyVisible: history.top >= 0 && history.bottom <= window.innerHeight,
-      navigationOverlap: overlaps,
-    };
+    const layout = await page.evaluate(() => {
+      const history = document.querySelector('.history-card').getBoundingClientRect();
+      const preferences = document.querySelector('.preference-controls').getBoundingClientRect();
+      const links = document.querySelector('.dashboard-links').getBoundingClientRect();
+      const overlaps = !(preferences.right <= links.left || preferences.left >= links.right || preferences.bottom <= links.top || preferences.top >= links.bottom);
+      return {
+        viewportHeight: window.innerHeight,
+        scrollHeight: document.documentElement.scrollHeight,
+        historyBottom: history.bottom,
+        historyVisible: history.top >= 0 && history.bottom <= window.innerHeight,
+        navigationOverlap: overlaps,
+        creditsHeight: document.querySelector('.reset-credit-strip').getBoundingClientRect().height,
+      };
+    });
+    expect(layout.scrollHeight).toBeLessThanOrEqual(layout.viewportHeight);
+    expect(layout.historyBottom).toBeLessThanOrEqual(layout.viewportHeight);
+    expect(layout.historyVisible).toBe(true);
+    expect(layout.navigationOverlap).toBe(false);
+    expect(layout.creditsHeight).toBeLessThanOrEqual(64);
   });
-  expect(layout.scrollHeight).toBeLessThanOrEqual(layout.viewportHeight);
-  expect(layout.historyBottom).toBeLessThanOrEqual(layout.viewportHeight);
-  expect(layout.historyVisible).toBe(true);
-  expect(layout.navigationOverlap).toBe(false);
-});
+}
 
 test('renders detailed analytics, reset markers and cost mode by default', async ({ page }) => {
   await page.route('**/api/analytics?*', route => {
@@ -2497,6 +2510,19 @@ test('analytics tracks reset-credit balances and observed expiration durations w
   await expect(page.locator('#reset-credits-expiration')).toHaveText('Expires in 2 h 0 min');
   await expect.poll(() => page.evaluate(() => resetCreditsChart?.data.datasets.map(dataset => dataset.data.map(point => point.y)))).toEqual([[3, 2], [4, 2]]);
   expect(await page.evaluate(() => resetCreditsChart.options.scales.y.ticks.precision)).toBe(0);
+  await page.setViewportSize({ width: 1920, height: 900 });
+  const desktopLayout = await page.locator('#reset-credits-card').evaluate(card => ({
+    height: card.getBoundingClientRect().height,
+    top: card.getBoundingClientRect().top,
+    weeklyBottom: document.getElementById('weekly-limit-value-card').getBoundingClientRect().bottom,
+    followsWeekly: card.previousElementSibling.id === 'weekly-limit-value-card',
+    chartHeight: document.getElementById('reset-credits-chart-wrap').getBoundingClientRect().height,
+  }));
+  expect(desktopLayout.height).toBeLessThanOrEqual(340);
+  expect(desktopLayout.top).toBeGreaterThan(desktopLayout.weeklyBottom);
+  expect(desktopLayout.followsWeekly).toBe(true);
+  expect(desktopLayout.chartHeight).toBeGreaterThanOrEqual(150);
+  await page.setViewportSize({ width: 375, height: 812 });
   await page.locator('#reset-credits-card summary').click();
   await expect(page.locator('#reset-credits-data-body tr')).toHaveCount(2);
   await expect(page.locator('#reset-credits-data-body tr').first()).toContainText('Expires in 4 h 0 min');

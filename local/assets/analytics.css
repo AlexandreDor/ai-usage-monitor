@@ -284,8 +284,8 @@ input { display: block; min-height: 36px; margin-top: 4px; padding: 7px 10px; }
 .analytics-card { min-width: 0; padding: 24px; }
 .analytics-card.wide { grid-column: 1 / -1; }
 #limits-chart-card { order: 1; }
-#reset-credits-card { order: 2; }
-#weekly-limit-value-card { order: 3; }
+#weekly-limit-value-card { order: 2; }
+#reset-credits-card { order: 3; }
 #tokens-chart-card { order: 4; }
 #reset-history-card { order: 5; }
 #allocation-card { order: 6; }
@@ -428,5 +428,15 @@ td { color: #dbeafe; }
 .diagnostics-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #8b949e; }
 .model-unavailable { opacity: .7; }
 
-.reset-credit-summary { grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); margin: 20px 0 12px; }
-.reset-credit-summary strong { font-size: 1.35rem; overflow-wrap: anywhere; }
+#reset-credits-card { padding: 18px; }
+#reset-credits-card .section-heading { flex-wrap: wrap; gap: 12px 24px; margin-bottom: 8px; }
+#reset-credits-card h2 { font-size: 1rem; }
+.reset-credit-summary { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+.reset-credit-summary > div { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; }
+.reset-credit-summary .metric-label { font-size: .65rem; letter-spacing: .03em; }
+.reset-credit-summary strong { font-size: 1rem; overflow-wrap: anywhere; }
+.reset-credit-status { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 16px; margin-bottom: 10px; }
+.reset-credit-status .chart-summary { min-height: 0; margin: 0; font-size: .7rem; }
+#reset-credits-chart-wrap { height: 170px; }
+#reset-credits-card .chart-data-details { margin-top: 8px; }
+#reset-credits-card .chart-description { margin: 10px 0; }

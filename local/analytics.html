@@ -200,21 +200,6 @@
         </details>
       </article>
 
-      <article class="card analytics-card wide" id="reset-credits-card">
-        <div class="section-heading"><div><span class="section-kicker" data-i18n="resetCredits.title">Account reset credits</span><h2 data-i18n="resetCredits.history">Reset credits over time</h2></div></div>
-        <p class="chart-description" data-i18n="resetCredits.description">Account balance and time until the soonest expiration at each observation. The date range applies to history; the current balance uses the latest collection. Application and model filters do not affect credits.</p>
-        <div class="metric-grid reset-credit-summary">
-          <div class="metric-card"><span class="metric-label" data-i18n="resetCredits.available">Available resets</span><strong id="reset-credits-count">-</strong></div>
-          <div class="metric-card"><span class="metric-label" data-i18n="resetCredits.expiration">Soonest expiration</span><strong id="reset-credits-expiration" data-i18n="resetCredits.unavailable">Unavailable</strong></div>
-        </div>
-        <p class="chart-summary" id="reset-credits-observed"></p>
-        <div class="chart-wrap" id="reset-credits-chart-wrap"><canvas id="reset-credits-chart" role="img" class="time-slice-chart" data-i18n-aria-label="resetCredits.history" aria-label="Reset credits over time" aria-describedby="reset-credits-chart-summary reset-credits-table-caption"></canvas></div>
-        <p class="chart-summary" id="reset-credits-chart-summary" role="status" aria-live="polite"></p>
-        <details class="chart-data-details"><summary data-i18n="resetCredits.table">Show reset credit data table</summary><div class="table-scroll" tabindex="0" role="region" aria-labelledby="reset-credits-table-caption">
-          <table class="chart-data-table"><caption id="reset-credits-table-caption" data-i18n="resetCredits.caption">Account reset credit observations</caption><thead><tr><th data-i18n="analytics.date">Date</th><th data-i18n="resetCredits.available">Available resets</th><th data-i18n="resetCredits.remaining">Time to expiration</th><th data-i18n="resetCredits.expiration">Soonest expiration</th></tr></thead><tbody id="reset-credits-data-body"></tbody></table>
-        </div></details>
-      </article>
-
       <article class="card analytics-card wide" id="weekly-limit-value-card">
         <div class="section-heading chart-heading">
           <div>
@@ -240,6 +225,27 @@
           <summary data-i18n="analytics.showWeeklyLimitValueTable">Show weekly limit value table</summary>
           <div class="table-scroll">
             <table class="chart-data-table weekly-value-table"><caption id="weekly-limit-value-table-caption" data-i18n="analytics.weeklyLimitValueTableCaption">Implicit weekly limit value data</caption><thead><tr><th data-i18n="analytics.date">Date</th><th data-i18n="analytics.weeklyValueEstimate">Estimate</th><th data-i18n="analytics.observedCostUsd">Observed cost ($)</th><th data-i18n="analytics.quotaConsumed">Quota consumed</th><th data-i18n="analytics.rawValueUsd">Raw value ($)</th><th data-i18n="analytics.smoothedValueUsd">Smoothed value ($)</th><th data-i18n="analytics.sensitivityRange">Sensitivity range</th><th data-i18n="analytics.quality">Quality</th><th data-i18n="analytics.explanation">Explanation</th></tr></thead><tbody id="weekly-limit-value-data-body"></tbody></table>
+          </div>
+        </details>
+      </article>
+
+      <article class="card analytics-card wide" id="reset-credits-card">
+        <div class="section-heading">
+          <div><span class="section-kicker" data-i18n="resetCredits.title">Account reset credits</span><h2 data-i18n="resetCredits.history">Reset credits over time</h2></div>
+          <div class="reset-credit-summary">
+            <div><span class="metric-label" data-i18n="resetCredits.available">Available resets</span><strong id="reset-credits-count">-</strong></div>
+            <div><span class="metric-label" data-i18n="resetCredits.expiration">Soonest expiration</span><strong id="reset-credits-expiration" data-i18n="resetCredits.unavailable">Unavailable</strong></div>
+          </div>
+        </div>
+        <div class="reset-credit-status">
+          <p class="chart-summary" id="reset-credits-observed"></p>
+          <p class="chart-summary" id="reset-credits-chart-summary" role="status" aria-live="polite"></p>
+        </div>
+        <div class="chart-wrap" id="reset-credits-chart-wrap"><canvas id="reset-credits-chart" role="img" class="time-slice-chart" data-i18n-aria-label="resetCredits.history" aria-label="Reset credits over time" aria-describedby="reset-credits-chart-summary reset-credits-table-caption"></canvas></div>
+        <details class="chart-data-details"><summary data-i18n="resetCredits.table">Show reset credit data table</summary>
+          <p class="chart-description" data-i18n="resetCredits.description">Account balance and time until the soonest expiration at each observation. The date range applies to history; the current balance uses the latest collection. Application and model filters do not affect credits.</p>
+          <div class="table-scroll" tabindex="0" role="region" aria-labelledby="reset-credits-table-caption">
+            <table class="chart-data-table"><caption id="reset-credits-table-caption" data-i18n="resetCredits.caption">Account reset credit observations</caption><thead><tr><th data-i18n="analytics.date">Date</th><th data-i18n="resetCredits.available">Available resets</th><th data-i18n="resetCredits.remaining">Time to expiration</th><th data-i18n="resetCredits.expiration">Soonest expiration</th></tr></thead><tbody id="reset-credits-data-body"></tbody></table>
           </div>
         </details>
       </article>

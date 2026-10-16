@@ -72,13 +72,13 @@
     <span class="forecast-status" id="forecast-status" data-i18n="dashboard.forecastUnavailable">Forecast unavailable</span>
   </aside>
 
-  <section class="reset-credit-strip" aria-labelledby="reset-credit-title">
+  <section class="reset-credit-strip" aria-labelledby="reset-credit-title" aria-describedby="reset-credits-observed">
     <h2 id="reset-credit-title" class="card-label" data-i18n="resetCredits.title">Account reset credits</h2>
     <div class="reset-credit-metrics">
-      <div><strong id="reset-credits-count">-</strong><span data-i18n="resetCredits.available">Available resets</span></div>
-      <div><strong id="reset-credits-expiration" data-i18n="resetCredits.unavailable">Unavailable</strong><span data-i18n="resetCredits.expiration">Soonest expiration</span></div>
+      <div><span data-i18n="resetCredits.available">Available resets</span><strong id="reset-credits-count">-</strong></div>
+      <div><span data-i18n="resetCredits.expiration">Soonest expiration</span><strong id="reset-credits-expiration" data-i18n="resetCredits.unavailable">Unavailable</strong></div>
     </div>
-    <p id="reset-credits-observed" class="reset-info"></p>
+    <p id="reset-credits-observed" class="sr-only"></p>
   </section>
 
   <main class="grid">

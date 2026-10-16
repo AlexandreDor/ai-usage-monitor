@@ -573,22 +573,46 @@ canvas.time-slice-chart {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px 24px;
+  gap: 8px 20px;
   max-width: 960px;
-  margin: 0 auto 20px;
-  padding: 12px 24px;
+  margin: 0 auto 14px;
+  padding: 10px 16px;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: 12px;
   background: var(--surface);
 }
-.reset-credit-strip .card-label { flex-basis: 100%; margin-bottom: 0; }
-.reset-credit-strip .reset-info { font-size: .8rem; }
+.reset-credit-strip .card-label { margin-bottom: 0; font-size: .68rem; }
 .reset-credit-metrics {
   display: flex;
   flex-wrap: wrap;
-  gap: 16px 48px;
+  gap: 8px 24px;
   margin: 0;
 }
-.reset-credit-metrics > div { display: flex; flex-direction: column; gap: 4px; }
-.reset-credit-metrics strong { color: var(--text); font-size: 1.25rem; }
-.reset-credit-metrics span { color: var(--muted); font-size: .8rem; }
+.reset-credit-metrics > div { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 6px; }
+.reset-credit-metrics strong { color: var(--text); font-size: .95rem; }
+.reset-credit-metrics span { color: var(--muted); font-size: .7rem; }
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (min-width: 1000px) {
+  body { padding-block: 20px 24px; }
+  header { gap: 10px; margin-bottom: 18px; }
+  header h1 { font-size: 3.5rem; }
+  .advanced-preferences { margin-top: .25rem; }
+  .limit-card { padding: 24px; }
+  .pct-value { font-size: 4rem; margin-bottom: 14px; }
+  .pace-indicator { margin-top: 14px; padding: 8px 12px; }
+  .grid { gap: 14px; }
+  .history-card { padding: 20px; }
+  .history-label { margin-bottom: 10px; }
+}
