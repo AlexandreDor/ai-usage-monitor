@@ -265,6 +265,13 @@ function resetUpdateDelay(data, scrapedAt, now) {
   return deadlines.length ? Math.max(5_000, Math.min(...deadlines) - now) : Infinity;
 }
 
+async function refreshScheduled() {
+  // A timer requests a new snapshot even if an earlier read is still loading
+  // history. Explicit refresh calls retain their existing coalescing behavior.
+  if (refreshInFlight) await refreshInFlight;
+  if (document.visibilityState === 'visible') return refresh();
+}
+
 function scheduleRefresh(data = null) {
   clearTimeout(refreshTimer);
   refreshTimer = null;
@@ -281,7 +288,7 @@ function scheduleRefresh(data = null) {
   if (!isLocalDashboard()) {
     pendingResetUpdates.clear();
     const nextUpdate = (Math.floor((now - 5_000) / snapshotIntervalMs) + 1) * snapshotIntervalMs + 5_000;
-    refreshTimer = setTimeout(refresh, Math.max(REFRESH_RETRY_INITIAL_MS, nextUpdate - now));
+    refreshTimer = setTimeout(refreshScheduled, Math.max(REFRESH_RETRY_INITIAL_MS, nextUpdate - now));
     return;
   }
 
@@ -299,12 +306,12 @@ function scheduleRefresh(data = null) {
     : Number.NaN;
   if (Number.isFinite(nextUpdate) && nextUpdate > now) {
     resetRefreshRetry();
-    refreshTimer = setTimeout(refresh, Math.min(nextUpdate - now, resetDelay));
+    refreshTimer = setTimeout(refreshScheduled, Math.min(nextUpdate - now, resetDelay));
     return;
   }
 
   refreshTimer = setTimeout(
-    refresh,
+    refreshScheduled,
     Math.min(consumeRefreshRetryDelay(dashboardActiveIntervalMs), resetDelay),
   );
 }

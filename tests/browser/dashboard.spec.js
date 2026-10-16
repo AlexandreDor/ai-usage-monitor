@@ -151,6 +151,46 @@ for (const secondDelay of [20, 28]) test(`retains both pending checks when the s
   await expect(page.locator('#weekly-pct')).toHaveText('100%');
 });
 
+test('reads reset quotas after a slow initial history request finishes', async ({ page }) => {
+  await mockUsage(page);
+  const epoch = Math.floor(DASHBOARD_NOW.getTime() / 1000);
+  let current = {
+    ...snapshot, scraped_at: new Date(DASHBOARD_NOW.getTime() - 5000).toISOString(),
+    five_h_reset_at: epoch + 18000, weekly_reset_at: epoch + 7 * 86400,
+  };
+  let releaseHistory;
+  const historyGate = new Promise(resolve => { releaseHistory = resolve; });
+  let historyRequests = 0;
+  let dataRequests = 0;
+  let heartbeats = 0;
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({
+    status: 204, headers: {
+      'X-Codex-Reset-Checks-At': (++heartbeats === 1 ? `${epoch + 10},` : '')
+        + `${epoch + 18030},${epoch + 7 * 86400 + 30}`,
+    },
+  }));
+  await page.route('**/data.json?*', route => {
+    dataRequests += 1;
+    return route.fulfill({ json: current });
+  });
+  await page.route('**/history.json?*', async route => {
+    if (++historyRequests === 1) await historyGate;
+    await route.fulfill({ json: [snapshot] });
+  });
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await expect.poll(() => historyRequests).toBe(1);
+  await expect.poll(() => page.evaluate(() => serverResetChecks.size)).toBe(3);
+  current = { ...current, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 10000).toISOString() };
+  await page.clock.runFor(15000);
+  expect(dataRequests).toBe(1);
+  releaseHistory();
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+  expect(dataRequests).toBe(2);
+  await page.clock.runFor(15000);
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+});
+
 test('signals visible local dashboard activity without affecting rendering', async ({ page }) => {
   await page.clock.install({ time: DASHBOARD_NOW });
   const heartbeats = [];
