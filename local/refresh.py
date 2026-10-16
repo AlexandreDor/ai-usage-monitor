@@ -94,14 +94,31 @@ def plan(runtime, now):
     return identifier, int(delay)
 
 
-def complete(runtime, identifier, status, now):
+def next_reset_check(runtime):
+    """Expose only the next check time, never the private scheduler state."""
+    state = read_json(runtime / "reset-refresh.json")
+    pending = state.get("pending", {})
+    if not isinstance(pending, dict):
+        return None
+    deadlines = [due for due in pending.values() if type(due) is int and due > 0]
+    if not deadlines:
+        return None
+    retry_at = state.get("retry_at", 0)
+    if type(retry_at) is not int:
+        retry_at = 0
+    return max(min(deadlines), retry_at)
+
+
+def complete(runtime, identifier, status, now, started_at=None):
     state_path = runtime / "reset-refresh.json"
     state = read_json(state_path)
     if status == 0:
         pending = state.get("pending", {})
         completed = state.setdefault("completed", {})
         for key, due in list(pending.items()):
-            if due <= now:
+            # A cycle that started before a deadline cannot satisfy it merely
+            # because notification delivery finished after that deadline.
+            if due <= (now if started_at is None else started_at):
                 window, reset = key.split(":")
                 completed[window] = max(completed.get(window, 0), int(reset))
                 del pending[key]
@@ -118,4 +135,4 @@ if __name__ == "__main__":
     if action == "plan":
         print(*plan(Path(directory), int(arguments[0])))
     elif action == "complete":
-        complete(Path(directory), arguments[0], int(arguments[1]), int(arguments[2]))
+        complete(Path(directory), arguments[0], *map(int, arguments[1:]))

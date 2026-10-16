@@ -295,13 +295,17 @@ The **Refresh Codex** button requests an immediate live quota collection and
 reloads the displayed data when it finishes. It requires `monitor.sh --loop`
 and `serve.sh` to share the same runtime directory. The button is disabled
 while a request is running; collection failures preserve the last valid data.
-It is hidden in external Gist mode.
+Notification or other downstream cycle failures do not fail a successful quota
+refresh; those failures remain visible in monitor health. The button is hidden
+in external Gist mode.
 
 Loop mode also schedules a live collection 30 seconds after each announced
 5-hour or weekly reset, even with every dashboard tab closed. Coincident resets
 share one collection; a regular or manual collection after that deadline also
-satisfies the check. Failed reset checks retry after 30 seconds. These checks
-use the same collection lock and preserve the regular history/Gist cadence.
+satisfies the check. Failed reset checks retry 30 seconds after the attempt
+finishes. These checks use the same collection lock and preserve the regular
+history/Gist cadence. The dashboard receives the persisted next check time in
+its activity heartbeat, including after reopening or reloading the page.
 
 The live dashboard calculates snapshot freshness directly from `scraped_at` and
 `sample_interval_seconds`. It marks data stale once its age exceeds the greater

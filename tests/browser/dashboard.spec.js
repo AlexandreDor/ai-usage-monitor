@@ -100,6 +100,29 @@ for (const window of ['five_h', 'weekly']) test(`reloads after the ${window} res
   await expect(page.locator('#five-h-pct')).toHaveText('100%');
 });
 
+for (const window of ['five_h', 'weekly']) test(`recovers the monitor's pending ${window} check after a page reload`, async ({ page }) => {
+  await mockUsage(page);
+  const checkAt = Math.floor(DASHBOARD_NOW.getTime() / 1000) + 10;
+  let current = {
+    ...snapshot, scraped_at: new Date(DASHBOARD_NOW.getTime() - 5000).toISOString(),
+    [window + '_reset_at']: checkAt + 18000,
+  };
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({
+    status: 204, headers: { 'X-Codex-Reset-Check-At': String(checkAt) },
+  }));
+  await page.route('**/data.json?*', route => route.fulfill({ json: current }));
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await page.reload();
+  await expect.poll(() => page.evaluate(() => serverResetCheckAtMs)).toBe(checkAt * 1000);
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await page.clock.runFor(14000);
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  current = { ...current, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 15000).toISOString() };
+  await page.clock.runFor(1000);
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+});
+
 test('signals visible local dashboard activity without affecting rendering', async ({ page }) => {
   await page.clock.install({ time: DASHBOARD_NOW });
   const heartbeats = [];

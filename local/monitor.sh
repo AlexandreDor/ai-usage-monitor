@@ -4695,6 +4695,7 @@ run_cycle() {
 
   local json public_json gist_json status=0 history_json="[]" storage_ok=1
   CYCLE_ERROR=""
+  QUOTA_COLLECTION_STATUS=1
   if json=$(fetch_status_json "$interval_seconds"); then
     echo "$json" | python3 -m json.tool 2>/dev/null || echo "$json"
     public_json="$json"
@@ -4710,6 +4711,7 @@ run_cycle() {
         append_cycle_error "Long-term archive update failed"
       fi
       if write_local_snapshot "$public_json"; then
+        QUOTA_COLLECTION_STATUS=0
         if [[ -f "$HISTORY_FILE" ]]; then
           history_json="$(<"$HISTORY_FILE")"
         fi
@@ -4732,7 +4734,12 @@ run_cycle() {
         echo "[WARN] Skipping GitHub Gist sync because local storage failed." >&2
       fi
     else
-      write_current_snapshot "$public_json" || { status=1; append_cycle_error "Current snapshot write failed"; }
+      if write_current_snapshot "$public_json"; then
+        QUOTA_COLLECTION_STATUS=0
+      else
+        status=1
+        append_cycle_error "Current snapshot write failed"
+      fi
     fi
 
     local five_h weekly five_h_reset weekly_reset five_h_reset_at weekly_reset_at limit_id scraped_at scraped_at_epoch
@@ -4775,6 +4782,7 @@ run_once() {
   local interval_seconds="$1" cycle_mode="${2:-full}" regular_interval
   regular_interval="${3:-$interval_seconds}"
   local lock_fd start_ms end_ms duration_ms status=0
+  QUOTA_COLLECTION_STATUS=1
   exec {lock_fd}>"$LOCK_FILE"
   chmod 600 "$LOCK_FILE"
   if ! flock -n "$lock_fd"; then
@@ -4841,7 +4849,7 @@ effective_collection_interval() {
 run_loop() {
   local interval="$1" fail_fast="$2"
   local now_epoch completed_at next_regular last_attempt delay effective cycle_status=0 live_due
-  local refresh_request reset_delay refresh_plan
+  local refresh_request reset_delay refresh_plan collection_status
 
   now_epoch="$(date -u +%s)"
   last_attempt="$now_epoch"
@@ -4852,6 +4860,7 @@ run_loop() {
     refresh_plan="$(python3 "$SCRIPT_DIR/refresh.py" plan "$RUNTIME_DIR" "$now_epoch")" || return 1
     read -r refresh_request reset_delay <<< "$refresh_plan"
     cycle_status=0
+    unset QUOTA_COLLECTION_STATUS
     if (( now_epoch >= next_regular )); then
       effective="$(effective_collection_interval "$interval" "$now_epoch")"
       last_attempt="$now_epoch"
@@ -4889,7 +4898,10 @@ run_loop() {
       continue
     fi
 
-    python3 "$SCRIPT_DIR/refresh.py" complete "$RUNTIME_DIR" "$refresh_request" "$cycle_status" "$now_epoch" || return 1
+    completed_at="$(date -u +%s)"
+    collection_status="${QUOTA_COLLECTION_STATUS:-$cycle_status}"
+    (( cycle_status != 75 )) || collection_status=75
+    python3 "$SCRIPT_DIR/refresh.py" complete "$RUNTIME_DIR" "$refresh_request" "$collection_status" "$completed_at" "$now_epoch" || return 1
     if (( cycle_status == 75 )); then
       sleep "$DASHBOARD_HEARTBEAT_POLL_SECONDS"
       continue

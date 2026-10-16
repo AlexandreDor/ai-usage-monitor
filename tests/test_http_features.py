@@ -142,6 +142,22 @@ class HttpFeatureTests(unittest.TestCase):
         for path in ["/dashboard-refresh.json", "/dashboard-refresh-result.json", "/reset-refresh.json", "/refresh.py"]:
             self.assertEqual(self.request(path)[0], 404)
 
+    def test_heartbeat_reports_only_the_next_persisted_reset_check(self):
+        state_path = self.runtime / "reset-refresh.json"
+        self.addCleanup(state_path.unlink, missing_ok=True)
+        state_path.write_text(json.dumps({
+            "limit_id": "private-limit", "pending": {"five_h:100": 130, "weekly:200": 230},
+            "retry_at": 160,
+        }))
+        status, headers, body = self.request("/api/dashboard-heartbeat", {"X-Codex-Dashboard-Activity": "visible"}, "POST")
+        self.assertEqual(status, 204)
+        self.assertEqual(headers["X-Codex-Reset-Check-At"], "160")
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(body, b"")
+        self.assertNotIn("private-limit", str(headers))
+        state_path.write_text('{"pending":{}}')
+        self.assertIsNone(self.request("/api/dashboard-heartbeat", {"X-Codex-Dashboard-Activity": "visible"}, "POST")[1].get("X-Codex-Reset-Check-At"))
+
 
 if __name__ == "__main__":
     unittest.main()
