@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from bisect import bisect_right
 import datetime as dt
 import json
 import math
@@ -39,7 +38,12 @@ from history import (
     canonicalize_limit_id,
     opaque_limit_id_from_raw,
 )
-from weekly_reset import FullWeeklyResetProof, prune_full_weekly_resets, saved_full_weekly_resets
+from weekly_reset import (
+    WEEKLY_EVIDENCE_START_KEY,
+    prune_weekly_reset_evidence,
+    saved_full_weekly_resets,
+    saved_observed_weekly_resets,
+)
 
 RECENT_SECONDS = 24 * 60 * 60
 MEDIUM_SECONDS = 7 * 24 * 60 * 60
@@ -372,7 +376,7 @@ def compact(connection: sqlite3.Connection, retention_days: int) -> None:
 
     if retention_days > 0:
         cutoff = anchor - retention_days * 24 * 60 * 60
-        prune_full_weekly_resets(connection, cutoff)
+        prune_weekly_reset_evidence(connection, cutoff)
         connection.execute("DELETE FROM snapshots WHERE scraped_at_epoch < ?", (cutoff,))
         connection.execute(
             "DELETE FROM forecast_samples WHERE scraped_at_epoch < ?", (cutoff,)
@@ -410,11 +414,7 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
     ).fetchall()
     connection.execute("DELETE FROM reset_events")
     full_events = saved_full_weekly_resets(connection)
-    full_epochs_by_owner: dict[str, list[int]] = {}
-    full_proofs_by_owner: dict[str, list[FullWeeklyResetProof]] = {}
     for proof in full_events:
-        full_epochs_by_owner.setdefault(proof.owner, []).append(proof.first_at)
-        full_proofs_by_owner.setdefault(proof.owner, []).append(proof)
         connection.execute(
             """INSERT INTO reset_events (
                 window, reset_at_epoch, observed_at_epoch,
@@ -423,14 +423,21 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             (proof.first_at, proof.confirmed_at),
         )
 
-    def full_reset_since(previous_epoch, current) -> FullWeeklyResetProof | None:
-        # A removed full/live observation must not turn its confirmed cycle
-        # into a second scheduled crossing or measured refill at another time.
-        epochs = full_epochs_by_owner.get(current[6], ())
-        index = bisect_right(epochs, current[0]) - 1
-        if index >= 0 and epochs[index] > previous_epoch:
-            return full_proofs_by_owner[current[6]][index]
-        return None
+    for event in saved_observed_weekly_resets(connection):
+        connection.execute(
+            """INSERT OR IGNORE INTO reset_events (
+                window, reset_at_epoch, observed_at_epoch, before_pct, after_pct, detection_method
+            ) VALUES ('weekly', ?, ?, ?, ?, ?)""",
+            (event.first_at, event.observed_at, event.before_pct, event.after_pct, event.method),
+        )
+
+    evidence = connection.execute(
+        "SELECT value FROM metadata WHERE key=?", (WEEKLY_EVIDENCE_START_KEY,),
+    ).fetchone()
+    try:
+        evidence_start = int(evidence[0]) if evidence else None
+    except (TypeError, ValueError):
+        evidence_start = 0  # Damaged coverage metadata cannot authorize guesses.
 
     windows = (("5h", 1, 2), ("weekly", 3, 4))
     scheduled_5h_cycles = set()
@@ -447,6 +454,8 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
         if previous[6] is None or current[6] is None or previous[6] != current[6]:
             continue
         for window, pct_index, reset_index in windows:
+            if window == "weekly" and evidence_start is not None and current[0] >= evidence_start:
+                continue
             reset_at = previous[reset_index]
             if not isinstance(reset_at, int) or reset_at <= 0:
                 continue
@@ -458,7 +467,6 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
                     or not isinstance(current[pct_index], (int, float)):
                 continue
             current_reset_at = current[reset_index]
-            full = full_reset_since(previous[0], current) if window == "weekly" else None
             if (
                 previous[0] < reset_at <= current[0]
                 # A materially advanced full-to-full 5-hour cycle is handled
@@ -479,7 +487,6 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
                     or (
                         isinstance(current_reset_at, int)
                         and current_reset_at > reset_at
-                        and (full is None or full.first_at >= reset_at)
                     )
                 )
             ):
@@ -597,6 +604,8 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
     # limit group and anchor the event to the first complete post-reset sample.
     previous_weekly = None
     for current in rows:
+        if evidence_start is not None and current[0] >= evidence_start:
+            break
         current_pct, current_deadline = current[3], current[4]
         if not isinstance(current_pct, (int, float)) or not isinstance(current_deadline, int):
             # As for 5h above, an owner change hidden in a partial row must
@@ -612,23 +621,6 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             ):
                 previous_weekly = None
             continue
-        full = full_reset_since(previous_weekly[0] if previous_weekly else 0, current)
-        scheduled_full_successor = False
-        if (full is not None and full.confirmed_at < full.deadline <= current[0]
-                and current_deadline > full.deadline
-                and reset_observation_gap_acceptable(
-                    full.confirmed_at, current[0], full.interval, current[5])):
-            # A later scheduled crossing belongs to the confirmed cycle's
-            # deadline, not the superseded deadline in a sparse old snapshot.
-            connection.execute(
-                """INSERT OR IGNORE INTO reset_events (
-                    window, reset_at_epoch, observed_at_epoch,
-                    before_pct, after_pct, detection_method
-                ) VALUES ('weekly', ?, ?, 100, ?, 'scheduled_crossing')""",
-                (full.deadline, current[0], current_pct),
-            )
-            scheduled_weekly_cycles.add((full.deadline, full.owner))
-            scheduled_full_successor = True
         if previous_weekly is None:
             previous_weekly = current
             continue
@@ -637,9 +629,7 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
         previous_pct, current_pct = previous[3], current[3]
         previous_deadline, current_deadline = previous[4], current[4]
         refill_change = current_pct - previous_pct
-        scheduled_crossing = (
-            (previous_deadline, previous[6]) in scheduled_weekly_cycles or scheduled_full_successor
-        )
+        scheduled_crossing = (previous_deadline, previous[6]) in scheduled_weekly_cycles
         if (
             not scheduled_crossing
             and previous[6] is not None
@@ -649,7 +639,6 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             and isinstance(current_deadline, int)
             and current_deadline > previous_deadline
             and previous[0] < previous_deadline <= current[0]
-            and (full is None or full.first_at >= previous_deadline)
         ):
             # The complete baseline can span same-owner partial snapshots.
             # Classify a crossed planned deadline from that baseline as a
@@ -686,11 +675,6 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
             and isinstance(previous_pct, (int, float))
             and isinstance(previous_deadline, int)
             and not scheduled_crossing
-            # A materially later deadline may be a distinct measured refill;
-            # only suppress the current pair while it still describes this
-            # full-quota cycle, rather than every later renewal in the pair.
-            and not (full is not None and current_deadline
-                     < full.deadline + RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS)
             and current_deadline >= previous_deadline + RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS
             and refill_change > 0
             and (

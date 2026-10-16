@@ -662,7 +662,12 @@ quota. Each fresh confirmation saves its candidate and confirming observation
 independently of quota snapshots, including in live mode. Rebuilding reset
 history preserves its original event and confirmation times after 30-minute
 or hourly compaction, without inventing cycles from discarded partial samples
-or duplicating a superseded scheduled reset. These proofs follow
+or duplicating a superseded scheduled reset. Once the detector observes a
+baseline, subsequent scheduled and measured weekly resets are also saved from
+its actual live/full observations, including the measured before/after quota.
+Sparse snapshots cannot override those decisions or turn a pending full-quota
+candidate into a measured refill. Older scheduled/refill history retains its
+snapshot backfill behavior. These proofs follow
 `ARCHIVE_RETENTION_DAYS`; zero keeps them indefinitely. Historical quota samples
 without a saved confirmation do not establish a full-quota cycle retroactively.
 A 5-hour reset

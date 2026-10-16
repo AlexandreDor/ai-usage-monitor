@@ -19,9 +19,15 @@ from typing import Any
 
 from storage import ArchiveCorruptionError, canonicalize_limit_id, connect_database
 from weekly_reset import (
+    RANDOM_WEEKLY_RESET_FULL_REFILL_PCT,
+    RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT,
+    RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS,
+    WEEKLY_EVIDENCE_START_KEY,
+    is_weekly_refill,
     legacy_baseline_has_evidence,
     observe_and_record_full_weekly_reset,
     observe_full_weekly_reset,
+    record_observed_weekly_reset,
 )
 
 
@@ -32,9 +38,6 @@ QUOTA_INCREASE_TOLERANCE_PCT = 5.0
 RESET_SHIFT_TOLERANCE_SECONDS = 30 * 60
 RESET_OSCILLATION_MIN_DELTA_SECONDS = 3 * 60
 RESET_MISSING_CONFIRMATIONS = 2
-RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT = 20.0
-RANDOM_WEEKLY_RESET_FULL_REFILL_PCT = 98.0
-RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS = 30 * 60
 # The 5-hour API can expose a freshly started cycle only after some of its
 # quota has already been consumed.  Use the same conservative refill evidence
 # as the weekly detector so a real 26% -> 87% rollover is not reported as an
@@ -190,15 +193,7 @@ def _save_state(connection: sqlite3.Connection, limit_id: str, window: str,
 
 def _weekly_reset(previous_pct: float, current_pct: float,
                   previous_reset: int | None, current_reset: int | None) -> bool:
-    if previous_reset is None or current_reset is None:
-        return False
-    change = current_pct - previous_pct
-    return (
-        current_reset >= previous_reset + RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS
-        and change > 0
-        and (change >= RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT
-             or current_pct >= RANDOM_WEEKLY_RESET_FULL_REFILL_PCT)
-    )
+    return is_weekly_refill(previous_pct, current_pct, previous_reset, current_reset)
 
 
 def _observed_five_hour_reset(previous_pct: float, current_pct: float,
@@ -396,6 +391,16 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     recognized_weekly = window == "weekly" and _weekly_reset(
         previous_pct, current_pct, previous_reset, current_reset
     )
+    if (window == "weekly" and state_exists and not force_baseline
+            and state.get("last_reset_at") is not None
+            and not full_weekly_confirmed and not full_weekly_pending):
+        record_observed_weekly_reset(
+            connection,
+            {"epoch": previous_epoch, "pct": previous_pct, "reset_at": previous_reset,
+             "owner": limit_id, "interval": previous_interval},
+            {"epoch": epoch, "pct": current_pct, "reset_at": current_reset,
+             "owner": limit_id, "interval": current_interval},
+        )
     recognized_weekly = recognized_weekly or full_weekly_confirmed or full_weekly_pending
     recognized_five_hour = (
         window == "5h"
@@ -536,6 +541,20 @@ def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any], *
     if epoch is None:
         return
     limit_id = _limit_id(snapshot.get("limit_id"))
+    prior_weekly_state = connection.execute(
+        "SELECT 1 FROM anomaly_detector_state WHERE limit_id=? AND window='weekly'", (limit_id,),
+    ).fetchone()
+    prior_observation_epoch = connection.execute(
+        "SELECT COALESCE(MAX(updated_at_epoch), 0) FROM anomaly_detector_state"
+    ).fetchone()[0]
+    # Once every poll is classified, sparse snapshots must not invent events
+    # that contradict its complete live/full observation stream. On a fresh
+    # archive, keep historical snapshot backfill through the initial baseline.
+    if epoch > prior_observation_epoch:
+        connection.execute(
+            "INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)",
+            (WEEKLY_EVIDENCE_START_KEY, str(epoch if prior_weekly_state else epoch + 1)),
+        )
     active = connection.execute(
         "SELECT value FROM metadata WHERE key = 'anomaly_active_limit_id'"
     ).fetchone()
@@ -554,11 +573,8 @@ def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any], *
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """, (limit_id,),
         )
-    # Capture this before the 5h detector processes the current sample and
-    # overwrites a timestamp that can reveal an intervening legacy partial.
-    prior_observation_epoch = connection.execute(
-        "SELECT COALESCE(MAX(updated_at_epoch), 0) FROM anomaly_detector_state"
-    ).fetchone()[0]
+    # The timestamp captured above predates this poll's owner/5h mutations,
+    # which could otherwise hide an intervening legacy partial.
     for window, pct_key, reset_key in WINDOWS:
         _detect_window(
             connection, limit_id=limit_id, window=window,

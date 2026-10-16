@@ -448,23 +448,136 @@ class FullWeeklyResetHistoryTests(unittest.TestCase):
         with self.connection:
             archive.rebuild_reset_events(self.connection)
         self.assertEqual([
-            (self.base + 1000, self.base + 1800, "scheduled_crossing"),
+            (self.base + 1000, self.base + 1100, "scheduled_crossing"),
             (self.base + 1200, self.base + 1500, "full_observed"),
         ], self.events())
+
+    def assert_interrupted_owner_cannot_reuse_a_full_proof(self, *, archived, owner):
+        self.poll(0, 1000, 99)
+        self.poll(100, 1000, archived=False)
+        self.poll(300, 3000, archived=False)
+        self.poll(600, 3000, archived=False)
+        interruption = self.sample(self.base + 900, None, None, owner)
+        with self.connection:
+            anomalies.process_snapshot(self.connection, interruption)
+            if archived:
+                archive.insert_snapshot(self.connection, interruption)
+        self.poll(4000, 6000)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([(self.base + 300, self.base + 600, "full_observed")], self.events())
+
+    def test_foreign_archived_partial_interrupts_successor_baseline(self):
+        self.assert_interrupted_owner_cannot_reuse_a_full_proof(archived=True, owner="group-b")
+
+    def test_foreign_live_partial_interrupts_successor_baseline(self):
+        self.assert_interrupted_owner_cannot_reuse_a_full_proof(archived=False, owner="group-b")
+
+    def test_unknown_archived_partial_interrupts_successor_baseline(self):
+        self.assert_interrupted_owner_cannot_reuse_a_full_proof(archived=True, owner=None)
+
+    def test_unknown_live_partial_interrupts_successor_baseline(self):
+        self.assert_interrupted_owner_cannot_reuse_a_full_proof(archived=False, owner=None)
+
+    def test_scheduled_successor_preserves_consumed_quota_and_retention(self):
+        self.poll(0, 1000, 99)
+        self.poll(100, 1000, archived=False)
+        self.poll(300, 3000, archived=False)
+        self.poll(600, 3000, 20, archived=False)
+        self.poll(4000, 6000, 99)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual((20, 99), self.connection.execute(
+            "SELECT before_pct, after_pct FROM reset_events WHERE detection_method='scheduled_crossing'"
+        ).fetchone())
+        self.poll(25 * 3600, 600000, 99)
+        with self.connection:
+            archive.compact(self.connection, 0)
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual((20, 99), self.connection.execute(
+            "SELECT before_pct, after_pct FROM reset_events WHERE detection_method='scheduled_crossing'"
+        ).fetchone())
+        with self.connection:
+            archive.compact(self.connection, 1)
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([], self.events())
+
+    def test_scheduled_successor_uses_later_observed_consumption(self):
+        self.poll(0, 1000, 99)
+        self.poll(100, 1000, archived=False)
+        self.poll(300, 3000, archived=False)
+        self.poll(600, 3000, 20, archived=False)
+        self.poll(2000, 3000, 10)
+        self.poll(4000, 6000, 99)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual((10, 99), self.connection.execute(
+            "SELECT before_pct, after_pct FROM reset_events WHERE detection_method='scheduled_crossing'"
+        ).fetchone())
+
+    def test_any_full_reset_before_old_deadline_prevents_a_duplicate_crossing(self):
+        self.poll(0, 1000, 99)
+        self.poll(100, 1000, archived=False)
+        self.poll(300, 3000, archived=False)
+        self.poll(600, 3000, archived=False)
+        self.poll(1500, 6000, archived=False)
+        self.poll(1800, 6000, archived=False)
+        self.poll(2700, 6000)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([
+            (self.base + 300, self.base + 600, "full_observed"),
+            (self.base + 1500, self.base + 1800, "full_observed"),
+        ], self.events())
+
+    def test_next_full_candidate_is_not_a_measured_refill_before_confirmation(self):
+        self.poll(0, 400000, 99)
+        self.poll(100, 400000, archived=False)
+        self.poll(300, 500000, archived=False)
+        self.poll(400, 500000, archived=False)
+        self.poll(900, 600000)
+        expected = [(self.base + 300, self.base + 400, "full_observed")]
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual(expected, self.events())
+        self.poll(1100, 500000)  # Rejection must not leave a fabricated refill.
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual(expected, self.events())
+
+    def test_first_full_candidate_does_not_inherit_a_sparse_snapshot_refill(self):
+        self.poll(0, 400000, 99)
+        self.poll(100, 400000, archived=False)
+        self.poll(300, 600000)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([], self.events())
+        self.poll(600, 400000)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([], self.events())
+
+    def test_partial_percentage_cannot_supply_a_missing_refill_deadline(self):
+        self.poll(0, 400000)
+        with self.connection:
+            anomalies.process_snapshot(self.connection, self.sample(self.base + 300, None, 20))
+        self.poll(900, 600000)
+        self.poll(1800, 600000)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        self.assertEqual([], self.events())
 
     def test_full_proof_does_not_suppress_another_owners_scheduled_reset(self):
         self.poll(0, 400000, archived=False)
         self.poll(300, 600000, archived=False)
         self.poll(600, 600000, archived=False)
+        self.poll(700, 1000, owner="group-b")
+        self.poll(1700, 600000, owner="group-b")
         with self.connection:
-            for offset, reset in ((0, 400), (900, 600000)):
-                archive.insert_snapshot(self.connection, self.sample(
-                    self.base + offset, self.base + reset, owner="group-b",
-                ))
             archive.rebuild_reset_events(self.connection)
         self.assertEqual([
             (self.base + 300, self.base + 600, "full_observed"),
-            (self.base + 400, self.base + 900, "scheduled_crossing"),
+            (self.base + 1000, self.base + 1700, "scheduled_crossing"),
         ], self.events())
 
     def test_invalid_or_foreign_confirmation_proof_is_not_an_event(self):

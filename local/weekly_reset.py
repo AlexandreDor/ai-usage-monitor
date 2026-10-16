@@ -12,6 +12,11 @@ from typing import Any, NamedTuple
 MIN_ADVANCE_SECONDS = 1800
 CONFIRMATION_TOLERANCE_SECONDS = 60
 CONFIRMED_EVENT_KEY_PREFIX = "full_weekly_reset_confirmed:"
+OBSERVED_EVENT_KEY_PREFIX = "weekly_reset_observed:"
+WEEKLY_EVIDENCE_START_KEY = "weekly_reset_evidence_start"
+RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT = 20.0
+RANDOM_WEEKLY_RESET_FULL_REFILL_PCT = 98.0
+RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS = MIN_ADVANCE_SECONDS
 
 
 class FullWeeklyResetProof(NamedTuple):
@@ -20,6 +25,24 @@ class FullWeeklyResetProof(NamedTuple):
     owner: str
     deadline: int
     interval: int
+
+
+class WeeklyResetEvent(NamedTuple):
+    first_at: int
+    observed_at: int
+    owner: str
+    before_pct: float
+    after_pct: float
+    method: str
+
+
+def is_weekly_refill(previous_pct, current_pct, previous_reset, current_reset) -> bool:
+    if previous_reset is None or current_reset is None:
+        return False
+    change = current_pct - previous_pct
+    return (current_reset >= previous_reset + RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS
+            and change > 0 and (change >= RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT
+                                or current_pct >= RANDOM_WEEKLY_RESET_FULL_REFILL_PCT))
 
 
 def _number(value: Any) -> bool:
@@ -151,14 +174,77 @@ def saved_full_weekly_resets(connection) -> list[FullWeeklyResetProof]:
     return sorted(events)
 
 
-def prune_full_weekly_resets(connection, cutoff: int) -> None:
+def _observed_weekly_event(previous, current) -> WeeklyResetEvent | None:
+    """Validate an actual adjacent detector pair, never a synthetic baseline."""
+    for sample in (previous, current):
+        if (not all(_number(sample.get(key)) for key in ("epoch", "pct", "reset_at", "interval"))
+                or sample["epoch"] <= 0 or not 0 <= sample["pct"] <= 100
+                or sample["reset_at"] <= 0 or sample["interval"] <= 0):
+            return None
+    owner = current["owner"]
+    if (not isinstance(owner, str) or not owner or owner == "__unknown__"
+            or previous["owner"] != owner or current["epoch"] <= previous["epoch"]
+            or not current["epoch"] < current["reset_at"] <= current["epoch"] + 8 * 86400):
+        return None
+    scheduled = (
+        previous["epoch"] < previous["reset_at"] <= current["epoch"]
+        and current["reset_at"] > previous["reset_at"]
+        and current["epoch"] - previous["epoch"]
+        <= max(3600, 2 * max(previous["interval"], current["interval"]))
+    )
+    if scheduled:
+        first_at, method = int(previous["reset_at"]), "scheduled_crossing"
+    elif is_weekly_refill(previous["pct"], current["pct"], previous["reset_at"], current["reset_at"]):
+        first_at, method = int(current["epoch"]), "random_observed"
+    else:
+        return None
+    return WeeklyResetEvent(first_at, int(current["epoch"]), owner,
+                            previous["pct"], current["pct"], method)
+
+
+def record_observed_weekly_reset(connection, previous, current) -> None:
+    event = _observed_weekly_event(previous, current)
+    if event is None:
+        return
+    connection.execute(
+        "INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)",
+        (f"{OBSERVED_EVENT_KEY_PREFIX}{event.method}:{event.first_at}",
+         json.dumps({"previous": previous, "observation": current}, separators=(",", ":"))),
+    )
+    connection.execute(
+        """INSERT OR IGNORE INTO reset_events (
+            window, reset_at_epoch, observed_at_epoch, before_pct, after_pct, detection_method
+        ) VALUES ('weekly', ?, ?, ?, ?, ?)""",
+        (event.first_at, event.observed_at, event.before_pct, event.after_pct, event.method),
+    )
+
+
+def saved_observed_weekly_resets(connection) -> list[WeeklyResetEvent]:
+    events = []
+    for key, value in connection.execute(
+            "SELECT key, value FROM metadata WHERE key GLOB ?", (OBSERVED_EVENT_KEY_PREFIX + "*",)):
+        try:
+            proof = json.loads(value)
+            event = _observed_weekly_event(proof["previous"], proof["observation"])
+            if event and key == f"{OBSERVED_EVENT_KEY_PREFIX}{event.method}:{event.first_at}":
+                events.append(event)
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return sorted(events)
+
+
+def prune_weekly_reset_evidence(connection, cutoff: int) -> None:
     """Apply archive retention to durable proofs as well as their events."""
     for proof in saved_full_weekly_resets(connection):
         if proof.first_at < cutoff:
             connection.execute("DELETE FROM metadata WHERE key = ?",
                                (f"{CONFIRMED_EVENT_KEY_PREFIX}{proof.first_at}",))
+    for event in saved_observed_weekly_resets(connection):
+        if event.first_at < cutoff:
+            connection.execute("DELETE FROM metadata WHERE key = ?",
+                               (f"{OBSERVED_EVENT_KEY_PREFIX}{event.method}:{event.first_at}",))
     connection.execute(
-        "DELETE FROM reset_events WHERE detection_method = 'full_observed' AND reset_at_epoch < ?",
+        "DELETE FROM reset_events WHERE window = 'weekly' AND reset_at_epoch < ?",
         (cutoff,),
     )
 
