@@ -301,7 +301,9 @@ reloads the displayed data when it finishes. It requires `monitor.sh --loop`
 and `serve.sh` to share the same runtime directory. The button is disabled
 while a request is running; collection failures preserve the last valid data.
 Notification or other downstream cycle failures do not fail a successful quota
-refresh; those failures remain visible in monitor health. The button is hidden
+refresh. Publication is acknowledged before Gist sync, notifications, or token
+collection, so slow downstream work cannot time out an already published
+refresh; downstream failures remain visible in monitor health. The button is hidden
 in external Gist mode.
 
 Loop mode also schedules a live collection 30 seconds after each announced

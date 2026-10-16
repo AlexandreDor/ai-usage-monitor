@@ -109,6 +109,12 @@ def pending_reset_checks(runtime):
     return sorted({max(due, retry_at) for due in deadlines})
 
 
+def acknowledge(runtime, identifier, status):
+    """Publish the quota result without waiting for downstream cycle work."""
+    if identifier != "-" and status != 75:
+        write_json(runtime / "dashboard-refresh-result.json", {"id": identifier, "success": status == 0})
+
+
 def complete(runtime, identifier, status, now, started_at=None):
     state_path = runtime / "reset-refresh.json"
     state = read_json(state_path)
@@ -126,13 +132,14 @@ def complete(runtime, identifier, status, now, started_at=None):
     else:
         state["retry_at"] = now + (5 if status == 75 else 30)
     write_json(state_path, state)
-    if identifier != "-" and status != 75:
-        write_json(runtime / "dashboard-refresh-result.json", {"id": identifier, "success": status == 0})
+    acknowledge(runtime, identifier, status)
 
 
 if __name__ == "__main__":
     action, directory, *arguments = sys.argv[1:]
     if action == "plan":
         print(*plan(Path(directory), int(arguments[0])))
+    elif action == "acknowledge":
+        acknowledge(Path(directory), arguments[0], int(arguments[1]))
     elif action == "complete":
         complete(Path(directory), arguments[0], *map(int, arguments[1:]))

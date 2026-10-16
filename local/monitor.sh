@@ -4773,10 +4773,17 @@ check_token_usage() {
     --hermes-db "$HERMES_DB_PATH"
 }
 
+acknowledge_dashboard_refresh() {
+  local identifier="$1" collection_status="$2"
+  [[ "$identifier" != - ]] || return 0
+  python3 "$SCRIPT_DIR/refresh.py" acknowledge "$RUNTIME_DIR" "$identifier" "$collection_status"
+}
+
 run_cycle() {
   local interval_seconds="$1"
   local cycle_mode="${2:-full}" regular_interval
   regular_interval="${3:-$interval_seconds}"
+  local refresh_request="${4:--}"
   if [[ "$cycle_mode" != full && "$cycle_mode" != live ]]; then
     echo "[ERROR] Unsupported cycle mode: ${cycle_mode}." >&2
     return 2
@@ -4814,6 +4821,21 @@ run_cycle() {
         storage_ok=0
         append_cycle_error "Local snapshot write failed"
       fi
+    else
+      if write_current_snapshot "$public_json"; then
+        QUOTA_COLLECTION_STATUS=0
+      else
+        status=1
+        append_cycle_error "Current snapshot write failed"
+      fi
+    fi
+
+    # The HTTP request has its own deadline. Report publication before Gist,
+    # notifications or token collection can delay the rest of this cycle.
+    acknowledge_dashboard_refresh "$refresh_request" "$QUOTA_COLLECTION_STATUS" \
+      || { status=1; append_cycle_error "Dashboard refresh acknowledgement failed"; }
+
+    if [[ "$cycle_mode" == full ]]; then
       gist_json="$public_json"
       if (( interval_seconds != regular_interval )); then
         if ! gist_json="$(snapshot_with_interval "$public_json" "$regular_interval")"; then
@@ -4826,13 +4848,6 @@ run_cycle() {
         sync_gist "$gist_json" "$history_json" || { status=1; append_cycle_error "GitHub Gist sync failed"; }
       else
         echo "[WARN] Skipping GitHub Gist sync because local storage failed." >&2
-      fi
-    else
-      if write_current_snapshot "$public_json"; then
-        QUOTA_COLLECTION_STATUS=0
-      else
-        status=1
-        append_cycle_error "Current snapshot write failed"
       fi
     fi
 
@@ -4857,6 +4872,8 @@ run_cycle() {
   else
     status=1
     append_cycle_error "Codex limit collection failed"
+    acknowledge_dashboard_refresh "$refresh_request" "$QUOTA_COLLECTION_STATUS" \
+      || append_cycle_error "Dashboard refresh acknowledgement failed"
   fi
 
   if [[ "$cycle_mode" == full ]]; then
@@ -4875,6 +4892,7 @@ PYEOF
 run_once() {
   local interval_seconds="$1" cycle_mode="${2:-full}" regular_interval
   regular_interval="${3:-$interval_seconds}"
+  local refresh_request="${5:--}"
   local lock_fd start_ms end_ms duration_ms status=0
   QUOTA_COLLECTION_STATUS=1
   exec {lock_fd}>"$LOCK_FILE"
@@ -4887,7 +4905,7 @@ run_once() {
   fi
 
   start_ms="$(monotonic_milliseconds)"
-  if run_cycle "$interval_seconds" "$cycle_mode" "$regular_interval"; then
+  if run_cycle "$interval_seconds" "$cycle_mode" "$regular_interval" "$refresh_request"; then
     status=0
   else
     status=$?
@@ -4958,7 +4976,7 @@ run_loop() {
     if (( now_epoch >= next_regular )); then
       effective="$(effective_collection_interval "$interval" "$now_epoch")"
       last_attempt="$now_epoch"
-      run_once "$effective" full "$interval" 1 || cycle_status=$?
+      run_once "$effective" full "$interval" 1 "$refresh_request" || cycle_status=$?
       completed_at="$(date -u +%s)"
       delay="$(seconds_until_next_interval "$completed_at" "$interval")"
       next_regular=$((completed_at + delay))
@@ -4966,12 +4984,12 @@ run_loop() {
     elif [[ "$refresh_request" != - ]] || (( reset_delay == 0 )); then
       last_attempt="$now_epoch"
       effective="$(effective_collection_interval "$interval" "$now_epoch")"
-      run_once "$effective" live "$interval" 1 || cycle_status=$?
+      run_once "$effective" live "$interval" 1 "$refresh_request" || cycle_status=$?
     elif (( interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS )) \
       && dashboard_activity_recent "$now_epoch" \
       && (( now_epoch - last_attempt >= DASHBOARD_ACTIVE_INTERVAL_SECONDS )); then
       last_attempt="$now_epoch"
-      run_once "$DASHBOARD_ACTIVE_INTERVAL_SECONDS" live "$interval" 1 || cycle_status=$?
+      run_once "$DASHBOARD_ACTIVE_INTERVAL_SECONDS" live "$interval" 1 "$refresh_request" || cycle_status=$?
       echo "[$(format_paris_now)] Dashboard active; next live check is eligible in ${DASHBOARD_ACTIVE_INTERVAL_SECONDS}s."
     else
       delay=$((next_regular - now_epoch))
