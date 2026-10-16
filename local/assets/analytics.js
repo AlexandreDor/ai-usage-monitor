@@ -1016,7 +1016,7 @@ function renderResets(data = {}) {
   for (const item of items) {
     const row = document.createElement('tr');
     pillCell(row, item.window);
-    pillCell(row, item.category === 'random' ? t('random') : item.category === 'end_of_week' ? t('endOfWeek') : t('scheduled'));
+    pillCell(row, item.detection_method === 'full_observed' ? t('fullQuotaCycle') : item.category === 'random' ? t('random') : item.category === 'end_of_week' ? t('endOfWeek') : t('scheduled'));
     cell(row, formatDate(item.reset_at));
     cell(row, formatDate(item.observed_at));
     cell(row, `${item.before_pct ?? EMPTY_VALUE}% → ${item.after_pct ?? EMPTY_VALUE}%`);

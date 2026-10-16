@@ -2411,9 +2411,9 @@ def reset_history(
     end_of_week_summary = {"count": 0, "unused_pct_points": 0.0}
     for weekly_row in weekly_rows:
         before = weekly_row["before_pct"]
-        if weekly_row["detection_method"] == "random_observed":
+        if weekly_row["detection_method"] in {"random_observed", "full_observed"}:
             random_summary["count"] += 1
-            _ideal, change = random_impacts[weekly_row["reset_at_epoch"]]
+            _ideal, change = random_impacts.get(weekly_row["reset_at_epoch"], (None, None))
             if change is not None:
                 random_summary["net_vs_ideal_pct_points"] += change
                 if change >= 0:
@@ -2450,7 +2450,7 @@ def reset_history(
         "items": [
             {
                 "window": row["window"],
-                "category": "random" if row["detection_method"] == "random_observed" else "end_of_week" if row["window"] == "weekly" else "scheduled",
+                "category": "random" if row["detection_method"] in {"random_observed", "full_observed"} else "end_of_week" if row["window"] == "weekly" else "scheduled",
                 "reset_at": iso_utc(row["reset_at_epoch"]),
                 "observed_at": iso_utc(row["observed_at_epoch"]),
                 "observation_delay_seconds": max(0, row["observed_at_epoch"] - row["reset_at_epoch"]),
@@ -2472,7 +2472,7 @@ def reset_history(
                 "ideal_weekly_pace_pct": random_impacts.get(row["reset_at_epoch"], (None, None))[0],
                 "pace_delta_pct_points": random_impacts.get(row["reset_at_epoch"], (None, None))[1],
                 "unused_pct_points": round(float(row["before_pct"]), 3)
-                if row["window"] == "weekly" and row["detection_method"] != "random_observed" and isinstance(row["before_pct"], (int, float)) and row["before_pct"] > 0
+                if row["window"] == "weekly" and row["detection_method"] not in {"random_observed", "full_observed"} and isinstance(row["before_pct"], (int, float)) and row["before_pct"] > 0
                 else 0,
                 "estimated_cycle_cost_usd": (
                     cycle_metrics.get(row["reset_at_epoch"], {}).get("estimated_cycle_cost_usd")

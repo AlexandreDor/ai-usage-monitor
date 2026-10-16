@@ -6,6 +6,7 @@ TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "${SKIP_PYTHON_TESTS:-0}" != 1 ]]; then
   python3 "$TEST_DIR/test_alerts.py"
   python3 "$TEST_DIR/test_anomalies.py"
+  python3 "$TEST_DIR/test_weekly_reset.py"
   python3 "$TEST_DIR/test_history.py"
   python3 "$TEST_DIR/test_codex_client.py"
   python3 "$TEST_DIR/test_config.py"

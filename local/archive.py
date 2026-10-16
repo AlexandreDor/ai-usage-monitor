@@ -38,6 +38,12 @@ from history import (
     canonicalize_limit_id,
     opaque_limit_id_from_raw,
 )
+from weekly_reset import (
+    WEEKLY_EVIDENCE_START_KEY,
+    prune_weekly_reset_evidence,
+    saved_full_weekly_resets,
+    saved_observed_weekly_resets,
+)
 
 RECENT_SECONDS = 24 * 60 * 60
 MEDIUM_SECONDS = 7 * 24 * 60 * 60
@@ -370,6 +376,7 @@ def compact(connection: sqlite3.Connection, retention_days: int) -> None:
 
     if retention_days > 0:
         cutoff = anchor - retention_days * 24 * 60 * 60
+        prune_weekly_reset_evidence(connection, cutoff)
         connection.execute("DELETE FROM snapshots WHERE scraped_at_epoch < ?", (cutoff,))
         connection.execute(
             "DELETE FROM forecast_samples WHERE scraped_at_epoch < ?", (cutoff,)
@@ -396,7 +403,7 @@ def compact(connection: sqlite3.Connection, retention_days: int) -> None:
 
 
 def rebuild_reset_events(connection: sqlite3.Connection) -> None:
-    """Derive scheduled and unexpected weekly resets from retained snapshots."""
+    """Combine durable full-quota proofs with other snapshot-derived resets."""
     rows = connection.execute(
         """
         SELECT scraped_at_epoch, five_h_pct, five_h_reset_at,
@@ -406,6 +413,32 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
         """
     ).fetchall()
     connection.execute("DELETE FROM reset_events")
+    full_events = saved_full_weekly_resets(connection)
+    for proof in full_events:
+        connection.execute(
+            """INSERT INTO reset_events (
+                window, reset_at_epoch, observed_at_epoch,
+                before_pct, after_pct, detection_method
+            ) VALUES ('weekly', ?, ?, 100, 100, 'full_observed')""",
+            (proof.first_at, proof.confirmed_at),
+        )
+
+    for event in saved_observed_weekly_resets(connection):
+        connection.execute(
+            """INSERT OR IGNORE INTO reset_events (
+                window, reset_at_epoch, observed_at_epoch, before_pct, after_pct, detection_method
+            ) VALUES ('weekly', ?, ?, ?, ?, ?)""",
+            (event.first_at, event.observed_at, event.before_pct, event.after_pct, event.method),
+        )
+
+    evidence = connection.execute(
+        "SELECT value FROM metadata WHERE key=?", (WEEKLY_EVIDENCE_START_KEY,),
+    ).fetchone()
+    try:
+        evidence_start = int(evidence[0]) if evidence else None
+    except (TypeError, ValueError):
+        evidence_start = 0  # Damaged coverage metadata cannot authorize guesses.
+
     windows = (("5h", 1, 2), ("weekly", 3, 4))
     scheduled_5h_cycles = set()
     scheduled_weekly_cycles = set()
@@ -421,6 +454,8 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
         if previous[6] is None or current[6] is None or previous[6] != current[6]:
             continue
         for window, pct_index, reset_index in windows:
+            if window == "weekly" and evidence_start is not None and current[0] >= evidence_start:
+                continue
             reset_at = previous[reset_index]
             if not isinstance(reset_at, int) or reset_at <= 0:
                 continue
@@ -569,6 +604,8 @@ def rebuild_reset_events(connection: sqlite3.Connection) -> None:
     # limit group and anchor the event to the first complete post-reset sample.
     previous_weekly = None
     for current in rows:
+        if evidence_start is not None and current[0] >= evidence_start:
+            break
         current_pct, current_deadline = current[3], current[4]
         if not isinstance(current_pct, (int, float)) or not isinstance(current_deadline, int):
             # As for 5h above, an owner change hidden in a partial row must
@@ -662,6 +699,7 @@ def ingest(
     history_path: Path,
     snapshot: dict[str, Any],
     retention_days: int,
+    *, legacy_weekly_state: str | None = None,
 ) -> None:
     # Reject future rolling-history entries before creating or mutating the
     # SQLite archive.  Legacy malformed entries are still salvaged as before.
@@ -691,11 +729,11 @@ def ingest(
                 (SCHEMA_VERSION,),
             )
             insert_snapshot(connection, snapshot)
+            # Record the fresh confirmation before compaction can discard
+            # evidence. Live polls use this same idempotent detector path.
+            process_snapshot(connection, snapshot, legacy_weekly_state=legacy_weekly_state)
             compact(connection, retention_days)
             rebuild_reset_events(connection)
-            # Detector state is compact and independent from snapshots.  The
-            # same call is idempotent when a live cycle replays this sample.
-            process_snapshot(connection, snapshot)
     finally:
         connection.close()
     os.chmod(database_path, 0o600)
@@ -768,7 +806,8 @@ def run(args: argparse.Namespace) -> int:
     database_path = Path(args.database)
     history_path = Path(args.history)
     try:
-        ingest(database_path, history_path, snapshot, retention_days)
+        ingest(database_path, history_path, snapshot, retention_days,
+               legacy_weekly_state=getattr(args, "legacy_weekly_state", None))
         return 0
     except ArchiveCorruptionError as exc:
         try:
@@ -778,7 +817,8 @@ def run(args: argparse.Namespace) -> int:
             return 1
         warn(f"Corrupt archive copied to {backup}; rebuilding it from rolling history.")
         try:
-            ingest(database_path, history_path, snapshot, retention_days)
+            ingest(database_path, history_path, snapshot, retention_days,
+                   legacy_weekly_state=getattr(args, "legacy_weekly_state", None))
             return 0
         except (ArchiveCorruptionError, OSError, OverflowError, sqlite3.DatabaseError) as rebuild_error:
             error(f"Could not rebuild archive after corruption: {rebuild_error}")
@@ -793,6 +833,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--database", required=True, help="SQLite archive path")
     parser.add_argument("--history", required=True, help="Rolling history JSON path")
     parser.add_argument("--retention-days", required=True, help="0 for unlimited, otherwise 1..36500")
+    parser.add_argument("--legacy-weekly-state")
     return parser
 
 
