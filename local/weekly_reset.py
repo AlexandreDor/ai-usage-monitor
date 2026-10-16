@@ -235,7 +235,7 @@ def saved_observed_weekly_resets(connection) -> list[WeeklyResetEvent]:
 
 
 def observe_weekly_reset_history(connection, *, epoch, pct, reset_at, owner, interval,
-                                 prior_observation_epoch=0, full_state="") -> None:
+                                 prior_observation_epoch=0, prior_owner=None, full_state="") -> None:
     """Classify events from a separate last complete, owner-scoped baseline.
 
     Anomaly state also tracks incomplete percentages and cannot serve as this
@@ -254,6 +254,24 @@ def observe_weekly_reset_history(connection, *, epoch, pct, reset_at, owner, int
         return
     known_owner = isinstance(owner, str) and owner and owner != "__unknown__"
     baseline = state.get("baseline") if known_owner and state.get("owner") == owner else None
+    evidence = connection.execute(
+        "SELECT 1 FROM metadata WHERE key=?", (WEEKLY_EVIDENCE_START_KEY,),
+    ).fetchone()
+    legacy_interrupted = state.get("legacy_interrupted") is True
+    if not evidence:
+        retained = connection.execute(
+            "SELECT limit_id FROM snapshots WHERE scraped_at_epoch < ? "
+            "ORDER BY scraped_at_epoch DESC LIMIT 1", (epoch,),
+        ).fetchone()
+        prior_owners = ([prior_owner] if prior_owner is not None else [])
+        if state:
+            prior_owners.append(state.get("owner"))
+        if retained:
+            prior_owners.append(retained[0])
+        # Partial live polls may never reach snapshots. Remember an interrupted
+        # upgrade bridge until the first complete baseline, including an owner
+        # saved by the legacy detector before this version's first observation.
+        legacy_interrupted |= not known_owner or any(previous != owner for previous in prior_owners)
     interval = int(interval) if _number(interval) and interval > 0 else 900
     complete = (_number(pct) and 0 <= pct <= 100 and _number(reset_at)
                 and epoch < reset_at <= epoch + 8 * 86400 and known_owner)
@@ -261,20 +279,21 @@ def observe_weekly_reset_history(connection, *, epoch, pct, reset_at, owner, int
         current = {"epoch": epoch, "pct": pct, "reset_at": reset_at, "owner": owner, "interval": interval}
         if isinstance(baseline, dict):
             record_observed_weekly_reset(connection, baseline, current)
-        if not connection.execute("SELECT 1 FROM metadata WHERE key=?", (WEEKLY_EVIDENCE_START_KEY,)).fetchone():
+        if not evidence:
             pending = _load(full_state).get("candidate")
             confirmed = any(proof.confirmed_at == epoch for proof in saved_full_weekly_resets(connection))
             # Preserve the initial legacy transition only until a complete baseline
             # exists. A known full candidate/confirmation already has stronger
             # evidence and must not be reclassified by sparse legacy snapshots.
-            start = epoch if baseline is not None or pending or confirmed else epoch + 1
+            start = epoch if baseline is not None or pending or confirmed or legacy_interrupted else epoch + 1
             connection.execute("INSERT INTO metadata(key, value) VALUES (?, ?)",
                                (WEEKLY_EVIDENCE_START_KEY, str(start)))
         baseline = current
     connection.execute(
         "INSERT INTO metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (WEEKLY_HISTORY_STATE_KEY,
-         json.dumps({"observed_at": epoch, "owner": owner, "baseline": baseline}, separators=(",", ":"))),
+         json.dumps({"observed_at": epoch, "owner": owner, "baseline": baseline,
+                     "legacy_interrupted": legacy_interrupted}, separators=(",", ":"))),
     )
 
 

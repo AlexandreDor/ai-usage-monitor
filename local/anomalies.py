@@ -569,6 +569,7 @@ def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any], *
         reset_at=snapshot.get("weekly_reset_at"), owner=limit_id,
         interval=snapshot.get("sample_interval_seconds"),
         prior_observation_epoch=prior_observation_epoch,
+        prior_owner=active_limit,
         full_state=weekly_state.get("full_weekly_reset_state", ""),
     )
 

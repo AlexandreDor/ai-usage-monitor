@@ -522,6 +522,48 @@ class FullWeeklyResetHistoryTests(unittest.TestCase):
     def test_first_live_missing_deadline_keeps_initial_legacy_transition(self):
         self.assert_initial_partial_preserves_legacy_backfill(20, archived=False)
 
+    def assert_initial_live_interruption_cancels_legacy_backfill(self, owner, *, legacy):
+        if legacy:
+            self.poll(0, 1000, 20)
+        else:
+            with self.connection:
+                archive.insert_snapshot(self.connection, self.sample(self.base, self.base + 1000, 20))
+        with self.connection:
+            anomalies.process_snapshot(self.connection, self.sample(self.base + 500, None, None, owner))
+            if legacy:
+                # The old detector saved active ownership, but had no separate
+                # weekly history state or full-quota classifier field.
+                self.connection.execute("DELETE FROM metadata WHERE key IN (?, ?)",
+                                        (WEEKLY_HISTORY_STATE_KEY, WEEKLY_EVIDENCE_START_KEY))
+                for limit, encoded in self.connection.execute(
+                        "SELECT limit_id,state_json FROM anomaly_detector_state WHERE window='weekly'").fetchall():
+                    state = json.loads(encoded)
+                    state.pop("full_weekly_reset_state", None)
+                    self.connection.execute("UPDATE anomaly_detector_state SET state_json=? "
+                                            "WHERE window='weekly' AND limit_id=?", (json.dumps(state), limit))
+            else:
+                anomalies.process_snapshot(self.connection, self.sample(self.base + 700, None, None))
+        self.poll(1500, 5000, 99)
+        with self.connection:
+            archive.rebuild_reset_events(self.connection)
+        expected = [(self.base + 1000, self.base + 1500, "scheduled_crossing")] if owner == "group-a" else []
+        self.assertEqual(expected, self.events())
+
+    def test_initial_live_foreign_partial_and_return_cancel_legacy_bridge(self):
+        self.assert_initial_live_interruption_cancels_legacy_backfill("group-b", legacy=False)
+
+    def test_initial_live_unknown_partial_and_return_cancel_legacy_bridge(self):
+        self.assert_initial_live_interruption_cancels_legacy_backfill(None, legacy=False)
+
+    def test_legacy_active_foreign_owner_cancels_initial_bridge(self):
+        self.assert_initial_live_interruption_cancels_legacy_backfill("group-b", legacy=True)
+
+    def test_legacy_active_unknown_owner_cancels_initial_bridge(self):
+        self.assert_initial_live_interruption_cancels_legacy_backfill(None, legacy=True)
+
+    def test_legacy_active_same_owner_preserves_initial_bridge(self):
+        self.assert_initial_live_interruption_cancels_legacy_backfill("group-a", legacy=True)
+
     def test_legacy_anomaly_state_cannot_bridge_an_archived_owner_interruption(self):
         self.poll(0, 1000, 20)
         for offset, owner in ((500, "group-b"), (700, "group-a")):
