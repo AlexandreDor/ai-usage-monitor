@@ -228,7 +228,7 @@ source and destination ancestry must be owned by root or the service account;
 group/other-writable ancestors are rejected unless they have the sticky bit.
 Private children of root-owned sticky `/tmp` remain supported. This prevents
 another user from replacing a checked directory before SQLite opens its path.
-The backup command verifies the current v4 schema and integrity before publication,
+The backup command verifies the current v5 schema and integrity before publication,
 uses mode `600`, rejects symlinks and overlapping runs, and preserves existing
 backups after a failed copy. Transfer a verified backup to separate storage if
 off-machine recovery is required. Restore using the documented

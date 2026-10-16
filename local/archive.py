@@ -37,6 +37,7 @@ from history import (
     SCHEMA_VERSION as SNAPSHOT_SCHEMA_VERSION,
     canonicalize_limit_id,
     opaque_limit_id_from_raw,
+    sanitize_reset_credits,
 )
 from weekly_reset import (
     WEEKLY_EVIDENCE_START_KEY,
@@ -172,6 +173,7 @@ def normalize_snapshot(value: Any, *, strict: bool) -> dict[str, Any] | None:
         "history_window_hours": None,
         "limit_id": None,
         "forecast": None,
+        "reset_credits": sanitize_reset_credits(value.get("reset_credits")),
     }
 
     for key in ("five_h_reset", "weekly_reset"):
@@ -287,6 +289,18 @@ def insert_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any]) ->
         """,
         row_values(snapshot),
     )
+    credits = snapshot.get("reset_credits")
+    # A missing observation clears a replacement at the same timestamp. Older
+    # observations must not masquerade as the current account's balance.
+    connection.execute("DELETE FROM reset_credit_snapshots WHERE scraped_at_epoch = ?",
+                       (snapshot["scraped_at_epoch"],))
+    if credits is not None:
+        connection.execute(
+            "INSERT INTO reset_credit_snapshots VALUES (?, ?, ?, ?)",
+            (snapshot["scraped_at_epoch"], credits["available_count"],
+             credits["next_expiration_at"], int(credits["expiration_known"])),
+        )
+
     forecast = snapshot.get("forecast")
     if forecast is not None:
         connection.execute(

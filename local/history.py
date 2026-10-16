@@ -138,6 +138,25 @@ def timestamp_to_epoch(value: Any) -> int | float:
     return int(seconds) if seconds.is_integer() else seconds
 
 
+def sanitize_reset_credits(value: Any) -> dict[str, Any] | None:
+    """Keep only the public account summary; never publish credit identifiers."""
+    if not isinstance(value, Mapping):
+        return None
+    count = value.get("available_count")
+    if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= (1 << 53) - 1:
+        return None
+    expiration = value.get("next_expiration_at")
+    known = value.get("expiration_known") is True and "next_expiration_at" in value
+    if expiration is not None:
+        if isinstance(expiration, bool) or not isinstance(expiration, int) or not 0 < expiration <= 253402300799:
+            expiration, known = None, False
+    if count == 0:
+        expiration, known = None, True
+    elif not known:
+        expiration = None
+    return {"available_count": count, "next_expiration_at": expiration, "expiration_known": known}
+
+
 def validate_percentage(field: str, value: Any) -> int | float | None:
     if value is None:
         return None
@@ -289,6 +308,9 @@ def normalize_entry(
     for field in RESET_EPOCH_FIELDS:
         if field in snapshot:
             normalized[field] = sanitize_optional_epoch(snapshot.get(field))
+
+    if "reset_credits" in snapshot:
+        normalized["reset_credits"] = sanitize_reset_credits(snapshot.get("reset_credits"))
 
     if "sample_interval_seconds" in snapshot:
         interval = snapshot.get("sample_interval_seconds")

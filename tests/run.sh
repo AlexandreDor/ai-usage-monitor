@@ -9,6 +9,7 @@ if [[ "${SKIP_PYTHON_TESTS:-0}" != 1 ]]; then
   python3 "$TEST_DIR/test_weekly_reset.py"
   python3 "$TEST_DIR/test_history.py"
   python3 "$TEST_DIR/test_codex_client.py"
+  python3 "$TEST_DIR/test_reset_credits.py"
   python3 "$TEST_DIR/test_config.py"
   python3 "$TEST_DIR/test_storage_durability.py"
   python3 "$TEST_DIR/test_analytics_backend.py"

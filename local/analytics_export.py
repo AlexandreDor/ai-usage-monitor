@@ -13,7 +13,7 @@ from analytics import AnalyticsError, AnalyticsUnavailableError, build_payload, 
 MAX_EXPORT_ROWS = 10_000
 MAX_EXPORT_BYTES = 16 * 1024 * 1024
 TOKEN_COLUMNS = ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens", "total_tokens", "estimated_cost_usd")
-LIMIT_COLUMNS = ("at", "five_h_pct", "weekly_pct", "ideal_weekly_pct", "forecast_chance_24h_pct", "forecast_chance_6h_pct", "forecast_generated_at", "samples")
+LIMIT_COLUMNS = ("at", "five_h_pct", "weekly_pct", "ideal_weekly_pct", "forecast_chance_24h_pct", "forecast_chance_6h_pct", "forecast_generated_at", "samples", "reset_credits_observed_at", "reset_credits_available", "reset_credits_next_expiration_at", "reset_credits_expiration_known", "reset_credits_expiration_seconds")
 WEEKLY_COLUMNS = ("at", "model", "providers", "observed_cost_usd", "quota_consumed_pct_points", "raw_value_usd", "value_usd", "quality", "reason", "inferred", "carried", "source_at", "source_age_seconds", "source_method", "value_lower_usd", "value_upper_usd", "high_uncertainty")
 RESET_COLUMNS = ("window", "category", "reset_at", "observed_at", "before_pct", "after_pct", "detection_method", "forecast_chance_24h_pct", "forecast_chance_6h_pct", "estimated_cycle_cost_usd", "extrapolated_100_value_usd", "cycle_cost_status", "cycle_cost_reason")
 DATASET_SECTIONS = {"limits": "limits", "tokens": "tokens", "weekly_value": "weekly", "breakdown": "breakdown", "resets": "resets"}

@@ -163,10 +163,26 @@ function scheduleFreshnessUpdate(classification = null) {
   const staleDelay = state.status === 'fresh'
     ? state.scrapedAtMs + (state.staleAfterSeconds + 1) * 1000 - now
     : Number.POSITIVE_INFINITY;
-  freshnessTimer = setTimeout(renderFreshness, Math.max(1, Math.min(nextMinuteDelay, staleDelay)));
+  const expirationMs = dashboardData.reset_credits?.expiration_known
+    ? dashboardData.reset_credits.next_expiration_at * 1000 - now : 0;
+  const expirationDelay = expirationMs > 0 ? expirationMs : Number.POSITIVE_INFINITY;
+  freshnessTimer = setTimeout(renderFreshness, Math.max(1, Math.min(nextMinuteDelay, staleDelay, expirationDelay)));
+}
+
+function renderResetCredits() {
+  const credits = dashboardData?.reset_credits;
+  const valid = Number.isSafeInteger(credits?.available_count) && credits.available_count >= 0;
+  document.getElementById('reset-credits-count').textContent = valid ? String(credits.available_count) : '-';
+  const expiration = document.getElementById('reset-credits-expiration');
+  expiration.textContent = CodexPreferences.resetCreditExpiration(credits);
+  expiration.title = credits?.expiration_known && credits.next_expiration_at
+    ? formatParisUnixTimestamp(credits.next_expiration_at) : '';
+  document.getElementById('reset-credits-observed').textContent = dashboardData
+    ? CodexPreferences.t('resetCredits.asOf', { date: formatParisDateTime(dashboardData.scraped_at) }) : '';
 }
 
 function renderFreshness() {
+  renderResetCredits();
   const badge = document.getElementById('freshness-badge');
   const detail = document.getElementById('freshness-detail');
   if (!dashboardData) {
@@ -454,6 +470,7 @@ function setHistoryState(state) {
 
 function setHistoryCanvasVisible(visible) {
   const canvas = document.getElementById('history-chart');
+  document.getElementById('history-chart-wrap').hidden = !visible;
   canvas.hidden = !visible;
   removeElementAttribute(canvas, 'aria-describedby');
 }
@@ -691,7 +708,7 @@ function renderHistory(history) {
   const context = document.getElementById('history-chart').getContext('2d');
   let options = {
     responsive: true,
-    maintainAspectRatio: true,
+    maintainAspectRatio: false,
     parsing: false,
     normalized: true,
     animation: false,
