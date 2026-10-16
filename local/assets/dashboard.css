@@ -105,17 +105,14 @@ header h1 {
 }
 
 .refresh-button {
-  padding: 9px 16px;
-  border: 1px solid #60a5fa;
-  border-radius: 8px;
-  background: var(--surface2);
-  color: var(--text);
+  padding: 0 0 2px;
+  border: 0;
+  background: transparent;
   font: inherit;
-  font-size: 0.85rem;
+  white-space: nowrap;
   cursor: pointer;
 }
 
-.refresh-button:hover { background: #17345c; }
 .refresh-button:focus-visible { outline: 2px solid #93c5fd; outline-offset: 3px; }
 .refresh-button:disabled { opacity: 0.7; cursor: wait; }
 
@@ -518,6 +515,13 @@ body[data-freshness="stale"] .limit-card {
 .footer-tagline {
   font-style: italic;
 }
+
+/* Keep dashboard spacing compact; viewport-specific rules can tighten it further. */
+body:where([data-dashboard-source]) { padding-block: 20px 24px; }
+:where([data-dashboard-source]) header { gap: 10px; margin-bottom: 20px; }
+:where([data-dashboard-source]) .limit-card { padding: 24px 28px 22px; }
+:where([data-dashboard-source]) .history-card { padding: 20px; }
+:where([data-dashboard-source]) .history-label { margin-bottom: 12px; }
 
 canvas {
   max-height: 220px;

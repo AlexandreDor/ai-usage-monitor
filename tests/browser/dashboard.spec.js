@@ -30,6 +30,53 @@ async function mockUsage(page, history = [snapshot]) {
   await page.route('**/history.json?*', route => route.fulfill({ json: history }));
 }
 
+for (const height of [980, 900]) {
+  for (const language of ['en', 'fr']) {
+    test(`fits dashboard and inline refresh in a Full HD browser ${height}px high (${language})`, async ({ page }) => {
+      await page.setViewportSize({ width: 1920, height });
+      await mockUsage(page);
+      let finish;
+      const collection = new Promise(resolve => { finish = resolve; });
+      await page.route('**/api/refresh', async route => {
+        await collection;
+        await route.fulfill({ json: { success: true } });
+      });
+      await page.goto('/dashboard.html');
+      await expect(page.locator('#five-h-pct')).toHaveText('72%');
+      await page.evaluate(language => CodexPreferences.set({ language }), language);
+      const button = page.locator('#refresh-codex');
+      for (const collecting of [false, true]) {
+        if (collecting) {
+          await button.click();
+          await expect(button).toBeDisabled();
+        }
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        const layout = await page.evaluate(() => {
+          const refresh = document.getElementById('refresh-codex').getBoundingClientRect();
+          const links = [...document.querySelectorAll('.dashboard-links a')].map(link => link.getBoundingClientRect());
+          const history = document.querySelector('.history-card').getBoundingClientRect();
+          return {
+            height: innerHeight,
+            scrollHeight: document.documentElement.scrollHeight,
+            scrollWidth: document.documentElement.scrollWidth,
+            width: innerWidth,
+            historyBottom: history.bottom,
+            chartHeight: document.getElementById('history-chart').getBoundingClientRect().height,
+            inline: links.every(link => refresh.top < link.bottom && refresh.bottom > link.top),
+          };
+        });
+        expect(layout.scrollHeight).toBeLessThanOrEqual(layout.height);
+        expect(layout.scrollWidth).toBeLessThanOrEqual(layout.width);
+        expect(layout.historyBottom).toBeLessThanOrEqual(layout.height);
+        expect(layout.chartHeight).toBeGreaterThanOrEqual(100);
+        expect(layout.inline).toBe(true);
+      }
+      finish();
+      await expect(button).toBeEnabled();
+    });
+  }
+}
+
 test('collects fresh Codex quotas from the button and prevents duplicate requests', async ({ page }) => {
   await mockUsage(page);
   let finish;
