@@ -30,6 +30,214 @@ async function mockUsage(page, history = [snapshot]) {
   await page.route('**/history.json?*', route => route.fulfill({ json: history }));
 }
 
+for (const height of [980, 900]) {
+  for (const language of ['en', 'fr']) {
+    test(`fits dashboard and inline refresh in a Full HD browser ${height}px high (${language})`, async ({ page }) => {
+      await page.setViewportSize({ width: 1920, height });
+      await mockUsage(page);
+      let finish;
+      const collection = new Promise(resolve => { finish = resolve; });
+      await page.route('**/api/refresh', async route => {
+        await collection;
+        await route.fulfill({ json: { success: true } });
+      });
+      await page.goto('/dashboard.html');
+      await expect(page.locator('#five-h-pct')).toHaveText('72%');
+      await page.evaluate(language => CodexPreferences.set({ language }), language);
+      const button = page.locator('#refresh-codex');
+      for (const collecting of [false, true]) {
+        if (collecting) {
+          await button.click();
+          await expect(button).toBeDisabled();
+        }
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        const layout = await page.evaluate(() => {
+          const refresh = document.getElementById('refresh-codex').getBoundingClientRect();
+          const links = [...document.querySelectorAll('.dashboard-links a')].map(link => link.getBoundingClientRect());
+          const history = document.querySelector('.history-card').getBoundingClientRect();
+          return {
+            height: innerHeight,
+            scrollHeight: document.documentElement.scrollHeight,
+            scrollWidth: document.documentElement.scrollWidth,
+            width: innerWidth,
+            historyBottom: history.bottom,
+            chartHeight: document.getElementById('history-chart').getBoundingClientRect().height,
+            inline: links.every(link => refresh.top < link.bottom && refresh.bottom > link.top),
+          };
+        });
+        expect(layout.scrollHeight).toBeLessThanOrEqual(layout.height);
+        expect(layout.scrollWidth).toBeLessThanOrEqual(layout.width);
+        expect(layout.historyBottom).toBeLessThanOrEqual(layout.height);
+        expect(layout.chartHeight).toBeGreaterThanOrEqual(100);
+        expect(layout.inline).toBe(true);
+      }
+      finish();
+      await expect(button).toBeEnabled();
+    });
+  }
+}
+
+test('collects fresh Codex quotas from the button and prevents duplicate requests', async ({ page }) => {
+  await mockUsage(page);
+  let finish;
+  const gate = new Promise(resolve => { finish = resolve; });
+  let requests = 0;
+  let current = snapshot;
+  await page.route('**/data.json?*', route => route.fulfill({ json: current }));
+  await page.route('**/api/refresh', async route => {
+    requests += 1;
+    expect(route.request().method()).toBe('POST');
+    expect(route.request().headers()['x-codex-dashboard-refresh']).toBe('1');
+    expect(route.request().postData()).toBeNull();
+    await gate;
+    current = { ...snapshot, five_h_pct: 99, weekly_pct: 98, scraped_at: DASHBOARD_NOW.toISOString() };
+    await route.fulfill({ json: { success: true } });
+  });
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  const button = page.getByRole('button', { name: 'Refresh Codex', exact: true });
+  await button.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#refresh-codex')).toBeDisabled();
+  await expect(page.locator('#refresh-codex')).toHaveAttribute('aria-busy', 'true');
+  await page.evaluate(() => { void collectCodex(); });
+  expect(requests).toBe(1);
+  finish();
+  await expect(page.locator('#five-h-pct')).toHaveText('99%');
+  await expect(button).toBeEnabled();
+  await expect(page.locator('#error-banner')).toBeHidden();
+  await page.locator('#language-toggle').click();
+  await expect(page.getByRole('button', { name: 'Actualiser Codex', exact: true })).toBeEnabled();
+});
+
+test('preserves quotas and restores the button after collection failure', async ({ page }) => {
+  await mockUsage(page);
+  await page.route('**/api/refresh', route => route.fulfill({ status: 503 }));
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await page.getByRole('button', { name: 'Refresh Codex', exact: true }).click();
+  await expect(page.locator('#error-banner')).toContainText('monitor is running in loop mode');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await expect(page.locator('#refresh-codex')).toBeEnabled();
+});
+
+for (const window of ['five_h', 'weekly']) test(`reloads after the ${window} reset even if its next deadline was already announced`, async ({ page }) => {
+  await mockUsage(page);
+  const reset = Math.floor(DASHBOARD_NOW.getTime() / 1000) + 10;
+  let requests = 0;
+  await page.route('**/data.json?*', route => {
+    requests += 1;
+    return route.fulfill({ json: {
+      ...snapshot,
+      scraped_at: requests === 1 ? DASHBOARD_NOW.toISOString() : new Date(DASHBOARD_NOW.getTime() + 15000).toISOString(),
+      [window + '_reset_at']: requests === 1 ? reset : reset + 18000,
+      five_h_pct: requests === 1 ? 1 : 20,
+    } });
+  });
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('1%');
+  await page.clock.runFor(15000);
+  await page.evaluate(() => refresh());
+  await page.clock.runFor(29000);
+  expect(requests).toBe(2);
+  await page.route('**/data.json?*', route => route.fulfill({ json: {
+    ...snapshot, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 45000).toISOString(),
+  } }));
+  await page.clock.runFor(1000);
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+});
+
+for (const window of ['five_h', 'weekly']) test(`recovers the monitor's pending ${window} check after a page reload`, async ({ page }) => {
+  await mockUsage(page);
+  const checkAt = Math.floor(DASHBOARD_NOW.getTime() / 1000) + 10;
+  let current = {
+    ...snapshot, scraped_at: new Date(DASHBOARD_NOW.getTime() - 5000).toISOString(),
+    [window + '_reset_at']: checkAt + 18000,
+  };
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({
+    status: 204, headers: { 'X-Codex-Reset-Checks-At': String(checkAt) },
+  }));
+  await page.route('**/data.json?*', route => route.fulfill({ json: current }));
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await page.reload();
+  await expect.poll(() => page.evaluate(() => [...serverResetChecks])).toEqual([checkAt * 1000]);
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await page.evaluate(() => refresh());
+  await page.clock.runFor(14000);
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  current = { ...current, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 15000).toISOString() };
+  await page.clock.runFor(1000);
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+});
+
+for (const secondDelay of [20, 28]) test(`retains both pending checks when the second finishes after ${secondDelay}s`, async ({ page }) => {
+  await mockUsage(page);
+  const epoch = Math.floor(DASHBOARD_NOW.getTime() / 1000);
+  let current = {
+    ...snapshot, scraped_at: new Date(DASHBOARD_NOW.getTime() - 5000).toISOString(),
+    five_h_reset_at: epoch + 18000, weekly_reset_at: epoch + 7 * 86400,
+  };
+  let heartbeats = 0;
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({
+    status: 204, headers: {
+      'X-Codex-Reset-Checks-At': ++heartbeats === 1
+        ? `${epoch + 10},${epoch + secondDelay}` : `${epoch + 18030}`,
+    },
+  }));
+  await page.route('**/data.json?*', route => route.fulfill({ json: current }));
+  await page.goto('/dashboard.html');
+  await expect.poll(() => page.evaluate(() => serverResetChecks.size)).toBe(2);
+  await page.evaluate(() => refresh());
+  current = { ...current, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 10000).toISOString() };
+  await page.clock.runFor(15000);
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+  await expect(page.locator('#weekly-pct')).toHaveText('36%');
+  current = { ...current, weekly_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + secondDelay * 1000).toISOString() };
+  await page.clock.runFor((secondDelay + 5 - 15) * 1000);
+  await expect(page.locator('#weekly-pct')).toHaveText('100%');
+});
+
+test('reads reset quotas after a slow initial history request finishes', async ({ page }) => {
+  await mockUsage(page);
+  const epoch = Math.floor(DASHBOARD_NOW.getTime() / 1000);
+  let current = {
+    ...snapshot, scraped_at: new Date(DASHBOARD_NOW.getTime() - 5000).toISOString(),
+    five_h_reset_at: epoch + 18000, weekly_reset_at: epoch + 7 * 86400,
+  };
+  let releaseHistory;
+  const historyGate = new Promise(resolve => { releaseHistory = resolve; });
+  let historyRequests = 0;
+  let dataRequests = 0;
+  let heartbeats = 0;
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({
+    status: 204, headers: {
+      'X-Codex-Reset-Checks-At': (++heartbeats === 1 ? `${epoch + 10},` : '')
+        + `${epoch + 18030},${epoch + 7 * 86400 + 30}`,
+    },
+  }));
+  await page.route('**/data.json?*', route => {
+    dataRequests += 1;
+    return route.fulfill({ json: current });
+  });
+  await page.route('**/history.json?*', async route => {
+    if (++historyRequests === 1) await historyGate;
+    await route.fulfill({ json: [snapshot] });
+  });
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await expect.poll(() => historyRequests).toBe(1);
+  await expect.poll(() => page.evaluate(() => serverResetChecks.size)).toBe(3);
+  current = { ...current, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 10000).toISOString() };
+  await page.clock.runFor(15000);
+  expect(dataRequests).toBe(1);
+  releaseHistory();
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+  expect(dataRequests).toBe(2);
+  await page.clock.runFor(15000);
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+});
+
 test('signals visible local dashboard activity without affecting rendering', async ({ page }) => {
   await page.clock.install({ time: DASHBOARD_NOW });
   const heartbeats = [];
@@ -111,7 +319,7 @@ test('works offline and exposes no serious or critical accessibility violations'
   const historyOrder = await page.locator('.history-card').evaluate(card => [
     ...card.children,
   ].map(child => child.id));
-  expect(historyOrder.indexOf('history-error')).toBeLessThan(historyOrder.indexOf('history-chart'));
+  expect(historyOrder.indexOf('history-error')).toBeLessThan(historyOrder.indexOf('history-chart-wrap'));
   expect(externalRequests).toEqual([]);
   await expect(page.locator('body')).not.toContainText('—');
 
@@ -549,7 +757,7 @@ test('renders advanced analytics and remains local', async ({ page }) => {
   await expect(page.locator('#random-reset-count')).toHaveText('1');
   await expect(page.locator('#random-reset-impact')).toHaveText('30.004 pts gained · 0 pts lost vs ideal pace');
   await expect(page.locator('#end-week-reset-count')).toHaveText('1');
-  await expect(page.locator('.metric-card')).toHaveCount(10);
+  await expect(page.locator('.metric-grid[aria-label] .metric-card')).toHaveCount(10);
   await expect(page.locator('#token-metric-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#limits-chart-card #token-metric-toggle')).toHaveCount(1);
   await expect(page.locator('#toggle-token-overlay')).toHaveAttribute('aria-pressed', 'true');
@@ -884,29 +1092,53 @@ test('selects GPT when models appear after an initially empty archive', async ({
   await expect(page.locator('#analytics-error')).toBeHidden();
 });
 
-test('keeps the complete dashboard above the fold at 1920x1080', async ({ page }) => {
-  await page.setViewportSize({ width: 1920, height: 1080 });
-  await mockUsage(page);
-  await page.goto('/dashboard.html');
+for (const viewport of [
+  { width: 1920, height: 1050 },
+  { width: 1920, height: 900 },
+  { width: 1536, height: 840 },
+  { width: 1536, height: 800 },
+  { width: 1536, height: 720 },
+  { width: 1280, height: 650 },
+]) {
+  for (const language of ['en', 'fr']) {
+    test(`keeps the complete dashboard within a desktop browser window ${viewport.width}x${viewport.height} (${language})`, async ({ page }) => {
+      // Cover browser toolbars and display scaling, beyond physical screen resolution.
+      await page.setViewportSize(viewport);
+      await mockUsage(page);
+      await page.route('**/data.json?*', route => route.fulfill({ json: {
+        ...snapshot,
+        reset_credits: { available_count: 3, next_expiration_at: Math.floor(DASHBOARD_NOW.getTime() / 1000) - 1, expiration_known: true },
+      } }));
+      await page.goto('/dashboard.html');
+      await expect(page.locator('#reset-credits-count')).toHaveText('3');
+      await page.evaluate(language => CodexPreferences.set({ language }), language);
+      // Include the responsive chart's final size in the page height check.
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 
-  const layout = await page.evaluate(() => {
-    const history = document.querySelector('.history-card').getBoundingClientRect();
-    const preferences = document.querySelector('.preference-controls').getBoundingClientRect();
-    const links = document.querySelector('.dashboard-links').getBoundingClientRect();
-    const overlaps = !(preferences.right <= links.left || preferences.left >= links.right || preferences.bottom <= links.top || preferences.top >= links.bottom);
-    return {
-      viewportHeight: window.innerHeight,
-      scrollHeight: document.documentElement.scrollHeight,
-      historyBottom: history.bottom,
-      historyVisible: history.top >= 0 && history.bottom <= window.innerHeight,
-      navigationOverlap: overlaps,
-    };
-  });
-  expect(layout.scrollHeight).toBeLessThanOrEqual(layout.viewportHeight);
-  expect(layout.historyBottom).toBeLessThanOrEqual(layout.viewportHeight);
-  expect(layout.historyVisible).toBe(true);
-  expect(layout.navigationOverlap).toBe(false);
-});
+      const layout = await page.evaluate(() => {
+        const history = document.querySelector('.history-card').getBoundingClientRect();
+        const preferences = document.querySelector('.preference-controls').getBoundingClientRect();
+        const links = document.querySelector('.dashboard-links').getBoundingClientRect();
+        const overlaps = !(preferences.right <= links.left || preferences.left >= links.right || preferences.bottom <= links.top || preferences.top >= links.bottom);
+        return {
+          viewportHeight: window.innerHeight,
+          scrollHeight: document.documentElement.scrollHeight,
+          historyBottom: history.bottom,
+          historyVisible: history.top >= 0 && history.bottom <= window.innerHeight,
+          canvasHeight: document.getElementById('history-chart').getBoundingClientRect().height,
+          navigationOverlap: overlaps,
+          creditsHeight: document.querySelector('.reset-credit-strip').getBoundingClientRect().height,
+        };
+      });
+      expect(layout.scrollHeight).toBeLessThanOrEqual(layout.viewportHeight);
+      expect(layout.historyBottom).toBeLessThanOrEqual(layout.viewportHeight);
+      expect(layout.historyVisible).toBe(true);
+      expect(layout.canvasHeight).toBeGreaterThanOrEqual(100);
+      expect(layout.navigationOverlap).toBe(false);
+      expect(layout.creditsHeight).toBeLessThanOrEqual(64);
+    });
+  }
+}
 
 test('renders detailed analytics, reset markers and cost mode by default', async ({ page }) => {
   await page.route('**/api/analytics?*', route => {
@@ -2181,6 +2413,70 @@ test('shares validated time-zone and dated exchange-rate preferences across page
   await expect(page.locator('[data-preference-input="rateDate"]')).toHaveValue('2026-10-07');
 });
 
+for (const range of ['custom', '30d', 'all']) {
+  test(`keeps valid pagination after changing the timezone for ${range} dates`, async ({ page }) => {
+    const queries = [];
+    await page.route('**/api/analytics?*', route => {
+      const query = new URL(route.request().url()).searchParams;
+      queries.push(query);
+      const zone = query.get('timezone');
+      const total = range === 'custom' && zone === 'America/New_York' ? 50 : 51;
+      const resetOffset = Number(query.get('reset_offset') || 0);
+      // Allocation clamps stale offsets; reset history returns the requested page.
+      const breakdownOffset = Math.min(Number(query.get('breakdown_offset') || 0), Math.floor((total - 1) / 50) * 50);
+      const period = { ...analyticsPayload.period, range, timezone: zone };
+      if (range === 'custom') {
+        period.from = zone === 'UTC' ? '2025-01-01T00:00:00Z' : '2025-01-01T05:00:00Z';
+        period.to = zone === 'UTC' ? '2026-01-01T00:00:00Z' : '2026-01-01T05:00:00Z';
+      }
+      const resets = {
+        ...enhancedAnalyticsPayload.resets, total, offset: resetOffset,
+        items: Array.from({ length: total }, (_, index) => ({
+          ...analyticsPayload.resets.items[0], reset_at: new Date(Date.UTC(2025, 0, 1 + (50 - index) * 7, 0, 30)).toISOString(),
+        })).slice(resetOffset, resetOffset + 50),
+      };
+      const tokens = {
+        ...analyticsPayload.tokens,
+        breakdown: paginatedBreakdown.slice(breakdownOffset, Math.min(breakdownOffset + 50, total)),
+        breakdown_pagination: { total, offset: breakdownOffset, limit: 50 },
+      };
+      const payload = { ...analyticsPayload, revision: 'unchanged-archive', period, tokens, resets };
+      if (query.get('sections') === 'base') {
+        payload.pending_sections = ['weekly', 'resets'];
+        delete payload.weekly_limit_value;
+      }
+      return route.fulfill({ json: payload });
+    });
+    const dates = range === 'custom' ? 'from_date=2025-01-01&to_date=2025-12-31' : `range=${range}`;
+    await page.goto(`/analytics.html?${dates}&timezone=UTC`);
+    await expect(page.locator('#reset-page-label')).toHaveText('1–50 of 51');
+    await page.locator('#resets-next').click();
+    await expect(page.locator('#reset-page-label')).toHaveText('51–51 of 51');
+    await page.locator('#breakdown-next').click();
+    await expect(page.locator('#breakdown-page-label')).toHaveText('51–51 of 51');
+
+    const previousRequests = queries.length;
+    await page.locator('.advanced-preferences summary').click();
+    await page.locator('[data-preference-input="timezone"]').fill('America/New_York');
+    await page.locator('[data-preference-input="timezone"]').blur();
+    await expect.poll(() => queries.slice(previousRequests).length).toBe(3);
+    const label = range === 'custom' ? '1–50 of 50' : '51–51 of 51';
+    await expect(page.locator('#reset-page-label')).toHaveText(label);
+    await expect(page.locator('#breakdown-page-label')).toHaveText(label);
+    await expect(page.locator('#resets-body tr')).toHaveCount(range === 'custom' ? 50 : 1);
+    await expect(page.locator('#weekly-section-status')).toBeHidden();
+    await expect(page.locator('#resets-section-status')).toBeHidden();
+    const newQueries = queries.slice(previousRequests);
+    expect(newQueries.map(query => query.get('sections')).sort()).toEqual(['base', 'resets', 'weekly']);
+    for (const query of newQueries) {
+      expect(query.get('timezone')).toBe('America/New_York');
+      expect(query.get('reset_offset')).toBe(range === 'custom' ? '0' : '50');
+      expect(query.get('breakdown_offset')).toBe(range === 'custom' ? '0' : '50');
+    }
+    await expect(page.locator('#analytics-error')).toBeHidden();
+  });
+}
+
 test('opens accessible data tables when Chart construction fails and limits diagnostics to safe fields', async ({ page }) => {
   await page.route('**/assets/chart.umd.min.js', route => route.fulfill({ contentType: 'application/javascript', body: 'window.Chart = function() { throw new Error("broken chart"); };' }));
   await page.route('**/api/analytics?*', route => route.fulfill({ json: analyticsPayload }));
@@ -2435,3 +2731,102 @@ for (const storageMode of ['URL', 'local storage']) {
     await expect(page.locator('#analytics-warnings')).toContainText('exceeds 50 models');
   });
 }
+
+test('account reset credits count down, localize, and retain the observed balance at expiry', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  await mockUsage(page);
+  await page.clock.pauseAt(new Date(DASHBOARD_NOW.getTime() + 1000));
+  const expiration = Math.floor(DASHBOARD_NOW.getTime() / 1000) + 121;
+  const data = { ...snapshot, reset_credits: { available_count: 3, next_expiration_at: expiration, expiration_known: true } };
+  await page.route('**/data.json?*', route => route.fulfill({ json: data }));
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#reset-credits-count')).toHaveText('3');
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Expires in 2 min');
+  await expect(page.locator('#reset-credits-observed')).toContainText('03/08/2026 19:30');
+  await page.clock.runFor(60_000);
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Expires in 1 min');
+  await page.evaluate(() => CodexPreferences.set({ language: 'fr' }));
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Expire dans 1 min');
+  await page.clock.runFor(60_000);
+  await expect(page.locator('#reset-credits-expiration')).toContainText('Expiration atteinte');
+  await expect(page.locator('#reset-credits-count')).toHaveText('3');
+  await page.setViewportSize({ width: 375, height: 812 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.clock.resume();
+  expectNoAxeViolations(await new AxeBuilder({ page }).analyze(), ['critical', 'serious']);
+});
+
+test('account reset credits distinguish missing, zero, unknown expiry, and non-expiring balances', async ({ page }) => {
+  await mockUsage(page);
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#reset-credits-count')).toHaveText('-');
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Unavailable');
+  for (const [credits, count, expiration] of [
+    [{ available_count: 0, next_expiration_at: null, expiration_known: true }, '0', 'No resets available'],
+    [{ available_count: 2, next_expiration_at: null, expiration_known: false }, '2', 'Expiration unavailable'],
+    [{ available_count: 2, next_expiration_at: null, expiration_known: true }, '2', 'No expiration'],
+  ]) {
+    await page.evaluate(credits => renderData({ ...dashboardData, reset_credits: credits }, { schedule: false }), credits);
+    await expect(page.locator('#reset-credits-count')).toHaveText(count);
+    await expect(page.locator('#reset-credits-expiration')).toHaveText(expiration);
+  }
+  await page.evaluate(() => renderData({ ...dashboardData, reset_credits: null }, { schedule: false }));
+  await expect(page.locator('#reset-credits-count')).toHaveText('-');
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Unavailable');
+});
+
+test('analytics tracks reset-credit balances and observed expiration durations with a table fallback', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  const now = Date.parse('2026-08-04T10:00:00Z');
+  await page.clock.install({ time: now - 1000 });
+  await page.clock.pauseAt(now);
+  const payload = structuredClone(analyticsPayload);
+  payload.limits.reset_credits_current = { at: '2026-08-04T10:00:00Z', available_count: 2, next_expiration_at: now / 1000 + 7200, expiration_known: true };
+  payload.limits.series = payload.limits.series.map((point, index) => ({
+    ...point, reset_credits_observed_at: point.at, reset_credits_available: 3 - index,
+    reset_credits_next_expiration_at: Date.parse(point.at) / 1000 + (4 - index * 2) * 3600,
+    reset_credits_expiration_known: true, reset_credits_expiration_seconds: (4 - index * 2) * 3600,
+  }));
+  await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+  await page.goto('/analytics.html');
+  await expect(page.locator('#reset-credits-count')).toHaveText('2');
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Expires in 2 h 0 min');
+  await expect.poll(() => page.evaluate(() => resetCreditsChart?.data.datasets.map(dataset => dataset.data.map(point => point.y)))).toEqual([[3, 2], [4, 2]]);
+  expect(await page.evaluate(() => resetCreditsChart.options.scales.y.ticks.precision)).toBe(0);
+  await page.setViewportSize({ width: 1920, height: 900 });
+  const desktopLayout = await page.locator('#reset-credits-card').evaluate(card => ({
+    height: card.getBoundingClientRect().height,
+    top: card.getBoundingClientRect().top,
+    weeklyBottom: document.getElementById('weekly-limit-value-card').getBoundingClientRect().bottom,
+    followsWeekly: card.previousElementSibling.id === 'weekly-limit-value-card',
+    chartHeight: document.getElementById('reset-credits-chart-wrap').getBoundingClientRect().height,
+  }));
+  expect(desktopLayout.height).toBeLessThanOrEqual(340);
+  expect(desktopLayout.top).toBeGreaterThan(desktopLayout.weeklyBottom);
+  expect(desktopLayout.followsWeekly).toBe(true);
+  expect(desktopLayout.chartHeight).toBeGreaterThanOrEqual(150);
+  await page.setViewportSize({ width: 375, height: 812 });
+  await page.locator('#reset-credits-card summary').click();
+  await expect(page.locator('#reset-credits-data-body tr')).toHaveCount(2);
+  await expect(page.locator('#reset-credits-data-body tr').first()).toContainText('Expires in 4 h 0 min');
+  await page.clock.runFor(60_000);
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Expires in 1 h 59 min');
+  // Historical values remain relative to their collection, not the browser clock.
+  await expect(page.locator('#reset-credits-data-body tr').first()).toContainText('Expires in 4 h 0 min');
+  await page.evaluate(() => CodexPreferences.set({ language: 'fr' }));
+  await expect(page.locator('#reset-credits-expiration')).toHaveText('Expire dans 1 h 59 min');
+  await expect(page.locator('#reset-credits-card h2')).toHaveText('Évolution des crédits de reset');
+  await page.setViewportSize({ width: 375, height: 812 });
+  const layout = await page.locator('#reset-credits-card').evaluate(card => ({
+    right: card.getBoundingClientRect().right,
+    overflow: card.scrollWidth > card.clientWidth,
+  }));
+  expect(layout.right).toBeLessThanOrEqual(375);
+  expect(layout.overflow).toBe(false);
+  await page.clock.resume();
+  expectNoAxeViolations(await new AxeBuilder({ page }).include('#reset-credits-card').analyze(), ['critical', 'serious']);
+  await page.locator('#reset-credits-card').screenshot({ path: 'test-results/reset-credits-analytics-mobile.png' });
+  await page.evaluate(() => { window.Chart = undefined; renderChartSection('credits', lastPayload.limits); });
+  await expect(page.locator('#reset-credits-chart-wrap')).toBeHidden();
+  await expect(page.locator('#reset-credits-data-body tr')).toHaveCount(2);
+});

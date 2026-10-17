@@ -30,6 +30,7 @@ function element(id) {
         contains: name => classes.has(name),
       },
       getContext: () => ({}),
+      addEventListener: () => {},
     });
   }
   return elements.get(id);

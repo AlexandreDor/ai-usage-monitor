@@ -17,6 +17,9 @@ reset probabilities from the independent Codex Forecast service.
 - Current remaining quota for the active 5-hour and weekly windows, with both
   dashboard cards visible by default.
 - Reset dates and weekly pace compared with ideal consumption.
+- Available account reset credits and a live countdown to their soonest expiration
+  when provided by Codex. Missing or incomplete expiry details remain unavailable;
+  credit identifiers and descriptions are never published.
 - Rolling history chart generated from local quota and Forecast snapshots.
 - The 5-hour series and reset markers are hidden by default in charts, and
   5-hour reset statistics are hidden by default; they remain available from
@@ -48,6 +51,11 @@ The local Analytics page provides:
   weekly resets (weekly history is selected by default; All and 5-hour remain
   available), with the last Forecast probabilities observed less than 45
   minutes before each reset when available;
+- account reset credit history: available balance, soonest expiry, and time to
+  expiry at each observation, with a chart, accessible table, and quota CSV
+  columns. The current balance uses the latest collection independently of the
+  selected historical period and token filters. Historical balances are not
+  reconstructed before collection was enabled;
 - local token consumption from Codex, OpenCode, and Hermes;
 - uncached input, cache read, cache write, output, reasoning, and total token
   counters;
@@ -170,6 +178,9 @@ period-wide token or cost totals.
   runs local `5h:reset` hooks, but stays silent on Discord/Telegram.
 - Detection of conservative early weekly refills and full 5-hour cycles whose
   quota stays at 100% while the reset deadline advances.
+- Weekly 100% → 100% deadline advances are confirmed by a subsequent fresh
+  observation before notifying or running `weekly:reset` hooks. They are
+  labeled as cycles observed at full quota, without claiming a measured refill.
 - Discord and Telegram delivery with independent durable state per channel.
 - Bounded retries for temporary network errors without replaying a channel that
   already succeeded.
@@ -286,10 +297,30 @@ the default 900-second interval, later runs align with `:00`, `:15`, `:30`, and
 While a locally served dashboard tab is visible, loop mode also refreshes the
 current quota snapshot and evaluates alerts at `DASHBOARD_ACTIVE_INTERVAL_SECONDS`
 (300 seconds by default). These
-live checks do not write `history.json`, SQLite, Forecast or token samples, or
-the optional Gist. Hiding or closing every dashboard tab restores the regular
-cadence after at most 90 seconds. A regular `LOOP_INTERVAL` shorter than or
-equal to the active interval keeps its existing complete-cycle behavior.
+live checks do not add `history.json`, SQLite quota, Forecast or token samples,
+or update the optional Gist. Compact detector state, anomalies and confirmed
+full-quota weekly cycles are persisted in SQLite. Hiding or closing every
+dashboard tab restores the regular cadence after at most 90 seconds. A regular
+`LOOP_INTERVAL` shorter than or equal to the active interval keeps its existing
+complete-cycle behavior.
+
+The **Refresh Codex** button requests an immediate live quota collection and
+reloads the displayed data when it finishes. It requires `monitor.sh --loop`
+and `serve.sh` to share the same runtime directory. The button is disabled
+while a request is running; collection failures preserve the last valid data.
+Notification or other downstream cycle failures do not fail a successful quota
+refresh. Publication is acknowledged before Gist sync, notifications, or token
+collection, so slow downstream work cannot time out an already published
+refresh; downstream failures remain visible in monitor health. The button is hidden
+in external Gist mode.
+
+Loop mode also schedules a live collection 30 seconds after each announced
+5-hour or weekly reset, even with every dashboard tab closed. Coincident resets
+share one collection; a regular or manual collection after that deadline also
+satisfies the check. Failed reset checks retry 30 seconds after the attempt
+finishes. These checks use the same collection lock and preserve the regular
+history/Gist cadence. The dashboard receives all persisted pending check times in
+its activity heartbeat, including after reopening or reloading the page.
 
 The live dashboard calculates snapshot freshness directly from `scraped_at` and
 `sample_interval_seconds`. It marks data stale once its age exceeds the greater
@@ -355,7 +386,7 @@ job fails or is skipped. Release validation uses the same coverage runner.
 `npm audit --audit-level=low` is also blocking: every vulnerability reported at
 low severity or above fails the CI job, while `package-lock.json` remains the
 reproducible installation source. Migration tests cover fresh archives,
-supported v1–v3 archives upgrading to v4, data/integrity preservation, and
+supported v1–v4 archives upgrading to v5, data/integrity preservation, and
 rejection of future or partial schemas. The packaged systemd units are
 validated by CI and can be installed with
 [`docs/INSTALL.md`](docs/INSTALL.md).
@@ -416,8 +447,11 @@ TLS; only bind it to a trusted network. It exposes an explicit allowlist of
 dashboard assets, sanitized JSON files, and the read-only Analytics API. It does
 not serve `.env`, SQLite, health data, the dashboard heartbeat, delivery
 journals, locks, or directory listings. The local dashboard sends a bodyless
-`POST /api/dashboard-heartbeat`; the server records activity but never launches
-the separate monitor process.
+`POST /api/dashboard-heartbeat` to record activity and `POST /api/refresh` to
+request a live collection from the separate monitor loop. Both require a
+dashboard-specific header and reject request bodies. The server never launches
+Codex or the monitor itself. Refresh requests wait up to 60 seconds for the
+monitor result; an unavailable monitor produces an explicit error.
 
 ## Configuration
 
@@ -588,6 +622,33 @@ one duplicate execution; hooks with externally visible side effects should use
 idempotence. Observed local 5-hour resets remain local-only during retries:
 replaying their hook never creates a network reset occurrence.
 
+The optional maintained weekly starter is `local/weekly_window_start.py`:
+
+```dotenv
+ALERT_SCRIPT_1=/home/user/ai-usage-monitor/local/weekly_window_start.py
+ALERT_SCRIPT_1_EVENTS=weekly:reset
+ALERT_SCRIPT_TIMEOUT_SECONDS=1800
+```
+
+This replaces older private `local/scripts/weekly-window-start.sh` hooks; those
+user files are never overwritten by an upgrade. It reads status before making
+a request and skips the request if current quota consumption already proves an
+active cycle. Otherwise it sends an ephemeral, read-only `Salut` with
+GPT-6.1 Sol and medium reasoning. It accepts observed quota consumption or a
+confirmed deadline advance, and distinguishes the latter from verified usage.
+A successful Codex response plus an unchanged future deadline at 100% remains
+unverified. A durable private receipt caps each reset occurrence at ten attempts
+or 1795 seconds, including bounded child processes; monitor retries and process
+restarts retain that budget. An exhausted occurrence stays unverified without
+sending further Codex requests. Logs and receipts use `CODEX_MONITOR_RUNTIME_DIR`
+when configured, so packaged releases keep their state under `/var/lib` across
+upgrades. The starter also supports release archives without Git metadata.
+The `WEEKLY_START_MAX_ATTEMPTS`, `WEEKLY_START_WAIT_SECONDS`
+(default 120), `WEEKLY_START_RETRY_WINDOW_SECONDS` and `WEEKLY_START_LOG_FILE`
+environment overrides can be set in a trusted wrapper. No request is made to
+force a whole percentage point of consumption. Diagnostics remain in the
+private runtime log. Enabling the hook makes real Codex requests and uses quota.
+
 ### History and collection
 
 | Variable | Default | Accepted values | Description |
@@ -600,14 +661,45 @@ replaying their hook never creates a network reset occurrence.
 | `CODEX_BIN` | `codex` | Executable name or path | Codex CLI command used by the monitor. |
 | `MONITOR_DEBUG` | `0` | `0` or `1` | Enables bounded sanitized Codex and HTTP diagnostics. |
 
-The SQLite archive retains detailed quota, Forecast, reset, anomaly, and token
-data for Analytics. Existing schema v1, v2, and v3 archives migrate
-transactionally to v4 on their next writable monitor cycle; `--check` does not
+The SQLite archive retains detailed quota, Forecast, reset, reset-credit, anomaly, and token
+data for Analytics. Existing schema v1, v2, v3, and v4 archives migrate
+transactionally to v5 on their next writable monitor cycle; `--check` does not
 open or migrate the archive.
 The detector tolerates quota noise up to 5 percentage points and reset-date
 movement up to 30 minutes; a disappeared reset date is confirmed after two
 valid observations. Planned deadline crossings, the recognized weekly refill
-pattern, and the recognized full 5-hour pattern are excluded. A 5-hour reset
+pattern, confirmed weekly cycles at full quota, and the recognized full
+5-hour pattern are excluded. A weekly full-quota cycle requires an advance of
+at least 30 minutes before the old deadline, then another complete observation
+confirming the new deadline within 60 seconds. Both adjacent gaps must be at
+most `max(3600, 2 * sample_interval_seconds)` and all observations must belong
+to the same known limit group. Partial samples and owner changes cancel an
+unconfirmed candidate. The event is anchored to the first advanced observation;
+its confirmation time is retained separately. Small date drift cannot replay
+the hook. Confirmation after the old deadline still supersedes that scheduled
+reset and runs only one hook. An unconfirmed deadline-shift anomaly is deferred
+until confirmation; rejecting the candidate retains the original anomaly.
+Upgrades seed the new classifier from a complete same-owner legacy baseline
+only when its state field is absent and the previous saved observation corroborates
+it without a conflicting retained poll. That observation is captured before
+the current collection overwrites it, including in live mode. An explicitly
+canceled chain stays canceled; unavailable or incomplete evidence starts a new
+baseline instead of guessing continuity.
+Analytics labels this `full_observed` evidence separately from a
+measured refill and assigns it no measured quota gain or unused end-of-week
+quota. Each fresh confirmation saves its candidate and confirming observation
+independently of quota snapshots, including in live mode. Rebuilding reset
+history preserves its original event and confirmation times after 30-minute
+or hourly compaction, without inventing cycles from discarded partial samples
+or duplicating a superseded scheduled reset. Once the detector observes a
+baseline, subsequent scheduled and measured weekly resets are also saved from
+its actual live/full observations, including the measured before/after quota.
+Sparse snapshots cannot override those decisions or turn a pending full-quota
+candidate into a measured refill. Older scheduled/refill history retains its
+snapshot backfill behavior. These proofs follow
+`ARCHIVE_RETENTION_DAYS`; zero keeps them indefinitely. Historical quota samples
+without a saved confirmation do not establish a full-quota cycle retroactively.
+A 5-hour reset
 with 100% remaining is recognized only from two complete observations in the
 same limit group, with a strictly later valid deadline; the first observation
 carrying the new deadline anchors the event. Repeating that deadline is
@@ -620,9 +712,10 @@ retained until it can be delivered.
 The rolling JSON history is separate and retains samples according to their
 actual timestamps. Changing the collection interval does not change the time
 span requested by `HISTORY_RETENTION_HOURS`; only the defensive entry and size
-limits can shorten it. Dashboard-triggered live checks update only `data.json`,
-so they never increase graph or archive density. Alerts use every successful
-live observation, while Forecast and token collection remain on full cycles.
+limits can shorten it. Dashboard-triggered live checks update `data.json` and
+compact detector/event records, so they never increase quota graph or snapshot
+archive density. Alerts use every successful live observation, while Forecast
+and token collection remain on full cycles.
 
 ### Token Analytics
 
@@ -1198,7 +1291,7 @@ the `backup()` destination is autonomous.
 ### Restore safely
 
 The restore is fail-fast. It first reserves a new mode-`700` safety directory,
-before creating and verifying an autonomous schema v4 archive next to the
+before creating and verifying an autonomous schema v5 archive next to the
 active database. A safety-directory collision therefore creates no candidate;
 a corrupt, unrelated, or obsolete-schema candidate also leaves the active
 database intact. Once the candidate is valid, stop at least both services and

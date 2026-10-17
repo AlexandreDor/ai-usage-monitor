@@ -26,6 +26,7 @@
     </div>
     <nav class="dashboard-links" data-i18n-aria-label="dashboard.navigationAria" aria-label="Dashboard navigation">
       <a class="nav-link external-link" href="https://github.com/AlexandreDor/ai-usage-monitor" target="_blank" rel="noopener noreferrer"><span data-i18n="dashboard.githubLink">GitHub repository</span> <span aria-hidden="true">↗</span></a>
+      <button id="refresh-codex" class="nav-link refresh-button" type="button" aria-busy="false">Refresh Codex</button>
       <a class="nav-link" href="analytics.html"><span data-i18n="dashboard.analyticsLink">Advanced analytics</span> <span aria-hidden="true">→</span></a>
     </nav>
     <div class="preference-controls" data-i18n-aria-label="preferences.ariaLabel" aria-label="Display preferences">
@@ -72,6 +73,15 @@
     <span class="forecast-status" id="forecast-status" data-i18n="dashboard.forecastUnavailable">Forecast unavailable</span>
   </aside>
 
+  <section class="reset-credit-strip" aria-labelledby="reset-credit-title" aria-describedby="reset-credits-observed">
+    <h2 id="reset-credit-title" class="card-label" data-i18n="resetCredits.title">Account reset credits</h2>
+    <div class="reset-credit-metrics">
+      <div><span data-i18n="resetCredits.available">Available resets</span><strong id="reset-credits-count">-</strong></div>
+      <div><span data-i18n="resetCredits.expiration">Soonest expiration</span><strong id="reset-credits-expiration" data-i18n="resetCredits.unavailable">Unavailable</strong></div>
+    </div>
+    <p id="reset-credits-observed" class="sr-only"></p>
+  </section>
+
   <main class="grid">
     <section class="card limit-card" id="five-hour-card" aria-labelledby="five-hour-title">
       <h2 class="card-label" id="five-hour-title" data-i18n="dashboard.fiveHourLimit">5-Hour Limit</h2>
@@ -92,7 +102,7 @@
     <section class="card full history-card" aria-labelledby="history-label">
       <h2 class="card-label history-label" id="history-label" data-i18n="dashboard.history">History</h2>
       <div id="history-error" class="history-error" role="alert" hidden></div>
-      <canvas id="history-chart" class="time-slice-chart" role="img" aria-labelledby="history-label"></canvas>
+      <div class="history-chart-wrap" id="history-chart-wrap"><canvas id="history-chart" class="time-slice-chart" role="img" aria-labelledby="history-label"></canvas></div>
     </section>
   </main>
 

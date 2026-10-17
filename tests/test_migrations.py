@@ -177,7 +177,7 @@ CREATE INDEX idx_forecast_samples_scraped_at
     ON forecast_samples(scraped_at_epoch);
 """
 
-_EXPECTED_V4_COLUMNS = {
+_EXPECTED_V5_COLUMNS = {
     "metadata": {"key", "value"},
     "snapshots": {
         "scraped_at_epoch", "scraped_at", "five_h_pct", "five_h_reset",
@@ -206,6 +206,7 @@ _EXPECTED_V4_COLUMNS = {
         "detected_at_epoch", "before_pct", "after_pct", "before_reset_at",
         "after_reset_at", "message", "journaled_at",
     },
+    "reset_credit_snapshots": {"scraped_at_epoch", "available_count", "next_expiration_at", "expiration_known"},
     "anomaly_detector_state": {
         "limit_id", "window", "state_json", "updated_at_epoch",
     },
@@ -257,19 +258,19 @@ class SQLiteMigrationTests(unittest.TestCase):
                 )
             connection.execute(f"PRAGMA user_version = {version}")
 
-    def _assert_v4_layout(self, connection: sqlite3.Connection) -> None:
-        for table, expected_columns in _EXPECTED_V4_COLUMNS.items():
+    def _assert_v5_layout(self, connection: sqlite3.Connection) -> None:
+        for table, expected_columns in _EXPECTED_V5_COLUMNS.items():
             actual_columns = {
                 str(row[1])
                 for row in connection.execute(f'PRAGMA table_info("{table}")')
             }
             self.assertEqual(expected_columns, actual_columns, table)
 
-    def test_fresh_database_is_created_at_v4_and_integrity_checked(self) -> None:
+    def test_fresh_database_is_created_at_v5_and_integrity_checked(self) -> None:
         with storage.connect_database(self.path) as connection:
-            self.assertEqual((4,), connection.execute("PRAGMA user_version").fetchone())
+            self.assertEqual((5,), connection.execute("PRAGMA user_version").fetchone())
             self.assertEqual(
-                ("4",),
+                ("5",),
                 connection.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone(),
@@ -282,21 +283,21 @@ class SQLiteMigrationTests(unittest.TestCase):
                 ).fetchone(),
             )
             self.assertEqual(("ok",), connection.execute("PRAGMA quick_check").fetchone())
-            self._assert_v4_layout(connection)
+            self._assert_v5_layout(connection)
 
         self.assertEqual(
             [], list(self.path.parent.glob(f"{self.path.name}.pre-migration.*"))
         )
 
-    def test_supported_legacy_versions_migrate_to_v4_without_losing_rows(self) -> None:
+    def test_supported_legacy_versions_migrate_to_v5_without_losing_rows(self) -> None:
         for version in (1, 2, 3):
             with self.subTest(version=version):
                 self._create_legacy_archive(version)
                 with storage.connect_database(self.path) as connection:
                     self.assertEqual(
-                        (4,), connection.execute("PRAGMA user_version").fetchone()
+                        (5,), connection.execute("PRAGMA user_version").fetchone()
                     )
-                    self._assert_v4_layout(connection)
+                    self._assert_v5_layout(connection)
                     self.assertEqual(
                         ("limit-" + hashlib.sha256(f"v{version}".encode()).hexdigest(),),
                         connection.execute(
@@ -329,7 +330,7 @@ class SQLiteMigrationTests(unittest.TestCase):
 
     def test_future_schema_is_rejected_before_any_migration_or_backup(self) -> None:
         with sqlite3.connect(self.path) as connection:
-            connection.execute("PRAGMA user_version = 5")
+            connection.execute("PRAGMA user_version = 6")
 
         with self.assertRaisesRegex(storage.ArchiveSchemaError, "unsupported archive schema"):
             storage.connect_database(self.path)
@@ -338,7 +339,7 @@ class SQLiteMigrationTests(unittest.TestCase):
             [], list(self.path.parent.glob(f"{self.path.name}.pre-migration.*"))
         )
         with sqlite3.connect(self.path) as connection:
-            self.assertEqual((5,), connection.execute("PRAGMA user_version").fetchone())
+            self.assertEqual((6,), connection.execute("PRAGMA user_version").fetchone())
 
     def test_partial_known_schema_is_rejected_without_being_completed(self) -> None:
         with sqlite3.connect(self.path) as connection:

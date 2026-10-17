@@ -18,6 +18,16 @@ import sys
 from typing import Any
 
 from storage import ArchiveCorruptionError, canonicalize_limit_id, connect_database
+from weekly_reset import (
+    RANDOM_WEEKLY_RESET_FULL_REFILL_PCT,
+    RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT,
+    RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS,
+    is_weekly_refill,
+    legacy_baseline_has_evidence,
+    observe_and_record_full_weekly_reset,
+    observe_full_weekly_reset,
+    observe_weekly_reset_history,
+)
 
 
 # These are intentionally named and shared with archive.py/monitor.sh's
@@ -27,9 +37,6 @@ QUOTA_INCREASE_TOLERANCE_PCT = 5.0
 RESET_SHIFT_TOLERANCE_SECONDS = 30 * 60
 RESET_OSCILLATION_MIN_DELTA_SECONDS = 3 * 60
 RESET_MISSING_CONFIRMATIONS = 2
-RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT = 20.0
-RANDOM_WEEKLY_RESET_FULL_REFILL_PCT = 98.0
-RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS = 30 * 60
 # The 5-hour API can expose a freshly started cycle only after some of its
 # quota has already been consumed.  Use the same conservative refill evidence
 # as the weekly detector so a real 26% -> 87% rollover is not reported as an
@@ -185,15 +192,7 @@ def _save_state(connection: sqlite3.Connection, limit_id: str, window: str,
 
 def _weekly_reset(previous_pct: float, current_pct: float,
                   previous_reset: int | None, current_reset: int | None) -> bool:
-    if previous_reset is None or current_reset is None:
-        return False
-    change = current_pct - previous_pct
-    return (
-        current_reset >= previous_reset + RANDOM_WEEKLY_RESET_MIN_DEADLINE_ADVANCE_SECONDS
-        and change > 0
-        and (change >= RANDOM_WEEKLY_RESET_MIN_CHANGE_PCT
-             or current_pct >= RANDOM_WEEKLY_RESET_FULL_REFILL_PCT)
-    )
+    return is_weekly_refill(previous_pct, current_pct, previous_reset, current_reset)
 
 
 def _observed_five_hour_reset(previous_pct: float, current_pct: float,
@@ -280,9 +279,29 @@ def _record_reset_history(state: dict[str, Any], epoch: int,
             state["stable_count"] = 0
 
 
+def _resolve_full_weekly_shift(connection: sqlite3.Connection, limit_id: str,
+                               state: dict[str, Any], confirmed_at: int = 0) -> None:
+    """Release a deferred anomaly unless its original candidate was confirmed."""
+    pending = state.pop("pending_full_weekly_shift", None)
+    if not isinstance(pending, dict) or pending.get("epoch") == confirmed_at:
+        return
+    epoch = _epoch(pending.get("epoch"))
+    before, after = _epoch(pending.get("before_reset")), _epoch(pending.get("after_reset"))
+    if epoch is None or before is None or after is None:
+        return
+    _insert_anomaly(
+        connection, limit_id=limit_id, window="weekly", anomaly_type="reset_shift",
+        episode=f"{before}:{after}:{epoch}", detected_at=epoch,
+        before_pct=100, after_pct=100, before_reset=before, after_reset=after,
+        message=f"weekly reset date moved by {abs(after - before) // 60} minutes "
+                "without a confirmed quota reset.",
+    )
+
+
 def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str,
                    pct: Any, reset_at: Any, epoch: int,
-                   sample_interval: Any, force_baseline: bool) -> None:
+                   sample_interval: Any, force_baseline: bool,
+                   prior_observation_epoch: int, legacy_weekly_state: str | None) -> None:
     current_pct = _number(pct)
     current_reset = _epoch(reset_at)
     current_interval = (
@@ -290,6 +309,13 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
         or RESET_OBSERVATION_DEFAULT_INTERVAL_SECONDS
     )
     if current_pct is None:
+        # A partial sample cannot confirm a provisional full-quota cycle.
+        if window == "weekly":
+            state, exists = _load_state(connection, limit_id, window, epoch)
+            if exists and epoch > state.get("last_epoch", 0):
+                _resolve_full_weekly_shift(connection, limit_id, state)
+                state["full_weekly_reset_state"] = ""
+                _save_state(connection, limit_id, window, state, epoch)
         return
     state, state_exists = _load_state(connection, limit_id, window, epoch)
     # Switching the globally active group must not erase a durable baseline.
@@ -308,6 +334,11 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
             "reset_shift_episode_started": 0,
             "quota_increase_active": False, "reset_shift_signature": None,
         })
+        if window == "weekly":
+            state["full_weekly_reset_state"] = observe_full_weekly_reset(
+                "", epoch=epoch, pct=current_pct, reset_at=current_reset,
+                owner=limit_id, interval=current_interval,
+            )[0]
         _record_reset_history(state, epoch, current_reset)
         _save_state(connection, limit_id, window, state, epoch)
         return
@@ -324,9 +355,42 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     if previous_reset is None:
         previous_reset = _epoch(state.get("last_available_reset_at"))
     scheduled_crossing = _scheduled_crossing(state, epoch)
+    full_weekly_confirmed = 0
+    full_weekly_pending = False
+    if window == "weekly":
+        full_state = "" if force_baseline else state.get("full_weekly_reset_state", "")
+        if (not force_baseline and "full_weekly_reset_state" not in state
+                and previous_epoch >= prior_observation_epoch
+                and legacy_baseline_has_evidence(
+                    connection, epoch=previous_epoch, pct=previous_pct,
+                    reset_at=state.get("last_reset_at"), owner=limit_id, before_epoch=epoch,
+                    prior_state=legacy_weekly_state)):
+            # Pre-feature detector state still has a useful complete baseline.
+            # Only absence permits migration: an explicit empty value records
+            # a partial observation or another deliberate chain cancellation.
+            full_state = observe_full_weekly_reset(
+                "", epoch=previous_epoch, pct=previous_pct,
+                reset_at=state.get("last_reset_at"), owner=limit_id,
+                interval=previous_interval,
+            )[0]
+        full_state, full_weekly_confirmed, full_weekly_pending = observe_and_record_full_weekly_reset(
+            connection, full_state, epoch=epoch, pct=current_pct, reset_at=current_reset,
+            owner=limit_id, interval=current_interval,
+        )
+        state["full_weekly_reset_state"] = full_state
+        # Keep the original movement durable while confirmation is pending.
+        # A rejected/replaced candidate must not erase the shift just because
+        # the normal baseline has already advanced to its provisional date.
+        _resolve_full_weekly_shift(connection, limit_id, state, full_weekly_confirmed)
+        if (full_weekly_pending and previous_reset is not None and current_reset is not None
+                and abs(current_reset - previous_reset) > RESET_SHIFT_TOLERANCE_SECONDS):
+            state["pending_full_weekly_shift"] = {
+                "epoch": epoch, "before_reset": previous_reset, "after_reset": current_reset,
+            }
     recognized_weekly = window == "weekly" and _weekly_reset(
         previous_pct, current_pct, previous_reset, current_reset
     )
+    recognized_weekly = recognized_weekly or full_weekly_confirmed or full_weekly_pending
     recognized_five_hour = (
         window == "5h"
         and reset_observation_gap_acceptable(
@@ -459,24 +523,36 @@ def _detect_window(connection: sqlite3.Connection, *, limit_id: str, window: str
     _save_state(connection, limit_id, window, state, epoch)
 
 
-def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any]) -> None:
+def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any], *,
+                     legacy_weekly_state: str | None = None) -> None:
     """Process one normalized snapshot inside the caller's transaction."""
     epoch = _epoch(snapshot.get("scraped_at_epoch"))
     if epoch is None:
         return
     limit_id = _limit_id(snapshot.get("limit_id"))
+    prior_observation_epoch = connection.execute(
+        "SELECT COALESCE(MAX(updated_at_epoch), 0) FROM anomaly_detector_state"
+    ).fetchone()[0]
     active = connection.execute(
         "SELECT value FROM metadata WHERE key = 'anomaly_active_limit_id'"
     ).fetchone()
     active_limit = active[0] if active else None
     force_baseline = active_limit != limit_id
     if force_baseline:
+        if active_limit is not None:
+            previous, exists = _load_state(connection, active_limit, "weekly", epoch)
+            if exists and epoch > previous.get("last_epoch", 0):
+                _resolve_full_weekly_shift(connection, active_limit, previous)
+                previous["full_weekly_reset_state"] = ""
+                _save_state(connection, active_limit, "weekly", previous, epoch)
         connection.execute(
             """
             INSERT INTO metadata(key, value) VALUES('anomaly_active_limit_id', ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """, (limit_id,),
         )
+    # The timestamp captured above predates this poll's owner/5h mutations,
+    # which could otherwise hide an intervening legacy partial.
     for window, pct_key, reset_key in WINDOWS:
         _detect_window(
             connection, limit_id=limit_id, window=window,
@@ -484,7 +560,18 @@ def process_snapshot(connection: sqlite3.Connection, snapshot: dict[str, Any]) -
             epoch=epoch,
             sample_interval=snapshot.get("sample_interval_seconds"),
             force_baseline=force_baseline,
+            prior_observation_epoch=prior_observation_epoch,
+            legacy_weekly_state=legacy_weekly_state,
         )
+    weekly_state, _exists = _load_state(connection, limit_id, "weekly", epoch)
+    observe_weekly_reset_history(
+        connection, epoch=epoch, pct=snapshot.get("weekly_pct"),
+        reset_at=snapshot.get("weekly_reset_at"), owner=limit_id,
+        interval=snapshot.get("sample_interval_seconds"),
+        prior_observation_epoch=prior_observation_epoch,
+        prior_owner=active_limit,
+        full_state=weekly_state.get("full_weekly_reset_state", ""),
+    )
 
 
 def pending_anomalies(connection: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -555,7 +642,8 @@ def command(args: argparse.Namespace) -> None:
         with connection:
             if args.action == "observe":
                 value = json.load(sys.stdin)
-                process_snapshot(connection, _parse_snapshot(value))
+                process_snapshot(connection, _parse_snapshot(value),
+                                 legacy_weekly_state=args.legacy_weekly_state)
             elif args.action == "journal":
                 if not mark_journaled(connection, args.anomaly_id, args.at):
                     raise ValueError("unknown or already journaled anomaly")
@@ -569,6 +657,8 @@ def parser() -> argparse.ArgumentParser:
     for action in ("pending", "observe"):
         command_parser = sub.add_parser(action)
         command_parser.add_argument("--database", required=True)
+        if action == "observe":
+            command_parser.add_argument("--legacy-weekly-state")
     journal = sub.add_parser("journal")
     journal.add_argument("--database", required=True)
     journal.add_argument("anomaly_id")

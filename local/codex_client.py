@@ -558,6 +558,39 @@ def reset_label(window: Mapping[str, Any] | None) -> str:
     return reset.strftime("%d/%m/%Y %H:%M")
 
 
+def reset_credits_summary(result: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Use the authoritative count, and require complete details for expiry."""
+    raw = result.get("rateLimitResetCredits")
+    if not isinstance(raw, Mapping):
+        return None
+    summary = snapshot_contract.sanitize_reset_credits({"available_count": raw.get("availableCount")})
+    if summary is None or summary["available_count"] == 0:
+        return summary
+    credits = raw.get("credits")
+    count = summary["available_count"]
+    if not isinstance(credits, list) or len(credits) != count:
+        return summary
+    expirations = []
+    ids = set()
+    for credit in credits:
+        if (not isinstance(credit, Mapping) or credit.get("status") != "available"
+                or not isinstance(credit.get("id"), str) or not credit["id"] or credit["id"] in ids
+                or "expiresAt" not in credit):
+            return summary
+        ids.add(credit["id"])
+        expiration = credit["expiresAt"]
+        if expiration is not None:
+            normalized = snapshot_contract.sanitize_reset_credits({
+                "available_count": count, "next_expiration_at": expiration, "expiration_known": True,
+            })
+            if not normalized["expiration_known"]:
+                return summary
+            expirations.append(expiration)
+    summary["expiration_known"] = True
+    summary["next_expiration_at"] = min(expirations) if expirations else None
+    return summary
+
+
 def build_snapshot(
     result: Mapping[str, Any],
     *,
@@ -601,6 +634,7 @@ def build_snapshot(
         "scraped_at": scraped_at,
         "sample_interval_seconds": sample_interval_seconds,
         "history_window_hours": history_window_hours,
+        "reset_credits": reset_credits_summary(result),
     }
     try:
         return snapshot_contract.validate_snapshot(snapshot)

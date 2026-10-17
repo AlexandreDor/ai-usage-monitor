@@ -6,8 +6,17 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-17
+
 ### Added
 
+- Local dashboard button to collect fresh Codex quotas, plus automatic live
+  collections 30 seconds after announced 5-hour and weekly resets, including
+  when the dashboard is closed.
+- Account reset credit balances and expiration countdowns in the dashboard
+  and Analytics, with historical observations, an accessible table, and quota
+  CSV columns. Missing credit details remain unknown, and private credit
+  identifiers and descriptions are never published.
 - Progressive Analytics loading, previous-period comparisons, remembered filters
   and locally shareable views, complete filtered CSV downloads, and sanitized
   monitor/archive/anomaly diagnostics.
@@ -37,6 +46,8 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Fixed
 
+- Reset Analytics allocation and reset-history pages when changing the timezone
+  of a custom date range, preventing empty pages after its UTC boundaries move.
 - Preserve SQLite reader locks during archive-path validation so diagnostics
   cannot leave Analytics attached to deleted WAL files after collection.
 - Preserve requested allocation and reset pages when a collection changes the
@@ -45,6 +56,14 @@ Git tag and the value in `VERSION` is the single source of truth.
   skipping it, including overlapping pagination requests in different tables.
 - Restore Python 3.9 backup compatibility with non-following path metadata
   reads, and require the backup suite on Python 3.9.25 in CI.
+- Confirm weekly 100% → 100% deadline advances consistently in alerts, anomaly
+  detection and reset history, with durable hook deduplication and distinct
+  full-quota evidence instead of an unsupported refill claim.
+- Preserve confirmed full-quota weekly cycles and their original observation
+  times across live/full collection, restarts and archive compaction, without
+  reconstructing canceled candidates or duplicating superseded reset events.
+- Provide a maintained, bounded weekly starter that validates cycle evidence
+  instead of declaring success from any future reset date.
 - Disable persistent Analytics caching under replaceable or symlinked ancestors
   before SQLite opens a path, while preserving calculations and trusted sticky
   directories.
@@ -58,6 +77,11 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Changed
 
+- Upgrade the local SQLite archive to schema v5 for reset credit observations,
+  preserving existing quota history and creating a verified backup before
+  migrating older archives. Credit history starts with new collections.
+  Returning to an older release requires restoring an archive backup supported
+  by that release; see [the upgrade and rollback guide](docs/INSTALL.md#upgrade).
 - Show unstable but identifiable positive model estimates with high-uncertainty
   markers and sensitivity ranges, including explicit unbounded upper ranges.
 

@@ -32,8 +32,8 @@ except ImportError:  # Standalone storage restore helper used by recovery toolin
         return opaque_limit_id_from_raw(value)
 
 
-SCHEMA_VERSION = "4"
-SCHEMA_VERSION_NUMBER = 4
+SCHEMA_VERSION = "5"
+SCHEMA_VERSION_NUMBER = 5
 PUBLIC_LIMIT_ID_CONTRACT_VERSION_KEY = "public_limit_id_contract_version"
 PUBLIC_LIMIT_ID_CONTRACT_VERSION = "1"
 SQLITE_RETRY_ATTEMPTS = 5
@@ -356,6 +356,26 @@ _V4_SCHEMA_STATEMENTS = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_anomaly_detector_state_updated ON anomaly_detector_state(updated_at_epoch)",
 )
+
+_V5_TABLE_COLUMNS = {
+    **_V4_TABLE_COLUMNS,
+    "reset_credit_snapshots": {
+        "scraped_at_epoch", "available_count", "next_expiration_at", "expiration_known",
+    },
+}
+
+_V5_SCHEMA_STATEMENTS = (
+    *_V4_SCHEMA_STATEMENTS,
+    """
+    CREATE TABLE IF NOT EXISTS reset_credit_snapshots (
+        scraped_at_epoch INTEGER PRIMARY KEY REFERENCES snapshots(scraped_at_epoch) ON DELETE CASCADE,
+        available_count INTEGER NOT NULL CHECK(available_count >= 0),
+        next_expiration_at INTEGER,
+        expiration_known INTEGER NOT NULL CHECK(expiration_known IN (0, 1))
+    )
+    """,
+)
+
 
 _V4_INDEX_NAMES = frozenset({
     "idx_snapshots_scraped_at",
@@ -711,7 +731,7 @@ def _set_schema_metadata(connection: sqlite3.Connection) -> None:
 
 
 def create_schema(connection: sqlite3.Connection) -> None:
-    """Create the archive or migrate an explicitly recognized archive to v4."""
+    """Create the archive or migrate an explicitly recognized archive to v5."""
     raw_version = connection.execute("PRAGMA user_version").fetchone()
     try:
         version = int(raw_version[0]) if raw_version else 0
@@ -721,33 +741,36 @@ def create_schema(connection: sqlite3.Connection) -> None:
     tables = _table_names(connection)
     fresh = version == 0 and not tables
     legacy_without_pragma = version == 0 and {"metadata", "snapshots"}.issubset(tables)
-    if version not in (0, 1, 2, 3, SCHEMA_VERSION_NUMBER):
+    if version not in (0, 1, 2, 3, 4, SCHEMA_VERSION_NUMBER):
         raise ArchiveSchemaError(
-            f"unsupported archive schema version {version}; expected 1, 2, 3 or {SCHEMA_VERSION_NUMBER}"
+            f"unsupported archive schema version {version}; expected 1, 2, 3, 4 or {SCHEMA_VERSION_NUMBER}"
         )
     if version == 0 and not fresh and not legacy_without_pragma:
         raise ArchiveSchemaError("archive has tables but no recognized schema version")
 
     if version == 1 or legacy_without_pragma:
         _validate_tables(connection, _V1_TABLE_COLUMNS, version=1)
-        _validate_existing_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+        _validate_existing_tables(connection, _V5_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
     elif version == 2:
         _validate_tables(connection, _V2_TABLE_COLUMNS, version=2)
-        _validate_existing_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+        _validate_existing_tables(connection, _V5_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
     elif version == 3:
         _validate_tables(connection, _V3_TABLE_COLUMNS, version=3)
-        _validate_existing_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+        _validate_existing_tables(connection, _V5_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+    elif version == 4:
+        _validate_tables(connection, _V4_TABLE_COLUMNS, version=4)
+        _validate_existing_tables(connection, _V5_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
     elif version == SCHEMA_VERSION_NUMBER:
-        _validate_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+        _validate_tables(connection, _V5_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
 
     started_transaction = not connection.in_transaction
     if started_transaction:
         connection.execute("BEGIN IMMEDIATE")
     try:
-        if fresh or version in (0, 1, 2, 3):
-            for statement in _V4_SCHEMA_STATEMENTS:
+        if fresh or version in (0, 1, 2, 3, 4):
+            for statement in _V5_SCHEMA_STATEMENTS:
                 connection.execute(statement)
-            connection.execute("PRAGMA user_version = 4")
+            connection.execute("PRAGMA user_version = 5")
         elif version == SCHEMA_VERSION_NUMBER:
             # Keep indexes repairable without silently accepting a partial table schema.
             connection.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_scraped_at ON snapshots(scraped_at_epoch)")
@@ -760,7 +783,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
             connection.execute("CREATE INDEX IF NOT EXISTS idx_quota_anomalies_window_time ON quota_anomalies(window, detected_at_epoch)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_anomaly_detector_state_updated ON anomaly_detector_state(updated_at_epoch)")
         _set_schema_metadata(connection)
-        _validate_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+        _validate_tables(connection, _V5_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
         _ensure_limit_id_contract(connection)
         if started_transaction:
             # Validate the post-migration layout before making it durable.
@@ -796,15 +819,15 @@ def _schema_state(connection: sqlite3.Connection) -> tuple[int, bool, bool]:
     except (TypeError, ValueError) as exc:
         raise ArchiveSchemaError("archive schema version is not an integer") from exc
     tables = _table_names(connection)
-    if version not in (0, 1, 2, 3, SCHEMA_VERSION_NUMBER):
+    if version not in (0, 1, 2, 3, 4, SCHEMA_VERSION_NUMBER):
         raise ArchiveSchemaError(
-            f"unsupported archive schema version {version}; expected 1, 2, 3 or {SCHEMA_VERSION_NUMBER}"
+            f"unsupported archive schema version {version}; expected 1, 2, 3, 4 or {SCHEMA_VERSION_NUMBER}"
         )
     fresh = version == 0 and not tables
     legacy_without_pragma = version == 0 and {"metadata", "snapshots"}.issubset(tables)
     if version == 0 and not fresh and not legacy_without_pragma:
         raise ArchiveSchemaError("archive has tables but no recognized schema version")
-    if version in (1, 2, 3):
+    if version in (1, 2, 3, 4):
         return version, True, False
     if version == 0:
         # A genuinely empty file is a fresh archive.  Only the recognized
@@ -967,7 +990,7 @@ def connect_database(database_path: Path, *, read_only: bool = False) -> sqlite3
                 raise ArchiveSchemaError(
                     f"read-only analytics requires archive schema v{SCHEMA_VERSION_NUMBER}; found v{version}"
                 )
-            _validate_tables(connection, _V4_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
+            _validate_tables(connection, _V5_TABLE_COLUMNS, version=SCHEMA_VERSION_NUMBER)
             if _limit_id_migration_required(connection):
                 # Analytics must never expose a legacy raw ID, but its read-only
                 # contract must not mutate the on-disk archive.  Query an

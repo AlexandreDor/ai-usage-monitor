@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -120,6 +121,42 @@ class HttpFeatureTests(unittest.TestCase):
             self.assertEqual(self.request(path)[0], 400, path)
         for path in ["/http_server.py", "/backup.py", "/runtime/health.json", "/runtime/history.sqlite3", "/../monitor.sh"]:
             self.assertEqual(self.request(path)[0], 404, path)
+
+    def test_refresh_requires_empty_post_and_dashboard_header(self):
+        self.assertEqual(self.request("/api/refresh")[0], 404)
+        self.assertEqual(self.request("/api/refresh", method="POST")[0], 403)
+        headers = {"X-Codex-Dashboard-Refresh": "1"}
+        with mock.patch.object(http_server, "request_refresh", return_value=True) as collect:
+            status, response_headers, body = self.request("/api/refresh", headers, "POST")
+            self.assertEqual(status, 200)
+            self.assertTrue(json.loads(body)["success"])
+            self.assertEqual(response_headers["Cache-Control"], "no-store")
+            collect.assert_called_once_with(self.runtime)
+        self.assertEqual(self.request("/api/refresh", {**headers, "Content-Length": "1"}, "POST")[0], 400)
+        self.assertEqual(self.request("/api/refresh", {**headers, "Transfer-Encoding": "chunked"}, "POST")[0], 400)
+        for result in [False, TimeoutError(), OSError()]:
+            with mock.patch.object(http_server, "request_refresh", **({"side_effect": result} if isinstance(result, Exception) else {"return_value": result})):
+                self.assertEqual(self.request("/api/refresh", headers, "POST")[0], 503)
+        with http_server.refresh_lock:
+            self.assertEqual(self.request("/api/refresh", headers, "POST")[0], 409)
+        for path in ["/dashboard-refresh.json", "/dashboard-refresh-result.json", "/reset-refresh.json", "/refresh.py"]:
+            self.assertEqual(self.request(path)[0], 404)
+
+    def test_heartbeat_reports_only_persisted_reset_check_times(self):
+        state_path = self.runtime / "reset-refresh.json"
+        self.addCleanup(state_path.unlink, missing_ok=True)
+        state_path.write_text(json.dumps({
+            "limit_id": "private-limit", "pending": {"five_h:100": 130, "weekly:200": 230},
+            "retry_at": 160,
+        }))
+        status, headers, body = self.request("/api/dashboard-heartbeat", {"X-Codex-Dashboard-Activity": "visible"}, "POST")
+        self.assertEqual(status, 204)
+        self.assertEqual(headers["X-Codex-Reset-Checks-At"], "160,230")
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(body, b"")
+        self.assertNotIn("private-limit", str(headers))
+        state_path.write_text('{"pending":{}}')
+        self.assertIsNone(self.request("/api/dashboard-heartbeat", {"X-Codex-Dashboard-Activity": "visible"}, "POST")[1].get("X-Codex-Reset-Checks-At"))
 
 
 if __name__ == "__main__":

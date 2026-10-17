@@ -28,6 +28,9 @@ const state = {
   explicitModels: false,
 };
 let limitsChart = null;
+let resetCreditsChart = null;
+let resetCreditsTimer = null;
+let resetCreditsCurrent = null;
 let weeklyLimitValueChart = null;
 let tokensChart = null;
 let refreshTimer = null;
@@ -211,6 +214,8 @@ function formatPercent(value) {
   return number === null ? EMPTY_VALUE : `${Math.round(number * 10) / 10}%`;
 }
 function formatChartValue(value, kind) {
+  if (kind === 'reset-count') return formatFullTokens(value);
+  if (kind === 'duration-hours') return CodexPreferences.resetCreditDuration(value * 3600);
   if (kind === 'percent') return formatPercent(value);
   if (kind === 'usd') return formatUsd(value);
   if (kind === 'cost') return formatCost(value);
@@ -270,6 +275,7 @@ function showChartFallback(id) {
 function renderChartSection(name, data) {
   const sections = {
     limits: [renderLimits, 'limits-data-body', 'limits-chart-wrap', 'limits-chart-summary'],
+    credits: [renderResetCredits, 'reset-credits-data-body', 'reset-credits-chart-wrap', 'reset-credits-chart-summary'],
     weekly: [renderWeeklyLimitValue, 'weekly-limit-value-data-body', 'weekly-limit-value-chart-wrap', 'weekly-limit-value-summary'],
     tokens: [renderTokens, 'tokens-data-body', 'tokens-chart-wrap', 'tokens-chart-summary'],
   };
@@ -285,9 +291,10 @@ function renderChartSection(name, data) {
     if (name === 'tokens') byId('tokens-chart-card').hidden = false;
     showChartFallback(table);
     byId(summary).textContent += ` · ${t('chartFallbackTable')}`;
-    const instance = name === 'limits' ? limitsChart : name === 'weekly' ? weeklyLimitValueChart : tokensChart;
+    const instance = name === 'limits' ? limitsChart : name === 'credits' ? resetCreditsChart : name === 'weekly' ? weeklyLimitValueChart : tokensChart;
     try { instance?.destroy(); } catch (_ignored) { /* Broken charts may reject cleanup. */ }
     if (name === 'limits') limitsChart = null;
+    else if (name === 'credits') resetCreditsChart = null;
     else if (name === 'weekly') weeklyLimitValueChart = null;
     else tokensChart = null;
   }
@@ -628,6 +635,76 @@ function renderLimits(data = {}) {
   limitsChart = new Chart(byId('limits-chart').getContext('2d'), { type: 'line', data: { datasets: limitDatasets }, options });
   updateTokenOverlay();
 }
+
+function creditText(key, values = {}) { return CodexPreferences.t(`resetCredits.${key}`, values); }
+function renderResetCreditsCurrent() {
+  clearTimeout(resetCreditsTimer);
+  resetCreditsTimer = null;
+  const credits = resetCreditsCurrent;
+  const count = credits?.available_count;
+  byId('reset-credits-count').textContent = Number.isSafeInteger(count) && count >= 0 ? formatFullTokens(count) : EMPTY_VALUE;
+  byId('reset-credits-expiration').textContent = CodexPreferences.resetCreditExpiration(credits);
+  byId('reset-credits-expiration').title = credits?.expiration_known && credits.next_expiration_at
+    ? formatDate(credits.next_expiration_at * 1000) : '';
+  byId('reset-credits-observed').textContent = credits?.at ? creditText('asOf', { date: formatDate(credits.at) }) : '';
+  if (document.visibilityState !== 'hidden' && count > 0 && credits.expiration_known && credits.next_expiration_at * 1000 > Date.now()) {
+    resetCreditsTimer = setTimeout(renderResetCreditsCurrent, Math.min(60_000, credits.next_expiration_at * 1000 - Date.now()));
+  }
+}
+function renderResetCredits(data = {}) {
+  resetCreditsCurrent = data.reset_credits_current || null;
+  renderResetCreditsCurrent();
+  const points = Array.isArray(data.series) ? data.series : [];
+  const known = points.filter(point => Number.isSafeInteger(point.reset_credits_available) && point.reset_credits_available >= 0);
+  byId('reset-credits-chart-summary').textContent = known.length
+    ? t('samples', { value: formatFullTokens(known.length) }) : creditText('empty');
+  deferTable('reset-credits-data-body', () => {
+    const fragment = document.createDocumentFragment();
+    for (const point of points) {
+      const row = document.createElement('tr');
+      const at = point.reset_credits_observed_at || point.at;
+      cell(row, formatDate(at));
+      cell(row, Number.isSafeInteger(point.reset_credits_available) ? formatFullTokens(point.reset_credits_available) : EMPTY_VALUE);
+      cell(row, CodexPreferences.resetCreditExpiration({
+        available_count: point.reset_credits_available,
+        expiration_known: point.reset_credits_expiration_known,
+        next_expiration_at: point.reset_credits_next_expiration_at,
+      }, timestampMs(at)));
+      cell(row, point.reset_credits_next_expiration_at ? formatDate(point.reset_credits_next_expiration_at * 1000) : EMPTY_VALUE);
+      fragment.appendChild(row);
+    }
+    replaceRows(byId('reset-credits-data-body'), fragment);
+  });
+  byId('reset-credits-chart-wrap').hidden = !known.length || typeof Chart !== 'function';
+  if (!known.length || typeof Chart !== 'function') {
+    if (resetCreditsChart) { resetCreditsChart.destroy(); resetCreditsChart = null; }
+    return;
+  }
+  const datasets = [
+    { datasetKey: 'reset-credits-count', label: creditText('available'), data: points.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.reset_credits_available) })),
+      valueKind: 'reset-count', borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.08)', stepped: true, fill: true, pointRadius: 2, borderWidth: 2, spanGaps: false },
+    { datasetKey: 'reset-credits-expiration', label: creditText('remainingHours'), data: points.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.reset_credits_expiration_seconds) === null ? null : point.reset_credits_expiration_seconds / 3600 })),
+      valueKind: 'duration-hours', yAxisID: 'expiration', borderColor: '#fbbf24', pointRadius: 2, borderWidth: 2, spanGaps: false },
+  ];
+  if (resetCreditsChart) {
+    const visibility = rememberChartDatasetVisibility(resetCreditsChart);
+    resetCreditsChart.data.datasets = datasets;
+    applyChartDatasetVisibility(resetCreditsChart, datasets, visibility);
+    resetCreditsChart.options.scales.y.title.text = creditText('available');
+    resetCreditsChart.options.scales.expiration.title.text = creditText('remainingHours');
+    applyChartBounds(resetCreditsChart.options, points);
+    resetCreditsChart.update('none');
+    return;
+  }
+  const options = chartBase(points);
+  options.scales.y.title = { display: true, text: creditText('available'), color: '#86a2c5' };
+  options.scales.y.ticks.precision = 0;
+  options.scales.expiration = { beginAtZero: true, position: 'right', grid: { drawOnChartArea: false },
+    title: { display: true, text: creditText('remainingHours'), color: '#86a2c5' }, ticks: { color: '#86a2c5' } };
+  resetCreditsChart = new Chart(byId('reset-credits-chart').getContext('2d'), { type: 'line', data: { datasets }, options });
+}
+document.addEventListener('visibilitychange', () => { if (resetCreditsCurrent) renderResetCreditsCurrent(); });
+window.addEventListener('pagehide', () => { clearTimeout(resetCreditsTimer); resetCreditsTimer = null; });
 
 function weeklyValueQuality(value) {
   const key = `weeklyValueQuality_${String(value || 'unavailable').replace(/[^a-z_]/gu, '')}`;
@@ -1016,7 +1093,7 @@ function renderResets(data = {}) {
   for (const item of items) {
     const row = document.createElement('tr');
     pillCell(row, item.window);
-    pillCell(row, item.category === 'random' ? t('random') : item.category === 'end_of_week' ? t('endOfWeek') : t('scheduled'));
+    pillCell(row, item.detection_method === 'full_observed' ? t('fullQuotaCycle') : item.category === 'random' ? t('random') : item.category === 'end_of_week' ? t('endOfWeek') : t('scheduled'));
     cell(row, formatDate(item.reset_at));
     cell(row, formatDate(item.observed_at));
     cell(row, `${item.before_pct ?? EMPTY_VALUE}% → ${item.after_pct ?? EMPTY_VALUE}%`);
@@ -1290,6 +1367,7 @@ function render(payload) {
   const period = payload.period || {};
   currentPeriod = period;
   renderChartSection('limits', payload.limits || {});
+  renderChartSection('credits', payload.limits || {});
   if (payload.weekly_limit_value) renderChartSection('weekly', payload.weekly_limit_value);
   renderChartSection('tokens', payload.tokens || {});
   renderBreakdown(payload.tokens?.breakdown || [], payload.tokens?.breakdown_pagination);
@@ -1736,7 +1814,12 @@ function refreshLocalizedAnalytics() {
 
 let activeTimezone = timezone();
 if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(() => {
-  if (activeTimezone !== timezone()) { activeTimezone = timezone(); queueRefresh(); }
+  if (activeTimezone !== timezone()) {
+    activeTimezone = timezone();
+    // Custom dates move their UTC boundaries when the selected zone changes.
+    if (state.range === 'custom') resetPagination();
+    queueRefresh();
+  }
   else refreshLocalizedAnalytics();
 });
 for (const button of document.querySelectorAll('[data-range]')) {

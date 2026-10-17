@@ -19,6 +19,29 @@
       },
       languages: { en: 'English', fr: 'Français' },
       currencies: { EUR: '€ EUR', USD: '$ USD' },
+      resetCredits: {
+        title: 'Account reset credits',
+        available: 'Available resets',
+        expiration: 'Soonest expiration',
+        unavailable: 'Unavailable',
+        unknown: 'Expiration unavailable',
+        none: 'No resets available',
+        noExpiry: 'No expiration',
+        expired: 'Expiration reached · awaiting collection',
+        expiresIn: 'Expires in {duration}',
+        days: '{days} d {hours} h',
+        hours: '{hours} h {minutes} min',
+        minutes: '{minutes} min',
+        lessThanMinute: 'less than a minute',
+        asOf: 'Account balance collected {date}',
+        history: 'Reset credits over time',
+        description: 'Account balance and time until the soonest expiration at each observation. The date range applies to history; the current balance uses the latest collection. Application and model filters do not affect credits.',
+        table: 'Show reset credit data table',
+        caption: 'Account reset credit observations',
+        remaining: 'Time to expiration',
+        remainingHours: 'Time to expiration (h)',
+        empty: 'No reset credit observations in this period.',
+      },
       dashboard: {
         pageTitle: 'Codex Usage Monitor',
         description: 'Live dashboard for OpenAI Codex CLI usage limits',
@@ -26,6 +49,10 @@
         navigationAria: 'Dashboard navigation',
         analyticsLink: 'Advanced analytics',
         githubLink: 'GitHub repository',
+        refreshCodex: 'Refresh Codex',
+        refreshingCodex: 'Refreshing Codex…',
+        collectionBusy: 'A Codex refresh is already in progress. Try again shortly.',
+        collectionUnavailable: 'Codex refresh failed. Check that the monitor is running in loop mode.',
         forecastAria: 'Global reset forecast from a third-party service',
         globalResetForecast: 'Global reset forecast',
         thirdParty: 'Third-party',
@@ -322,6 +349,7 @@
         noSuccessfulCollection: 'No successful collection yet',
         hermesBaseline: 'Hermes pre-monitor baseline excluded from dated totals: {value} tokens.',
         random: 'Random',
+        fullQuotaCycle: 'Cycle observed at full quota',
         endOfWeek: 'End of week',
         scheduled: 'Scheduled',
         gain: 'Gain',
@@ -350,6 +378,29 @@
       },
       languages: { en: 'English', fr: 'Français' },
       currencies: { EUR: '€ EUR', USD: '$ USD' },
+      resetCredits: {
+        title: 'Crédits de reset du compte',
+        available: 'Resets disponibles',
+        expiration: 'Expiration la plus proche',
+        unavailable: 'Indisponible',
+        unknown: 'Expiration indisponible',
+        none: 'Aucun reset disponible',
+        noExpiry: 'Sans expiration',
+        expired: 'Expiration atteinte · en attente de collecte',
+        expiresIn: 'Expire dans {duration}',
+        days: '{days} j {hours} h',
+        hours: '{hours} h {minutes} min',
+        minutes: '{minutes} min',
+        lessThanMinute: "moins d’une minute",
+        asOf: 'Solde du compte collecté le {date}',
+        history: 'Évolution des crédits de reset',
+        description: 'Solde du compte et temps avant la première expiration à chaque observation. La période filtre l’historique ; le solde actuel utilise la dernière collecte. Les filtres d’application et de modèle ne s’appliquent pas aux crédits.',
+        table: 'Afficher le tableau des crédits de reset',
+        caption: 'Observations des crédits de reset du compte',
+        remaining: 'Durée avant expiration',
+        remainingHours: 'Durée avant expiration (h)',
+        empty: 'Aucune observation de crédits de reset sur cette période.',
+      },
       dashboard: {
         pageTitle: 'Moniteur d’utilisation Codex',
         description: 'Tableau de bord en direct des limites d’utilisation de la CLI OpenAI Codex',
@@ -357,6 +408,10 @@
         navigationAria: 'Navigation du tableau de bord',
         analyticsLink: 'Analytics avancées',
         githubLink: 'Dépôt GitHub',
+        refreshCodex: 'Actualiser Codex',
+        refreshingCodex: 'Actualisation de Codex…',
+        collectionBusy: 'Une actualisation Codex est déjà en cours. Réessayez dans un instant.',
+        collectionUnavailable: 'Échec de l’actualisation Codex. Vérifiez que le moniteur fonctionne en mode boucle.',
         forecastAria: 'Prévision globale des réinitialisations fournie par un service tiers',
         globalResetForecast: 'Prévision globale des resets',
         thirdParty: 'Service tiers',
@@ -653,6 +708,7 @@
         noSuccessfulCollection: 'Aucune collecte réussie pour le moment',
         hermesBaseline: 'Baseline Hermes avant surveillance exclue des totaux datés : {value} tokens.',
         random: 'Aléatoire',
+        fullQuotaCycle: 'Cycle observé à quota plein',
         endOfWeek: 'Fin de semaine',
         scheduled: 'Prévue',
         gain: 'Gain',
@@ -905,8 +961,30 @@
   }
 
   preferences = load();
+  function resetCreditDuration(seconds) {
+    const minutes = Math.floor(Math.max(0, seconds) / 60);
+    if (minutes < 1) return translate('resetCredits.lessThanMinute');
+    const hours = Math.floor(minutes / 60);
+    if (hours >= 24) return translate('resetCredits.days', { days: Math.floor(hours / 24), hours: hours % 24 });
+    if (hours) return translate('resetCredits.hours', { hours, minutes: minutes % 60 });
+    return translate('resetCredits.minutes', { minutes });
+  }
+
+  function resetCreditExpiration(summary, now = Date.now()) {
+    if (!Number.isSafeInteger(summary?.available_count) || summary.available_count < 0) return translate('resetCredits.unavailable');
+    if (summary.available_count === 0) return translate('resetCredits.none');
+    if (summary.expiration_known !== true) return translate('resetCredits.unknown');
+    if (summary.next_expiration_at === null) return translate('resetCredits.noExpiry');
+    if (!Number.isSafeInteger(summary.next_expiration_at) || summary.next_expiration_at <= 0) return translate('resetCredits.unknown');
+    const seconds = summary.next_expiration_at - now / 1000;
+    return seconds <= 0 ? translate('resetCredits.expired')
+      : translate('resetCredits.expiresIn', { duration: resetCreditDuration(seconds) });
+  }
+
   const api = {
     DEFAULTS,
+    resetCreditDuration,
+    resetCreditExpiration,
     STORAGE_KEY,
     USD_TO_EUR_RATE,
     get: () => ({ ...preferences }),

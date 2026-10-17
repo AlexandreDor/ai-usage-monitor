@@ -38,6 +38,44 @@ let dashboardSource = null;
 let refreshInFlight = null;
 let activeRefreshKey = null;
 let queuedRefreshState = null;
+let collectionInFlight = null;
+const pendingResetUpdates = new Map();
+const serverResetChecks = new Set();
+
+function renderRefreshControl() {
+  const button = document.getElementById('refresh-codex');
+  if (!button) return;
+  button.hidden = !isLocalDashboard();
+  button.disabled = collectionInFlight !== null;
+  setElementAttribute(button, 'aria-busy', String(collectionInFlight !== null));
+  button.textContent = t(collectionInFlight ? 'refreshingCodex' : 'refreshCodex');
+}
+
+function collectCodex() {
+  if (collectionInFlight) return collectionInFlight;
+  if (!isLocalDashboard()) return Promise.resolve();
+  collectionInFlight = (async () => {
+    try {
+      const response = await fetch('api/refresh', {
+        method: 'POST',
+        headers: { 'X-Codex-Dashboard-Refresh': '1' },
+        cache: 'no-store',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error(t(response.status === 409 ? 'collectionBusy' : 'collectionUnavailable'));
+      // Finish any earlier snapshot read before requesting the new collection.
+      if (refreshInFlight) await refreshInFlight;
+      await refresh();
+    } catch (error) {
+      setMainError(error instanceof Error ? error.message : t('collectionUnavailable'));
+    } finally {
+      collectionInFlight = null;
+      renderRefreshControl();
+    }
+  })();
+  renderRefreshControl();
+  return collectionInFlight;
+}
 
 function t(key, values = {}) {
   return typeof CodexPreferences === 'object' ? CodexPreferences.t(`dashboard.${key}`, values) : key;
@@ -163,10 +201,26 @@ function scheduleFreshnessUpdate(classification = null) {
   const staleDelay = state.status === 'fresh'
     ? state.scrapedAtMs + (state.staleAfterSeconds + 1) * 1000 - now
     : Number.POSITIVE_INFINITY;
-  freshnessTimer = setTimeout(renderFreshness, Math.max(1, Math.min(nextMinuteDelay, staleDelay)));
+  const expirationMs = dashboardData.reset_credits?.expiration_known
+    ? dashboardData.reset_credits.next_expiration_at * 1000 - now : 0;
+  const expirationDelay = expirationMs > 0 ? expirationMs : Number.POSITIVE_INFINITY;
+  freshnessTimer = setTimeout(renderFreshness, Math.max(1, Math.min(nextMinuteDelay, staleDelay, expirationDelay)));
+}
+
+function renderResetCredits() {
+  const credits = dashboardData?.reset_credits;
+  const valid = Number.isSafeInteger(credits?.available_count) && credits.available_count >= 0;
+  document.getElementById('reset-credits-count').textContent = valid ? String(credits.available_count) : '-';
+  const expiration = document.getElementById('reset-credits-expiration');
+  expiration.textContent = CodexPreferences.resetCreditExpiration(credits);
+  expiration.title = credits?.expiration_known && credits.next_expiration_at
+    ? formatParisUnixTimestamp(credits.next_expiration_at) : '';
+  document.getElementById('reset-credits-observed').textContent = dashboardData
+    ? CodexPreferences.t('resetCredits.asOf', { date: formatParisDateTime(dashboardData.scraped_at) }) : '';
 }
 
 function renderFreshness() {
+  renderResetCredits();
   const badge = document.getElementById('freshness-badge');
   const detail = document.getElementById('freshness-detail');
   if (!dashboardData) {
@@ -204,6 +258,36 @@ function consumeRefreshRetryDelay(maximumMs) {
   return delay;
 }
 
+function resetUpdateDelay(data, scrapedAt, now) {
+  for (const window of ['five_h', 'weekly']) {
+    const reset = data?.[`${window}_reset_at`];
+    if (!Number.isInteger(reset) || reset <= 0) continue;
+    const key = `${window}:${reset}`;
+    for (const [previousKey, due] of pendingResetUpdates) {
+      if (previousKey.startsWith(`${window}:`) && previousKey !== key && due - 35_000 > now) {
+        pendingResetUpdates.delete(previousKey);
+      }
+    }
+    if (reset * 1000 + 30_000 > scrapedAt) pendingResetUpdates.set(key, reset * 1000 + 35_000);
+  }
+  for (const [key, due] of pendingResetUpdates) {
+    if (scrapedAt >= due - 5_000 || now >= due + 60_000) pendingResetUpdates.delete(key);
+  }
+  const deadlines = [...pendingResetUpdates.values()];
+  for (const check of serverResetChecks) {
+    if (scrapedAt >= check || now >= check + 65_000) serverResetChecks.delete(check);
+    else deadlines.push(check + 5_000);
+  }
+  return deadlines.length ? Math.max(5_000, Math.min(...deadlines) - now) : Infinity;
+}
+
+async function refreshScheduled() {
+  // A timer requests a new snapshot even if an earlier read is still loading
+  // history. Explicit refresh calls retain their existing coalescing behavior.
+  if (refreshInFlight) await refreshInFlight;
+  if (document.visibilityState === 'visible') return refresh();
+}
+
 function scheduleRefresh(data = null) {
   clearTimeout(refreshTimer);
   refreshTimer = null;
@@ -218,8 +302,9 @@ function scheduleRefresh(data = null) {
   const scrapedAt = Date.parse(rawScrapedAt);
 
   if (!isLocalDashboard()) {
+    pendingResetUpdates.clear();
     const nextUpdate = (Math.floor((now - 5_000) / snapshotIntervalMs) + 1) * snapshotIntervalMs + 5_000;
-    refreshTimer = setTimeout(refresh, Math.max(REFRESH_RETRY_INITIAL_MS, nextUpdate - now));
+    refreshTimer = setTimeout(refreshScheduled, Math.max(REFRESH_RETRY_INITIAL_MS, nextUpdate - now));
     return;
   }
 
@@ -228,18 +313,22 @@ function scheduleRefresh(data = null) {
     resetRefreshRetry();
   }
 
+  // Allow five seconds for the monitor to publish its reset + 30s check,
+  // then briefly retry if that collection is still running.
+  const resetDelay = resetUpdateDelay(data, scrapedAt, now);
+
   const nextUpdate = Number.isFinite(scrapedAt)
     ? scrapedAt + dashboardActiveIntervalMs + REFRESH_RETRY_INITIAL_MS
     : Number.NaN;
   if (Number.isFinite(nextUpdate) && nextUpdate > now) {
     resetRefreshRetry();
-    refreshTimer = setTimeout(refresh, nextUpdate - now);
+    refreshTimer = setTimeout(refreshScheduled, Math.min(nextUpdate - now, resetDelay));
     return;
   }
 
   refreshTimer = setTimeout(
-    refresh,
-    consumeRefreshRetryDelay(dashboardActiveIntervalMs),
+    refreshScheduled,
+    Math.min(consumeRefreshRetryDelay(dashboardActiveIntervalMs), resetDelay),
   );
 }
 
@@ -250,6 +339,23 @@ function applyDashboardActiveInterval(rawValue) {
   if (intervalMs === dashboardActiveIntervalMs) return;
   dashboardActiveIntervalMs = intervalMs;
   refreshRetryDelayMs = Math.min(refreshRetryDelayMs, dashboardActiveIntervalMs);
+  if (isLocalDashboard() && document.visibilityState === 'visible') {
+    scheduleRefresh(mainFailure ? null : dashboardData);
+  }
+}
+
+function applyResetChecks(rawValue) {
+  const checks = new Set((typeof rawValue === 'string' ? rawValue.split(',') : [])
+    .map(Number).filter(seconds => Number.isSafeInteger(seconds) && seconds > 0)
+    .map(seconds => seconds * 1000));
+  const previous = [...serverResetChecks].join(',');
+  // Retain elapsed checks until their result has been read. A heartbeat can
+  // stop advertising a completed check before its publication-grace timer.
+  for (const check of serverResetChecks) {
+    if (check > Date.now() && !checks.has(check)) serverResetChecks.delete(check);
+  }
+  for (const check of checks) serverResetChecks.add(check);
+  if (previous === [...serverResetChecks].join(',')) return;
   if (isLocalDashboard() && document.visibilityState === 'visible') {
     scheduleRefresh(mainFailure ? null : dashboardData);
   }
@@ -266,6 +372,7 @@ async function sendDashboardHeartbeat() {
       credentials: 'same-origin',
     });
     applyDashboardActiveInterval(response.headers?.get('X-Codex-Dashboard-Interval-Seconds'));
+    if (response.ok) applyResetChecks(response.headers?.get('X-Codex-Reset-Checks-At'));
   } catch (_error) {
     // Activity signaling is advisory and must never hide otherwise valid data.
   } finally {
@@ -454,6 +561,7 @@ function setHistoryState(state) {
 
 function setHistoryCanvasVisible(visible) {
   const canvas = document.getElementById('history-chart');
+  document.getElementById('history-chart-wrap').hidden = !visible;
   canvas.hidden = !visible;
   removeElementAttribute(canvas, 'aria-describedby');
 }
@@ -691,7 +799,7 @@ function renderHistory(history) {
   const context = document.getElementById('history-chart').getContext('2d');
   let options = {
     responsive: true,
-    maintainAspectRatio: true,
+    maintainAspectRatio: false,
     parsing: false,
     normalized: true,
     animation: false,
@@ -843,6 +951,7 @@ async function fetchGist(gistId) {
 }
 
 function refresh() {
+  renderRefreshControl();
   const gistId = GIST_ID;
   const requestedState = {
     gistId,
@@ -893,6 +1002,7 @@ function refresh() {
 }
 
 function refreshLocalizedDashboard() {
+  renderRefreshControl();
   if (dashboardSource) renderSource(dashboardSource);
   if (dashboardData) renderData(dashboardData, { schedule: false, clearError: false });
   else renderFreshness();
@@ -915,10 +1025,12 @@ function refreshLocalizedDashboard() {
 }
 
 if (typeof CodexPreferences === 'object') CodexPreferences.subscribe(refreshLocalizedDashboard);
+document.getElementById('refresh-codex')?.addEventListener('click', collectCodex);
 document.addEventListener('visibilitychange', handleDashboardVisibility);
 window.addEventListener('pageshow', handleDashboardVisibility);
 window.addEventListener('pagehide', handleDashboardPageHide);
 renderSource(isLocalDashboard() ? 'local' : 'external');
+renderRefreshControl();
 renderFreshness();
 startDashboardHeartbeat();
 refresh();

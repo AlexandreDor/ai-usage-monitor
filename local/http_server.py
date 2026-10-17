@@ -18,6 +18,7 @@ import time
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from analytics import AnalyticsError, build_payload
+from refresh import pending_reset_checks, request_refresh
 
 root = pathlib.Path(__file__).parent.resolve()
 port = 8080
@@ -44,6 +45,7 @@ def configure(arguments):
 
 
 heartbeat_lock = threading.Lock()
+refresh_lock = threading.Lock()
 heartbeat_coalesce_seconds = 5
 static_cache = {}
 static_cache_lock = threading.Lock()
@@ -221,11 +223,13 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
         self.cache_control = "no-store"
         request_path = unquote(urlsplit(self.path).path)
-        if request_path != "/api/dashboard-heartbeat":
+        if request_path not in {"/api/dashboard-heartbeat", "/api/refresh"}:
             self.send_error(404, "Not found")
             return
-        if self.headers.get("X-Codex-Dashboard-Activity") != "visible":
-            self.send_json(403, {"error": "dashboard activity header is required"})
+        refreshing = request_path == "/api/refresh"
+        header, expected = ("X-Codex-Dashboard-Refresh", "1") if refreshing else ("X-Codex-Dashboard-Activity", "visible")
+        if self.headers.get(header) != expected:
+            self.send_json(403, {"error": "dashboard request header is required"})
             return
         raw_content_length = self.headers.get("Content-Length", "0")
         try:
@@ -236,6 +240,19 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         if content_length != 0 or self.headers.get("Transfer-Encoding") is not None:
             self.send_json(400, {"error": "request body must be empty"})
             return
+        if refreshing:
+            if not refresh_lock.acquire(blocking=False):
+                self.send_json(409, {"error": "a refresh is already in progress"})
+                return
+            try:
+                success = request_refresh(runtime_directory)
+            except (OSError, TimeoutError):
+                self.send_json(503, {"error": "monitor refresh unavailable; check that monitor loop mode is running"})
+            else:
+                self.send_json(200 if success else 503, {"success": success})
+            finally:
+                refresh_lock.release()
+            return
         try:
             record_dashboard_heartbeat()
         except OSError:
@@ -243,6 +260,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             return
         self.send_response(204)
         self.send_header("X-Codex-Dashboard-Interval-Seconds", str(dashboard_active_interval))
+        reset_checks = pending_reset_checks(runtime_directory)
+        if reset_checks:
+            self.send_header("X-Codex-Reset-Checks-At", ",".join(map(str, reset_checks)))
         self.send_header("Content-Length", "0")
         self.end_headers()
 

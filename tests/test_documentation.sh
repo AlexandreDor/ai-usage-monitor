@@ -297,7 +297,7 @@ database, expected = sys.argv[1:]
 with sqlite3.connect(database) as connection:
     result = connection.execute("PRAGMA quick_check").fetchone()
     assert result == ("ok",), result
-    assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+    assert connection.execute("PRAGMA user_version").fetchone() == (5,)
     value = connection.execute(
         "SELECT value FROM metadata WHERE key = 'test_fixture'"
     ).fetchone()
