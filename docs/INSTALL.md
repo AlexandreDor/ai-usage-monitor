@@ -161,6 +161,13 @@ Do not copy a live `usage-history.sqlite3` file while the monitor is writing;
 the procedure uses Python's standard-library `sqlite3.Connection.backup()` and
 checks `PRAGMA quick_check`.
 
+Version 0.2.0 upgrades recognized older archives to schema v5 on the first
+collection. It keeps existing quota history and creates a verified adjacent
+`*.pre-migration.*` backup before changing the schema. Reset credit history
+starts with new collections; older observations remain unknown. Keep the
+pre-upgrade backup when validating this release: older code cannot read the
+upgraded v5 archive.
+
 ## Rollback
 
 Rollback changes only the release link; configuration and `/var/lib` history
@@ -187,6 +194,12 @@ If the failed release changed the archive schema, restore the separately
 verified SQLite backup only after stopping both services and following the
 README's safety and validation procedure. Never delete the old release or
 backup until a successful collection and Analytics request have completed.
+
+For a rollback from 0.2.0 to a release using schema v4 or earlier, switching
+the release link alone is insufficient. Restore a verified pre-upgrade archive
+supported by the selected release, using that release's storage helper for
+the restore checks. Preserve the v5 archive separately first; observations
+collected after the backup are not present in the restored archive.
 
 ## Uninstallation
 

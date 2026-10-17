@@ -6,11 +6,17 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-17
+
 ### Added
 
 - Local dashboard button to collect fresh Codex quotas, plus automatic live
   collections 30 seconds after announced 5-hour and weekly resets, including
   when the dashboard is closed.
+- Account reset credit balances and expiration countdowns in the dashboard
+  and Analytics, with historical observations, an accessible table, and quota
+  CSV columns. Missing credit details remain unknown, and private credit
+  identifiers and descriptions are never published.
 - Progressive Analytics loading, previous-period comparisons, remembered filters
   and locally shareable views, complete filtered CSV downloads, and sanitized
   monitor/archive/anomaly diagnostics.
@@ -71,6 +77,11 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Changed
 
+- Upgrade the local SQLite archive to schema v5 for reset credit observations,
+  preserving existing quota history and creating a verified backup before
+  migrating older archives. Credit history starts with new collections.
+  Returning to an older release requires restoring an archive backup supported
+  by that release; see [the upgrade and rollback guide](docs/INSTALL.md#upgrade).
 - Show unstable but identifiable positive model estimates with high-uncertainty
   markers and sensitivity ranges, including explicit unbounded upper ranges.
 
