@@ -30,6 +30,214 @@ async function mockUsage(page, history = [snapshot]) {
   await page.route('**/history.json?*', route => route.fulfill({ json: history }));
 }
 
+for (const height of [980, 900]) {
+  for (const language of ['en', 'fr']) {
+    test(`fits dashboard and inline refresh in a Full HD browser ${height}px high (${language})`, async ({ page }) => {
+      await page.setViewportSize({ width: 1920, height });
+      await mockUsage(page);
+      let finish;
+      const collection = new Promise(resolve => { finish = resolve; });
+      await page.route('**/api/refresh', async route => {
+        await collection;
+        await route.fulfill({ json: { success: true } });
+      });
+      await page.goto('/dashboard.html');
+      await expect(page.locator('#five-h-pct')).toHaveText('72%');
+      await page.evaluate(language => CodexPreferences.set({ language }), language);
+      const button = page.locator('#refresh-codex');
+      for (const collecting of [false, true]) {
+        if (collecting) {
+          await button.click();
+          await expect(button).toBeDisabled();
+        }
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        const layout = await page.evaluate(() => {
+          const refresh = document.getElementById('refresh-codex').getBoundingClientRect();
+          const links = [...document.querySelectorAll('.dashboard-links a')].map(link => link.getBoundingClientRect());
+          const history = document.querySelector('.history-card').getBoundingClientRect();
+          return {
+            height: innerHeight,
+            scrollHeight: document.documentElement.scrollHeight,
+            scrollWidth: document.documentElement.scrollWidth,
+            width: innerWidth,
+            historyBottom: history.bottom,
+            chartHeight: document.getElementById('history-chart').getBoundingClientRect().height,
+            inline: links.every(link => refresh.top < link.bottom && refresh.bottom > link.top),
+          };
+        });
+        expect(layout.scrollHeight).toBeLessThanOrEqual(layout.height);
+        expect(layout.scrollWidth).toBeLessThanOrEqual(layout.width);
+        expect(layout.historyBottom).toBeLessThanOrEqual(layout.height);
+        expect(layout.chartHeight).toBeGreaterThanOrEqual(100);
+        expect(layout.inline).toBe(true);
+      }
+      finish();
+      await expect(button).toBeEnabled();
+    });
+  }
+}
+
+test('collects fresh Codex quotas from the button and prevents duplicate requests', async ({ page }) => {
+  await mockUsage(page);
+  let finish;
+  const gate = new Promise(resolve => { finish = resolve; });
+  let requests = 0;
+  let current = snapshot;
+  await page.route('**/data.json?*', route => route.fulfill({ json: current }));
+  await page.route('**/api/refresh', async route => {
+    requests += 1;
+    expect(route.request().method()).toBe('POST');
+    expect(route.request().headers()['x-codex-dashboard-refresh']).toBe('1');
+    expect(route.request().postData()).toBeNull();
+    await gate;
+    current = { ...snapshot, five_h_pct: 99, weekly_pct: 98, scraped_at: DASHBOARD_NOW.toISOString() };
+    await route.fulfill({ json: { success: true } });
+  });
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  const button = page.getByRole('button', { name: 'Refresh Codex', exact: true });
+  await button.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#refresh-codex')).toBeDisabled();
+  await expect(page.locator('#refresh-codex')).toHaveAttribute('aria-busy', 'true');
+  await page.evaluate(() => { void collectCodex(); });
+  expect(requests).toBe(1);
+  finish();
+  await expect(page.locator('#five-h-pct')).toHaveText('99%');
+  await expect(button).toBeEnabled();
+  await expect(page.locator('#error-banner')).toBeHidden();
+  await page.locator('#language-toggle').click();
+  await expect(page.getByRole('button', { name: 'Actualiser Codex', exact: true })).toBeEnabled();
+});
+
+test('preserves quotas and restores the button after collection failure', async ({ page }) => {
+  await mockUsage(page);
+  await page.route('**/api/refresh', route => route.fulfill({ status: 503 }));
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await page.getByRole('button', { name: 'Refresh Codex', exact: true }).click();
+  await expect(page.locator('#error-banner')).toContainText('monitor is running in loop mode');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await expect(page.locator('#refresh-codex')).toBeEnabled();
+});
+
+for (const window of ['five_h', 'weekly']) test(`reloads after the ${window} reset even if its next deadline was already announced`, async ({ page }) => {
+  await mockUsage(page);
+  const reset = Math.floor(DASHBOARD_NOW.getTime() / 1000) + 10;
+  let requests = 0;
+  await page.route('**/data.json?*', route => {
+    requests += 1;
+    return route.fulfill({ json: {
+      ...snapshot,
+      scraped_at: requests === 1 ? DASHBOARD_NOW.toISOString() : new Date(DASHBOARD_NOW.getTime() + 15000).toISOString(),
+      [window + '_reset_at']: requests === 1 ? reset : reset + 18000,
+      five_h_pct: requests === 1 ? 1 : 20,
+    } });
+  });
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('1%');
+  await page.clock.runFor(15000);
+  await page.evaluate(() => refresh());
+  await page.clock.runFor(29000);
+  expect(requests).toBe(2);
+  await page.route('**/data.json?*', route => route.fulfill({ json: {
+    ...snapshot, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 45000).toISOString(),
+  } }));
+  await page.clock.runFor(1000);
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+});
+
+for (const window of ['five_h', 'weekly']) test(`recovers the monitor's pending ${window} check after a page reload`, async ({ page }) => {
+  await mockUsage(page);
+  const checkAt = Math.floor(DASHBOARD_NOW.getTime() / 1000) + 10;
+  let current = {
+    ...snapshot, scraped_at: new Date(DASHBOARD_NOW.getTime() - 5000).toISOString(),
+    [window + '_reset_at']: checkAt + 18000,
+  };
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({
+    status: 204, headers: { 'X-Codex-Reset-Checks-At': String(checkAt) },
+  }));
+  await page.route('**/data.json?*', route => route.fulfill({ json: current }));
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await page.reload();
+  await expect.poll(() => page.evaluate(() => [...serverResetChecks])).toEqual([checkAt * 1000]);
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await page.evaluate(() => refresh());
+  await page.clock.runFor(14000);
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  current = { ...current, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 15000).toISOString() };
+  await page.clock.runFor(1000);
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+});
+
+for (const secondDelay of [20, 28]) test(`retains both pending checks when the second finishes after ${secondDelay}s`, async ({ page }) => {
+  await mockUsage(page);
+  const epoch = Math.floor(DASHBOARD_NOW.getTime() / 1000);
+  let current = {
+    ...snapshot, scraped_at: new Date(DASHBOARD_NOW.getTime() - 5000).toISOString(),
+    five_h_reset_at: epoch + 18000, weekly_reset_at: epoch + 7 * 86400,
+  };
+  let heartbeats = 0;
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({
+    status: 204, headers: {
+      'X-Codex-Reset-Checks-At': ++heartbeats === 1
+        ? `${epoch + 10},${epoch + secondDelay}` : `${epoch + 18030}`,
+    },
+  }));
+  await page.route('**/data.json?*', route => route.fulfill({ json: current }));
+  await page.goto('/dashboard.html');
+  await expect.poll(() => page.evaluate(() => serverResetChecks.size)).toBe(2);
+  await page.evaluate(() => refresh());
+  current = { ...current, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 10000).toISOString() };
+  await page.clock.runFor(15000);
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+  await expect(page.locator('#weekly-pct')).toHaveText('36%');
+  current = { ...current, weekly_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + secondDelay * 1000).toISOString() };
+  await page.clock.runFor((secondDelay + 5 - 15) * 1000);
+  await expect(page.locator('#weekly-pct')).toHaveText('100%');
+});
+
+test('reads reset quotas after a slow initial history request finishes', async ({ page }) => {
+  await mockUsage(page);
+  const epoch = Math.floor(DASHBOARD_NOW.getTime() / 1000);
+  let current = {
+    ...snapshot, scraped_at: new Date(DASHBOARD_NOW.getTime() - 5000).toISOString(),
+    five_h_reset_at: epoch + 18000, weekly_reset_at: epoch + 7 * 86400,
+  };
+  let releaseHistory;
+  const historyGate = new Promise(resolve => { releaseHistory = resolve; });
+  let historyRequests = 0;
+  let dataRequests = 0;
+  let heartbeats = 0;
+  await page.route('**/api/dashboard-heartbeat', route => route.fulfill({
+    status: 204, headers: {
+      'X-Codex-Reset-Checks-At': (++heartbeats === 1 ? `${epoch + 10},` : '')
+        + `${epoch + 18030},${epoch + 7 * 86400 + 30}`,
+    },
+  }));
+  await page.route('**/data.json?*', route => {
+    dataRequests += 1;
+    return route.fulfill({ json: current });
+  });
+  await page.route('**/history.json?*', async route => {
+    if (++historyRequests === 1) await historyGate;
+    await route.fulfill({ json: [snapshot] });
+  });
+  await page.goto('/dashboard.html');
+  await expect(page.locator('#five-h-pct')).toHaveText('72%');
+  await expect.poll(() => historyRequests).toBe(1);
+  await expect.poll(() => page.evaluate(() => serverResetChecks.size)).toBe(3);
+  current = { ...current, five_h_pct: 100, scraped_at: new Date(DASHBOARD_NOW.getTime() + 10000).toISOString() };
+  await page.clock.runFor(15000);
+  expect(dataRequests).toBe(1);
+  releaseHistory();
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+  expect(dataRequests).toBe(2);
+  await page.clock.runFor(15000);
+  await expect(page.locator('#five-h-pct')).toHaveText('100%');
+});
+
 test('signals visible local dashboard activity without affecting rendering', async ({ page }) => {
   await page.clock.install({ time: DASHBOARD_NOW });
   const heartbeats = [];

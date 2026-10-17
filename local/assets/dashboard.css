@@ -104,6 +104,18 @@ header h1 {
   gap: 8px 12px;
 }
 
+.refresh-button {
+  padding: 0 0 2px;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.refresh-button:focus-visible { outline: 2px solid #93c5fd; outline-offset: 3px; }
+.refresh-button:disabled { opacity: 0.7; cursor: wait; }
+
 #mode-badge {
   font-weight: 750;
   letter-spacing: 0.06em;
@@ -503,6 +515,13 @@ body[data-freshness="stale"] .limit-card {
 .footer-tagline {
   font-style: italic;
 }
+
+/* Keep dashboard spacing compact; viewport-specific rules can tighten it further. */
+body:where([data-dashboard-source]) { padding-block: 20px 24px; }
+:where([data-dashboard-source]) header { gap: 10px; margin-bottom: 20px; }
+:where([data-dashboard-source]) .limit-card { padding: 24px 28px 22px; }
+:where([data-dashboard-source]) .history-card { padding: 20px; }
+:where([data-dashboard-source]) .history-label { margin-bottom: 12px; }
 
 canvas {
   max-height: 220px;

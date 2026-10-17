@@ -4773,10 +4773,17 @@ check_token_usage() {
     --hermes-db "$HERMES_DB_PATH"
 }
 
+acknowledge_dashboard_refresh() {
+  local identifier="$1" collection_status="$2"
+  [[ "$identifier" != - ]] || return 0
+  python3 "$SCRIPT_DIR/refresh.py" acknowledge "$RUNTIME_DIR" "$identifier" "$collection_status"
+}
+
 run_cycle() {
   local interval_seconds="$1"
   local cycle_mode="${2:-full}" regular_interval
   regular_interval="${3:-$interval_seconds}"
+  local refresh_request="${4:--}"
   if [[ "$cycle_mode" != full && "$cycle_mode" != live ]]; then
     echo "[ERROR] Unsupported cycle mode: ${cycle_mode}." >&2
     return 2
@@ -4786,6 +4793,7 @@ run_cycle() {
   local json public_json gist_json status=0 history_json="[]" storage_ok=1
   local legacy_weekly_prior_state=""
   CYCLE_ERROR=""
+  QUOTA_COLLECTION_STATUS=1
   # Preserve the previous live observation before data.json, the archive and
   # anomaly state are replaced by this poll. Live partials are not in history.
   legacy_weekly_prior_state="$(capture_weekly_prior_state)" || legacy_weekly_prior_state=""
@@ -4804,6 +4812,7 @@ run_cycle() {
         append_cycle_error "Long-term archive update failed"
       fi
       if write_local_snapshot "$public_json"; then
+        QUOTA_COLLECTION_STATUS=0
         if [[ -f "$HISTORY_FILE" ]]; then
           history_json="$(<"$HISTORY_FILE")"
         fi
@@ -4812,6 +4821,21 @@ run_cycle() {
         storage_ok=0
         append_cycle_error "Local snapshot write failed"
       fi
+    else
+      if write_current_snapshot "$public_json"; then
+        QUOTA_COLLECTION_STATUS=0
+      else
+        status=1
+        append_cycle_error "Current snapshot write failed"
+      fi
+    fi
+
+    # The HTTP request has its own deadline. Report publication before Gist,
+    # notifications or token collection can delay the rest of this cycle.
+    acknowledge_dashboard_refresh "$refresh_request" "$QUOTA_COLLECTION_STATUS" \
+      || { status=1; append_cycle_error "Dashboard refresh acknowledgement failed"; }
+
+    if [[ "$cycle_mode" == full ]]; then
       gist_json="$public_json"
       if (( interval_seconds != regular_interval )); then
         if ! gist_json="$(snapshot_with_interval "$public_json" "$regular_interval")"; then
@@ -4825,8 +4849,6 @@ run_cycle() {
       else
         echo "[WARN] Skipping GitHub Gist sync because local storage failed." >&2
       fi
-    else
-      write_current_snapshot "$public_json" || { status=1; append_cycle_error "Current snapshot write failed"; }
     fi
 
     local five_h weekly five_h_reset weekly_reset five_h_reset_at weekly_reset_at limit_id scraped_at scraped_at_epoch
@@ -4850,6 +4872,8 @@ run_cycle() {
   else
     status=1
     append_cycle_error "Codex limit collection failed"
+    acknowledge_dashboard_refresh "$refresh_request" "$QUOTA_COLLECTION_STATUS" \
+      || append_cycle_error "Dashboard refresh acknowledgement failed"
   fi
 
   if [[ "$cycle_mode" == full ]]; then
@@ -4868,17 +4892,20 @@ PYEOF
 run_once() {
   local interval_seconds="$1" cycle_mode="${2:-full}" regular_interval
   regular_interval="${3:-$interval_seconds}"
+  local refresh_request="${5:--}"
   local lock_fd start_ms end_ms duration_ms status=0
+  QUOTA_COLLECTION_STATUS=1
   exec {lock_fd}>"$LOCK_FILE"
   chmod 600 "$LOCK_FILE"
   if ! flock -n "$lock_fd"; then
     echo "[INFO] Another monitor cycle is active; this cycle was skipped."
     exec {lock_fd}>&-
+    [[ "${4:-0}" != 1 ]] || return 75
     return 0
   fi
 
   start_ms="$(monotonic_milliseconds)"
-  if run_cycle "$interval_seconds" "$cycle_mode" "$regular_interval"; then
+  if run_cycle "$interval_seconds" "$cycle_mode" "$regular_interval" "$refresh_request"; then
     status=0
   else
     status=$?
@@ -4934,41 +4961,43 @@ effective_collection_interval() {
 run_loop() {
   local interval="$1" fail_fast="$2"
   local now_epoch completed_at next_regular last_attempt delay effective cycle_status=0 live_due
+  local refresh_request reset_delay refresh_plan collection_status
 
   now_epoch="$(date -u +%s)"
-  effective="$(effective_collection_interval "$interval" "$now_epoch")"
   last_attempt="$now_epoch"
-  run_once "$effective" full "$interval" || cycle_status=$?
-  if (( cycle_status != 0 )); then
-    echo "[WARN] Scrape cycle failed, will retry at the next scheduled check"
-    (( fail_fast == 1 )) && return "$cycle_status"
-  fi
-  completed_at="$(date -u +%s)"
-  delay="$(seconds_until_next_interval "$completed_at" "$interval")"
-  next_regular=$((completed_at + delay))
-  echo "[$(format_paris_now)] Next regular check at $(format_paris_timestamp "$next_regular") (in ${delay}s)..."
+  next_regular="$now_epoch"
 
   while true; do
     now_epoch="$(date -u +%s)"
+    refresh_plan="$(python3 "$SCRIPT_DIR/refresh.py" plan "$RUNTIME_DIR" "$now_epoch")" || return 1
+    read -r refresh_request reset_delay <<< "$refresh_plan"
     cycle_status=0
+    unset QUOTA_COLLECTION_STATUS
     if (( now_epoch >= next_regular )); then
       effective="$(effective_collection_interval "$interval" "$now_epoch")"
       last_attempt="$now_epoch"
-      run_once "$effective" full "$interval" || cycle_status=$?
+      run_once "$effective" full "$interval" 1 "$refresh_request" || cycle_status=$?
       completed_at="$(date -u +%s)"
       delay="$(seconds_until_next_interval "$completed_at" "$interval")"
       next_regular=$((completed_at + delay))
       echo "[$(format_paris_now)] Next regular check at $(format_paris_timestamp "$next_regular") (in ${delay}s)..."
+    elif [[ "$refresh_request" != - ]] || (( reset_delay == 0 )); then
+      last_attempt="$now_epoch"
+      effective="$(effective_collection_interval "$interval" "$now_epoch")"
+      run_once "$effective" live "$interval" 1 "$refresh_request" || cycle_status=$?
     elif (( interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS )) \
       && dashboard_activity_recent "$now_epoch" \
       && (( now_epoch - last_attempt >= DASHBOARD_ACTIVE_INTERVAL_SECONDS )); then
       last_attempt="$now_epoch"
-      run_once "$DASHBOARD_ACTIVE_INTERVAL_SECONDS" live "$interval" || cycle_status=$?
+      run_once "$DASHBOARD_ACTIVE_INTERVAL_SECONDS" live "$interval" 1 "$refresh_request" || cycle_status=$?
       echo "[$(format_paris_now)] Dashboard active; next live check is eligible in ${DASHBOARD_ACTIVE_INTERVAL_SECONDS}s."
     else
       delay=$((next_regular - now_epoch))
-      if (( interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS && delay > DASHBOARD_HEARTBEAT_POLL_SECONDS )); then
+      if (( delay > DASHBOARD_HEARTBEAT_POLL_SECONDS )); then
         delay="$DASHBOARD_HEARTBEAT_POLL_SECONDS"
+      fi
+      if (( reset_delay > 0 && reset_delay < delay )); then
+        delay="$reset_delay"
       fi
       if (( interval > DASHBOARD_ACTIVE_INTERVAL_SECONDS )) && dashboard_activity_recent "$now_epoch"; then
         live_due=$((last_attempt + DASHBOARD_ACTIVE_INTERVAL_SECONDS))
@@ -4981,7 +5010,15 @@ run_loop() {
       continue
     fi
 
-    if (( cycle_status != 0 )); then
+    completed_at="$(date -u +%s)"
+    collection_status="${QUOTA_COLLECTION_STATUS:-$cycle_status}"
+    (( cycle_status != 75 )) || collection_status=75
+    python3 "$SCRIPT_DIR/refresh.py" complete "$RUNTIME_DIR" "$refresh_request" "$collection_status" "$completed_at" "$now_epoch" || return 1
+    if (( cycle_status == 75 )); then
+      sleep "$DASHBOARD_HEARTBEAT_POLL_SECONDS"
+      continue
+    fi
+    if (( cycle_status != 0 && cycle_status != 75 )); then
       echo "[WARN] Scrape cycle failed, will retry at the next scheduled check"
       (( fail_fast == 1 )) && return "$cycle_status"
     fi
