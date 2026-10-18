@@ -63,7 +63,7 @@ count_file_lines() {
 
 count_notifications() {
   if [[ -f "$1" ]]; then
-    grep -Ec ' · (Low balance|Reset)$' "$1" || true
+    wc -l < "$1"
   else
     printf '0\n'
   fi
@@ -345,7 +345,7 @@ cp "$CRASH_STATE" "$STATE_FILE"
 # shellcheck disable=SC2317,SC2329
 send_alert() { printf '%s\n' "$1" >> "$NOTIFICATION_LOG"; return 0; }
 check_thresholds 100 100 unknown later '' "$((old_weekly_deadline + 30 * 60))" "$((now + 2))" group-a
-assert_contains "$(<"$NOTIFICATION_LOG")" "📅 Codex · Weekly quota · Reset" "hook journal missed the following reset"
+assert_contains "$(<"$NOTIFICATION_LOG")" "📅 · Weekly quota · Reset" "hook journal missed the following reset"
 
 # Notification retries remain independent from the one-shot script journal.
 reset_case

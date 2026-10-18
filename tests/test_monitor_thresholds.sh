@@ -13,7 +13,7 @@ ALERT_LOG="${TEST_ROOT}/alerts"
 send_alert() { printf '%s\n' "$1" >> "$ALERT_LOG"; }
 count_alerts() {
   if [[ -f "$ALERT_LOG" ]]; then
-    grep -Ec ' · (Low balance|Reset)$' "$ALERT_LOG" || true
+    wc -l < "$ALERT_LOG"
   else
     printf '0\n'
   fi
@@ -27,7 +27,10 @@ run_sample 70 '' "$((now + 1))"
 assert_eq 2 "$(count_alerts)" "80 to 70 crossing"
 run_sample 4 '' "$((now + 2))"
 assert_eq 3 "$(count_alerts)" "multi-threshold drop emitted more than once"
-assert_contains "$(<"$ALERT_LOG")" 'Threshold crossed: 4%' "most critical threshold not selected"
+assert_eq '⏱️ · 5h quota · 4% remaining · unknown' "$(tail -n 1 "$ALERT_LOG")" \
+  "multi-threshold alert did not show the observed balance"
+assert_contains "$(<"$STATE_FILE")" 'notified_5h_thresholds=80,70,50,25,10,5,4' \
+  "multi-threshold drop did not acknowledge every crossed level"
 
 run_sample 6 '' "$((now + 3))"
 run_sample 4 '' "$((now + 4))"

@@ -188,6 +188,14 @@ period-wide token or cost totals.
 - No notification or Gist credential is passed to local alert scripts or the
   Codex subprocess.
 
+Discord and Telegram quota notifications use a single line with the window,
+remaining balance or reset type, and next reset date. Dates use
+`DD/MM/YYYY HH:MM` in `Europe/Paris`; an unavailable or already elapsed next
+deadline is shown as `unknown`. Threshold notifications omit the crossed
+threshold and weekly pace. Existing queued notifications retain their original
+text during retries. Anomaly notifications and local script messages keep
+their own formats.
+
 ### Local storage and diagnostics
 
 - Current snapshot in `local/runtime/data.json`.

@@ -59,8 +59,8 @@ for scenario in full consumed paused failed interrupted; do
     [[ ! -e "$TEST_ROOT/notifications.log" ]] || fail 'paused renewal replayed an alert'
   else
     assert_eq 13600 "$(cat "$TEST_ROOT/hooks.log")" "$scenario renewal must run only the original observation's hook"
-    assert_eq 1 "$(grep -c 'Cycle renewed' "$TEST_ROOT/notifications.log")" "$scenario renewal must notify once"
-    [[ "$(cat "$TEST_ROOT/notifications.log")" != *'A new usage cycle is available.'* ]] \
+    assert_eq 1 "$(grep -c 'Reset from 100% to 100%' "$TEST_ROOT/notifications.log")" "$scenario renewal must notify once"
+    [[ "$(cat "$TEST_ROOT/notifications.log")" != *' · Reset · '* ]] \
       || fail "$scenario renewal also delivered the superseded scheduled reset"
   fi
 done

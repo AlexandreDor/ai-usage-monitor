@@ -96,10 +96,10 @@ for scenario in consumed scheduled canceled; do
   assert_archive 3 "$confirmed"
   if (( confirmed )); then
     assert_eq "$((base_epoch + 300))" "$(cat "$TEST_ROOT/hooks.log")" "$scenario hook identity changed"
-    assert_eq 1 "$(grep -c 'Cycle renewed' "$TEST_ROOT/notifications.log")" "$scenario notification count changed"
+    assert_eq 1 "$(grep -c 'Reset from 100% to 100%' "$TEST_ROOT/notifications.log")" "$scenario notification count changed"
   else
     [[ ! -e "$TEST_ROOT/hooks.log" ]] || fail 'live partial cancellation ran a hook'
-    [[ "$(cat "$TEST_ROOT/notifications.log")" != *'Cycle renewed'* ]] || fail 'live partial cancellation notified a renewal'
+    [[ "$(cat "$TEST_ROOT/notifications.log")" != *'Reset from 100% to 100%'* ]] || fail 'live partial cancellation notified a renewal'
   fi
 done
 
