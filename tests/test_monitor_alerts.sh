@@ -53,6 +53,8 @@ assert_alert_count 0
 # A reset is detected even when the 5h window disappears, and only once.
 check_thresholds "" 70 "unknown" "later" "" "$((now + 3600))" "$((now + 301))"
 assert_alert_count 1
+assert_eq '⏱️ · 5h quota · Reset · unknown' "$(<"$ALERT_LOG")" \
+  "scheduled reset invented an unavailable next deadline"
 check_thresholds "" 70 "unknown" "later" "" "$((now + 3600))" "$((now + 302))"
 assert_alert_count 1
 [[ "$(state_value last_notified_5h_reset_at)" == "$((now + 300))" ]] || fail "5h reset was not persisted"
@@ -104,7 +106,7 @@ new_consumed_deadline=$((observed_consumed_at + 5 * 60 * 60))
 check_thresholds 26 100 later unknown "$old_consumed_deadline" '' "$now" group-a
 check_thresholds 87 100 later unknown "$new_consumed_deadline" '' "$observed_consumed_at" group-a
 assert_alert_count 1
-assert_contains "$(<"$ALERT_LOG")" "Reset detected" \
+assert_eq "⏱️ · 5h quota · Reset outside normal date · $(format_paris_timestamp "$new_consumed_deadline")" "$(<"$ALERT_LOG")" \
   "consumed observed reset was not announced"
 assert_eq "$new_consumed_deadline" "$(state_value five_h_armed_reset_at)" \
   "consumed observed reset did not arm its new deadline"
@@ -119,6 +121,8 @@ assert_eq "$new_consumed_deadline" "$(state_value five_h_armed_reset_at)" \
 next_consumed_deadline=$((new_consumed_deadline + 5 * 60 * 60))
 check_thresholds 100 100 later unknown "$next_consumed_deadline" '' "$((new_consumed_deadline + 1))" group-a
 assert_alert_count 3
+assert_eq "⏱️ · 5h quota · Reset · $(format_paris_timestamp "$next_consumed_deadline")" \
+  "$(tail -n 1 "$ALERT_LOG")" "scheduled reset did not use the new future deadline"
 
 # The same refill evidence is insufficient after a gap beyond the shared
 # observation bound. Keep the old cycle armed and do not announce a reset.
@@ -323,7 +327,8 @@ send_alert() {
 }
 check_thresholds 100 100 "unknown" "later" "" "$((old_weekly_deadline + 30 * 60))" "$((now + 2))"
 assert_alert_count 2
-assert_contains "$(tail -n 2 "$ALERT_LOG" | head -n 1)" "📅 Codex · Weekly quota · Reset" "failed threshold delivery hid the reset"
+assert_eq "📅 · Weekly quota · Reset · $(format_paris_timestamp "$((old_weekly_deadline + 30 * 60))")" \
+  "$(tail -n 1 "$ALERT_LOG")" "failed threshold delivery hid the reset or used its old deadline"
 [[ -z "$(state_value pending_weekly_threshold)" ]] || fail "old threshold remained pending after reset"
 
 # Legacy threshold baselines have no limit owner and are reinitialized from the
@@ -334,13 +339,13 @@ printf 'state_version=3\nprev_5h_pct=100\nprev_weekly_pct=80\n' > "$STATE_FILE"
 check_thresholds 100 40 "unknown" "later" "" "$old_weekly_deadline" "$now" "group-b"
 assert_alert_count 0
 
-# Threshold alerts include the same weekly pace delta shown by the dashboard.
+# Threshold alerts contain only the remaining balance and next reset date.
 reset_case
 ALERT_THRESHOLDS=50
 check_thresholds 100 40 "unknown" "later" "" "$((now + 7 * 24 * 60 * 60 / 2))" "$now"
 assert_alert_count 1
 alert_message="$(<"$ALERT_LOG")"
-[[ "$alert_message" == *$'Weekly pace vs ideal: -10.0 pts · 20.0% below'* ]] \
-  || fail "weekly pace delta was missing from threshold alert"
+assert_eq "📅 · Weekly quota · 40% remaining · $(format_paris_timestamp "$((now + 7 * 24 * 60 * 60 / 2))")" \
+  "$alert_message" "weekly threshold message contained extra details"
 
 printf 'PASS: monitor reset alert tests\n'

@@ -97,7 +97,7 @@ import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
 resets = [item for item in items if item["kind"] == "reset"
-          and "Reset detected" in item["message"]]
+          and "Reset outside normal date" in item["message"]]
 assert len(resets) == 1, items
 assert resets[0]["status"] == "delivered", resets[0]
 PYEOF
@@ -141,7 +141,7 @@ assert_eq "$register_retry_observed" \
   "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE_FILE")" \
   "failed consumed reset registration lost its durable intent"
 eval "$(declare -f expire_observed_owner_cycle_original | sed '1s/^expire_observed_owner_cycle_original /expire_observed_owner_cycle /')"
-check_thresholds 10 100 later unknown "$register_retry_new" '' \
+check_thresholds 10 100 later unknown "$((register_retry_new + 60))" '' \
   "$((register_retry_observed + 1))" group-a >/dev/null
 assert_eq 1 "$(fake_curl_count "${FAKE_CURL_COUNT_DIR}/discord")" \
   "consumed reset registration retry was not delivered exactly once"
@@ -150,16 +150,17 @@ assert_eq 0 "$(awk -F= '$1 == "pending_consumed_5h_reset_at" {print $2}' "$STATE
 assert_eq "$register_retry_new" \
   "$(awk -F= '$1 == "five_h_armed_reset_at" {print $2}' "$STATE_FILE")" \
   "consumed reset retry did not arm the real next deadline"
-python3 - "$ALERT_DELIVERIES_FILE" "$register_retry_observed" <<'PYEOF'
+python3 - "$ALERT_DELIVERIES_FILE" "$register_retry_observed" \
+  "$(format_paris_timestamp "$register_retry_new")" <<'PYEOF'
 import json
 import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
 resets = [item for item in items if item["kind"] == "reset"
-          and "Reset detected" in item["message"]]
+          and "Reset outside normal date" in item["message"]]
 assert len(resets) == 1, items
 assert resets[0]["event_data"]["reset_epoch"] == int(sys.argv[2]), resets[0]
-assert "Remaining: 87%" in resets[0]["message"], resets[0]
+assert resets[0]["message"] == f"⏱️ · 5h quota · Reset outside normal date · {sys.argv[3]}", resets[0]
 PYEOF
 
 # A crash after the atomic journal write but before final state persistence is
@@ -206,7 +207,7 @@ import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
 resets = [item for item in items if item["kind"] == "reset"
-          and "Reset detected" in item["message"]]
+          and "Reset outside normal date" in item["message"]]
 assert len(resets) == 1, items
 PYEOF
 
@@ -255,7 +256,7 @@ import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
 resets = [item for item in items if item["kind"] == "reset"
-          and "Reset detected" in item["message"]]
+          and "Reset outside normal date" in item["message"]]
 assert len(resets) == 2, items
 assert {item["event_data"]["limit_id"] for item in resets} == {sys.argv[2], sys.argv[3]}, resets
 assert all(item["status"] == "delivered" for item in resets), resets
@@ -295,7 +296,7 @@ import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
 resets = [item for item in items if item["kind"] == "reset"
-          and "Reset detected" in item["message"]]
+          and "Reset outside normal date" in item["message"]]
 assert len(resets) == 1, items
 assert resets[0]["status"] == "delivered", resets
 PYEOF
@@ -351,7 +352,7 @@ import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
 resets = [item for item in items if item["kind"] == "reset"
-          and "Reset detected" in item["message"]]
+          and "Reset outside normal date" in item["message"]]
 assert len(resets) == 1, items
 assert resets[0]["event_data"]["limit_id"] == sys.argv[2], resets
 assert resets[0]["status"] == "delivered", resets

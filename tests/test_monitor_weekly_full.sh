@@ -37,10 +37,11 @@ sample 1792044901 1792649701
 [[ ! -e "$TEST_ROOT/notifications.log" ]] || fail 'unconfirmed full cycle sent an alert'
 sample 1792045801 1792649711
 assert_eq 'weekly|1792044901|1792045801' "$(cat "$TEST_ROOT/hooks.log")" 'confirmed cycle hook context'
-assert_contains "$(cat "$TEST_ROOT/notifications.log")" 'Cycle renewed' 'full cycle was presented as a measured refill'
+assert_eq "📅 · Weekly quota · Reset from 100% to 100%· $(format_paris_timestamp 1792649711)" \
+  "$(cat "$TEST_ROOT/notifications.log")" 'full cycle message did not use its confirmed next deadline'
 sample 1792046701 1792649712
 assert_eq 1 "$(wc -l < "$TEST_ROOT/hooks.log")" 'confirmed full cycle hook replayed'
-assert_eq 1 "$(grep -c 'Cycle renewed' "$TEST_ROOT/notifications.log")" 'full cycle notification replayed'
+assert_eq 1 "$(grep -c 'Reset from 100% to 100%' "$TEST_ROOT/notifications.log")" 'full cycle notification replayed'
 
 # Failure after the hook intent is durable retries the original full-cycle
 # action, including after a partial observation, without another reset alert.

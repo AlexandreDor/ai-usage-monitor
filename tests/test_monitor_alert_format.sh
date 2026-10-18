@@ -8,22 +8,28 @@ source "$MONITOR_PATH"
 use_test_runtime
 monitor_defaults
 
-assert_eq $'⏱️ Codex · 5h quota · Low balance\nRemaining: 12.5%\nThreshold crossed: 25%\nResets: 18/05/2033 05:33' \
+assert_eq '⏱️ · 5h quota · 12.5% remaining · 18/05/2033 05:33' \
   "$(format_alert_message threshold 5h 12.5 25 '18/05/2033 05:33')" \
   "5h threshold message"
-assert_eq $'⏱️ Codex · 5h quota · Low balance\nRemaining: 12.5%\nThreshold crossed: 25%\nResets: 18/05/2033 05:33\n\nWeekly pace vs ideal: -10.0 pts · 20.0% below' \
+assert_eq '⏱️ · 5h quota · 12.5% remaining · 18/05/2033 05:33' \
   "$(format_alert_message threshold 5h 12.5 25 '18/05/2033 05:33' '-10.0 pts · 20.0% below')" \
-  "5h threshold message with pace"
-assert_eq $'📅 Codex · Weekly quota · Low balance\nRemaining: 40%\nThreshold crossed: 50%\nResets: 25/05/2033 04:13' \
+  "5h threshold message omits pace"
+assert_eq '📅 · Weekly quota · 40% remaining · 25/05/2033 04:13' \
   "$(format_alert_message threshold weekly 40 50 '25/05/2033 04:13')" \
   "weekly threshold message without pace"
-assert_eq $'📅 Codex · Weekly quota · Low balance\nRemaining: 40%\nThreshold crossed: 50%\nResets: tomorrow\n\nWeekly pace vs ideal: -10.0 pts · 20.0% below' \
+assert_eq '📅 · Weekly quota · 40% remaining · tomorrow' \
   "$(format_alert_message threshold weekly 40 50 tomorrow '-10.0 pts · 20.0% below')" \
-  "weekly threshold message with pace"
-assert_eq $'⏱️ Codex · 5h quota · Reset\nA new usage cycle is available.' \
-  "$(format_alert_message reset 5h)" "5h reset message"
-assert_eq $'📅 Codex · Weekly quota · Reset\nA new usage cycle is available.' \
-  "$(format_alert_message reset weekly)" "weekly reset message"
+  "weekly threshold message omits pace"
+assert_eq '⏱️ · 5h quota · Reset · 18/05/2033 05:33' \
+  "$(format_alert_message reset 5h '' '' '18/05/2033 05:33')" "5h reset message"
+assert_eq '📅 · Weekly quota · Reset · 25/05/2033 04:13' \
+  "$(format_alert_message reset weekly '' '' '25/05/2033 04:13')" "weekly reset message"
+assert_eq '⏱️ · 5h quota · Reset · unknown' \
+  "$(format_alert_message reset 5h)" "5h reset without a next deadline"
+assert_eq '⏱️ · 5h quota · Reset outside normal date · 18/05/2033 05:33' \
+  "$(format_alert_message observed_reset 5h '' '' '18/05/2033 05:33')" "observed 5h reset message"
+assert_eq '📅 · Weekly quota · Reset from 100% to 100%· 25/05/2033 04:13' \
+  "$(format_alert_message full_reset weekly '' '' '25/05/2033 04:13')" "full weekly reset message"
 assert_eq $'⏱️ Codex · 5h quota · Anomaly\nQuota rose unexpectedly.' \
   "$(format_alert_message anomaly 5h '' '' '' '' 'Quota rose unexpectedly.')" \
   "5h anomaly message"
@@ -31,7 +37,7 @@ assert_eq $'📅 Codex · Weekly quota · Anomaly\nReset deadline moved unexpect
   "$(format_alert_message anomaly weekly '' '' '' '' 'Reset deadline moved unexpectedly.')" \
   "weekly anomaly message"
 
-# Newline-containing messages reach both transports as one payload.
+# Compact notifications and multiline anomalies reach both transports intact.
 message="$(format_alert_message threshold weekly 40 50 tomorrow '-10.0 pts · 20.0% below')"
 DISCORD_WEBHOOK='https://discord.com/api/webhooks/123/token'
 TELEGRAM_BOT_TOKEN='123:token'
@@ -57,16 +63,18 @@ curl() {
   [[ -z "$output" ]] || printf '{"ok":true}' > "$output"
   printf '200'
 }
-alert_http_attempt discord "$message"
-assert_eq "$message" "$(python3 - "$captured_discord_payload" <<'PYEOF'
+for message in "$message" "$(format_alert_message anomaly 5h '' '' '' '' 'Quota rose unexpectedly.')"; do
+  alert_http_attempt discord "$message"
+  assert_eq "$message" "$(python3 - "$captured_discord_payload" <<'PYEOF'
 import json
 import pathlib
 import sys
 print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["content"])
 PYEOF
-)" "Discord lost message newlines"
-alert_http_attempt telegram "$message"
-assert_eq "$message" "$(<"$captured_message")" "Telegram lost message newlines"
+)" "Discord changed the message"
+  alert_http_attempt telegram "$message"
+  assert_eq "$message" "$(<"$captured_message")" "Telegram changed the message"
+done
 
 # A pending occurrence that predates the formatter keeps its old payload after
 # a failed delivery and a later retry.
