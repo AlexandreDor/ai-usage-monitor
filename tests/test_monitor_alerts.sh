@@ -124,6 +124,19 @@ assert_alert_count 3
 assert_eq "⏱️ · 5h quota · Reset · $(format_paris_timestamp "$next_consumed_deadline")" \
   "$(tail -n 1 "$ALERT_LOG")" "scheduled reset did not use the new future deadline"
 
+# A refill can advance a deadline that has already elapsed by the time it is
+# observed. The notification must not present that deadline as the next reset.
+for observed_deadline_offset in -60 0; do
+  reset_case
+  elapsed_observed_at=$((now + 300))
+  elapsed_next_deadline=$((elapsed_observed_at + observed_deadline_offset))
+  check_thresholds 26 100 unknown unknown "$((now - 3600))" '' "$now" group-a
+  check_thresholds 87 100 unknown unknown "$elapsed_next_deadline" '' "$elapsed_observed_at" group-a
+  assert_alert_count 1
+  assert_eq '⏱️ · 5h quota · Reset outside normal date · unknown' "$(<"$ALERT_LOG")" \
+    "observed reset announced an elapsed deadline as its next reset"
+done
+
 # The same refill evidence is insufficient after a gap beyond the shared
 # observation bound. Keep the old cycle armed and do not announce a reset.
 reset_case

@@ -3424,7 +3424,7 @@ check_thresholds() {
       "$pending_consumed_5h_reset_limit_id" "$pending_consumed_5h_reset_at" \
       "$pending_consumed_5h_reset_at" \
       "$(format_alert_message observed_reset 5h '' '' \
-        "$(format_paris_timestamp "$pending_consumed_5h_next_reset_at")")")" || {
+        "$(next_reset_label "$pending_consumed_5h_next_reset_at" "$pending_consumed_5h_reset_at")")")" || {
       ALERT_PROCESSING_ERROR="observed 5h reset request construction failed"
       return 1
     }
@@ -4134,7 +4134,7 @@ check_thresholds() {
       registration_status=0
       register_network_alert reset 5h reset "$cycle_key" \
         "$(format_alert_message observed_reset 5h '' '' \
-          "$(format_paris_timestamp "$consumed_observed_5h_next_reset_at")")" \
+          "$(next_reset_label "$consumed_observed_5h_next_reset_at" "$consumed_observed_5h_event_at")")" \
         "{\"limit_id\":\"${limit_id}\",\"reset_epoch\":${consumed_observed_5h_event_at}}" \
         "$consumed_observed_5h_event_at" \
         "$((consumed_observed_5h_event_at + 5 * 60 * 60))" false \
