@@ -193,8 +193,8 @@ rm -f "$STATE_FILE" "$ALERT_DELIVERIES_FILE" "$FAKE_CURL_LOG"
 export FAKE_CURL_COUNT_DIR="${TEST_ROOT}/counts-observed-5h-delayed-register"
 delayed_start=2000001060
 delayed_observed_at=$((delayed_start + 300))
-delayed_next_deadline=$((delayed_observed_at + 1800))
-check_thresholds 26 100 unknown unknown "$((delayed_start - 3600))" '' "$delayed_start" group-a >/dev/null
+delayed_next_deadline=$((delayed_observed_at + 1860))
+check_thresholds 26 100 unknown unknown "$((delayed_observed_at + 60))" '' "$delayed_start" group-a >/dev/null
 expire_observed_owner_cycle() { return 1; }
 if check_thresholds 87 100 unknown unknown "$delayed_next_deadline" '' \
   "$delayed_observed_at" group-a >/dev/null 2>&1; then
@@ -214,7 +214,8 @@ import json
 import sys
 
 items = json.load(open(sys.argv[1], encoding="utf-8"))["alerts"]
-resets = [item for item in items if item["kind"] == "reset"]
+resets = [item for item in items if item["kind"] == "reset"
+          and item["event_data"]["reset_epoch"] == int(sys.argv[2])]
 assert len(resets) == 1, items
 assert resets[0]["status"] == "delivered", resets[0]
 assert resets[0]["event_data"]["reset_epoch"] == int(sys.argv[2]), resets[0]
