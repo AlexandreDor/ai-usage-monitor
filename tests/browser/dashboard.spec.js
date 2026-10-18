@@ -1122,6 +1122,7 @@ for (const viewport of [
       await mockUsage(page);
       await page.route('**/data.json?*', route => route.fulfill({ json: {
         ...snapshot,
+        weekly_reset_at: Math.floor(DASHBOARD_NOW.getTime() / 1000) + 3 * 86400,
         reset_credits: { available_count: 3, next_expiration_at: Math.floor(DASHBOARD_NOW.getTime() / 1000) - 1, expiration_known: true },
       } }));
       await page.goto('/dashboard.html');
@@ -1147,6 +1148,7 @@ for (const viewport of [
       });
       expect(layout.scrollHeight).toBeLessThanOrEqual(layout.viewportHeight);
       expect(layout.historyBottom).toBeLessThanOrEqual(layout.viewportHeight);
+      expect(layout.viewportHeight - layout.historyBottom).toBeGreaterThanOrEqual((viewport.height <= 800 ? 24 : 32) - 1);
       expect(layout.historyVisible).toBe(true);
       expect(layout.canvasHeight).toBeGreaterThanOrEqual(100);
       expect(layout.navigationOverlap).toBe(false);
