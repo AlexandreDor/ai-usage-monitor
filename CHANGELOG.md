@@ -6,6 +6,25 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-18
+
+### Changed
+
+- Use compact single-line Discord and Telegram quota notifications, with the
+  remaining balance for threshold alerts and distinct scheduled, observed
+  5-hour, and confirmed full-quota weekly reset messages. Next reset dates use
+  `DD/MM/YYYY HH:MM` in `Europe/Paris`; missing or elapsed deadlines are shown
+  as `unknown`. Notifications already queued retain their original text.
+
+### Fixed
+
+- Hide the dashboard data age while snapshots are fresh. Stale snapshots still
+  show their age and collection delay, and unavailable data keeps its explicit
+  status in both local and external modes.
+
+This release keeps SQLite schema v5 and the existing configuration format.
+Upgrading from 0.2.0 does not require an archive migration.
+
 ## [0.2.0] - 2026-10-17
 
 ### Added
