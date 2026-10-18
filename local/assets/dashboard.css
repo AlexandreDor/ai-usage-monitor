@@ -405,11 +405,15 @@ body[data-freshness="stale"] .limit-card {
   font-size: 0.9rem;
 }
 
+.forecast-strip,
+.reset-credit-strip {
+  min-height: 48px;
+  padding: 10px 16px;
+}
+
 .forecast-strip {
   max-width: 960px;
-  min-height: 58px;
   margin: 0 auto 18px;
-  padding: 10px 16px;
   display: flex;
   align-items: center;
   gap: 18px;
@@ -466,10 +470,14 @@ body[data-freshness="stale"] .limit-card {
   white-space: nowrap;
 }
 
+.forecast-metric strong,
+.reset-credit-metrics strong {
+  font-size: 1rem;
+  line-height: 1.25;
+}
+
 .forecast-metric strong {
   color: #93c5fd;
-  font-size: 1.2rem;
-  line-height: 1;
 }
 
 .forecast-metric strong.threshold-reached {
@@ -598,7 +606,6 @@ canvas.time-slice-chart {
   gap: 8px 20px;
   max-width: 960px;
   margin: 0 auto 14px;
-  padding: 10px 16px;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface);
@@ -611,7 +618,7 @@ canvas.time-slice-chart {
   margin: 0;
 }
 .reset-credit-metrics > div { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 6px; }
-.reset-credit-metrics strong { color: var(--text); font-size: .95rem; }
+.reset-credit-metrics strong { color: var(--text); }
 .reset-credit-metrics span { color: var(--muted); font-size: .7rem; }
 
 .sr-only {
@@ -653,8 +660,7 @@ canvas.time-slice-chart {
   header { gap: 6px; margin-bottom: 12px; }
   header h1 { font-size: 2.75rem; }
   .advanced-preferences { margin-top: 0; }
-  .forecast-strip { min-height: 48px; padding: 8px 12px; margin-bottom: 12px; }
-  .reset-credit-strip { padding: 8px 12px; margin-bottom: 12px; }
+  .forecast-strip, .reset-credit-strip { padding: 8px 12px; margin-bottom: 12px; }
   .limit-card { padding: 16px 20px; }
   .pct-value { font-size: 3.25rem; margin-bottom: 10px; }
   .pace-indicator { margin-top: 10px; padding: 6px 10px; }
