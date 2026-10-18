@@ -6,6 +6,13 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve observed 5-hour reset notifications when registration recovery uses
+  a synthetic arm for the same event. Partial retries now deliver the original
+  notification once instead of an internal suppression message, and retain
+  existing delivery attempts and retry deadlines.
+
 ## [0.2.1] - 2026-10-18
 
 ### Changed
