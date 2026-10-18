@@ -18,6 +18,10 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ### Fixed
 
+- Show `unknown` for an observed 5-hour refill whose next deadline has already
+  elapsed at the original observation, including during registration recovery.
+  A deadline that was future at that observation retains its original label
+  across delayed retries.
 - Hide the dashboard data age while snapshots are fresh. Stale snapshots still
   show their age and collection delay, and unavailable data keeps its explicit
   status in both local and external modes.
