@@ -682,9 +682,9 @@ function renderResetCredits(data = {}) {
   }
   const datasets = [
     { datasetKey: 'reset-credits-count', label: creditText('available'), data: points.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.reset_credits_available) })),
-      valueKind: 'reset-count', borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.08)', stepped: true, fill: true, pointRadius: 2, borderWidth: 2, spanGaps: false },
+      valueKind: 'reset-count', borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.08)', stepped: true, fill: true, pointRadius: 0, borderWidth: 2, spanGaps: false },
     { datasetKey: 'reset-credits-expiration', label: creditText('remainingHours'), data: points.map(point => ({ x: timestampMs(point.at), y: finiteNumber(point.reset_credits_expiration_seconds) === null ? null : point.reset_credits_expiration_seconds / 3600 })),
-      valueKind: 'duration-hours', yAxisID: 'expiration', borderColor: '#fbbf24', pointRadius: 2, borderWidth: 2, spanGaps: false },
+      valueKind: 'duration-hours', yAxisID: 'expiration', borderColor: '#fbbf24', pointRadius: 0, borderWidth: 2, spanGaps: false },
   ];
   if (resetCreditsChart) {
     const visibility = rememberChartDatasetVisibility(resetCreditsChart);

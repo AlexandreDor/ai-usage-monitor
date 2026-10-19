@@ -7,7 +7,7 @@
   --muted: #86a2c5;
   --usage-green: #22c55e;
   --orange: #f08c46;
-  --radius: 16px;
+  --radius: 14px;
 }
 
 * {
@@ -272,11 +272,12 @@ body[data-freshness="stale"] .limit-card {
   max-width: 960px;
   margin: 0 auto;
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
 }
 
 .card {
+  min-width: 0;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -418,7 +419,7 @@ body[data-freshness="stale"] .limit-card {
   align-items: center;
   gap: 18px;
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: var(--radius);
   background: rgba(8, 20, 43, 0.72);
   box-shadow: 0 12px 32px rgba(2, 8, 23, 0.32);
   backdrop-filter: blur(12px);
@@ -533,6 +534,7 @@ body[data-dashboard-source] { padding-bottom: 32px; }
 :where([data-dashboard-source]) .history-label { margin-bottom: 12px; }
 
 canvas {
+  max-width: 100%;
   max-height: 220px;
 }
 
@@ -544,13 +546,17 @@ canvas.time-slice-chart {
 .history-chart-wrap { position: relative; height: 220px; }
 .history-chart-wrap canvas { max-height: none; }
 
+@media (max-width: 999px) {
+  .preference-controls { position: static; }
+}
+
 @media (max-width: 720px) {
   body {
     padding-inline: 12px;
   }
 
   .grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .card {
@@ -608,7 +614,7 @@ canvas.time-slice-chart {
   max-width: 960px;
   margin: 0 auto 14px;
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--radius);
   background: var(--surface);
 }
 .reset-credit-strip .card-label { margin-bottom: 0; font-size: .68rem; }
