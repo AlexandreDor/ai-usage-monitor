@@ -525,6 +525,16 @@ format_paris_timestamp() {
   TZ=Europe/Paris date -d "@${epoch}" '+%d/%m/%Y %H:%M'
 }
 
+next_reset_label() {
+  local reset_at="${1:-}" sampled_at="$2"
+  # The cycle that just ended is not evidence of the next reset deadline.
+  if [[ "$reset_at" =~ ^[0-9]+$ ]] && (( reset_at > sampled_at )); then
+    format_paris_timestamp "$reset_at"
+  else
+    printf 'unknown'
+  fi
+}
+
 write_local_snapshot() {
   local json="$1"
 
@@ -672,8 +682,9 @@ PYEOF
 # are formatted before they enter the delivery journal, so an existing pending
 # payload remains immutable across retries and upgrades.
 format_alert_message() {
-  local kind="$1" window="$2" remaining="${3:-}" threshold="${4:-}"
-  local reset="${5:-}" pace="${6:-}" explanation="${7:-}"
+  # Keep the threshold/pace argument positions for existing formatter callers.
+  local kind="$1" window="$2" remaining="${3:-}"
+  local reset="${5:-unknown}" explanation="${7:-}"
   local emoji quota
   if [[ "$window" == 5h ]]; then
     emoji='⏱️'
@@ -685,14 +696,16 @@ format_alert_message() {
 
   case "$kind" in
     threshold)
-      printf '%s Codex · %s · Low balance\nRemaining: %s%%\nThreshold crossed: %s%%\nResets: %s' \
-        "$emoji" "$quota" "$remaining" "$threshold" "$reset"
-      if [[ -n "$pace" ]]; then
-        printf '\n\nWeekly pace vs ideal: %s' "$pace"
-      fi
+      printf '%s · %s · %s%% remaining · %s' "$emoji" "$quota" "$remaining" "$reset"
       ;;
     reset)
-      printf '%s Codex · %s · Reset\nA new usage cycle is available.' "$emoji" "$quota"
+      printf '%s · %s · Reset · %s' "$emoji" "$quota" "$reset"
+      ;;
+    observed_reset)
+      printf '%s · %s · Reset outside normal date · %s' "$emoji" "$quota" "$reset"
+      ;;
+    full_reset)
+      printf '%s · %s · Reset from 100%% to 100%%· %s' "$emoji" "$quota" "$reset"
       ;;
     anomaly)
       printf '%s Codex · %s · Anomaly\n%s' "$emoji" "$quota" "$explanation"
@@ -1324,11 +1337,12 @@ observe_full_weekly_reset() {
 }
 
 weekly_reset_message() {
+  local next_reset="$1"
   if (( confirmed_full_weekly_reset_at > 0 \
         && confirmed_full_weekly_reset_at == weekly_armed_reset_at )); then
-    printf '📅 Codex · Weekly quota · Cycle renewed\nA later weekly deadline was confirmed while quota remained full. No quota increase was measurable.'
+    format_alert_message full_reset weekly '' '' "$next_reset"
   else
-    format_alert_message reset weekly
+    format_alert_message reset weekly '' '' "$next_reset"
   fi
 }
 
@@ -2748,8 +2762,8 @@ PYEOF
   fi
   payload="$(MIGRATION_FIVE_MESSAGE="$(format_alert_message threshold 5h "$five_h_pct" "$pending_5h_threshold" "$five_h_reset")" \
     MIGRATION_WEEKLY_MESSAGE="$(format_alert_message threshold weekly "$weekly_pct" "$pending_weekly_threshold" "$weekly_reset")" \
-    MIGRATION_FIVE_RESET_MESSAGE="$(format_alert_message reset 5h)" \
-    MIGRATION_WEEKLY_RESET_MESSAGE="$(format_alert_message reset weekly)" \
+    MIGRATION_FIVE_RESET_MESSAGE="$(format_alert_message reset 5h '' '' "$five_h_reset")" \
+    MIGRATION_WEEKLY_RESET_MESSAGE="$(format_alert_message reset weekly '' '' "$weekly_reset")" \
     python3 - "$state_version" "$now" "$five_h_owner" "$weekly_owner" "$channels" "$thresholds_csv" \
       "$pending_5h_threshold" "$pending_weekly_threshold" "$prev_5h_pct" "$prev_weekly_pct" \
       "$five_h_pct" "$weekly_pct" "$five_h_reconstruct_reset" "$weekly_reconstruct_reset" \
@@ -2893,7 +2907,8 @@ check_thresholds() {
   local interrupted_script_identities=""
   local interrupted_script_actions=""
   local interrupted_script_failsafe_loaded=0
-  local thresholds state_key state_value pace t critical status=0 reset_age rule_position script_threshold
+  local thresholds state_key state_value t critical status=0 reset_age rule_position script_threshold
+  local next_five_h_reset next_weekly_reset
   local original_pending cycle_key covered_json registration_status disabled_notified transaction_epoch
   local weekly_cycle_key weekly_request_json
   local consumed_observed_5h_cycle_key="" consumed_observed_5h_request_json='{}'
@@ -3027,7 +3042,8 @@ check_thresholds() {
   fi
 
   mapfile -t thresholds < <(load_thresholds)
-  pace="$(weekly_pace_vs_ideal "$weekly_pct" "$weekly_reset_at" "$scraped_at_epoch")"
+  next_five_h_reset="$(next_reset_label "$five_h_reset_at" "$scraped_at_epoch")"
+  next_weekly_reset="$(next_reset_label "$weekly_reset_at" "$scraped_at_epoch")"
   if [[ "$weekly_pct" =~ ^([0-9]+([.][0-9]+)?)$ && "$weekly_reset_at" =~ ^[0-9]+$ ]] \
     && (( weekly_reset_at > 0 )); then
     weekly_observation_valid=1
@@ -3384,7 +3400,7 @@ check_thresholds() {
   fi
   if [[ ! -e "$ALERT_DELIVERIES_FILE" ]]; then
     if ! initialize_alert_delivery_journal "$journal_source_state_version" "$scraped_at_epoch" "$limit_id" \
-      "$five_h_pct" "$weekly_pct" "$five_h_reset" "$weekly_reset" "$observed_5h_reset_candidate" \
+      "$five_h_pct" "$weekly_pct" "$next_five_h_reset" "$next_weekly_reset" "$observed_5h_reset_candidate" \
       "$observed_5h_limit_id" "$five_h_armed_limit_id" \
       "$observed_weekly_limit_id" "$weekly_armed_limit_id"; then
       ALERT_PROCESSING_ERROR="alert journal initialization failed"
@@ -3407,9 +3423,8 @@ check_thresholds() {
     consumed_observed_5h_request_json="$(network_reset_request_json 5h \
       "$pending_consumed_5h_reset_limit_id" "$pending_consumed_5h_reset_at" \
       "$pending_consumed_5h_reset_at" \
-      "$(printf '⏱️ Codex · 5h quota · Reset detected\nRemaining: %s%%\nNext reset: %s' \
-        "$pending_consumed_5h_remaining_pct" \
-        "$(format_paris_timestamp "$pending_consumed_5h_next_reset_at")")")" || {
+      "$(format_alert_message observed_reset 5h '' '' \
+        "$(next_reset_label "$pending_consumed_5h_next_reset_at" "$pending_consumed_5h_reset_at")")")" || {
       ALERT_PROCESSING_ERROR="observed 5h reset request construction failed"
       return 1
     }
@@ -3911,7 +3926,7 @@ check_thresholds() {
       && [[ "$(configured_alert_channels_json)" != "[]" ]]; then
       weekly_network_request=1
       if ! weekly_request_json="$(network_reset_request_json weekly "$limit_id" \
-          "$weekly_armed_reset_at" "$scraped_at_epoch" "$(weekly_reset_message)")"; then
+          "$weekly_armed_reset_at" "$scraped_at_epoch" "$(weekly_reset_message "$next_weekly_reset")")"; then
         ALERT_PROCESSING_ERROR="weekly reset request construction failed"
         return 1
       fi
@@ -4060,7 +4075,7 @@ check_thresholds() {
         last_notified_5h_reset_at="$five_h_armed_reset_at"
       elif register_network_alert reset 5h reset \
         "$cycle_key" \
-        "$(format_alert_message reset 5h)" \
+        "$(format_alert_message reset 5h '' '' "$next_five_h_reset")" \
         "{\"limit_id\":\"${limit_id}\",\"reset_epoch\":${five_h_armed_reset_at}}" \
         "$five_h_armed_reset_at" "$((five_h_armed_reset_at + 5 * 60 * 60))" false \
         "$cycle_key"; then
@@ -4118,9 +4133,8 @@ check_thresholds() {
       cycle_key="limit:${limit_id}|reset:${consumed_observed_5h_event_at}"
       registration_status=0
       register_network_alert reset 5h reset "$cycle_key" \
-        "$(printf '⏱️ Codex · 5h quota · Reset detected\nRemaining: %s%%\nNext reset: %s' \
-          "$consumed_observed_5h_remaining_pct" \
-          "$(format_paris_timestamp "$consumed_observed_5h_next_reset_at")")" \
+        "$(format_alert_message observed_reset 5h '' '' \
+          "$(next_reset_label "$consumed_observed_5h_next_reset_at" "$consumed_observed_5h_event_at")")" \
         "{\"limit_id\":\"${limit_id}\",\"reset_epoch\":${consumed_observed_5h_event_at}}" \
         "$consumed_observed_5h_event_at" \
         "$((consumed_observed_5h_event_at + 5 * 60 * 60))" false \
@@ -4194,7 +4208,7 @@ check_thresholds() {
         last_notified_weekly_reset_at="$weekly_armed_reset_at"
       elif register_network_alert reset weekly reset \
         "$cycle_key" \
-        "$(weekly_reset_message)" \
+        "$(weekly_reset_message "$next_weekly_reset")" \
         "{\"limit_id\":\"${limit_id}\",\"reset_epoch\":${weekly_armed_reset_at}}" \
         "$weekly_armed_reset_at" "$((weekly_armed_reset_at + 7 * 24 * 60 * 60))" false \
         "$cycle_key"; then
@@ -4337,7 +4351,7 @@ PYEOF
 )"
         registration_status=0
         register_network_alert threshold 5h "$critical" "$cycle_key" \
-          "$(format_alert_message threshold 5h "$five_h_pct" "$critical" "$five_h_reset" "$pace")" \
+          "$(format_alert_message threshold 5h "$five_h_pct" "$critical" "$next_five_h_reset")" \
           "{\"limit_id\":\"${limit_id}\",\"remaining_pct\":${five_h_pct},\"reset_epoch\":${five_h_armed_reset_at},\"covered_thresholds\":${covered_json}}" \
           "$scraped_at_epoch" "$five_h_armed_reset_at" true || registration_status=$?
         if (( registration_status == 2 )); then
@@ -4401,7 +4415,7 @@ PYEOF
 )"
         registration_status=0
         register_network_alert threshold weekly "$critical" "$cycle_key" \
-          "$(format_alert_message threshold weekly "$weekly_pct" "$critical" "$weekly_reset" "$pace")" \
+          "$(format_alert_message threshold weekly "$weekly_pct" "$critical" "$next_weekly_reset")" \
           "{\"limit_id\":\"${limit_id}\",\"remaining_pct\":${weekly_pct},\"reset_epoch\":${weekly_armed_reset_at},\"covered_thresholds\":${covered_json}}" \
           "$scraped_at_epoch" "$weekly_armed_reset_at" true || registration_status=$?
         if (( registration_status == 2 )); then

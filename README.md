@@ -188,6 +188,14 @@ period-wide token or cost totals.
 - No notification or Gist credential is passed to local alert scripts or the
   Codex subprocess.
 
+Discord and Telegram quota notifications use a single line with the window,
+remaining balance or reset type, and next reset date. Dates use
+`DD/MM/YYYY HH:MM` in `Europe/Paris`; an unavailable or already elapsed next
+deadline is shown as `unknown`. Threshold notifications omit the crossed
+threshold and weekly pace. Existing queued notifications retain their original
+text during retries. Anomaly notifications and local script messages keep
+their own formats.
+
 ### Local storage and diagnostics
 
 - Current snapshot in `local/runtime/data.json`.
@@ -326,8 +334,9 @@ The live dashboard calculates snapshot freshness directly from `scraped_at` and
 `sample_interval_seconds`. It marks data stale once its age exceeds the greater
 of two collection intervals or one interval plus 60 seconds. The source remains
 `LOCAL` or `EXTERNAL`, while refresh failures appear separately and preserve the
-last valid values. The accessible status reports both total data age and, when
-stale, time past the expected update threshold. A valid fetch clears a refresh
+last valid values. The accessible status shows only the freshness badge for
+fresh data; stale data also shows its total age and time past the expected
+update threshold. A valid fetch clears a refresh
 error; only a sufficiently recent snapshot clears the stale state. This
 browser-side check needs no Analytics API or additional endpoint; in external
 mode it can therefore also identify an interrupted Gist publication.

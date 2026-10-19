@@ -89,11 +89,11 @@ PY
 )"
   if [[ "$scenario" == valid || "$scenario" == live_valid ]]; then
     assert_eq "$((base_epoch + 1000))" "$(cat "$TEST_ROOT/hooks.log")" "$scenario migration must preserve one hook anchor"
-    assert_eq 1 "$(grep -c 'Cycle renewed' "$TEST_ROOT/notifications.log")" "$scenario migration must notify once"
+    assert_eq 1 "$(grep -c 'Reset from 100% to 100%' "$TEST_ROOT/notifications.log")" "$scenario migration must notify once"
     assert_eq 0 "$anomaly_count" "$scenario migrated renewal became an anomaly"
   else
     [[ ! -e "$TEST_ROOT/hooks.log" ]] || fail "$scenario migration revived a live partial chain"
-    [[ "$(cat "$TEST_ROOT/notifications.log")" != *'Cycle renewed'* ]] || fail "$scenario falsely notified a renewal"
+    [[ "$(cat "$TEST_ROOT/notifications.log")" != *'Reset from 100% to 100%'* ]] || fail "$scenario falsely notified a renewal"
     assert_eq 1 "$anomaly_count" "$scenario lost the original reset-shift anomaly"
   fi
 done

@@ -291,11 +291,12 @@ test('works offline and exposes no serious or critical accessibility violations'
   await expect(page.locator('#freshness-status')).toHaveAttribute('role', 'status');
   await expect(page.locator('#freshness-status')).toHaveAttribute('aria-live', 'polite');
   await expect(page.locator('#freshness-status')).toHaveAttribute('aria-atomic', 'true');
-  await expect(page.locator('#freshness-status')).toHaveText('FRESH less than a minute');
+  await expect(page.locator('#freshness-status')).toHaveText('FRESH');
   await expect(page.locator('#freshness-badge')).toHaveText('FRESH');
   await expect(page.locator('#freshness-badge')).toHaveClass(/badge/);
   await expect(page.locator('#freshness-badge')).toBeVisible();
-  await expect(page.locator('#freshness-detail')).toHaveText('less than a minute');
+  await expect(page.locator('#freshness-detail')).toBeEmpty();
+  await expect(page.locator('#freshness-detail')).toBeHidden();
   await expect(page.locator('#last-updated')).toHaveText('Last scraped 03/08/2026 19:30');
   await expect(page.locator('#five-h-reset')).toHaveText('03/08/2026 19:35');
   await expect(page.locator('#weekly-reset')).toHaveText('03/01/2026 13:34');
@@ -341,6 +342,7 @@ test('hides the freshness badge when no valid snapshot is available', async ({ p
   await expect(page.locator('#weekly-bar')).not.toHaveAttribute('value');
   await expect(page.locator('#freshness-badge')).toBeHidden();
   await expect(page.locator('#freshness-detail')).toHaveText('Data unavailable');
+  await expect(page.locator('#freshness-detail')).toBeVisible();
   await expect(page.locator('#freshness-status')).toHaveText('Data unavailable');
   const results = await new AxeBuilder({ page }).analyze();
   expectNoAxeViolations(results, ['critical', 'serious']);
@@ -444,12 +446,13 @@ test('renders fresh external Gist data with independent source and freshness sta
   await expect(page.locator('#mode-badge')).toHaveText('EXTERNAL');
   await expect(page.locator('body')).toHaveAttribute('data-dashboard-source', 'external');
   await expect(page.locator('body')).toHaveAttribute('data-freshness', 'fresh');
-  await expect(page.locator('#freshness-status')).toContainText('FRESH');
+  await expect(page.locator('#freshness-status')).toHaveText('FRESH');
+  await expect(page.locator('#freshness-detail')).toBeHidden();
   await expect(page.locator('#error-banner')).toBeHidden();
 });
 
-test('becomes stale without a request and exposes age and collection delay', async ({ page }) => {
-  const shortIntervalSnapshot = { ...snapshot, sample_interval_seconds: 60 };
+for (const interval of [60, 120]) test(`shows age only after becoming stale with a ${interval}s collection interval`, async ({ page }) => {
+  const shortIntervalSnapshot = { ...snapshot, sample_interval_seconds: interval };
   await page.clock.install({ time: DASHBOARD_NOW });
   const dataRequests = [];
   await page.route('**/api/dashboard-heartbeat', route => route.fulfill({ status: 204 }));
@@ -460,18 +463,27 @@ test('becomes stale without a request and exposes age and collection delay', asy
   await page.route('**/history.json?*', route => route.fulfill({ json: [shortIntervalSnapshot] }));
   await page.goto('/dashboard.html');
   await expect(page.locator('body')).toHaveAttribute('data-freshness', 'fresh');
+  await expect(page.locator('#freshness-status')).toHaveText('FRESH');
+  await expect(page.locator('#freshness-detail')).toBeEmpty();
+  await expect(page.locator('#freshness-detail')).toBeHidden();
   const requestsBefore = dataRequests.length;
 
-  await page.clock.runFor(91_000);
+  await page.clock.runFor(interval * 2000 - 30_000);
+  await expect(page.locator('body')).toHaveAttribute('data-freshness', 'fresh');
+  await expect(page.locator('#freshness-status')).toHaveText('FRESH');
+  await expect(page.locator('#freshness-detail')).toBeEmpty();
+  await expect(page.locator('#freshness-detail')).toBeHidden();
+  await page.clock.runFor(1000);
 
   await expect(page.locator('body')).toHaveAttribute('data-freshness', 'stale');
-  await expect(page.locator('#freshness-status')).toContainText('STALE 2 min; collection delayed by less than a minute');
+  await expect(page.locator('#freshness-status')).toContainText(`STALE ${interval / 30} min; collection delayed by less than a minute`);
+  await expect(page.locator('#freshness-detail')).toBeVisible();
   await expect(page.locator('#freshness-badge')).toHaveText('STALE');
   await expect(page.locator('#freshness-badge')).toHaveClass(/badge/);
   await expect(page.locator('#freshness-badge')).toBeVisible();
   await page.locator('#language-toggle').click();
   await expect(page.locator('#freshness-badge')).toHaveText('PÉRIMÉ');
-  await expect(page.locator('#freshness-detail')).toContainText('2 min ; collecte en retard');
+  await expect(page.locator('#freshness-detail')).toContainText(`${interval / 30} min ; collecte en retard`);
   await expect(page.locator('#five-h-pct')).toHaveText('72%');
   expect(dataRequests).toHaveLength(requestsBefore);
   const results = await new AxeBuilder({ page }).analyze();
@@ -513,12 +525,15 @@ test('keeps stale values and source through a refresh error, then recovers', asy
   await page.evaluate(() => refresh());
   await expect(page.locator('#five-h-pct')).toHaveText('68%');
   await expect(page.locator('body')).toHaveAttribute('data-freshness', 'fresh');
-  await expect(page.locator('#freshness-status')).toContainText('FRESH');
+  await expect(page.locator('#freshness-status')).toHaveText('FRESH');
+  await expect(page.locator('#freshness-detail')).toBeEmpty();
+  await expect(page.locator('#freshness-detail')).toBeHidden();
   await expect(page.locator('#error-banner')).toBeHidden();
 
   await page.locator('#language-toggle').click();
   await expect(page.locator('#freshness-badge')).toHaveText('À JOUR');
-  await expect(page.locator('#freshness-detail')).toHaveText('moins d’une minute');
+  await expect(page.locator('#freshness-detail')).toBeEmpty();
+  await expect(page.locator('#freshness-detail')).toBeHidden();
   await expect(page.locator('#freshness-status')).not.toContainText('—');
 });
 
@@ -1107,6 +1122,7 @@ for (const viewport of [
       await mockUsage(page);
       await page.route('**/data.json?*', route => route.fulfill({ json: {
         ...snapshot,
+        weekly_reset_at: Math.floor(DASHBOARD_NOW.getTime() / 1000) + 3 * 86400,
         reset_credits: { available_count: 3, next_expiration_at: Math.floor(DASHBOARD_NOW.getTime() / 1000) - 1, expiration_known: true },
       } }));
       await page.goto('/dashboard.html');
@@ -1132,11 +1148,42 @@ for (const viewport of [
       });
       expect(layout.scrollHeight).toBeLessThanOrEqual(layout.viewportHeight);
       expect(layout.historyBottom).toBeLessThanOrEqual(layout.viewportHeight);
+      expect(layout.viewportHeight - layout.historyBottom).toBeGreaterThanOrEqual((viewport.height <= 800 ? 24 : 32) - 1);
       expect(layout.historyVisible).toBe(true);
       expect(layout.canvasHeight).toBeGreaterThanOrEqual(100);
       expect(layout.navigationOverlap).toBe(false);
       expect(layout.creditsHeight).toBeLessThanOrEqual(64);
     });
+  }
+}
+
+for (const width of [320, 390, 768, 999]) {
+  for (const name of ['dashboard', 'analytics']) {
+    for (const language of ['en', 'fr']) {
+      test(`keeps ${name} headers and cards within a ${width}px viewport (${language})`, async ({ page }) => {
+        await page.setViewportSize({ width, height: 900 });
+        await mockUsage(page);
+        await page.route('**/api/analytics?*', route => route.fulfill({ json: analyticsPayload }));
+        await page.goto(`/${name}.html`);
+        await expect(page.locator(name === 'dashboard' ? '#five-h-pct' : '#total-tokens')).toHaveText(name === 'dashboard' ? '72%' : '1.73M');
+        await page.evaluate(language => CodexPreferences.set({ language }), language);
+        await expect.poll(() => page.evaluate(() => {
+          const preferences = document.querySelector('.preference-controls').getBoundingClientRect();
+          const overlaps = [...document.querySelectorAll('header h1, header nav')].some(element => {
+            const rect = element.getBoundingClientRect();
+            return preferences.left < rect.right && preferences.right > rect.left
+              && preferences.top < rect.bottom && preferences.bottom > rect.top;
+          });
+          const overflowing = [...document.querySelectorAll('header, header h1, header nav a, .preference-controls, .grid, .card, .chart-wrap, .time-slice-chart, .section-heading, .chart-heading-actions, .sample-count')]
+            .filter(element => element.checkVisibility())
+            .filter(element => {
+              const rect = element.getBoundingClientRect();
+              return rect.left < -1 || rect.right > innerWidth + 1;
+            }).map(element => element.id || element.className || element.tagName);
+          return { overlaps, overflowing };
+        })).toEqual({ overlaps: false, overflowing: [] });
+      });
+    }
   }
 }
 
@@ -2407,6 +2454,13 @@ test('shares validated time-zone and dated exchange-rate preferences across page
   await zone.blur();
   await expect.poll(() => page.evaluate(() => CodexPreferences.timezone())).toBe('UTC');
   await page.getByRole('link', { name: 'Live limits' }).click();
+  await expect(page.locator('.advanced-preferences, [data-preference-input]')).toHaveCount(0);
+  await expect(page.locator('#last-updated')).toHaveText('Last scraped 03/08/2026 17:30');
+  expect(await page.evaluate(() => {
+    const { timezone, usdToEurRate, rateDate } = CodexPreferences.get();
+    return { timezone, usdToEurRate, rateDate };
+  })).toEqual({ timezone: 'UTC', usdToEurRate: 0.9, rateDate: '2026-10-07' });
+  await page.getByRole('link', { name: 'Advanced analytics' }).click();
   await page.locator('.advanced-preferences summary').click();
   await expect(page.locator('[data-preference-input="timezone"]')).toHaveValue('UTC');
   await expect(page.locator('[data-preference-input="usdToEurRate"]')).toHaveValue('0.9');
@@ -2775,6 +2829,26 @@ test('account reset credits distinguish missing, zero, unknown expiry, and non-e
   await expect(page.locator('#reset-credits-expiration')).toHaveText('Unavailable');
 });
 
+for (const [name, balances, radii] of [
+  ['single observation', [2], [2]],
+  ['null-separated observation', [null, 2, null], [0, 2, 0]],
+  ['mixed connected and isolated observations', [2, 2, null, 3, null, 4, 4], [0, 0, 0, 2, 0, 0, 0]],
+]) {
+  test(`keeps reset-credit markers visible for a ${name}`, async ({ page }) => {
+    const payload = structuredClone(analyticsPayload);
+    payload.limits.series = balances.map((balance, index) => ({
+      at: new Date(Date.parse('2026-08-03T00:00:00Z') + index * 3600000).toISOString(),
+      reset_credits_available: balance,
+      reset_credits_expiration_seconds: balance === null ? null : 3600,
+    }));
+    await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+    await page.goto('/analytics.html');
+    await expect(page.locator('#reset-credits-chart-wrap')).toBeVisible();
+    await expect.poll(() => page.evaluate(() => resetCreditsChart?.data.datasets.map((_, index) =>
+      resetCreditsChart.getDatasetMeta(index).data.map(point => point.options.radius)))).toEqual([radii, radii]);
+  });
+}
+
 test('analytics tracks reset-credit balances and observed expiration durations with a table fallback', async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 });
   const now = Date.parse('2026-08-04T10:00:00Z');
@@ -2792,6 +2866,10 @@ test('analytics tracks reset-credit balances and observed expiration durations w
   await expect(page.locator('#reset-credits-count')).toHaveText('2');
   await expect(page.locator('#reset-credits-expiration')).toHaveText('Expires in 2 h 0 min');
   await expect.poll(() => page.evaluate(() => resetCreditsChart?.data.datasets.map(dataset => dataset.data.map(point => point.y)))).toEqual([[3, 2], [4, 2]]);
+  expect(await page.evaluate(() => resetCreditsChart.data.datasets.map((_, index) => {
+    const meta = resetCreditsChart.getDatasetMeta(index);
+    return { lineWidth: meta.dataset.options.borderWidth, pointRadius: meta.data[0].options.radius };
+  }))).toEqual([{ lineWidth: 2, pointRadius: 0 }, { lineWidth: 2, pointRadius: 0 }]);
   expect(await page.evaluate(() => resetCreditsChart.options.scales.y.ticks.precision)).toBe(0);
   await page.setViewportSize({ width: 1920, height: 900 });
   const desktopLayout = await page.locator('#reset-credits-card').evaluate(card => ({

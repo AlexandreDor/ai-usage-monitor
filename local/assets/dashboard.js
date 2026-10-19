@@ -227,6 +227,7 @@ function renderFreshness() {
     document.body.dataset.freshness = 'unavailable';
     badge.hidden = true;
     badge.textContent = '';
+    detail.hidden = false;
     detail.textContent = t('dataUnavailable');
     stopFreshnessUpdate();
     return;
@@ -235,12 +236,13 @@ function renderFreshness() {
   document.body.dataset.freshness = state.status;
   badge.hidden = false;
   badge.textContent = t(state.status);
+  detail.hidden = state.status !== 'stale';
   detail.textContent = state.status === 'stale'
     ? t('staleDataAge', {
       age: formatElapsedDuration(state.ageSeconds),
       overdue: formatElapsedDuration(state.lateBySeconds),
     })
-    : t('dataAge', { age: formatElapsedDuration(state.ageSeconds) });
+    : '';
   scheduleFreshnessUpdate(state);
 }
 

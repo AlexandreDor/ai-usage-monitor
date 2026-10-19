@@ -1018,10 +1018,9 @@ def expire_observed_owner_cycle(document: dict[str, Any], window: str,
 
     Observed evidence consumes the detector's prior cycle.  Thresholds and
     pending reset rows for that owner/window must therefore be terminalized in
-    the same journal transaction.  ``preserve_cycle`` is used by weekly
-    observed refills: the new reset occurrence is created in this transaction
-    and is the only pending reset row retained for the owner.  A 5h observed
-    refill passes the superseded arm epoch instead and gets a local-only
+    the same journal transaction.  ``preserve_cycle`` identifies the new
+    notification for weekly or consumed 5h refills and is the only pending
+    reset row retained for the owner.  Other superseded arms get a local-only
     tombstone when no matching reset row already exists.
     """
 
@@ -1063,7 +1062,11 @@ def expire_observed_owner_cycle(document: dict[str, Any], window: str,
         _terminate(existing, "local_observed", now, "local_observed")
         changed += 1
 
-    if superseded_reset_epoch:
+    # A no-arm recovery can use the new event's timestamp as a synthetic arm.
+    # Never turn the preserved notification into its own suppression marker.
+    superseded_cycle = f"limit:{canonical_limit_id}|reset:{superseded_reset_epoch}"
+    if superseded_reset_epoch and (
+            preserve_cycle is None or not _same_cycle(preserve_cycle, superseded_cycle)):
         changed += suppress_local_reset_cycle(
             document, window, canonical_limit_id, superseded_reset_epoch, now,
         )

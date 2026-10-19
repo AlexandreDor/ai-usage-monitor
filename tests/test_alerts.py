@@ -268,6 +268,44 @@ class AlertJournalTests(unittest.TestCase):
         ))
         alerts.validate_document(self.document, allow_legacy=False)
 
+    def test_observed_reset_recovery_preserves_its_synthetic_arm(self):
+        limit_id = alerts.canonicalize_limit_id("default")
+        cycle = f"limit:{limit_id}|reset:400"
+        for window in ("5h", "weekly"):
+            for existing in (False, True):
+                with self.subTest(window=window, existing=existing):
+                    document = alerts.empty_journal(5, 100)
+                    incoming = reset_request(window=window, created=400, cycle=cycle)
+                    incoming["event_data"]["limit_id"] = limit_id
+                    incoming["expire_threshold_cycle"] = None
+                    if existing:
+                        occurrence = alerts.register(document, incoming)
+                        occurrence["channels"]["discord"].update(
+                            attempt_count=1, last_attempt_at=401,
+                            next_attempt_at=500, error_class="server_error",
+                        )
+                        snapshot = json.dumps(occurrence, sort_keys=True)
+
+                    alerts.expire_observed_owner_cycle(
+                        document, window, limit_id, 402,
+                        superseded_reset_epoch=400,
+                        preserve_cycle=cycle, new_reset_request=incoming,
+                    )
+
+                    self.assertEqual(1, len(document["alerts"]))
+                    occurrence = document["alerts"][0]
+                    self.assertEqual(incoming["message"], occurrence["message"])
+                    self.assertEqual("pending", occurrence["status"])
+                    self.assertEqual({"discord"}, set(occurrence["channels"]))
+                    if existing:
+                        self.assertEqual(snapshot, json.dumps(occurrence, sort_keys=True))
+                    self.assertEqual(0, alerts.expire_observed_owner_cycle(
+                        document, window, limit_id, 403,
+                        superseded_reset_epoch=400,
+                        preserve_cycle=cycle, new_reset_request=incoming,
+                    ))
+                    alerts.validate_document(document, allow_legacy=False)
+
     def test_observed_weekly_recovery_reuses_pending_reset_retry(self):
         weekly_id = alerts.canonicalize_limit_id("default")
         weekly_cycle = f"limit:{weekly_id}|reset:400"

@@ -25,7 +25,7 @@ if check_thresholds 100 100 later later 1792058001 1792649711 1792045801 group-a
 fi
 eval "$(declare -f original_five_intent | sed '1s/^original_five_intent /persist_observed_5h_intent /')"
 check_thresholds 100 100 later later 1792058001 1792649711 1792046701 group-a
-assert_eq 1 "$(grep -c 'Cycle renewed' "$TEST_ROOT/notifications.log")" 'interrupted weekly confirmation was lost'
+assert_eq 1 "$(grep -c 'Reset from 100% to 100%' "$TEST_ROOT/notifications.log")" 'interrupted weekly confirmation was lost'
 check_thresholds 100 100 later later 1792058001 1792649711 1792047601 group-a
-assert_eq 1 "$(grep -c 'Cycle renewed' "$TEST_ROOT/notifications.log")" 'recovered weekly confirmation replayed'
+assert_eq 1 "$(grep -c 'Reset from 100% to 100%' "$TEST_ROOT/notifications.log")" 'recovered weekly confirmation replayed'
 printf 'PASS: weekly confirmation survives an interrupted 5h intent\n'

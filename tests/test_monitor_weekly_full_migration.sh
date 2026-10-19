@@ -71,7 +71,7 @@ for baseline in legacy canceled partial pct_missing no_deadlines live_partial li
   sample "$((advanced_at + 1800))" 13011 "$owner"
   if [[ "$baseline" == legacy || "$baseline" == data_only ]]; then
     assert_eq 1000 "$(cat "$TEST_ROOT/hooks.log")" 'legacy baseline did not recover one original reset anchor'
-    assert_eq 1 "$(grep -c 'Cycle renewed' "$TEST_ROOT/notifications.log")" 'migrated renewal must notify once'
+    assert_eq 1 "$(grep -c 'Reset from 100% to 100%' "$TEST_ROOT/notifications.log")" 'migrated renewal must notify once'
   else
     [[ ! -e "$TEST_ROOT/hooks.log" ]] || fail "$baseline migration resurrected an invalid chain"
     [[ ! -e "$TEST_ROOT/notifications.log" ]] || fail "$baseline migration notified an invalid chain"
