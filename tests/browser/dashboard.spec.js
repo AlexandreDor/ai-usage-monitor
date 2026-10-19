@@ -2829,6 +2829,26 @@ test('account reset credits distinguish missing, zero, unknown expiry, and non-e
   await expect(page.locator('#reset-credits-expiration')).toHaveText('Unavailable');
 });
 
+for (const [name, balances, radii] of [
+  ['single observation', [2], [2]],
+  ['null-separated observation', [null, 2, null], [0, 2, 0]],
+  ['mixed connected and isolated observations', [2, 2, null, 3, null, 4, 4], [0, 0, 0, 2, 0, 0, 0]],
+]) {
+  test(`keeps reset-credit markers visible for a ${name}`, async ({ page }) => {
+    const payload = structuredClone(analyticsPayload);
+    payload.limits.series = balances.map((balance, index) => ({
+      at: new Date(Date.parse('2026-08-03T00:00:00Z') + index * 3600000).toISOString(),
+      reset_credits_available: balance,
+      reset_credits_expiration_seconds: balance === null ? null : 3600,
+    }));
+    await page.route('**/api/analytics?*', route => route.fulfill({ json: payload }));
+    await page.goto('/analytics.html');
+    await expect(page.locator('#reset-credits-chart-wrap')).toBeVisible();
+    await expect.poll(() => page.evaluate(() => resetCreditsChart?.data.datasets.map((_, index) =>
+      resetCreditsChart.getDatasetMeta(index).data.map(point => point.options.radius)))).toEqual([radii, radii]);
+  });
+}
+
 test('analytics tracks reset-credit balances and observed expiration durations with a table fallback', async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 });
   const now = Date.parse('2026-08-04T10:00:00Z');
