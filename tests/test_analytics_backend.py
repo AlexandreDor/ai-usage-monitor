@@ -443,5 +443,117 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(cache.get_or_compute(('fail',), lambda: 42), 42)
 
 
+class PartialWeeklyWindowTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.database = Path(temporary.name) / 'partial.sqlite3'
+        self.base = 1_700_000_000 // 21600 * 21600
+        self.end = self.base + 7200
+        self.writer = connect_database(self.database)
+        self.addCleanup(self.writer.close)
+        with self.writer:
+            self.writer.executemany(
+                'INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [(self.base + offset, str(offset), 80, None, None,
+                  100 - offset // 720 if offset >= 0 else 34, None,
+                  self.base + 604800 if offset >= 0 else self.base,
+                  60, 192, 'limit-a') for offset in range(-43200, 7201, 60)],
+            )
+            self.writer.execute('INSERT INTO reset_events VALUES (?, ?, ?, ?, ?, ?)',
+                                ('weekly', self.base, self.base, 34, 100, 'scheduled_crossing'))
+            self.writer.executemany('''INSERT INTO token_usage_events
+                (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+                VALUES (?, 'codex', ?, 'gpt-6.1-sol', ?, ?)''',
+                [(self.base - 3600, 'openai', 2_000_000, 'old-cycle')]
+                + [(self.base + 360 + index * 720,
+                    'openai' if index % 2 else 'openai-codex', 300_000, f'recent-{index}')
+                   for index in range(10)])
+
+    def estimate(self, *, end=None, now=None):
+        end = self.end if end is None else end
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.row_factory = sqlite3.Row
+            return analytics.weekly_limit_value(
+                connection, json.loads((ROOT / 'local/pricing.json').read_text()),
+                self.base, end + 1, now=end if now is None else now)
+
+    def test_post_reset_usage_produces_fresh_direct_values(self):
+        result = self.estimate()
+        for point in (result['series'][-1], result['by_model'][0]['series'][-1]):
+            self.assertTrue(point['partial_window'])
+            self.assertFalse(point.get('carried'))
+            self.assertEqual(point['window_start'], analytics.iso_utc(self.base))
+            self.assertEqual(point['window_seconds'], 7200)
+            self.assertEqual(point['quota_consumed_pct_points'], 10)
+            self.assertEqual(point['observed_cost_usd'], 6)
+            self.assertEqual(point['raw_value_usd'], 60)
+            self.assertEqual(point['quality'], 'low_confidence')
+
+    def test_short_window_keeps_pricing_and_model_attribution_checks(self):
+        with self.writer:
+            self.writer.execute("UPDATE token_usage_events SET provider = 'unpriced' WHERE external_id = 'recent-0'")
+        result = self.estimate()
+        self.assertEqual(result['series'][-1]['reason'], 'missing_price')
+        self.assertIsNone(result['by_model'][0]['series'][-1]['value_usd'])
+        with self.writer:
+            self.writer.execute("UPDATE token_usage_events SET provider = 'openai', model = 'gpt-6.2-sol' WHERE external_id = 'recent-0'")
+        result = self.estimate()
+        self.assertEqual(result['series'][-1]['raw_value_usd'], 60)
+        self.assertTrue(all(model['series'][-1]['value_usd'] is None for model in result['by_model']))
+
+    def test_short_window_requires_measurable_quota_use(self):
+        with self.writer:
+            self.writer.execute('UPDATE snapshots SET weekly_pct = 100 WHERE scraped_at_epoch >= ?', (self.base,))
+            self.writer.execute('UPDATE snapshots SET weekly_pct = 99 WHERE scraped_at_epoch = ?', (self.end,))
+        self.assertEqual(self.estimate()['series'][-1]['reason'], 'insufficient_quota_delta')
+
+    def test_short_window_rejects_gaps_and_too_short_intervals(self):
+        with self.writer:
+            self.writer.execute('UPDATE snapshots SET weekly_pct = 98 WHERE scraped_at_epoch = ?', (self.base + 600,))
+        self.assertIsNone(self.estimate(end=self.base + 600)['series'][-1]['value_usd'])
+        with self.writer:
+            self.writer.execute('DELETE FROM snapshots WHERE scraped_at_epoch > ? AND scraped_at_epoch < ?',
+                                (self.base + 600, self.end))
+        self.assertIsNone(self.estimate()['series'][-1]['value_usd'])
+
+    def test_short_window_stays_inside_latest_deadline_regime(self):
+        with self.writer:
+            self.writer.execute('UPDATE snapshots SET weekly_reset_at = weekly_reset_at + 3600 WHERE scraped_at_epoch >= ? AND scraped_at_epoch < ?',
+                                (self.base, self.base + 3600))
+        point = self.estimate()['series'][-1]
+        self.assertEqual(point['window_seconds'], 3600)
+        self.assertEqual(point['observed_cost_usd'], 3)
+        self.assertEqual(point['raw_value_usd'], 60)
+
+    def test_short_window_does_not_refresh_stale_data(self):
+        result = self.estimate(now=self.end + 121)
+        self.assertEqual(result['series'][-1]['reason'], 'stale_data')
+        self.assertTrue(all(model['series'][-1]['value_usd'] is None for model in result['by_model']))
+
+    def test_short_window_recovers_after_older_metadata_holes(self):
+        with self.writer:
+            self.writer.execute('DELETE FROM reset_events')
+            self.writer.execute('UPDATE snapshots SET weekly_reset_at = ?', (self.base + 604800,))
+        for column, original in (('weekly_reset_at', self.base + 604800), ('limit_id', 'limit-a')):
+            with self.subTest(column=column):
+                with self.writer:
+                    self.writer.execute(f'UPDATE snapshots SET {column} = NULL WHERE scraped_at_epoch = ?',
+                                        (self.end - 43200,))
+                try:
+                    point = self.estimate()['series'][-1]
+                    self.assertTrue(point.get('partial_window'), point)
+                    self.assertEqual(point['window_seconds'], 7200)
+                    self.assertEqual(point['raw_value_usd'], 60)
+                finally:
+                    with self.writer:
+                        self.writer.execute(f'UPDATE snapshots SET {column} = ? WHERE scraped_at_epoch = ?',
+                                            (original, self.end - 43200))
+        with self.writer:
+            self.writer.execute('UPDATE snapshots SET weekly_reset_at = NULL WHERE scraped_at_epoch = ?',
+                                (self.end,))
+        self.assertEqual(self.estimate()['series'][-1]['reason'], 'missing_deadline')
+
+
 if __name__ == '__main__':
     unittest.main()

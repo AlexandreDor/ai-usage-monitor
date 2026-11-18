@@ -42,7 +42,11 @@ WEEKLY_VALUE_MAX_WINDOW_SECONDS = (
     WEEKLY_VALUE_WINDOW_TARGET_SECONDS + WEEKLY_VALUE_WINDOW_TOLERANCE_SECONDS
 )
 WEEKLY_VALUE_POINT_INTERVAL_SECONDS = 6 * 3600
-WEEKLY_VALUE_MIN_QUOTA_DELTA_POINTS = 0.5
+# A one-point rounded quota drop can be entirely explained by observation
+# error. Require the same measurable signal as the adaptive mixed-model fit
+# before adding a direct value to the median or accepting it as a carry source.
+WEEKLY_VALUE_MIN_QUOTA_DELTA_POINTS = 2.0
+WEEKLY_VALUE_PARTIAL_MIN_WINDOW_SECONDS = 15 * 60
 WEEKLY_VALUE_MAX_POINTS = 10_000
 WEEKLY_VALUE_STALE_REASON = "stale_data"
 # Mixed-model attribution is deliberately conservative.  A target window is
@@ -1044,6 +1048,7 @@ def _mixed_point_from_fit(
     if not math.isfinite(value) or value <= 0:
         return None
     result = dict(point)
+    result.pop("partial_window", None)
     # Quota consumption and total API-equivalent cost are directly observed
     # shared-window quantities.  Only the coefficient/value attribution is
     # inferred; keeping both fields visible prevents readers from mistaking a
@@ -1163,7 +1168,9 @@ def _carry_weekly_model_values(series: list[dict[str, Any]]) -> int:
         point["value_usd"] = source["value_usd"]
         point["raw_value_usd"] = None
         point["quality"] = (
-            "high_uncertainty" if source["quality"] == "high_uncertainty" else "low_confidence"
+            source["quality"]
+            if source["quality"] in {"high_uncertainty", "volatile"}
+            else "low_confidence"
         )
         point["carried"] = True
         point["carried_from_reason"] = reason
@@ -1312,6 +1319,50 @@ def _window_start(
     return row, reason
 
 
+def _partial_window_start(
+    rows: list[sqlite3.Row],
+    end_row: sqlite3.Row,
+    end_epoch: int,
+    row_epochs: list[int],
+    reset_epochs: set[int],
+) -> sqlite3.Row | None:
+    """Use the longest recent continuous interval within the current cycle."""
+    limit_id = end_row["limit_id"]
+    deadline = end_row["weekly_reset_at"]
+    if (
+        not isinstance(limit_id, str) or not limit_id
+        or not isinstance(deadline, int) or deadline <= end_epoch
+        or not _finite_quota_number(end_row["weekly_pct"])
+    ):
+        return None
+    earliest = end_epoch - WEEKLY_VALUE_WINDOW_SECONDS
+    latest_reset = max((epoch for epoch in reset_epochs if epoch <= end_epoch), default=earliest)
+    left = bisect.bisect_left(row_epochs, max(earliest, latest_reset))
+    right = bisect.bisect_left(row_epochs, end_epoch)
+    previous_at = end_epoch
+    previous_quota = float(end_row["weekly_pct"])
+    start_row = None
+    for row in reversed(rows[left:right]):
+        at = row["scraped_at_epoch"]
+        quota = row["weekly_pct"]
+        if (
+            previous_at - at > WEEKLY_VALUE_TRAINING_MAX_SNAPSHOT_GAP_SECONDS
+            or row["limit_id"] != limit_id
+            or not isinstance(row["weekly_reset_at"], int)
+            or row["weekly_reset_at"] <= at
+            or not _weekly_deadlines_equivalent(row["weekly_reset_at"], deadline)
+            or not _finite_quota_number(quota)
+            or float(quota) < previous_quota
+        ):
+            break
+        start_row = row
+        previous_at = at
+        previous_quota = float(quota)
+    if start_row is None or end_epoch - start_row["scraped_at_epoch"] < WEEKLY_VALUE_PARTIAL_MIN_WINDOW_SECONDS:
+        return None
+    return start_row
+
+
 def _quality_for_value(delta_points: float, polled_delta: bool) -> str:
     return "low_confidence" if delta_points < 1.0 or polled_delta else "good"
 
@@ -1457,8 +1508,10 @@ def weekly_limit_value(
             if normalized == identity
             and isinstance(row["provider"], str) and row["provider"].strip()
         })
+        # Preserve invalid shared-quota evidence for every model. Only valid
+        # foreign-model events become ordinary attribution gaps.
         model_events = [
-            event if normalized == identity
+            event if normalized == identity or event[2] is not None
             else (event[0], None, "mixed_models", event[3])
             for normalized, event in zip(normalized_identities, events)
         ]
@@ -1690,6 +1743,16 @@ def _weekly_limit_value(
             start_row, reason = _window_start(rows, end_row, end_epoch, row_epochs)
             if start_row is None and reason is None:
                 reason = "window_duration"
+            if reason is None and start_row is not None and any(
+                start_row["scraped_at_epoch"] < reset_at <= end_epoch for reset_at in reset_epochs
+            ):
+                reason = "reset_in_window"
+            if reason in {"window_duration", "reset_in_window", "deadline_transition", "limit_transition",
+                          "missing_deadline", "missing_limit_id"}:
+                partial_start = _partial_window_start(rows, end_row, end_epoch, row_epochs, reset_epochs)
+                if partial_start is not None:
+                    start_row, reason = partial_start, None
+                    point["partial_window"] = True
         if reason is None and start_row is not None:
             start_epoch = start_row["scraped_at_epoch"]
             point["window_start"] = iso_utc(start_epoch)
@@ -1705,7 +1768,11 @@ def _weekly_limit_value(
             elif delta <= 0:
                 reason = "quota_increase" if delta < 0 else "zero_quota_delta"
             elif delta < WEEKLY_VALUE_MIN_QUOTA_DELTA_POINTS:
-                reason = "insufficient_quota_delta"
+                # A weak quota signal may bridge an ordinary gap, but must
+                # never conceal bad pricing or malformed event evidence.
+                _, event_reason, _ = _interval_event_cost(events, start_epoch, end_epoch, event_index)
+                reason = (event_reason if event_reason in WEEKLY_VALUE_CARRY_BLOCKING_REASONS
+                          else "insufficient_quota_delta")
             else:
                 fraction = delta / 100.0
                 point["consumed_fraction"] = round(fraction, 8)
@@ -1738,6 +1805,8 @@ def _weekly_limit_value(
                         smoothed = float(median(values))
                         dispersion = (max(values) - min(values)) / smoothed if smoothed > 0 else math.inf
                         quality = _quality_for_value(delta, polled_delta)
+                        if point.get("partial_window"):
+                            quality = "low_confidence"
                         if dispersion > 0.5:
                             quality = "volatile"
                         point["observed_cost_usd"] = round(cost, 8)
@@ -1755,6 +1824,7 @@ def _weekly_limit_value(
         "window_seconds": WEEKLY_VALUE_WINDOW_SECONDS,
         "point_interval_seconds": WEEKLY_VALUE_POINT_INTERVAL_SECONDS,
         "minimum_quota_delta_pct_points": WEEKLY_VALUE_MIN_QUOTA_DELTA_POINTS,
+        "minimum_partial_window_seconds": WEEKLY_VALUE_PARTIAL_MIN_WINDOW_SECONDS,
         "candidate_points": candidate_count,
         "cadenced_points": cadenced_count,
         "returned_points": len(series),

@@ -79,11 +79,17 @@ The local Analytics page provides:
   `observed all-source cost / consumed fraction`; it is independent of the
   source and model filters used by the token charts;
 - a short median of the current and two previous valid values for the trend,
-  with `good`, `low confidence`, and `volatile` quality states. Windows outside
-  11 h 45 min–12 h 15 min, quota resets or limit/deadline transitions,
-  increases or sub-0.5-point drops, stale/incomplete observations, missing
-  positive prices, invalid counters, and zero cost are shown as unavailable
-  with a reason rather than silently extrapolated;
+  with `good`, `low confidence`, and `volatile` quality states. Preferred windows
+  span 11 h 45 min–12 h 15 min. Quota resets or limit/deadline transitions,
+  increases or sub-two-point drops, stale/incomplete observations, missing
+  positive prices, invalid counters, and zero cost make a window unavailable
+  with a reason rather than silently extrapolated. A one-point rounded quota
+  drop cannot seed the median or replace a previously accepted model value;
+- when a twelve-hour direct window crosses a reset or collection/limit boundary,
+  use the longest continuous interval available in the current cycle, from
+  fifteen minutes up to twelve hours, with at least two quota points consumed.
+  Shorter windows remain low confidence, expose their actual duration in the
+  table and CSV, and retain all event-pricing and model-attribution checks;
 - the weekly-limit value controls compare GPT-5.6 Luna, Terra, Sol,
   GPT-6 Luna, Sol, Astra, and GPT-6.1 Sol on one chart by default, with distinct
   colors and independent toggles. The aggregate curve is hidden by default and can be
@@ -121,7 +127,8 @@ The local Analytics page provides:
   up to seven days through ordinary unavailable points and weekly resets. A
   carried point retains the original source date, age, and method and is shown
   with a hollow marker and dashed line (cross markers for high uncertainty).
-  Carried estimates preserve their source sensitivity bounds and high uncertainty. Limit changes, contradictory quota
+  Carried estimates preserve their source sensitivity bounds, high uncertainty,
+  and volatility. Limit changes, contradictory quota
   movement, malformed observations, missing prices, and stale current data
   clear the carry instead of extending it.
   The aggregate remains available, independently of token breakdown filters.
@@ -759,6 +766,9 @@ GPT-6.1 Sol's reference rates are $2 input, $0.10 cached input, $2.50 cache
 write, and $10 output per million tokens, as documented on its
 [model page](https://developers.openai.com/api/docs/models/gpt-6.1-sol).
 The catalog excludes long-context and alternate billing tiers.
+All catalog entries were checked on 2026-11-18; the
+[verification record](docs/pricing-verification-2026-11-18.md) lists current rates,
+primary sources, and the local, legacy, and unknown-model exceptions.
 
 Example with Codex and OpenCode only:
 

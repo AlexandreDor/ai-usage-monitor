@@ -213,7 +213,7 @@ with connect_database(smooth_db) as connection:
         (4 * window, 92, 30 * window, "limit-a"), (5 * window, 90, 30 * window, "limit-a"),
         (6 * window, 90, 30 * window, "limit-a"), (7 * window, 89.8, 30 * window, "limit-a"),
         (8 * window, 87.8, 30 * window, "limit-b"), (9 * window, 85.8, 40 * window, "limit-b"),
-        (10 * window, 84, 40 * window, "limit-b"), (11 * window, 82, 40 * window, "limit-b"),
+        (10 * window, 83.8, 40 * window, "limit-b"), (11 * window, 81.8, 40 * window, "limit-b"),
     ]
     connection.executemany(
         "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -256,8 +256,8 @@ jitter_smooth_db = test_root / "weekly-value-jitter-smoothing.sqlite3"
 with connect_database(jitter_smooth_db) as connection:
     deadline = 20 * window
     rows = [
-        (0, 100, deadline), (window, 99.5, deadline + 179),
-        (2 * window, 98, deadline), (3 * window, 96, deadline + 179),
+        (0, 100, deadline), (window, 99, deadline + 179),
+        (2 * window, 96, deadline), (3 * window, 92, deadline + 179),
     ]
     connection.executemany(
         "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -266,8 +266,8 @@ with connect_database(jitter_smooth_db) as connection:
     )
     connection.executemany(
         "INSERT INTO token_usage_events (occurred_at_epoch, source, provider, model, input_tokens, external_id) VALUES (?, 'codex', 'openai', 'gpt-5.6-sol', ?, ?)",
-        [(window + window // 2, 400000, "jitter-1"),
-         (2 * window + window // 2, 800000, "jitter-2")],
+        [(window + window // 2, 800000, "jitter-1"),
+         (2 * window + window // 2, 1600000, "jitter-2")],
     )
     connection.row_factory = __import__("sqlite3").Row
     result = weekly_limit_value(
@@ -277,6 +277,68 @@ with connect_database(jitter_smooth_db) as connection:
     by_at = {point["at"]: point for point in result["series"]}
     assert by_at[iso(2 * window)]["value_usd"] == 133.33333333, by_at[iso(2 * window)]
     assert by_at[iso(3 * window)]["value_usd"] == 166.66666667, by_at[iso(3 * window)]
+
+# One rounded quota step appears in two overlapping twelve-hour windows.
+# Neither window may seed the median or replace the accepted carry source.
+# A later two-point observation must remain usable without those weak values.
+low_signal_db = test_root / "weekly-value-low-signal.sqlite3"
+cadence = window // 2
+with connect_database(low_signal_db) as connection:
+    quotas = [100, 98, 96, 96, 96, 95, 95, 95, 93]
+    connection.executemany(
+        "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [(index * cadence, str(index * cadence), 80, None, None, quota, None,
+          20 * window, 900, 192, "limit-a") for index, quota in enumerate(quotas)],
+    )
+    connection.executemany(
+        """INSERT INTO token_usage_events
+           (occurred_at_epoch, source, provider, model, input_tokens, external_id)
+           VALUES (?, 'codex', 'openai', 'gpt-6.1-sol', ?, ?)""",
+        [(cadence // 2, 600000, "signal-1"),
+         (cadence + cadence // 2, 600000, "signal-2"),
+         (4 * cadence + cadence // 2, 50000, "rounded-step"),
+         (7 * cadence + cadence // 2, 600000, "signal-recovery")],
+    )
+    connection.row_factory = __import__("sqlite3").Row
+    result = weekly_limit_value(
+        connection, load_pricing(root / "local/pricing.json"), 0, 8 * cadence + 1,
+        now=8 * cadence, sample_interval_seconds=900,
+    )
+    aggregate = {point["at"]: point for point in result["series"]}
+    model = {point["at"]: point for point in result["by_model"][0]["series"]}
+    for index in (5, 6):
+        weak = aggregate[iso(index * cadence)]
+        assert weak["quota_consumed_pct_points"] == 1.0, weak
+        assert weak["reason"] == "insufficient_quota_delta", weak
+        assert weak["raw_value_usd"] is None and weak["value_usd"] is None, weak
+    for index in (5, 6, 7):
+        carried = model[iso(index * cadence)]
+        assert carried["carried"] and carried["value_usd"] == 60.0, carried
+        assert carried["source_at"] == iso(3 * cadence), carried
+    recovered = aggregate[iso(8 * cadence)]
+    assert recovered["quota_consumed_pct_points"] == 2.0, recovered
+    assert recovered["raw_value_usd"] == recovered["value_usd"] == 60.0, recovered
+    assert not model[iso(8 * cadence)].get("carried"), model[iso(8 * cadence)]
+    # Weak signal must not hide evidence that invalidates the carry source.
+    for event_model, provider, tokens, reason in (
+        ("gpt-6.1-sol", "unpriced-provider", 50000, "missing_price"),
+        ("gpt-6.1-sol", "openai", "invalid-counter", "invalid_event"),
+        ("gpt-6.2-sol", "unpriced-provider", 50000, "missing_price"),
+        ("gpt-6.2-sol", "openai", "invalid-counter", "invalid_event"),
+    ):
+        connection.execute(
+            "UPDATE token_usage_events SET model = ?, provider = ?, input_tokens = ? WHERE external_id = 'rounded-step'",
+            (event_model, provider, tokens),
+        )
+        blocked = weekly_limit_value(
+            connection, load_pricing(root / "local/pricing.json"), 0, 8 * cadence + 1,
+            now=8 * cadence, sample_interval_seconds=900,
+        )
+        blocked_model = {point["at"]: point for point in blocked["by_model"][0]["series"]}
+        for index in (5, 6):
+            point = blocked_model[iso(index * cadence)]
+            assert point["reason"] == reason and point["value_usd"] is None, point
+        assert blocked_model[iso(7 * cadence)]["value_usd"] is None, blocked_model
 
 cadence_db = test_root / "weekly-value-cadence.sqlite3"
 cadence_end = 4 * 21600
@@ -558,6 +620,10 @@ assert uncertain_gap["quality"] == uncertain_gap["source_quality"] == "high_unce
 assert uncertain_gap["source_at"] == uncertain_source["at"], uncertain_gap
 assert uncertain_gap["value_lower_usd"] == uncertain_source["value_lower_usd"], uncertain_gap
 assert uncertain_gap["value_upper_usd"] == uncertain_source["value_upper_usd"], uncertain_gap
+volatile_source = {**base_point, "quality": "volatile"}
+volatile_gap = {**reset_gap}
+assert _carry_weekly_model_values([volatile_source, volatile_gap]) == 1
+assert volatile_gap["quality"] == volatile_gap["source_quality"] == "volatile", volatile_gap
 PY
 
 python3 - "$ROOT_DIR" "$TEST_ROOT/mixed-weekly-value.sqlite3" <<'PY'
@@ -697,7 +763,8 @@ with connect_database(Path(sys.argv[2])) as connection:
     connection.execute("UPDATE token_usage_events SET model = 'unknown-model' WHERE external_id = 'mixed-gpt'")
     unknown = estimate()
     assert len(unknown["by_model"]) == 1
-    assert unknown["by_model"][0]["series"][1]["reason"] == "mixed_models"
+    assert unknown["by_model"][0]["series"][1]["reason"] == "missing_price", \
+        "unknown-model pricing must not be hidden as mixed usage"
     # Same model routes aggregate after provider-specific pricing; unknown prices still invalidate.
     connection.execute("UPDATE token_usage_events SET model = 'gpt-5.6-sol', provider = 'other' WHERE external_id = 'mixed-gpt'")
     providers = estimate()["by_model"]

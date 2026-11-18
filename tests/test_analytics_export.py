@@ -61,6 +61,17 @@ class AnalyticsExportTests(unittest.TestCase):
             with self.assertRaises(AnalyticsError):
                 build_csv(pathlib.Path("db"), pathlib.Path("prices"), {}, "breakdown")
 
+    def test_weekly_export_preserves_short_window_provenance(self):
+        point = {"at": "2026-11-18T08:00:00Z", "window_start": "2026-11-18T07:00:00Z",
+                 "window_seconds": 3600, "partial_window": True, "value_usd": 60,
+                 "quality": "low_confidence"}
+        with patch("analytics_export.build_payload", return_value={"weekly_limit_value": {"series": [point]}}):
+            body = build_csv(pathlib.Path("db"), pathlib.Path("prices"), {}, "weekly_value", now=2000)
+        row = next(csv.DictReader(io.StringIO(body.decode("utf-8-sig"))))
+        self.assertEqual(row["window_start"], point["window_start"])
+        self.assertEqual(row["window_seconds"], "3600")
+        self.assertEqual(row["partial_window"], "True")
+
     def test_formula_neutralization_does_not_alter_numbers(self):
         for value in ["=1", "+1", "-1", "@test", "\t=cmd", "  +cmd"]:
             self.assertEqual(safe_cell(value), "'" + value)

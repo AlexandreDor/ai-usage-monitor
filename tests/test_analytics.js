@@ -88,6 +88,13 @@ if (evaluate('formatUsd(75)') !== '$75.00') fail('weekly value formatting did no
 if (evaluate("weeklyLimitValueDatasets[0].valueKind") !== 'usd') fail('weekly value chart did not declare USD formatting');
 if (evaluate("formatChartValue(75, 'usd')") !== '$75.00') fail('weekly value chart formatter did not stay in USD');
 
+evaluate(`renderWeeklyLimitValue({ series: [{
+  at: '2026-08-01T01:00:00Z', window_start: '2026-08-01T00:00:00Z', window_seconds: 3600,
+  observed_cost_usd: 1.2, quota_consumed_pct_points: 2, raw_value_usd: 60, value_usd: 60,
+  quality: 'low_confidence', reason: null, partial_window: true
+}] })`);
+if (!element('weekly-limit-value-data-body').children[0].children[8].textContent.includes('available 1h interval')) fail('short direct window duration was not explained');
+
 evaluate(`renderWeeklyLimitValue({
   current_status: 'stale_data',
   series: [{ at: '2026-08-01T00:00:00Z', observed_cost_usd: 1.5, quota_consumed_pct_points: 2, raw_value_usd: 75, value_usd: 75, quality: 'good', reason: null }]

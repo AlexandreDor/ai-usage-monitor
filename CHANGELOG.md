@@ -6,8 +6,21 @@ Git tag and the value in `VERSION` is the single source of truth.
 
 ## [Unreleased]
 
+### Added
+
+- Add Standard short-context API pricing for GPT-6.2 Astra and Sol, including
+  Codex and auto provider identifiers, for token costs and weekly-value estimates.
+- Record a complete 2026-11-18 catalog price verification with primary sources,
+  the deprecated free endpoint, local-only zero rates, and legacy alias assumptions.
+
 ### Fixed
 
+- Estimate weekly value from the available continuous period after a reset or
+  collection boundary instead of waiting twelve hours despite measurable use.
+  Mark shorter direct windows as low confidence and expose their duration.
+- Require at least two quota percentage points for direct weekly-value estimates,
+  preventing overlapping one-point drops from dominating the median and being
+  carried through idle periods. Preserve volatile quality on carried estimates.
 - Preserve observed 5-hour reset notifications when registration recovery uses
   a synthetic arm for the same event. Partial retries now deliver the original
   notification once instead of an internal suppression message, and retain

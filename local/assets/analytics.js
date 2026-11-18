@@ -793,6 +793,8 @@ function renderWeeklyLimitValueTable(points) {
     let reasonText = point.carried
       ? t('weeklyValueCarried', { date: formatDate(point.source_at), quality: weeklyValueQuality(point.quality) })
       : point.inferred ? t('weeklyValueInferred')
+      : point.partial_window && weeklyValuePointValid(point)
+        ? t('weeklyValuePartialWindow', { duration: formatDuration(point.window_seconds) })
       : point.mixed_model_reason ? weeklyValueReason(point.mixed_model_reason)
         : point.reason ? weeklyValueReason(point.reason) : t('weeklyValueAvailable');
     if (!point.carried && point.mixed_model_reason === 'mixed_model_insufficient_samples'
