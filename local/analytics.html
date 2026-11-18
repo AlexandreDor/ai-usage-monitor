@@ -207,7 +207,7 @@
             <h2 data-i18n="analytics.weeklyLimitValueTitle">Implicit weekly limit value</h2>
           </div>
           <div class="chart-heading-actions">
-            <span class="sample-count" id="weekly-limit-value-window" data-i18n="analytics.weeklyLimitValueWindow">Rolling window · 12 h · one point / 6 h · USD</span>
+            <span class="sample-count" id="weekly-limit-value-window" data-i18n="analytics.weeklyLimitValueWindow">Window up to 12 h · one point / 6 h · USD</span>
           </div>
         </div>
         <p id="weekly-section-status" class="chart-summary" role="status" hidden></p>
@@ -216,7 +216,7 @@
           <div id="weekly-limit-value-models" class="weekly-value-models"></div>
         </fieldset>
         <p class="chart-description" data-i18n="analytics.weeklyValueModelDescription">Per-model values come from exclusive windows when available. Mixed usage may use a fit trained on adaptive non-overlapping intervals from the last 28 days. High-uncertainty estimates remain visible with cross markers and sensitivity ranges in the table. The last accepted value may be carried for up to 7 days across ordinary gaps and weekly resets.</p>
-        <p class="chart-description" data-i18n="analytics.weeklyLimitValueDescription">Aggregate values use a rolling twelve-hour window. Per-model mixed-usage values can use shorter measurable intervals and are inferred from the shared quota, not model-level quota observations. Hollow dashed points carry an earlier accepted estimate.</p>
+        <p class="chart-description" data-i18n="analytics.weeklyLimitValueDescription">Direct values prefer a rolling twelve-hour window. After a reset or data boundary, a shorter continuous interval of at least fifteen minutes may be used with low confidence; the table gives its duration. Mixed-model values are inferred from the shared quota. Hollow dashed points carry an earlier accepted estimate.</p>
         <p class="quality-legend" id="weekly-limit-value-quality" data-i18n="analytics.weeklyLimitValueQualityLegend">Quality: good · low confidence · high uncertainty · volatile. Sensitivity ranges assume a one-point error in each quota observation; they are not statistical confidence intervals. The table gives the sensitivity ranges.</p>
         <div class="chart-wrap" id="weekly-limit-value-chart-wrap"><canvas data-i18n-aria-label="analytics.weeklyLimitValueTitle" aria-label="Implicit weekly limit value" id="weekly-limit-value-chart" class="time-slice-chart" role="img" aria-describedby="weekly-limit-value-summary weekly-limit-value-table-caption"></canvas></div>
         <p class="empty-state" id="weekly-limit-value-empty" data-i18n="analytics.noWeeklyLimitValue" hidden>No comparable weekly limit value is available in this period.</p>
